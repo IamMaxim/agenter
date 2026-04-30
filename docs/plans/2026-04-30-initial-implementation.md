@@ -145,13 +145,20 @@ Exit criterion: the control plane and runner can register a runner, register wor
 - Create: `crates/agenter-control-plane/src/browser_ws.rs`
 - Modify: `crates/agenter-runner/src/main.rs`
 
-- [ ] Add Axum startup with health endpoint `GET /healthz`.
-- [ ] Add runner WebSocket endpoint with authenticated in-memory token for development.
-- [ ] Add browser WebSocket endpoint with subscribe-session support.
-- [ ] Add a fake runner mode that connects, sends `runner_hello`, accepts an agent input command, and emits deterministic normalized events.
-- [ ] Add an integration smoke test or runbook proving fake runner to browser event flow.
-- [ ] Run `cargo check --workspace` and `cargo test --workspace`.
-- [ ] Commit with `feat: wire fake runner event flow`.
+- [x] Add Axum startup with health endpoint `GET /healthz`.
+- [x] Add runner WebSocket endpoint with authenticated in-memory token for development.
+- [x] Add browser WebSocket endpoint with subscribe-session support.
+- [x] Add a fake runner mode that connects, sends `runner_hello`, accepts an agent input command, and emits deterministic normalized events.
+- [x] Add an integration smoke test or runbook proving fake runner to browser event flow.
+- [x] Run `cargo check --workspace` and `cargo test --workspace`.
+- [x] Commit with `feat: wire fake runner event flow`.
+
+Active execution notes:
+
+- Task 1.4 wires an in-memory Axum control plane with `/healthz`, `/api/runner/ws`, and `/api/browser/ws`; the dev runner token defaults to `dev-runner-token`.
+- The fake runner mode is enabled with `agenter-runner --fake` or `AGENTER_RUNNER_MODE=fake`, connects to `ws://127.0.0.1:7777/api/runner/ws` by default, and emits deterministic normalized events for smoke session `11111111-1111-1111-1111-111111111111`.
+- The automated smoke proof is `cargo test -p agenter-control-plane http::tests::smoke_routes_runner_events_to_subscribed_browser`; manual steps are recorded in `docs/runbooks/fake-runner-browser-smoke.md`.
+- Task 1.4 verification passed with `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace`; DB integration tests remain ignored without `DATABASE_URL` as recorded in Task 1.3.
 
 ## Milestone 2: Auth and Browser MVP
 
