@@ -193,12 +193,17 @@ Active execution notes:
 - Create frontend package files under `web/`
 - Modify: `docs/harness/VERIFICATION.md`
 
-- [ ] Choose SvelteKit or plain Svelte SPA and record the decision in `docs/decisions/`.
-- [ ] Scaffold login, workspace list, session list, and chat routes.
-- [ ] Add API client modules for auth, sessions, and WebSocket events.
-- [ ] Add frontend verification commands to `docs/harness/VERIFICATION.md`.
-- [ ] Run frontend checks and build.
-- [ ] Commit with `feat: scaffold browser ui`.
+- [x] Choose SvelteKit or plain Svelte SPA and record the decision in `docs/decisions/`.
+- [x] Scaffold login, workspace list, session list, and chat routes.
+- [x] Add API client modules for auth, sessions, and WebSocket events.
+- [x] Add frontend verification commands to `docs/harness/VERIFICATION.md`.
+- [x] Run frontend checks and build.
+- [x] Commit with `feat: scaffold browser ui`.
+
+Active execution notes:
+
+- Task 2.2 chooses a plain Svelte TypeScript SPA with Vite. The Rust control plane remains the owner of auth, REST APIs, and WebSocket APIs; the frontend is static and can be served by the control plane or a reverse proxy.
+- Backend workspace/session list and message endpoints are not implemented yet, so the scaffolded routes show coherent pending states on `404`; Task 2.3 will wire the full chat UX.
 
 ### Task 2.3: Implement Browser Chat UX
 

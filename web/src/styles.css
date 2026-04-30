@@ -1,0 +1,323 @@
+:root {
+  color: #1e2528;
+  background: #f6f7f4;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  min-height: 2.25rem;
+  border: 1px solid #214d57;
+  border-radius: 6px;
+  padding: 0.45rem 0.8rem;
+  color: #ffffff;
+  background: #214d57;
+  cursor: pointer;
+}
+
+button:disabled {
+  border-color: #c0c8c2;
+  color: #65706a;
+  background: #e4e8e1;
+  cursor: not-allowed;
+}
+
+button.secondary {
+  width: 100%;
+  border-color: #ccd3ce;
+  color: #293235;
+  background: #ffffff;
+}
+
+a {
+  color: inherit;
+}
+
+h1,
+p {
+  margin: 0;
+}
+
+code {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  color: #4d5b5f;
+  font-size: 0.78rem;
+}
+
+pre {
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+label {
+  display: grid;
+  gap: 0.35rem;
+  color: #4d5b5f;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+input,
+textarea {
+  width: 100%;
+  border: 1px solid #c6d0c9;
+  border-radius: 6px;
+  padding: 0.6rem 0.7rem;
+  color: #1e2528;
+  background: #ffffff;
+}
+
+input:focus,
+textarea:focus {
+  border-color: #2a6f77;
+  outline: 2px solid #b7d8d8;
+  outline-offset: 1px;
+}
+
+.boot-screen,
+.auth-screen {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 1rem;
+}
+
+.login-panel {
+  display: grid;
+  width: min(100%, 24rem);
+  gap: 1rem;
+  border: 1px solid #d7ddd8;
+  border-radius: 8px;
+  padding: 1.4rem;
+  background: #ffffff;
+}
+
+.eyebrow {
+  color: #66736d;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 16rem minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.sidebar {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  gap: 1.2rem;
+  border-right: 1px solid #d5dcd7;
+  padding: 1rem;
+  background: #ffffff;
+}
+
+.brand {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.brand span {
+  overflow: hidden;
+  color: #65706a;
+  font-size: 0.82rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+nav {
+  display: grid;
+  align-content: start;
+  gap: 0.25rem;
+}
+
+nav a {
+  border-radius: 6px;
+  padding: 0.55rem 0.65rem;
+  color: #405056;
+  text-decoration: none;
+}
+
+nav a.active,
+nav a:hover {
+  color: #10272c;
+  background: #e5eeee;
+}
+
+.content {
+  min-width: 0;
+  padding: 1.4rem;
+}
+
+.page-section,
+.chat-layout {
+  display: grid;
+  gap: 1rem;
+  max-width: 70rem;
+}
+
+.section-header,
+.chat-header,
+.row-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.section-header p,
+.chat-header p,
+.row-card span,
+.muted {
+  color: #65706a;
+}
+
+.data-list {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.row-card,
+.empty-state,
+.event-card {
+  border: 1px solid #d7ddd8;
+  border-radius: 8px;
+  padding: 0.85rem;
+  background: #ffffff;
+}
+
+.row-card div,
+.empty-state {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.row-link {
+  text-decoration: none;
+}
+
+.row-link:hover {
+  border-color: #9ab8ba;
+}
+
+.empty-state {
+  color: #5d6863;
+}
+
+.error {
+  color: #9b2f2f;
+  font-size: 0.9rem;
+}
+
+.chat-layout {
+  grid-template-rows: auto minmax(20rem, 1fr) auto auto;
+  height: calc(100vh - 2.8rem);
+}
+
+.chat-header {
+  min-width: 0;
+}
+
+.chat-header p {
+  overflow-wrap: anywhere;
+}
+
+.status-pill {
+  flex: 0 0 auto;
+  border: 1px solid #c8d4d1;
+  border-radius: 999px;
+  padding: 0.25rem 0.6rem;
+  color: #385158;
+  background: #edf4f2;
+  font-size: 0.82rem;
+}
+
+.event-stream {
+  display: grid;
+  align-content: start;
+  gap: 0.6rem;
+  overflow: auto;
+}
+
+.event-card {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.event-card span {
+  color: #385158;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.composer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.6rem;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+}
+
+@media (max-width: 760px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    grid-template-columns: 1fr;
+    border-right: 0;
+    border-bottom: 1px solid #d5dcd7;
+  }
+
+  nav {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .content {
+    padding: 1rem;
+  }
+
+  .section-header,
+  .chat-header,
+  .row-card,
+  .composer {
+    align-items: stretch;
+    flex-direction: column;
+    grid-template-columns: 1fr;
+  }
+
+  .chat-layout {
+    height: auto;
+    min-height: calc(100vh - 8rem);
+  }
+}

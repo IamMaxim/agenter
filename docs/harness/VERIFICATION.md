@@ -32,16 +32,17 @@ If SQLx offline checking is used, include the repository's SQLx prepare/check co
 
 ## Frontend Phase
 
-Once the Svelte frontend exists, expected baseline verification is:
+The Svelte frontend uses npm and lives in `web/`. Run frontend verification from that directory after any frontend source, package, or build configuration change:
 
 ```sh
+cd web
 npm run check
 npm run lint
 npm run test
 npm run build
 ```
 
-Adjust commands to the package manager chosen by the first frontend scaffold.
+`npm run check` runs `svelte-check`, `npm run lint` runs ESLint, `npm run test` runs Vitest, and `npm run build` runs the Vite production build.
 
 ## Integration Phase
 
