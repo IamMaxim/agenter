@@ -74,3 +74,52 @@ pub struct PendingApproval {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OidcProvider {
+    pub provider_id: String,
+    pub display_name: String,
+    pub issuer_url: String,
+    pub client_id: String,
+    pub client_secret_ciphertext: Option<String>,
+    pub scopes: Vec<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OidcLoginState {
+    pub state: String,
+    pub provider_id: String,
+    pub nonce: String,
+    pub pkce_verifier: Option<String>,
+    pub return_to: Option<String>,
+    pub expires_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorAccount {
+    pub connector_account_id: uuid::Uuid,
+    pub user_id: UserId,
+    pub connector_id: String,
+    pub external_account_id: String,
+    pub display_name: Option<String>,
+    pub linked_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorLinkCode {
+    pub code: String,
+    pub user_id: Option<UserId>,
+    pub connector_id: String,
+    pub external_account_id: String,
+    pub display_name: Option<String>,
+    pub expires_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}

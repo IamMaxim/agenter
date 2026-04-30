@@ -6,7 +6,21 @@ use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgPool, Result, Row};
 use uuid::Uuid;
 
-use crate::models::{AgentSession, CachedEvent, PendingApproval, Runner, User, Workspace};
+use crate::models::{
+    AgentSession, CachedEvent, ConnectorAccount, ConnectorLinkCode, OidcLoginState, OidcProvider,
+    PendingApproval, Runner, User, Workspace,
+};
+
+#[derive(Clone, Debug)]
+pub struct UpsertOidcProvider<'a> {
+    pub provider_id: &'a str,
+    pub display_name: &'a str,
+    pub issuer_url: &'a str,
+    pub client_id: &'a str,
+    pub client_secret_ciphertext: Option<&'a str>,
+    pub scopes: &'a [String],
+    pub enabled: bool,
+}
 
 pub async fn create_user(pool: &PgPool, email: &str, display_name: Option<&str>) -> Result<User> {
     let row = sqlx::query(
@@ -147,6 +161,170 @@ pub async fn find_password_credential_by_email(
     row.as_ref()
         .map(|row| Ok((user_from_row(row)?, row.try_get("password_hash")?)))
         .transpose()
+}
+
+pub async fn upsert_oidc_provider(
+    pool: &PgPool,
+    provider: UpsertOidcProvider<'_>,
+) -> Result<OidcProvider> {
+    let row = sqlx::query(
+        "insert into oidc_providers (
+            oidc_provider_id,
+            display_name,
+            issuer_url,
+            client_id,
+            client_secret_ciphertext,
+            scopes,
+            enabled
+         )
+         values ($1, $2, $3, $4, $5, $6, $7)
+         on conflict (oidc_provider_id)
+         do update set display_name = excluded.display_name,
+                       issuer_url = excluded.issuer_url,
+                       client_id = excluded.client_id,
+                       client_secret_ciphertext = excluded.client_secret_ciphertext,
+                       scopes = excluded.scopes,
+                       enabled = excluded.enabled,
+                       updated_at = now()
+         returning oidc_provider_id, display_name, issuer_url, client_id,
+             client_secret_ciphertext, scopes, enabled, created_at, updated_at",
+    )
+    .bind(provider.provider_id)
+    .bind(provider.display_name)
+    .bind(provider.issuer_url)
+    .bind(provider.client_id)
+    .bind(provider.client_secret_ciphertext)
+    .bind(provider.scopes)
+    .bind(provider.enabled)
+    .fetch_one(pool)
+    .await?;
+
+    oidc_provider_from_row(&row)
+}
+
+pub async fn find_oidc_provider(pool: &PgPool, provider_id: &str) -> Result<Option<OidcProvider>> {
+    let row = sqlx::query(
+        "select oidc_provider_id, display_name, issuer_url, client_id,
+                client_secret_ciphertext, scopes, enabled, created_at, updated_at
+         from oidc_providers
+         where oidc_provider_id = $1 and enabled = true",
+    )
+    .bind(provider_id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(oidc_provider_from_row).transpose()
+}
+
+pub async fn create_oidc_login_state(
+    pool: &PgPool,
+    state: &str,
+    provider_id: &str,
+    nonce: &str,
+    pkce_verifier: Option<&str>,
+    return_to: Option<&str>,
+    expires_at: DateTime<Utc>,
+) -> Result<OidcLoginState> {
+    let row = sqlx::query(
+        "insert into oidc_login_states (
+            state,
+            provider_id,
+            nonce,
+            pkce_verifier,
+            return_to,
+            expires_at
+         )
+         values ($1, $2, $3, $4, $5, $6)
+         returning state, provider_id, nonce, pkce_verifier, return_to,
+             expires_at, consumed_at, created_at",
+    )
+    .bind(state)
+    .bind(provider_id)
+    .bind(nonce)
+    .bind(pkce_verifier)
+    .bind(return_to)
+    .bind(expires_at)
+    .fetch_one(pool)
+    .await?;
+
+    oidc_login_state_from_row(&row)
+}
+
+pub async fn consume_oidc_login_state(
+    pool: &PgPool,
+    state: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<OidcLoginState>> {
+    let row = sqlx::query(
+        "update oidc_login_states
+         set consumed_at = $2
+         where state = $1
+           and consumed_at is null
+           and expires_at > $2
+         returning state, provider_id, nonce, pkce_verifier, return_to,
+             expires_at, consumed_at, created_at",
+    )
+    .bind(state)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(oidc_login_state_from_row).transpose()
+}
+
+pub async fn upsert_oidc_identity(
+    pool: &PgPool,
+    provider_id: &str,
+    subject: &str,
+    email: &str,
+    display_name: Option<&str>,
+) -> Result<User> {
+    let mut tx = pool.begin().await?;
+    let existing: Option<PgRow> = sqlx::query(
+        "select u.user_id, u.email, u.display_name, u.created_at, u.updated_at
+         from users u
+         join auth_identities ai on ai.user_id = u.user_id
+         where ai.provider_kind = 'oidc'
+           and ai.provider_id = $1
+           and ai.subject = $2",
+    )
+    .bind(provider_id)
+    .bind(subject)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let user = if let Some(row) = existing {
+        user_from_row(&row)?
+    } else {
+        let row = sqlx::query(
+            "insert into users (email, display_name)
+             values ($1, $2)
+             on conflict (email)
+             do update set display_name = coalesce(excluded.display_name, users.display_name),
+                           updated_at = now()
+             returning user_id, email, display_name, created_at, updated_at",
+        )
+        .bind(email)
+        .bind(display_name)
+        .fetch_one(&mut *tx)
+        .await?;
+        let user = user_from_row(&row)?;
+        sqlx::query(
+            "insert into auth_identities (user_id, provider_kind, provider_id, subject)
+             values ($1, 'oidc', $2, $3)
+             on conflict (provider_kind, provider_id, subject)
+             do update set user_id = excluded.user_id, updated_at = now()",
+        )
+        .bind(user.user_id.as_uuid())
+        .bind(provider_id)
+        .bind(subject)
+        .execute(&mut *tx)
+        .await?;
+        user
+    };
+
+    tx.commit().await?;
+    Ok(user)
 }
 
 pub async fn update_password_credential(
@@ -355,6 +533,93 @@ pub async fn resolve_approval(
     row.as_ref().map(approval_from_row).transpose()
 }
 
+pub async fn create_connector_link_code(
+    pool: &PgPool,
+    code: &str,
+    connector_id: &str,
+    external_account_id: &str,
+    display_name: Option<&str>,
+    expires_at: DateTime<Utc>,
+) -> Result<ConnectorLinkCode> {
+    let row = sqlx::query(
+        "insert into connector_link_codes (
+            code,
+            connector_id,
+            external_account_id,
+            display_name,
+            expires_at
+         )
+         values ($1, $2, $3, $4, $5)
+         returning code, user_id, connector_id, external_account_id, display_name,
+             expires_at, consumed_at, created_at",
+    )
+    .bind(code)
+    .bind(connector_id)
+    .bind(external_account_id)
+    .bind(display_name)
+    .bind(expires_at)
+    .fetch_one(pool)
+    .await?;
+
+    connector_link_code_from_row(&row)
+}
+
+pub async fn consume_connector_link_code(
+    pool: &PgPool,
+    code: &str,
+    user_id: UserId,
+    now: DateTime<Utc>,
+) -> Result<Option<ConnectorAccount>> {
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query(
+        "update connector_link_codes
+         set user_id = $2,
+             consumed_at = $3
+         where code = $1
+           and consumed_at is null
+           and expires_at > $3
+         returning code, user_id, connector_id, external_account_id, display_name,
+             expires_at, consumed_at, created_at",
+    )
+    .bind(code)
+    .bind(user_id.as_uuid())
+    .bind(now)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(link_code) = row.as_ref().map(connector_link_code_from_row).transpose()? else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+
+    let row = sqlx::query(
+        "insert into connector_accounts (
+            user_id,
+            connector_id,
+            external_account_id,
+            display_name,
+            linked_at
+         )
+         values ($1, $2, $3, $4, $5)
+         on conflict (connector_id, external_account_id)
+         do update set user_id = excluded.user_id,
+                       display_name = excluded.display_name,
+                       linked_at = excluded.linked_at,
+                       updated_at = now()
+         returning connector_account_id, user_id, connector_id, external_account_id,
+             display_name, linked_at, created_at, updated_at",
+    )
+    .bind(user_id.as_uuid())
+    .bind(&link_code.connector_id)
+    .bind(&link_code.external_account_id)
+    .bind(&link_code.display_name)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    let account = connector_account_from_row(&row)?;
+    tx.commit().await?;
+    Ok(Some(account))
+}
+
 fn user_from_row(row: &PgRow) -> Result<User> {
     Ok(User {
         user_id: UserId::from_uuid(row.try_get("user_id")?),
@@ -435,6 +700,60 @@ fn approval_from_row(row: &PgRow) -> Result<PendingApproval> {
         resolved_at: row.try_get("resolved_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn oidc_provider_from_row(row: &PgRow) -> Result<OidcProvider> {
+    Ok(OidcProvider {
+        provider_id: row.try_get("oidc_provider_id")?,
+        display_name: row.try_get("display_name")?,
+        issuer_url: row.try_get("issuer_url")?,
+        client_id: row.try_get("client_id")?,
+        client_secret_ciphertext: row.try_get("client_secret_ciphertext")?,
+        scopes: row.try_get("scopes")?,
+        enabled: row.try_get("enabled")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn oidc_login_state_from_row(row: &PgRow) -> Result<OidcLoginState> {
+    Ok(OidcLoginState {
+        state: row.try_get("state")?,
+        provider_id: row.try_get("provider_id")?,
+        nonce: row.try_get("nonce")?,
+        pkce_verifier: row.try_get("pkce_verifier")?,
+        return_to: row.try_get("return_to")?,
+        expires_at: row.try_get("expires_at")?,
+        consumed_at: row.try_get("consumed_at")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn connector_account_from_row(row: &PgRow) -> Result<ConnectorAccount> {
+    Ok(ConnectorAccount {
+        connector_account_id: row.try_get("connector_account_id")?,
+        user_id: UserId::from_uuid(row.try_get("user_id")?),
+        connector_id: row.try_get("connector_id")?,
+        external_account_id: row.try_get("external_account_id")?,
+        display_name: row.try_get("display_name")?,
+        linked_at: row.try_get("linked_at")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn connector_link_code_from_row(row: &PgRow) -> Result<ConnectorLinkCode> {
+    let user_id: Option<Uuid> = row.try_get("user_id")?;
+    Ok(ConnectorLinkCode {
+        code: row.try_get("code")?,
+        user_id: user_id.map(UserId::from_uuid),
+        connector_id: row.try_get("connector_id")?,
+        external_account_id: row.try_get("external_account_id")?,
+        display_name: row.try_get("display_name")?,
+        expires_at: row.try_get("expires_at")?,
+        consumed_at: row.try_get("consumed_at")?,
+        created_at: row.try_get("created_at")?,
     })
 }
 
@@ -707,6 +1026,121 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
+    async fn consumes_oidc_state_once_and_upserts_identity() {
+        let pool = test_pool().await;
+
+        let suffix = uuid::Uuid::new_v4();
+        let provider_id = format!("authentik-{suffix}");
+        let scopes = vec![
+            "openid".to_owned(),
+            "profile".to_owned(),
+            "email".to_owned(),
+        ];
+        let provider = upsert_oidc_provider(
+            &pool,
+            UpsertOidcProvider {
+                provider_id: &provider_id,
+                display_name: "Authentik",
+                issuer_url: "https://auth.example.test/application/o/agenter/",
+                client_id: "agenter",
+                client_secret_ciphertext: None,
+                scopes: &scopes,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("upsert oidc provider");
+        assert_eq!(provider.provider_id, provider_id);
+
+        let state = format!("state-{suffix}");
+        let expires_at = Utc::now() + chrono::Duration::minutes(5);
+        create_oidc_login_state(
+            &pool,
+            &state,
+            &provider.provider_id,
+            "nonce-1",
+            Some("pkce-1"),
+            Some("/sessions"),
+            expires_at,
+        )
+        .await
+        .expect("create oidc state");
+
+        let consumed = consume_oidc_login_state(&pool, &state, Utc::now())
+            .await
+            .expect("consume oidc state")
+            .expect("state should be consumable");
+        assert_eq!(consumed.nonce, "nonce-1");
+        assert!(consumed.consumed_at.is_some());
+
+        let second = consume_oidc_login_state(&pool, &state, Utc::now())
+            .await
+            .expect("consume state again");
+        assert!(second.is_none());
+
+        let email = format!("oidc-user-{suffix}@example.test");
+        let user = upsert_oidc_identity(
+            &pool,
+            &provider.provider_id,
+            "subject-1",
+            &email,
+            Some("Oidc User"),
+        )
+        .await
+        .expect("upsert oidc identity");
+        let same_user = upsert_oidc_identity(
+            &pool,
+            &provider.provider_id,
+            "subject-1",
+            &email,
+            Some("Oidc User"),
+        )
+        .await
+        .expect("upsert same oidc identity");
+        assert_eq!(same_user.user_id, user.user_id);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
+    async fn consumes_connector_link_code_once() {
+        let pool = test_pool().await;
+
+        let suffix = uuid::Uuid::new_v4();
+        let user = create_user(
+            &pool,
+            &format!("link-user-{suffix}@example.test"),
+            Some("Link User"),
+        )
+        .await
+        .expect("create link user");
+        let code = format!("link-{suffix}");
+        let expires_at = Utc::now() + chrono::Duration::minutes(5);
+        create_connector_link_code(
+            &pool,
+            &code,
+            "telegram",
+            &format!("telegram-{suffix}"),
+            Some("Telegram User"),
+            expires_at,
+        )
+        .await
+        .expect("create link code");
+
+        let account = consume_connector_link_code(&pool, &code, user.user_id, Utc::now())
+            .await
+            .expect("consume link code")
+            .expect("code should be consumable");
+        assert_eq!(account.user_id, user.user_id);
+        assert_eq!(account.connector_id, "telegram");
+
+        let second = consume_connector_link_code(&pool, &code, user.user_id, Utc::now())
+            .await
+            .expect("consume link code again");
+        assert!(second.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
     async fn migration_creates_required_tables() {
         let pool = test_pool().await;
 
@@ -721,7 +1155,9 @@ mod tests {
             "event_cache_cursors",
             "agent_sessions",
             "connector_accounts",
+            "connector_link_codes",
             "session_bindings",
+            "oidc_login_states",
             "pending_approvals",
             "event_cache",
             "connector_deliveries",
