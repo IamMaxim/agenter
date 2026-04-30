@@ -47,6 +47,10 @@ button.secondary {
   background: #ffffff;
 }
 
+button.secondary.compact {
+  width: auto;
+}
+
 a {
   color: inherit;
 }
@@ -276,6 +280,74 @@ nav a:hover {
   color: #385158;
   font-size: 0.8rem;
   font-weight: 700;
+}
+
+.message-row {
+  display: grid;
+  max-width: min(44rem, 88%);
+  gap: 0.25rem;
+  border-radius: 8px;
+  padding: 0.75rem 0.85rem;
+}
+
+.message-row span,
+.card-heading span {
+  color: #5d6863;
+  font-size: 0.76rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.user-message {
+  justify-self: end;
+  color: #10272c;
+  background: #dcebec;
+}
+
+.assistant-message {
+  justify-self: start;
+  background: #ffffff;
+  border: 1px solid #d7ddd8;
+}
+
+.card-heading,
+.inline-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.inline-actions {
+  justify-content: flex-start;
+}
+
+.command-card {
+  border-left: 4px solid #5b6472;
+}
+
+.tool-card {
+  border-left: 4px solid #8b6f2f;
+}
+
+.file-card {
+  border-left: 4px solid #6b7f3f;
+}
+
+.approval-card {
+  border-left: 4px solid #9a5a3a;
+}
+
+.error-card {
+  border-left: 4px solid #9b2f2f;
+}
+
+.back-link {
+  display: inline-block;
+  margin-bottom: 0.25rem;
+  color: #526066;
+  font-size: 0.84rem;
+  text-decoration: none;
 }
 
 .composer {

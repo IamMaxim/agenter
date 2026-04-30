@@ -1,8 +1,11 @@
 use std::env;
 
 use agenter_core::{
-    AgentCapabilities, AgentMessageDeltaEvent, AgentProviderId, AppEvent, MessageCompletedEvent,
-    RunnerId, SessionId, UserMessageEvent, WorkspaceId, WorkspaceRef,
+    AgentCapabilities, AgentErrorEvent, AgentMessageDeltaEvent, AgentProviderId, AppEvent,
+    ApprovalId, ApprovalKind, ApprovalRequestEvent, CommandCompletedEvent, CommandEvent,
+    CommandOutputEvent, CommandOutputStream, FileChangeEvent, FileChangeKind,
+    MessageCompletedEvent, RunnerId, SessionId, ToolEvent, UserMessageEvent, WorkspaceId,
+    WorkspaceRef,
 };
 use agenter_protocol::runner::{
     AgentInput, AgentProviderAdvertisement, RunnerCapabilities, RunnerClientMessage, RunnerCommand,
@@ -111,6 +114,9 @@ fn fake_hello(token: String) -> RunnerHello {
                 provider_id: AgentProviderId::from(AgentProviderId::CODEX),
                 capabilities: AgentCapabilities {
                     streaming: true,
+                    approvals: true,
+                    file_changes: true,
+                    command_execution: true,
                     ..AgentCapabilities::default()
                 },
             }],
@@ -148,6 +154,68 @@ fn deterministic_fake_events(session_id: SessionId, input: &AgentInput) -> Vec<A
             author_user_id: None,
             content,
         }),
+        AppEvent::CommandStarted(CommandEvent {
+            session_id,
+            command_id: "fake-command-1".to_owned(),
+            command: "printf fake-runner".to_owned(),
+            cwd: Some(".".to_owned()),
+            provider_payload: None,
+        }),
+        AppEvent::CommandOutputDelta(CommandOutputEvent {
+            session_id,
+            command_id: "fake-command-1".to_owned(),
+            stream: CommandOutputStream::Stdout,
+            delta: "fake-runner\n".to_owned(),
+            provider_payload: None,
+        }),
+        AppEvent::CommandCompleted(CommandCompletedEvent {
+            session_id,
+            command_id: "fake-command-1".to_owned(),
+            exit_code: Some(0),
+            success: true,
+            provider_payload: None,
+        }),
+        AppEvent::ToolStarted(ToolEvent {
+            session_id,
+            tool_call_id: "fake-tool-1".to_owned(),
+            name: "fake_lookup".to_owned(),
+            title: Some("Fake lookup".to_owned()),
+            input: Some(serde_json::json!({ "query": response.clone() })),
+            output: None,
+            provider_payload: None,
+        }),
+        AppEvent::ToolCompleted(ToolEvent {
+            session_id,
+            tool_call_id: "fake-tool-1".to_owned(),
+            name: "fake_lookup".to_owned(),
+            title: Some("Fake lookup".to_owned()),
+            input: None,
+            output: Some(serde_json::json!({ "ok": true })),
+            provider_payload: None,
+        }),
+        AppEvent::FileChangeProposed(FileChangeEvent {
+            session_id,
+            path: "fake-output.txt".to_owned(),
+            change_kind: FileChangeKind::Modify,
+            diff: Some("-old\n+fake runner output\n".to_owned()),
+            provider_payload: None,
+        }),
+        AppEvent::FileChangeApplied(FileChangeEvent {
+            session_id,
+            path: "fake-output.txt".to_owned(),
+            change_kind: FileChangeKind::Modify,
+            diff: None,
+            provider_payload: None,
+        }),
+        AppEvent::ApprovalRequested(ApprovalRequestEvent {
+            session_id,
+            approval_id: ApprovalId::from_uuid(Uuid::from_u128(0x44444444444444444444444444444444)),
+            kind: ApprovalKind::Command,
+            title: "Approve fake command".to_owned(),
+            details: Some("This is an in-memory approval stub.".to_owned()),
+            expires_at: None,
+            provider_payload: None,
+        }),
         AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {
             session_id,
             message_id: "fake-agent-1".to_owned(),
@@ -158,6 +226,12 @@ fn deterministic_fake_events(session_id: SessionId, input: &AgentInput) -> Vec<A
             session_id,
             message_id: "fake-agent-1".to_owned(),
             content: Some(response),
+            provider_payload: None,
+        }),
+        AppEvent::Error(AgentErrorEvent {
+            session_id: Some(session_id),
+            code: Some("fake_notice".to_owned()),
+            message: "Fake runner diagnostic card".to_owned(),
             provider_payload: None,
         }),
     ]
@@ -177,9 +251,10 @@ mod tests {
             },
         );
 
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 12);
         assert!(matches!(events[0], AppEvent::UserMessage(_)));
-        assert!(matches!(events[1], AppEvent::AgentMessageDelta(_)));
-        assert!(matches!(events[2], AppEvent::AgentMessageCompleted(_)));
+        assert!(matches!(events[1], AppEvent::CommandStarted(_)));
+        assert!(matches!(events[9], AppEvent::AgentMessageDelta(_)));
+        assert!(matches!(events[10], AppEvent::AgentMessageCompleted(_)));
     }
 }

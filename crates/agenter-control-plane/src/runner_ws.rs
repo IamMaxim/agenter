@@ -12,6 +12,7 @@ use axum::{
     response::Response,
 };
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -51,6 +52,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             hello.capabilities.clone(),
             hello.workspaces.clone(),
         )
+        .await;
+    let (outbound_sender, mut outbound_receiver) = mpsc::unbounded_channel();
+    state
+        .connect_runner(runner.runner_id, outbound_sender)
         .await;
     let Some(workspace) = runner.workspaces.first().cloned() else {
         return;
@@ -102,34 +107,53 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }),
     }));
 
-    if send_server_message(&mut sender, command).await.is_err() {
+    if state
+        .send_runner_message(runner.runner_id, command)
+        .await
+        .is_err()
+    {
         return;
     }
 
-    while let Some(message) = receiver.next().await {
-        match message {
-            Ok(Message::Text(text)) => {
-                if let Ok(RunnerClientMessage::Event(envelope)) =
-                    serde_json::from_str::<RunnerClientMessage>(&text)
-                {
-                    if let RunnerEvent::AgentEvent(AgentEvent { session_id, event }) =
-                        envelope.event
-                    {
-                        if app_event_session_id(&event) != Some(session_id) {
-                            tracing::warn!(
-                                %session_id,
-                                "runner event envelope session_id did not match embedded event"
-                            );
-                            continue;
+    loop {
+        tokio::select! {
+            message = receiver.next() => {
+                match message {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(RunnerClientMessage::Event(envelope)) =
+                            serde_json::from_str::<RunnerClientMessage>(&text)
+                        {
+                            if let RunnerEvent::AgentEvent(AgentEvent { session_id, event }) =
+                                envelope.event
+                            {
+                                if app_event_session_id(&event) != Some(session_id) {
+                                    tracing::warn!(
+                                        %session_id,
+                                        "runner event envelope session_id did not match embedded event"
+                                    );
+                                    continue;
+                                }
+                                state.publish_event(session_id, event).await;
+                            }
                         }
-                        state.publish_event(session_id, event).await;
                     }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                    Some(Ok(_)) => {}
                 }
             }
-            Ok(Message::Close(_)) | Err(_) => return,
-            Ok(_) => {}
+            outbound = outbound_receiver.recv() => {
+                let Some(outbound) = outbound else {
+                    break;
+                };
+                if send_server_message(&mut sender, outbound).await.is_err() {
+                    break;
+                }
+            }
         }
     }
+
+    state.disconnect_runner(runner.runner_id).await;
 }
 
 async fn send_server_message(

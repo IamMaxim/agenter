@@ -1,5 +1,11 @@
 import { requestJson } from './http';
-import type { RunnerInfo, SessionInfo, WorkspaceRef } from './types';
+import type {
+  ApprovalDecision,
+  BrowserEventEnvelope,
+  RunnerInfo,
+  SessionInfo,
+  WorkspaceRef
+} from './types';
 
 export interface CreateSessionRequest {
   workspace_id: string;
@@ -29,6 +35,12 @@ export async function getSession(sessionId: string): Promise<SessionInfo> {
   return requestJson<SessionInfo>(`/api/sessions/${encodeURIComponent(sessionId)}`);
 }
 
+export async function getSessionHistory(sessionId: string): Promise<BrowserEventEnvelope[]> {
+  return requestJson<BrowserEventEnvelope[]>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/history`
+  );
+}
+
 export async function createSession(request: CreateSessionRequest): Promise<SessionInfo> {
   return requestJson<SessionInfo>('/api/sessions', {
     method: 'POST',
@@ -44,4 +56,17 @@ export async function sendSessionMessage(
     method: 'POST',
     body: JSON.stringify(request)
   });
+}
+
+export async function decideApproval(
+  approvalId: string,
+  decision: ApprovalDecision
+): Promise<BrowserEventEnvelope> {
+  return requestJson<BrowserEventEnvelope>(
+    `/api/approvals/${encodeURIComponent(approvalId)}/decision`,
+    {
+      method: 'POST',
+      body: JSON.stringify(decision)
+    }
+  );
 }

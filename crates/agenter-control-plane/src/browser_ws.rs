@@ -1,6 +1,6 @@
 use agenter_core::UserId;
 use agenter_protocol::browser::{
-    BrowserAck, BrowserClientMessage, BrowserError, BrowserEventEnvelope, BrowserServerMessage,
+    BrowserAck, BrowserClientMessage, BrowserError, BrowserServerMessage,
 };
 use axum::{
     extract::{
@@ -77,15 +77,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: UserId) {
 
     let (cached_events, mut events) = state.subscribe_session(subscription.session_id).await;
     for event in cached_events {
-        if send_server_message(
-            &mut sender,
-            BrowserServerMessage::Event(BrowserEventEnvelope {
-                event_id: None,
-                event,
-            }),
-        )
-        .await
-        .is_err()
+        if send_server_message(&mut sender, BrowserServerMessage::Event(event))
+            .await
+            .is_err()
         {
             return;
         }
@@ -111,13 +105,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: UserId) {
             event = events.recv() => {
                 match event {
                     Ok(event) => {
-                        if send_server_message(
-                            &mut sender,
-                            BrowserServerMessage::Event(BrowserEventEnvelope {
-                                event_id: None,
-                                event,
-                            }),
-                        )
+                        if send_server_message(&mut sender, BrowserServerMessage::Event(event))
                         .await
                         .is_err()
                         {

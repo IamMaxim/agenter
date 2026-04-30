@@ -86,3 +86,9 @@ export interface BrowserError {
 }
 
 export type BrowserServerMessage = BrowserEventEnvelope | BrowserAck | BrowserError;
+
+export type ApprovalDecisionName = 'accept' | 'accept_for_session' | 'decline' | 'cancel';
+
+export interface ApprovalDecision {
+  decision: ApprovalDecisionName;
+}

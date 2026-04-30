@@ -212,12 +212,19 @@ Active execution notes:
 - Modify files under `web/`
 - Modify control-plane session APIs as needed
 
-- [ ] Implement session list and chat view with streaming text deltas.
-- [ ] Render command, file, tool, approval, and error cards from normalized events.
-- [ ] Add approval accept/decline actions.
-- [ ] Add browser reconnect behavior that reloads event cache and resubscribes.
-- [ ] Run backend and frontend verification.
-- [ ] Commit with `feat: add browser chat experience`.
+- [x] Implement session list and chat view with streaming text deltas.
+- [x] Render command, file, tool, approval, and error cards from normalized events.
+- [x] Add approval accept/decline actions.
+- [x] Add browser reconnect behavior that reloads event cache and resubscribes.
+- [x] Run backend and frontend verification.
+- [x] Commit with `feat: add browser chat experience`.
+
+Active execution notes:
+
+- Task 2.3 adds in-memory browser REST APIs for runners, runner workspaces, sessions, session history, session messages, and approval decisions.
+- Browser history and WebSocket payloads now carry event IDs so reconnect can reload cached events and avoid duplicate rendering.
+- Fake runner events now include representative command, tool, file, approval, error, user, and streaming assistant events for the browser cards.
+- Verification passed with `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`, `npm run check`, `npm run lint`, `npm run test`, and `npm run build`.
 
 ## Milestone 3: Real Agent Adapters
 
