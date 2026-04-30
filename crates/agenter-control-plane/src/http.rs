@@ -814,6 +814,7 @@ mod tests {
     };
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
+    use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{
         connect_async,
         tungstenite::{client::IntoClientRequest, Message},
@@ -822,6 +823,107 @@ mod tests {
 
     use super::*;
     use crate::runner_ws::smoke_session_id;
+
+    async fn next_runner_command(
+        receiver: &mut futures_util::stream::SplitStream<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        >,
+    ) -> agenter_protocol::runner::RunnerCommandEnvelope {
+        let frame = timeout(Duration::from_secs(2), receiver.next())
+            .await
+            .expect("runner command timeout")
+            .expect("runner command frame")
+            .expect("runner command websocket result");
+        let Message::Text(text) = frame else {
+            panic!("expected text runner command");
+        };
+        let RunnerServerMessage::Command(command) =
+            serde_json::from_str::<RunnerServerMessage>(&text).expect("decode runner command")
+        else {
+            panic!("expected runner command");
+        };
+        *command
+    }
+
+    async fn send_runner_response(
+        sender: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
+        request_id: RequestId,
+    ) {
+        sender
+            .send(Message::Text(
+                serde_json::to_string(&RunnerClientMessage::Response(
+                    agenter_protocol::runner::RunnerResponseEnvelope {
+                        request_id,
+                        outcome: agenter_protocol::runner::RunnerResponseOutcome::Ok {
+                            result: agenter_protocol::runner::RunnerCommandResult::Accepted,
+                        },
+                    },
+                ))
+                .expect("serialize runner response")
+                .into(),
+            ))
+            .await
+            .expect("send runner response");
+    }
+
+    async fn send_runner_app_event(
+        sender: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
+        request_id: Option<RequestId>,
+        event: AppEvent,
+    ) {
+        sender
+            .send(Message::Text(
+                serde_json::to_string(&RunnerClientMessage::Event(RunnerEventEnvelope {
+                    request_id,
+                    event: RunnerEvent::AgentEvent(AgentEvent {
+                        session_id: smoke_session_id(),
+                        event,
+                    }),
+                }))
+                .expect("serialize runner event")
+                .into(),
+            ))
+            .await
+            .expect("send runner event");
+    }
+
+    async fn next_browser_event(
+        receiver: &mut futures_util::stream::SplitStream<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        >,
+    ) -> BrowserEventEnvelope {
+        loop {
+            let frame = timeout(Duration::from_secs(2), receiver.next())
+                .await
+                .expect("browser event timeout")
+                .expect("browser event frame")
+                .expect("browser event websocket result");
+            let Message::Text(text) = frame else {
+                continue;
+            };
+            match serde_json::from_str::<BrowserServerMessage>(&text)
+                .expect("decode browser message")
+            {
+                BrowserServerMessage::Event(event) => return event,
+                BrowserServerMessage::Ack(_) => continue,
+                BrowserServerMessage::Error(error) => panic!("unexpected browser error: {error:?}"),
+            }
+        }
+    }
 
     #[tokio::test]
     async fn smoke_routes_runner_events_to_subscribed_browser() {
@@ -1064,6 +1166,226 @@ mod tests {
         assert!(history
             .iter()
             .any(|entry| matches!(entry.event, AppEvent::SessionStarted(_))));
+    }
+
+    #[tokio::test]
+    async fn full_browser_fake_runner_pipeline_routes_messages_events_history_and_approvals() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let browser_session_token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let app_service = app(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("read listener address");
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.expect("serve app");
+        });
+
+        let (runner_socket, _) = connect_async(format!("ws://{addr}/api/runner/ws"))
+            .await
+            .expect("connect runner");
+        let (mut runner_sender, mut runner_receiver) = runner_socket.split();
+        runner_sender
+            .send(Message::Text(
+                serde_json::to_string(&RunnerClientMessage::Hello(fake_hello()))
+                    .expect("serialize hello")
+                    .into(),
+            ))
+            .await
+            .expect("send runner hello");
+        let smoke_command = next_runner_command(&mut runner_receiver).await;
+        send_runner_response(&mut runner_sender, smoke_command.request_id).await;
+
+        let cookie = format!("{}={browser_session_token}", auth::SESSION_COOKIE_NAME);
+        let runners_response = app_service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runners")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .expect("build runners request"),
+            )
+            .await
+            .expect("route runners request");
+        assert_eq!(runners_response.status(), StatusCode::OK);
+        let runners_body = to_bytes(runners_response.into_body(), usize::MAX)
+            .await
+            .expect("read runners body");
+        let runners: serde_json::Value =
+            serde_json::from_slice(&runners_body).expect("runners json");
+        assert_eq!(runners.as_array().expect("runner list").len(), 1);
+
+        let mut browser_request = format!("ws://{addr}/api/browser/ws")
+            .into_client_request()
+            .expect("build browser websocket request");
+        browser_request
+            .headers_mut()
+            .insert(header::COOKIE, cookie.parse().expect("cookie header"));
+        let (browser_socket, _) = connect_async(browser_request)
+            .await
+            .expect("connect browser");
+        let (mut browser_sender, mut browser_receiver) = browser_socket.split();
+        browser_sender
+            .send(Message::Text(
+                serde_json::to_string(&BrowserClientMessage::SubscribeSession(SubscribeSession {
+                    request_id: Some(RequestId::from("sub-full")),
+                    session_id: smoke_session_id(),
+                }))
+                .expect("serialize subscribe")
+                .into(),
+            ))
+            .await
+            .expect("send browser subscription");
+        let _session_started = next_browser_event(&mut browser_receiver).await;
+
+        let send_response = app_service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{}/messages", smoke_session_id()))
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "content": "full pipeline message" }).to_string(),
+                    ))
+                    .expect("build message request"),
+            )
+            .await
+            .expect("route message request");
+        assert_eq!(send_response.status(), StatusCode::ACCEPTED);
+
+        let message_command = next_runner_command(&mut runner_receiver).await;
+        let agenter_protocol::runner::RunnerCommand::AgentSendInput(input_command) =
+            &message_command.command
+        else {
+            panic!("expected agent input command");
+        };
+        assert_eq!(input_command.session_id, smoke_session_id());
+        send_runner_response(&mut runner_sender, message_command.request_id.clone()).await;
+
+        let approval_id = ApprovalId::new();
+        send_runner_app_event(
+            &mut runner_sender,
+            Some(message_command.request_id.clone()),
+            AppEvent::UserMessage(agenter_core::UserMessageEvent {
+                session_id: smoke_session_id(),
+                message_id: Some("user-full-1".to_owned()),
+                author_user_id: None,
+                content: "full pipeline message".to_owned(),
+            }),
+        )
+        .await;
+        send_runner_app_event(
+            &mut runner_sender,
+            Some(message_command.request_id.clone()),
+            AppEvent::ApprovalRequested(ApprovalRequestEvent {
+                session_id: smoke_session_id(),
+                approval_id,
+                kind: ApprovalKind::Command,
+                title: "Approve full pipeline command".to_owned(),
+                details: Some("printf ok".to_owned()),
+                expires_at: None,
+                provider_payload: None,
+            }),
+        )
+        .await;
+        send_runner_app_event(
+            &mut runner_sender,
+            Some(message_command.request_id.clone()),
+            AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {
+                session_id: smoke_session_id(),
+                message_id: "agent-full-1".to_owned(),
+                delta: "full pipeline response".to_owned(),
+                provider_payload: None,
+            }),
+        )
+        .await;
+
+        let mut saw_user = false;
+        let mut saw_approval = false;
+        let mut saw_delta = false;
+        for _ in 0..6 {
+            let event = next_browser_event(&mut browser_receiver).await;
+            match event.event {
+                AppEvent::UserMessage(_) => saw_user = true,
+                AppEvent::ApprovalRequested(_) => saw_approval = true,
+                AppEvent::AgentMessageDelta(_) => saw_delta = true,
+                _ => {}
+            }
+            if saw_user && saw_approval && saw_delta {
+                break;
+            }
+        }
+        assert!(saw_user, "browser receives user event");
+        assert!(saw_approval, "browser receives approval event");
+        assert!(saw_delta, "browser receives agent delta event");
+
+        let decision_response = app_service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/approvals/{approval_id}/decision"))
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&ApprovalDecision::Accept)
+                            .expect("serialize approval decision"),
+                    ))
+                    .expect("build approval decision request"),
+            )
+            .await
+            .expect("route approval decision");
+        assert_eq!(decision_response.status(), StatusCode::OK);
+
+        let approval_command = next_runner_command(&mut runner_receiver).await;
+        let agenter_protocol::runner::RunnerCommand::AnswerApproval(answer) =
+            approval_command.command
+        else {
+            panic!("expected approval answer command");
+        };
+        assert_eq!(answer.approval_id, approval_id);
+        send_runner_response(&mut runner_sender, approval_command.request_id).await;
+
+        let history_response = app_service
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{}/history", smoke_session_id()))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .expect("build history request"),
+            )
+            .await
+            .expect("route history request");
+        assert_eq!(history_response.status(), StatusCode::OK);
+        let history_body = to_bytes(history_response.into_body(), usize::MAX)
+            .await
+            .expect("read history body");
+        let history: Vec<BrowserEventEnvelope> =
+            serde_json::from_slice(&history_body).expect("history json");
+        assert!(history
+            .iter()
+            .any(|entry| matches!(entry.event, AppEvent::UserMessage(_))));
+        assert!(history
+            .iter()
+            .any(|entry| matches!(entry.event, AppEvent::ApprovalRequested(_))));
+        assert!(history
+            .iter()
+            .any(|entry| matches!(entry.event, AppEvent::AgentMessageDelta(_))));
+        assert!(history
+            .iter()
+            .any(|entry| matches!(entry.event, AppEvent::ApprovalResolved(_))));
     }
 
     #[tokio::test]

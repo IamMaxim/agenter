@@ -228,6 +228,7 @@ Active execution notes:
 - Follow-up review fixes are committed in `fix: harden browser chat event flow`: approval decisions are now delivered to the runner before resolved events are published, duplicate resolved decisions return the cached event without re-sending runner commands, runner connections are not registered until required capabilities/workspaces are present, and empty `202 Accepted` responses no longer break the browser API client.
 - Second follow-up review fixes ensure runner-originated approval resolutions also close the pending approval, runner sends wait for the WebSocket writer to report delivery, stale runner disconnects cannot remove newer connections for the same runner, and session creation rejects providers not advertised by the selected runner.
 - Final approval-race fix adds a last-mile WebSocket writer guard so a browser approval answer queued before a runner-originated resolution is dropped before it can reach the runner socket.
+- Regression coverage now includes a full in-process browser plus fake-runner pipeline test for login, runner registration, browser subscription, message send, runner responses, streamed events, approval decisions, runner approval commands, and history replay. Runner websocket handling now treats valid command responses and heartbeats as first-class frames instead of logging them as undecodable text.
 
 ## Milestone 3: Real Agent Adapters
 

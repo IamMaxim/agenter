@@ -1,7 +1,8 @@
 use agenter_core::{AppEvent, SessionId, SessionInfo, SessionStatus, UserId};
 use agenter_protocol::runner::{
     AgentEvent, AgentInput, AgentInputCommand, RunnerClientMessage, RunnerCommand,
-    RunnerCommandEnvelope, RunnerEvent, RunnerServerMessage, PROTOCOL_VERSION,
+    RunnerCommandEnvelope, RunnerEvent, RunnerHeartbeat, RunnerResponseEnvelope,
+    RunnerServerMessage, PROTOCOL_VERSION,
 };
 use agenter_protocol::RequestId;
 use axum::{
@@ -136,23 +137,41 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             message = receiver.next() => {
                 match message {
                     Some(Ok(Message::Text(text))) => {
-                        if let Ok(RunnerClientMessage::Event(envelope)) =
-                            serde_json::from_str::<RunnerClientMessage>(&text)
-                        {
-                            if let RunnerEvent::AgentEvent(AgentEvent { session_id, event }) =
-                                envelope.event
-                            {
-                                if app_event_session_id(&event) != Some(session_id) {
-                                    tracing::warn!(
-                                        %session_id,
-                                        "runner event envelope session_id did not match embedded event"
-                                    );
-                                    continue;
+                        match classify_runner_client_text(&text) {
+                            Ok(RunnerClientFrame::Event(envelope)) => {
+                                if let RunnerEvent::AgentEvent(AgentEvent { session_id, event }) =
+                                    envelope.event
+                                {
+                                    if app_event_session_id(&event) != Some(session_id) {
+                                        tracing::warn!(
+                                            %session_id,
+                                            "runner event envelope session_id did not match embedded event"
+                                        );
+                                        continue;
+                                    }
+                                    state.publish_event(session_id, event).await;
                                 }
-                                state.publish_event(session_id, event).await;
                             }
-                        } else {
-                            tracing::warn!(runner_id = %runner.runner_id, "runner websocket ignored undecodable text frame");
+                            Ok(RunnerClientFrame::Response(response)) => {
+                                tracing::debug!(
+                                    runner_id = %runner.runner_id,
+                                    request_id = %response.request_id,
+                                    "runner command response received"
+                                );
+                            }
+                            Ok(RunnerClientFrame::Heartbeat(heartbeat)) => {
+                                tracing::debug!(
+                                    runner_id = %runner.runner_id,
+                                    sequence = heartbeat.sequence,
+                                    "runner heartbeat received"
+                                );
+                            }
+                            Ok(RunnerClientFrame::Hello) => {
+                                tracing::warn!(runner_id = %runner.runner_id, "runner hello received after handshake");
+                            }
+                            Err(_) => {
+                                tracing::warn!(runner_id = %runner.runner_id, "runner websocket ignored undecodable text frame");
+                            }
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => {
@@ -217,6 +236,23 @@ async fn send_server_message(
     sender.send(Message::Text(json.into())).await
 }
 
+#[derive(Debug)]
+enum RunnerClientFrame {
+    Hello,
+    Heartbeat(RunnerHeartbeat),
+    Response(RunnerResponseEnvelope),
+    Event(agenter_protocol::runner::RunnerEventEnvelope),
+}
+
+fn classify_runner_client_text(text: &str) -> Result<RunnerClientFrame, serde_json::Error> {
+    match serde_json::from_str::<RunnerClientMessage>(text)? {
+        RunnerClientMessage::Hello(_) => Ok(RunnerClientFrame::Hello),
+        RunnerClientMessage::Heartbeat(heartbeat) => Ok(RunnerClientFrame::Heartbeat(heartbeat)),
+        RunnerClientMessage::Response(response) => Ok(RunnerClientFrame::Response(response)),
+        RunnerClientMessage::Event(event) => Ok(RunnerClientFrame::Event(event)),
+    }
+}
+
 fn app_event_session_id(event: &AppEvent) -> Option<SessionId> {
     match event {
         AppEvent::SessionStarted(info) => Some(info.session_id),
@@ -237,5 +273,30 @@ fn app_event_session_id(event: &AppEvent) -> Option<SessionId> {
         AppEvent::ApprovalRequested(event) => Some(event.session_id),
         AppEvent::ApprovalResolved(event) => Some(event.session_id),
         AppEvent::Error(event) => event.session_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use agenter_protocol::runner::{
+        RunnerClientMessage, RunnerCommandResult, RunnerResponseEnvelope, RunnerResponseOutcome,
+    };
+
+    use super::*;
+
+    #[test]
+    fn classifies_runner_response_as_valid_runner_frame() {
+        let text = serde_json::to_string(&RunnerClientMessage::Response(RunnerResponseEnvelope {
+            request_id: RequestId::from("request-1"),
+            outcome: RunnerResponseOutcome::Ok {
+                result: RunnerCommandResult::Accepted,
+            },
+        }))
+        .expect("serialize runner response");
+
+        assert!(matches!(
+            classify_runner_client_text(&text),
+            Ok(RunnerClientFrame::Response(_))
+        ));
     }
 }
