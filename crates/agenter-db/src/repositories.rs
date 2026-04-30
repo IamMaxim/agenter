@@ -252,6 +252,7 @@ pub async fn create_oidc_login_state(
 
 pub async fn consume_oidc_login_state(
     pool: &PgPool,
+    provider_id: &str,
     state: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<OidcLoginState>> {
@@ -259,6 +260,7 @@ pub async fn consume_oidc_login_state(
         "update oidc_login_states
          set consumed_at = $2
          where state = $1
+           and provider_id = $3
            and consumed_at is null
            and expires_at > $2
          returning state, provider_id, nonce, pkce_verifier, return_to,
@@ -266,6 +268,7 @@ pub async fn consume_oidc_login_state(
     )
     .bind(state)
     .bind(now)
+    .bind(provider_id)
     .fetch_optional(pool)
     .await?;
 
@@ -280,7 +283,32 @@ pub async fn upsert_oidc_identity(
     display_name: Option<&str>,
 ) -> Result<User> {
     let mut tx = pool.begin().await?;
-    let existing: Option<PgRow> = sqlx::query(
+    let row = sqlx::query(
+        "insert into users (email, display_name)
+         values ($1, $2)
+         on conflict (email)
+         do update set display_name = coalesce(excluded.display_name, users.display_name),
+                       updated_at = now()
+         returning user_id, email, display_name, created_at, updated_at",
+    )
+    .bind(email)
+    .bind(display_name)
+    .fetch_one(&mut *tx)
+    .await?;
+    let candidate_user = user_from_row(&row)?;
+
+    sqlx::query(
+        "insert into auth_identities (user_id, provider_kind, provider_id, subject)
+         values ($1, 'oidc', $2, $3)
+         on conflict (provider_kind, provider_id, subject) do nothing",
+    )
+    .bind(candidate_user.user_id.as_uuid())
+    .bind(provider_id)
+    .bind(subject)
+    .execute(&mut *tx)
+    .await?;
+
+    let row = sqlx::query(
         "select u.user_id, u.email, u.display_name, u.created_at, u.updated_at
          from users u
          join auth_identities ai on ai.user_id = u.user_id
@@ -290,38 +318,9 @@ pub async fn upsert_oidc_identity(
     )
     .bind(provider_id)
     .bind(subject)
-    .fetch_optional(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
-
-    let user = if let Some(row) = existing {
-        user_from_row(&row)?
-    } else {
-        let row = sqlx::query(
-            "insert into users (email, display_name)
-             values ($1, $2)
-             on conflict (email)
-             do update set display_name = coalesce(excluded.display_name, users.display_name),
-                           updated_at = now()
-             returning user_id, email, display_name, created_at, updated_at",
-        )
-        .bind(email)
-        .bind(display_name)
-        .fetch_one(&mut *tx)
-        .await?;
-        let user = user_from_row(&row)?;
-        sqlx::query(
-            "insert into auth_identities (user_id, provider_kind, provider_id, subject)
-             values ($1, 'oidc', $2, $3)
-             on conflict (provider_kind, provider_id, subject)
-             do update set user_id = excluded.user_id, updated_at = now()",
-        )
-        .bind(user.user_id.as_uuid())
-        .bind(provider_id)
-        .bind(subject)
-        .execute(&mut *tx)
-        .await?;
-        user
-    };
+    let user = user_from_row(&row)?;
 
     tx.commit().await?;
     Ok(user)
@@ -541,6 +540,19 @@ pub async fn create_connector_link_code(
     display_name: Option<&str>,
     expires_at: DateTime<Utc>,
 ) -> Result<ConnectorLinkCode> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "update connector_link_codes
+         set consumed_at = now()
+         where connector_id = $1
+           and external_account_id = $2
+           and consumed_at is null",
+    )
+    .bind(connector_id)
+    .bind(external_account_id)
+    .execute(&mut *tx)
+    .await?;
+
     let row = sqlx::query(
         "insert into connector_link_codes (
             code,
@@ -558,8 +570,9 @@ pub async fn create_connector_link_code(
     .bind(external_account_id)
     .bind(display_name)
     .bind(expires_at)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     connector_link_code_from_row(&row)
 }
@@ -571,11 +584,35 @@ pub async fn consume_connector_link_code(
     now: DateTime<Utc>,
 ) -> Result<Option<ConnectorAccount>> {
     let mut tx = pool.begin().await?;
+    let existing_account: Option<PgRow> = sqlx::query(
+        "select ca.connector_account_id, ca.user_id, ca.connector_id,
+                ca.external_account_id, ca.display_name, ca.linked_at,
+                ca.created_at, ca.updated_at
+         from connector_link_codes clc
+         join connector_accounts ca
+           on ca.connector_id = clc.connector_id
+          and ca.external_account_id = clc.external_account_id
+          and ca.user_id = clc.user_id
+         where clc.code = $1
+           and clc.user_id = $2
+           and clc.consumed_at is not null",
+    )
+    .bind(code)
+    .bind(user_id.as_uuid())
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(row) = existing_account {
+        let account = connector_account_from_row(&row)?;
+        tx.commit().await?;
+        return Ok(Some(account));
+    }
+
     let row = sqlx::query(
         "update connector_link_codes
          set user_id = $2,
              consumed_at = $3
          where code = $1
+           and user_id is null
            and consumed_at is null
            and expires_at > $3
          returning code, user_id, connector_id, external_account_id, display_name,
@@ -1066,14 +1103,19 @@ mod tests {
         .await
         .expect("create oidc state");
 
-        let consumed = consume_oidc_login_state(&pool, &state, Utc::now())
+        let wrong_provider = consume_oidc_login_state(&pool, "wrong-provider", &state, Utc::now())
+            .await
+            .expect("wrong provider should not burn state");
+        assert!(wrong_provider.is_none());
+
+        let consumed = consume_oidc_login_state(&pool, &provider.provider_id, &state, Utc::now())
             .await
             .expect("consume oidc state")
             .expect("state should be consumable");
         assert_eq!(consumed.nonce, "nonce-1");
         assert!(consumed.consumed_at.is_some());
 
-        let second = consume_oidc_login_state(&pool, &state, Utc::now())
+        let second = consume_oidc_login_state(&pool, &provider.provider_id, &state, Utc::now())
             .await
             .expect("consume state again");
         assert!(second.is_none());
@@ -1136,7 +1178,12 @@ mod tests {
         let second = consume_connector_link_code(&pool, &code, user.user_id, Utc::now())
             .await
             .expect("consume link code again");
-        assert!(second.is_none());
+        assert_eq!(
+            second
+                .expect("same user retry returns linked account")
+                .connector_account_id,
+            account.connector_account_id
+        );
     }
 
     #[tokio::test]

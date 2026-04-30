@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -26,6 +26,10 @@ pub fn app(state: AppState) -> Router {
         .route("/api/auth/password/login", post(auth_login))
         .route("/api/auth/password/logout", post(auth_logout))
         .route("/api/auth/me", get(auth_me))
+        .route("/api/auth/oidc/{provider_id}/login", get(oidc_login))
+        .route("/api/auth/oidc/{provider_id}/callback", post(oidc_callback))
+        .route("/api/link-codes", post(create_link_code))
+        .route("/api/link/{code}", post(consume_link_code))
         .route("/api/runners", get(list_runners))
         .route(
             "/api/runners/{runner_id}/workspaces",
@@ -123,6 +127,35 @@ struct SendMessageRequest {
     content: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct OidcCallbackRequest {
+    state: String,
+    subject: String,
+    email: String,
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OidcLoginResponse {
+    provider_id: String,
+    state: String,
+    nonce: String,
+    authorization_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateLinkCodeRequest {
+    connector_id: String,
+    external_account_id: String,
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateLinkCodeResponse {
+    code: String,
+    expires_at: chrono::DateTime<Utc>,
+}
+
 async fn auth_login(
     State(state): State<AppState>,
     Json(request): Json<PasswordLoginRequest>,
@@ -166,6 +199,156 @@ async fn auth_me(State(state): State<AppState>, headers: HeaderMap) -> Response 
     };
 
     Json(user).into_response()
+}
+
+async fn oidc_login(State(state): State<AppState>, Path(provider_id): Path<String>) -> Response {
+    let Some(pool) = state.db_pool() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Ok(Some(provider)) = agenter_db::find_oidc_provider(pool, &provider_id).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let state_token = Uuid::new_v4().to_string();
+    let nonce = Uuid::new_v4().to_string();
+    let expires_at = Utc::now() + Duration::minutes(10);
+    if agenter_db::create_oidc_login_state(
+        pool,
+        &state_token,
+        &provider.provider_id,
+        &nonce,
+        None,
+        Some("/"),
+        expires_at,
+    )
+    .await
+    .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let authorization_url = oidc_authorization_url(&provider, &state_token, &nonce);
+    Json(OidcLoginResponse {
+        provider_id: provider.provider_id,
+        state: state_token,
+        nonce,
+        authorization_url,
+    })
+    .into_response()
+}
+
+async fn oidc_callback(
+    State(state): State<AppState>,
+    Path(provider_id): Path<String>,
+    Json(request): Json<OidcCallbackRequest>,
+) -> Response {
+    let Some(pool) = state.db_pool() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Ok(Some(login_state)) =
+        agenter_db::consume_oidc_login_state(pool, &provider_id, &request.state, Utc::now()).await
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if login_state.provider_id != provider_id {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Ok(user) = agenter_db::upsert_oidc_identity(
+        pool,
+        &provider_id,
+        &request.subject,
+        &request.email,
+        request.display_name.as_deref(),
+    )
+    .await
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let token = state
+        .create_authenticated_session(auth::AuthenticatedUser {
+            user_id: user.user_id,
+            email: user.email,
+            display_name: user.display_name,
+        })
+        .await;
+
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::SET_COOKIE,
+            auth::session_cookie_with_policy(&token, state.cookie_security()),
+        )],
+        Json(serde_json::json!({ "ok": true })),
+    )
+        .into_response()
+}
+
+async fn create_link_code(
+    State(state): State<AppState>,
+    Json(request): Json<CreateLinkCodeRequest>,
+) -> Response {
+    let Some(pool) = state.db_pool() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let code = Uuid::new_v4().to_string();
+    let expires_at = Utc::now() + Duration::minutes(15);
+    let Ok(link_code) = agenter_db::create_connector_link_code(
+        pool,
+        &code,
+        &request.connector_id,
+        &request.external_account_id,
+        request.display_name.as_deref(),
+        expires_at,
+    )
+    .await
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+
+    (
+        StatusCode::CREATED,
+        Json(CreateLinkCodeResponse {
+            code: link_code.code,
+            expires_at: link_code.expires_at,
+        }),
+    )
+        .into_response()
+}
+
+async fn consume_link_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(code): Path<String>,
+) -> Response {
+    let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(pool) = state.db_pool() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match agenter_db::consume_connector_link_code(pool, &code, user.user_id, Utc::now()).await {
+        Ok(Some(account)) => Json(serde_json::json!({
+            "connector_id": account.connector_id,
+            "external_account_id": account.external_account_id,
+            "display_name": account.display_name
+        }))
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+fn oidc_authorization_url(
+    provider: &agenter_db::models::OidcProvider,
+    state: &str,
+    nonce: &str,
+) -> String {
+    format!(
+        "{}/authorize?client_id={}&response_type=code&scope={}&state={}&nonce={}",
+        provider.issuer_url.trim_end_matches('/'),
+        provider.client_id,
+        provider.scopes.join("%20"),
+        state,
+        nonce
+    )
 }
 
 async fn list_runners(State(state): State<AppState>, headers: HeaderMap) -> Response {

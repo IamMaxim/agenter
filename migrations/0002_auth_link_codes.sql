@@ -22,9 +22,13 @@ create table connector_link_codes (
     expires_at timestamptz not null,
     consumed_at timestamptz,
     created_at timestamptz not null default now(),
-    unique (connector_id, external_account_id, consumed_at)
+    unique (code, user_id)
 );
 
 create index idx_connector_link_codes_unconsumed
     on connector_link_codes(connector_id, external_account_id, expires_at)
+    where consumed_at is null;
+
+create unique index idx_connector_link_codes_active_account
+    on connector_link_codes(connector_id, external_account_id)
     where consumed_at is null;

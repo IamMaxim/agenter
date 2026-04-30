@@ -207,6 +207,10 @@ impl AppState {
         self.inner.cookie_security
     }
 
+    pub fn db_pool(&self) -> Option<&sqlx::PgPool> {
+        self.inner.db_pool.as_ref()
+    }
+
     pub async fn login_password(&self, email: &str, password: &str) -> Option<String> {
         if let Some(pool) = &self.inner.db_pool {
             let (user, password_hash) = agenter_db::find_password_credential_by_email(pool, email)
@@ -245,6 +249,16 @@ impl AppState {
 
     pub async fn authenticated_user(&self, token: &str) -> Option<AuthenticatedUser> {
         self.inner.auth_sessions.lock().await.get(token).cloned()
+    }
+
+    pub async fn create_authenticated_session(&self, user: AuthenticatedUser) -> String {
+        let token = Uuid::new_v4().to_string();
+        self.inner
+            .auth_sessions
+            .lock()
+            .await
+            .insert(token.clone(), user);
+        token
     }
 
     pub fn bootstrap_user_id(&self) -> Option<UserId> {
