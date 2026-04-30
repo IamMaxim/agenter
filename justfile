@@ -24,14 +24,29 @@ db-reset:
 db-logs:
     docker compose logs -f postgres
 
+logs-up:
+    docker compose --profile logging up -d loki grafana promtail
+
+logs-down:
+    docker compose --profile logging stop loki grafana promtail
+
+logs-tail:
+    tail -F tmp/agenter-logs/agenter-control-plane.log tmp/agenter-logs/agenter-runner.log
+
 db-test:
     DATABASE_URL='{{database_url}}' cargo test -p agenter-db -- --ignored
 
 control-plane:
-    DATABASE_URL='{{database_url}}' AGENTER_BIND_ADDR='{{bind_addr}}' AGENTER_DEV_RUNNER_TOKEN='{{runner_token}}' AGENTER_COOKIE_SECURE=0 AGENTER_BOOTSTRAP_ADMIN_EMAIL='{{admin_email}}' AGENTER_BOOTSTRAP_ADMIN_PASSWORD='{{admin_password}}' cargo run -p agenter-control-plane
+    DATABASE_URL='{{database_url}}' AGENTER_BIND_ADDR='{{bind_addr}}' AGENTER_DEV_RUNNER_TOKEN='{{runner_token}}' AGENTER_COOKIE_SECURE=0 AGENTER_BOOTSTRAP_ADMIN_EMAIL='{{admin_email}}' AGENTER_BOOTSTRAP_ADMIN_PASSWORD='{{admin_password}}' AGENTER_LOG_DIR=tmp/agenter-logs cargo run -p agenter-control-plane
+
+control-plane-json:
+    DATABASE_URL='{{database_url}}' AGENTER_BIND_ADDR='{{bind_addr}}' AGENTER_DEV_RUNNER_TOKEN='{{runner_token}}' AGENTER_COOKIE_SECURE=0 AGENTER_BOOTSTRAP_ADMIN_EMAIL='{{admin_email}}' AGENTER_BOOTSTRAP_ADMIN_PASSWORD='{{admin_password}}' AGENTER_LOG_FORMAT=json AGENTER_LOG_DIR=tmp/agenter-logs cargo run -p agenter-control-plane
 
 runner mode="fake" workspace=workspace:
-    AGENTER_RUNNER_MODE='{{mode}}' AGENTER_WORKSPACE='{{workspace}}' AGENTER_CONTROL_PLANE_WS='{{control_plane_ws}}' AGENTER_DEV_RUNNER_TOKEN='{{runner_token}}' cargo run -p agenter-runner --bin agenter-runner
+    AGENTER_RUNNER_MODE='{{mode}}' AGENTER_WORKSPACE='{{workspace}}' AGENTER_CONTROL_PLANE_WS='{{control_plane_ws}}' AGENTER_DEV_RUNNER_TOKEN='{{runner_token}}' AGENTER_LOG_DIR=tmp/agenter-logs cargo run -p agenter-runner --bin agenter-runner
+
+runner-json mode="fake" workspace=workspace:
+    AGENTER_RUNNER_MODE='{{mode}}' AGENTER_WORKSPACE='{{workspace}}' AGENTER_CONTROL_PLANE_WS='{{control_plane_ws}}' AGENTER_DEV_RUNNER_TOKEN='{{runner_token}}' AGENTER_LOG_FORMAT=json AGENTER_LOG_DIR=tmp/agenter-logs cargo run -p agenter-runner --bin agenter-runner
 
 fake-runner workspace=workspace:
     just runner fake '{{workspace}}'
@@ -44,6 +59,9 @@ qwen-runner workspace=workspace:
 
 web:
     cd web && npm run dev
+
+web-debug:
+    cd web && VITE_AGENTER_DEBUG=1 npm run dev
 
 fmt:
     cargo fmt --all -- --check

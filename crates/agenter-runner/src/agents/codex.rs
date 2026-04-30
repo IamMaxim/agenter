@@ -47,6 +47,7 @@ pub struct CodexAppServer {
 
 impl CodexAppServer {
     pub fn spawn(workspace_path: PathBuf) -> anyhow::Result<Self> {
+        tracing::info!(workspace = %workspace_path.display(), "spawning codex app-server");
         let mut child = Command::new("codex")
             .args(["app-server", "--listen", "stdio://"])
             .current_dir(&workspace_path)
@@ -80,6 +81,11 @@ impl CodexAppServer {
         &mut self,
         request: &CodexTurnRequest,
     ) -> anyhow::Result<()> {
+        tracing::debug!(
+            session_id = %request.session_id,
+            has_external_session_id = request.external_session_id.is_some(),
+            "initializing codex app-server"
+        );
         self.send_request(
             "initialize",
             json!({
@@ -95,6 +101,7 @@ impl CodexAppServer {
 
         if let Some(thread_id) = &request.external_session_id {
             self.thread_id = Some(thread_id.clone());
+            tracing::info!(session_id = %request.session_id, provider_thread_id = %thread_id, "resuming codex thread");
             self.send_request(
                 "thread/resume",
                 json!({
@@ -107,6 +114,7 @@ impl CodexAppServer {
             )
             .await?;
         } else {
+            tracing::info!(session_id = %request.session_id, "starting codex thread");
             self.send_request(
                 "thread/start",
                 json!({
@@ -129,6 +137,16 @@ impl CodexAppServer {
                 "codex thread id was not observed before turn start"
             ));
         };
+        tracing::info!(
+            session_id = %request.session_id,
+            provider_thread_id = %thread_id,
+            prompt_len = request.prompt.len(),
+            payload_preview = agenter_core::logging::payload_preview(
+                &json!({"input": &request.prompt}),
+                agenter_core::logging::payload_logging_enabled()
+            ).as_deref(),
+            "starting codex turn"
+        );
         self.send_request(
             "turn/start",
             json!({
@@ -151,8 +169,18 @@ impl CodexAppServer {
         }
         let message = serde_json::from_str::<Value>(line.trim())
             .with_context(|| format!("codex emitted invalid JSON-RPC line: {line}"))?;
+        tracing::debug!(
+            method = message.get("method").and_then(serde_json::Value::as_str),
+            id = ?message.get("id"),
+            payload_preview = agenter_core::logging::payload_preview(
+                &message,
+                agenter_core::logging::payload_logging_enabled()
+            ).as_deref(),
+            "received codex json-rpc message"
+        );
         if let Some(thread_id) = codex_thread_id(&message) {
             self.thread_id = Some(thread_id.to_owned());
+            tracing::info!(provider_thread_id = %thread_id, "observed codex thread id");
         }
         Ok(Some(message))
     }
@@ -163,6 +191,12 @@ impl CodexAppServer {
         approval_kind: CodexApprovalKind,
         decision: ApprovalDecision,
     ) -> anyhow::Result<()> {
+        tracing::info!(
+            native_request_id = ?native_request_id,
+            ?approval_kind,
+            ?decision,
+            "sending codex approval response"
+        );
         write_json(
             &mut self.stdin,
             &json!({
@@ -176,6 +210,16 @@ impl CodexAppServer {
     async fn send_request(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
+        tracing::debug!(
+            id,
+            method,
+            payload_preview = agenter_core::logging::payload_preview(
+                &params,
+                agenter_core::logging::payload_logging_enabled()
+            )
+            .as_deref(),
+            "sending codex json-rpc request"
+        );
         write_json(
             &mut self.stdin,
             &json!({
@@ -189,13 +233,16 @@ impl CodexAppServer {
     }
 
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
+        tracing::debug!("shutting down codex app-server");
         self.stdin.shutdown().await.ok();
         match timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await {
             Ok(result) => {
                 result?;
+                tracing::debug!("codex app-server exited");
             }
             Err(_) => {
                 self.child.kill().await.ok();
+                tracing::warn!("killed codex app-server after shutdown timeout");
             }
         }
         Ok(())
@@ -209,6 +256,7 @@ pub async fn run_codex_turn(
         tokio::sync::Mutex<HashMap<ApprovalId, PendingCodexApproval>>,
     >,
 ) -> anyhow::Result<()> {
+    tracing::info!(session_id = %request.session_id, "codex turn task started");
     let mut server = CodexAppServer::spawn(request.workspace_path.clone())?;
     server.initialize_and_start_thread(&request).await?;
 
@@ -231,6 +279,13 @@ pub async fn run_codex_turn(
                 .lock()
                 .await
                 .insert(approval_id, PendingCodexApproval { response: sender });
+            tracing::info!(
+                session_id = %request.session_id,
+                %approval_id,
+                native_request_id = ?native_request_id,
+                ?approval_kind,
+                "codex approval request pending"
+            );
             event_sender.send(event).ok();
             if let Ok(decision) = receiver.await {
                 server
@@ -244,6 +299,7 @@ pub async fn run_codex_turn(
             let completed = matches!(event, AppEvent::AgentMessageCompleted(_));
             event_sender.send(event).ok();
             if completed {
+                tracing::info!(session_id = %request.session_id, "codex turn completed");
                 server.shutdown().await?;
                 return Ok(());
             }

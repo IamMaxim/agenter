@@ -230,6 +230,7 @@ impl AppState {
                 .lock()
                 .await
                 .insert(token.clone(), user);
+            tracing::debug!(email, "created database-backed authenticated session");
             return Some(token);
         }
 
@@ -244,6 +245,7 @@ impl AppState {
             .lock()
             .await
             .insert(token.clone(), admin.user.clone());
+        tracing::debug!(email, "created bootstrap authenticated session");
         Some(token)
     }
 
@@ -258,6 +260,7 @@ impl AppState {
             .lock()
             .await
             .insert(token.clone(), user);
+        tracing::debug!("created authenticated session");
         token
     }
 
@@ -269,7 +272,14 @@ impl AppState {
     }
 
     pub async fn logout(&self, token: &str) {
-        self.inner.auth_sessions.lock().await.remove(token);
+        let removed = self
+            .inner
+            .auth_sessions
+            .lock()
+            .await
+            .remove(token)
+            .is_some();
+        tracing::debug!(removed, "removed authenticated session");
     }
 
     pub async fn register_runner(
@@ -289,6 +299,12 @@ impl AppState {
             .await
             .runners
             .insert(runner_id, runner.clone());
+        tracing::info!(
+            %runner_id,
+            workspace_count = runner.workspaces.len(),
+            provider_count = runner.capabilities.agent_providers.len(),
+            "runner registered"
+        );
         runner
     }
 
@@ -305,6 +321,7 @@ impl AppState {
                 sender,
             },
         );
+        tracing::info!(%runner_id, %connection_id, "runner connected");
         connection_id
     }
 
@@ -315,6 +332,9 @@ impl AppState {
             .is_some_and(|connection| connection.connection_id == connection_id)
         {
             connections.remove(&runner_id);
+            tracing::info!(%runner_id, %connection_id, "runner disconnected");
+        } else {
+            tracing::debug!(%runner_id, %connection_id, "ignored stale runner disconnect");
         }
     }
 
@@ -332,6 +352,7 @@ impl AppState {
                 .get(&runner_id)
                 .cloned()
             else {
+                tracing::warn!(%runner_id, "runner send failed: not connected");
                 return Err(RunnerSendError::NotConnected);
             };
             connection.sender
@@ -339,10 +360,17 @@ impl AppState {
         let (delivered, delivered_receiver) = oneshot::channel();
         sender
             .send(OutboundRunnerMessage { message, delivered })
-            .map_err(|_| RunnerSendError::Closed)?;
-        delivered_receiver
+            .map_err(|_| {
+                tracing::warn!(%runner_id, "runner send failed: outbound queue closed");
+                RunnerSendError::Closed
+            })?;
+        let result = delivered_receiver
             .await
-            .unwrap_or(Err(RunnerSendError::Closed))
+            .unwrap_or(Err(RunnerSendError::Closed));
+        if let Err(error) = result {
+            tracing::warn!(%runner_id, ?error, "runner send delivery failed");
+        }
+        result
     }
 
     pub async fn list_runners(&self) -> Vec<RegisteredRunner> {
@@ -410,6 +438,14 @@ impl AppState {
             .await
             .sessions
             .insert(session_id, session.clone());
+        tracing::info!(
+            %session_id,
+            %owner_user_id,
+            %runner_id,
+            workspace_id = %session.workspace.workspace_id,
+            provider_id = %session.provider_id,
+            "session registered"
+        );
         session
     }
 
@@ -536,6 +572,12 @@ impl AppState {
         };
         match &envelope.event {
             AppEvent::ApprovalRequested(request) => {
+                tracing::info!(
+                    approval_id = %request.approval_id,
+                    %session_id,
+                    kind = ?request.kind,
+                    "approval requested"
+                );
                 self.inner.registry.lock().await.approvals.insert(
                     request.approval_id,
                     RegisteredApproval {
@@ -545,6 +587,11 @@ impl AppState {
                 );
             }
             AppEvent::ApprovalResolved(resolved) => {
+                tracing::info!(
+                    approval_id = %resolved.approval_id,
+                    %session_id,
+                    "approval resolved event received"
+                );
                 let mut registry = self.inner.registry.lock().await;
                 match registry.approvals.get_mut(&resolved.approval_id) {
                     Some(approval) => match &approval.status {
@@ -581,6 +628,7 @@ impl AppState {
         match &approval.status {
             ApprovalStatus::Pending => {
                 approval.status = ApprovalStatus::Resolving;
+                tracing::debug!(%approval_id, session_id = %approval.session_id, "approval resolution started");
                 ApprovalResolutionStart::Started {
                     session_id: approval.session_id,
                 }
@@ -661,7 +709,36 @@ impl AppState {
         };
 
         let _ = sender.send(envelope.clone());
+        tracing::debug!(
+            %session_id,
+            event_id = envelope.event_id.as_ref().map(ToString::to_string).as_deref(),
+            event_type = app_event_name(&envelope.event),
+            "stored and broadcast app event"
+        );
         envelope
+    }
+}
+
+fn app_event_name(event: &AppEvent) -> &'static str {
+    match event {
+        AppEvent::SessionStarted(_) => "session_started",
+        AppEvent::SessionStatusChanged(_) => "session_status_changed",
+        AppEvent::UserMessage(_) => "user_message",
+        AppEvent::AgentMessageDelta(_) => "agent_message_delta",
+        AppEvent::AgentMessageCompleted(_) => "agent_message_completed",
+        AppEvent::PlanUpdated(_) => "plan_updated",
+        AppEvent::ToolStarted(_) => "tool_started",
+        AppEvent::ToolUpdated(_) => "tool_updated",
+        AppEvent::ToolCompleted(_) => "tool_completed",
+        AppEvent::CommandStarted(_) => "command_started",
+        AppEvent::CommandOutputDelta(_) => "command_output_delta",
+        AppEvent::CommandCompleted(_) => "command_completed",
+        AppEvent::FileChangeProposed(_) => "file_change_proposed",
+        AppEvent::FileChangeApplied(_) => "file_change_applied",
+        AppEvent::FileChangeRejected(_) => "file_change_rejected",
+        AppEvent::ApprovalRequested(_) => "approval_requested",
+        AppEvent::ApprovalResolved(_) => "approval_resolved",
+        AppEvent::Error(_) => "error",
     }
 }
 

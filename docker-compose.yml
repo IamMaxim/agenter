@@ -16,5 +16,42 @@ services:
       timeout: 5s
       retries: 12
 
+  loki:
+    image: grafana/loki:3.3.2
+    container_name: agenter-loki
+    profiles:
+      - logging
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "3100:3100"
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: agenter-grafana
+    profiles:
+      - logging
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: agenter
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    ports:
+      - "3000:3000"
+    volumes:
+      - agenter-grafana-data:/var/lib/grafana
+
+  promtail:
+    image: grafana/promtail:3.3.2
+    container_name: agenter-promtail
+    profiles:
+      - logging
+    command: ["-config.file=/etc/promtail/config.yml"]
+    volumes:
+      - ./docker/promtail-config.yml:/etc/promtail/config.yml:ro
+      - ./tmp/agenter-logs:/var/log/agenter:ro
+    depends_on:
+      - loki
+
 volumes:
   agenter-postgres-data:
+  agenter-grafana-data:

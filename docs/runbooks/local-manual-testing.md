@@ -70,6 +70,23 @@ ok
 
 For local HTTP testing the just recipe sets `AGENTER_COOKIE_SECURE=0`, because secure cookies are not sent over plain `http://127.0.0.1`.
 
+By default `just control-plane` writes terminal logs and also appends structured logs to:
+
+```text
+tmp/agenter-logs/agenter-control-plane.log
+```
+
+Useful logging environment variables:
+
+```text
+RUST_LOG=agenter=debug,tower_http=debug,sqlx=warn
+AGENTER_LOG_FORMAT=pretty
+AGENTER_LOG_DIR=tmp/agenter-logs
+AGENTER_LOG_PAYLOADS=0
+```
+
+Set `AGENTER_LOG_FORMAT=json` when logs will be consumed by Promtail or another log shipper. Keep `AGENTER_LOG_PAYLOADS=0` unless you are doing local-only protocol debugging; when enabled, provider payload previews can include prompt text.
+
 ## Runner
 
 Start the deterministic fake runner:
@@ -86,6 +103,18 @@ just qwen-runner /path/to/workspace
 ```
 
 The real provider runners require authenticated local `codex` or `qwen` CLIs and currently start fresh native provider sessions for each browser prompt until native session ID persistence is implemented.
+
+Runner logs are written to:
+
+```text
+tmp/agenter-logs/agenter-runner.log
+```
+
+Tail both Rust service logs:
+
+```sh
+just logs-tail
+```
 
 ## Browser UI
 
@@ -104,6 +133,62 @@ http://127.0.0.1:5173/
 Log in with the bootstrap credentials, create a session for an advertised runner workspace, and send a prompt.
 
 The Vite dev server proxies `/api` and `/healthz` to the Rust control plane on `127.0.0.1:7777`, including the browser WebSocket.
+
+To add browser console diagnostics for API and WebSocket lifecycle:
+
+```sh
+just web-debug
+```
+
+This sets `VITE_AGENTER_DEBUG=1`. The default `just web` stays quiet.
+
+## Optional Loki and Grafana
+
+Start the optional local logging stack:
+
+```sh
+just logs-up
+```
+
+Use JSON-formatted Rust logs while Promtail is running:
+
+```sh
+just control-plane-json
+just runner-json fake .
+```
+
+Grafana is available at:
+
+```text
+http://127.0.0.1:3000/
+```
+
+Default local credentials:
+
+```text
+user: admin
+password: agenter
+```
+
+Add a Loki data source pointed at:
+
+```text
+http://loki:3100
+```
+
+Query examples:
+
+```logql
+{job="agenter"}
+{job="agenter", level="INFO"}
+{job="agenter", target=~".*runner.*"}
+```
+
+Stop the logging stack:
+
+```sh
+just logs-down
+```
 
 ## Useful Commands
 
@@ -131,3 +216,4 @@ just db-down
 - If no workspaces appear, confirm a runner is connected and its token matches `AGENTER_DEV_RUNNER_TOKEN`.
 - If port `7777` is busy, set `AGENTER_BIND_ADDR` for the control plane and set `AGENTER_CONTROL_PLANE_WS` to the matching WebSocket URL for the runner.
 - If the web UI cannot reach the backend, use the Vite dev server URL and keep the control plane on `127.0.0.1:7777`, or update `web/vite.config.ts` to match your custom `AGENTER_BIND_ADDR`.
+- If logs are missing from Grafana, confirm the Rust service was started with `AGENTER_LOG_FORMAT=json` and `AGENTER_LOG_DIR=tmp/agenter-logs`, then check `just logs-tail`.

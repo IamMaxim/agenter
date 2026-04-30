@@ -24,34 +24,53 @@ pub fn smoke_session_id() -> SessionId {
 }
 
 pub async fn handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    tracing::debug!("runner websocket upgrade requested");
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let Some(first) = receiver.next().await else {
+        tracing::warn!("runner websocket closed before hello");
         return;
     };
 
     let Ok(Message::Text(text)) = first else {
+        tracing::warn!("runner websocket first frame was not text");
         return;
     };
 
     let Ok(RunnerClientMessage::Hello(hello)) = serde_json::from_str::<RunnerClientMessage>(&text)
     else {
+        tracing::warn!("runner websocket rejected invalid hello frame");
         return;
     };
 
     if hello.protocol_version != PROTOCOL_VERSION || !state.is_runner_token_valid(&hello.token) {
+        tracing::warn!(
+            runner_id = %hello.runner_id,
+            protocol_version = %hello.protocol_version,
+            expected_protocol_version = PROTOCOL_VERSION,
+            token_valid = state.is_runner_token_valid(&hello.token),
+            "runner websocket rejected hello"
+        );
         return;
     }
 
     let Some(workspace) = hello.workspaces.first().cloned() else {
+        tracing::warn!(runner_id = %hello.runner_id, "runner hello rejected without workspaces");
         return;
     };
     let Some(provider) = hello.capabilities.agent_providers.first().cloned() else {
+        tracing::warn!(runner_id = %hello.runner_id, "runner hello rejected without providers");
         return;
     };
+    tracing::info!(
+        runner_id = %hello.runner_id,
+        workspace_count = hello.workspaces.len(),
+        provider_count = hello.capabilities.agent_providers.len(),
+        "runner hello accepted"
+    );
     let runner = state
         .register_runner(
             hello.runner_id,
@@ -108,6 +127,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     }));
 
     if send_server_message(&mut sender, command).await.is_err() {
+        tracing::warn!(runner_id = %runner.runner_id, "failed to send smoke command to runner");
         return;
     }
 
@@ -131,10 +151,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 }
                                 state.publish_event(session_id, event).await;
                             }
+                        } else {
+                            tracing::warn!(runner_id = %runner.runner_id, "runner websocket ignored undecodable text frame");
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Err(_)) => break,
+                    Some(Ok(Message::Close(_))) | None => {
+                        tracing::info!(runner_id = %runner.runner_id, "runner websocket closed");
+                        break;
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(runner_id = %runner.runner_id, %error, "runner websocket receive error");
+                        break;
+                    }
                     Some(Ok(_)) => {}
                 }
             }
@@ -144,12 +172,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 };
                 if let Some(approval_id) = approval_answer_id(&outbound.message) {
                     if !state.approval_is_resolving(approval_id).await {
+                        tracing::warn!(
+                            runner_id = %runner.runner_id,
+                            %approval_id,
+                            "dropped stale approval answer before runner delivery"
+                        );
                         let _ = outbound.delivered.send(Err(crate::state::RunnerSendError::StaleApproval));
                         continue;
                     }
                 }
                 let result = send_server_message(&mut sender, outbound.message).await;
                 let should_break = result.is_err();
+                if should_break {
+                    tracing::warn!(runner_id = %runner.runner_id, "runner websocket send failed");
+                }
                 let _ = outbound.delivered.send(result.map_err(|_| crate::state::RunnerSendError::Closed));
                 if should_break {
                     break;

@@ -15,10 +15,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .without_time()
-        .init();
+    agenter_core::logging::init_tracing("agenter-codex-spike");
 
     let (workspace, prompt) = parse_args()?;
     let workspace = workspace

@@ -3,6 +3,7 @@
 pub mod approval;
 pub mod events;
 pub mod ids;
+pub mod logging;
 pub mod session;
 pub mod workspace;
 

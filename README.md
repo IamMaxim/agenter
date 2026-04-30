@@ -17,6 +17,8 @@ just web
 
 See `docs/runbooks/local-manual-testing.md` for the full terminal sequence, default credentials, and troubleshooting notes.
 
+For verbose diagnostics, the runbook also covers `RUST_LOG`, local log files under `tmp/agenter-logs`, browser debug logging, and the optional Loki/Grafana Compose profile.
+
 ## Documentation Map
 
 - `docs/chatgpt/001_initial.md` - initial product discussion and technical direction.

@@ -411,6 +411,7 @@ Active execution notes:
 - The current Compose file intentionally starts only Postgres. Control plane, runner, and web UI still run as local developer processes so manual testing can inspect logs and provider CLI behavior directly.
 - The control plane runs migrations automatically on startup when `DATABASE_URL` is set; `just control-plane` sets the development database URL, insecure local HTTP cookies, bootstrap admin credentials, and the runner token.
 - Full deployment Compose for the control plane, optional runner containers, reverse proxy, and secret handling remains open under Task 7.3.
+- Manual testing diagnostics now include structured `tracing` setup for the Rust services, frontend debug logging behind `VITE_AGENTER_DEBUG=1`, local log files under `tmp/agenter-logs`, and optional Loki/Grafana/Promtail services behind the Compose `logging` profile. Logs are metadata-only by default; prompt/provider payload previews require `AGENTER_LOG_PAYLOADS=1`.
 
 ## Verification Policy
 

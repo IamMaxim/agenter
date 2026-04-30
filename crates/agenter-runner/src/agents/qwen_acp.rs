@@ -39,6 +39,7 @@ pub struct QwenAcp {
 
 impl QwenAcp {
     pub fn spawn(workspace_path: PathBuf) -> anyhow::Result<Self> {
+        tracing::info!(workspace = %workspace_path.display(), "spawning qwen acp");
         let mut child = Command::new("qwen")
             .args(["--acp", "--approval-mode", "default"])
             .current_dir(&workspace_path)
@@ -72,6 +73,11 @@ impl QwenAcp {
         &mut self,
         request: &QwenTurnRequest,
     ) -> anyhow::Result<()> {
+        tracing::debug!(
+            session_id = %request.session_id,
+            has_external_session_id = request.external_session_id.is_some(),
+            "initializing qwen acp"
+        );
         self.send_request(
             "initialize",
             json!({
@@ -91,6 +97,7 @@ impl QwenAcp {
 
         if let Some(session_id) = &request.external_session_id {
             self.provider_session_id = Some(session_id.clone());
+            tracing::info!(session_id = %request.session_id, provider_session_id = %session_id, "resuming qwen session");
             self.send_request(
                 "session/resume",
                 json!({
@@ -101,6 +108,7 @@ impl QwenAcp {
             )
             .await?;
         } else {
+            tracing::info!(session_id = %request.session_id, "starting qwen session");
             self.send_request(
                 "session/new",
                 json!({
@@ -120,6 +128,16 @@ impl QwenAcp {
                 "qwen session id was not observed before prompt start"
             ));
         };
+        tracing::info!(
+            session_id = %request.session_id,
+            provider_session_id = %session_id,
+            prompt_len = request.prompt.len(),
+            payload_preview = agenter_core::logging::payload_preview(
+                &json!({"prompt": &request.prompt}),
+                agenter_core::logging::payload_logging_enabled()
+            ).as_deref(),
+            "sending qwen prompt"
+        );
         let request_id = self
             .send_request(
                 "session/prompt",
@@ -139,13 +157,24 @@ impl QwenAcp {
         }
         let message = serde_json::from_str::<Value>(line.trim())
             .with_context(|| format!("qwen emitted invalid JSON-RPC line: {line}"))?;
+        tracing::debug!(
+            method = message.get("method").and_then(serde_json::Value::as_str),
+            id = ?message.get("id"),
+            payload_preview = agenter_core::logging::payload_preview(
+                &message,
+                agenter_core::logging::payload_logging_enabled()
+            ).as_deref(),
+            "received qwen json-rpc message"
+        );
         if let Some(session_id) = qwen_session_id(&message) {
             self.provider_session_id = Some(session_id.to_owned());
+            tracing::info!(provider_session_id = %session_id, "observed qwen session id");
         }
         Ok(Some(message))
     }
 
     pub async fn respond(&mut self, id: Value, result: Value) -> anyhow::Result<()> {
+        tracing::debug!(id = ?id, "sending qwen json-rpc response");
         write_json(
             &mut self.stdin,
             &json!({
@@ -159,6 +188,16 @@ impl QwenAcp {
     async fn send_request(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
+        tracing::debug!(
+            id,
+            method,
+            payload_preview = agenter_core::logging::payload_preview(
+                &params,
+                agenter_core::logging::payload_logging_enabled()
+            )
+            .as_deref(),
+            "sending qwen json-rpc request"
+        );
         write_json(
             &mut self.stdin,
             &json!({
@@ -172,13 +211,16 @@ impl QwenAcp {
     }
 
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
+        tracing::debug!("shutting down qwen acp");
         self.stdin.shutdown().await.ok();
         match timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await {
             Ok(result) => {
                 result?;
+                tracing::debug!("qwen acp exited");
             }
             Err(_) => {
                 self.child.kill().await.ok();
+                tracing::warn!("killed qwen acp after shutdown timeout");
             }
         }
         Ok(())
@@ -190,6 +232,7 @@ pub async fn run_qwen_turn(
     event_sender: mpsc::UnboundedSender<AppEvent>,
     pending_approvals: std::sync::Arc<tokio::sync::Mutex<HashMap<ApprovalId, PendingQwenApproval>>>,
 ) -> anyhow::Result<()> {
+    tracing::info!(session_id = %request.session_id, "qwen turn task started");
     let mut server = QwenAcp::spawn(request.workspace_path.clone())?;
     server.initialize_and_start_session(&request).await?;
 
@@ -198,6 +241,7 @@ pub async fn run_qwen_turn(
             return Err(anyhow!("qwen exited before returning a session id"));
         };
         if let Some(response) = inert_client_response(&message) {
+            tracing::debug!(id = ?message.get("id"), "answering qwen client request while waiting for session id");
             server.respond(message["id"].clone(), response).await?;
         }
     }
@@ -205,6 +249,7 @@ pub async fn run_qwen_turn(
     let prompt_request_id = server.send_prompt(&request).await?;
     while let Some(message) = server.next_message().await? {
         if let Some(response) = inert_client_response(&message) {
+            tracing::debug!(id = ?message.get("id"), "answering qwen client request");
             server.respond(message["id"].clone(), response).await?;
             continue;
         }
@@ -212,6 +257,7 @@ pub async fn run_qwen_turn(
         if is_response_to(&message, &prompt_request_id) {
             let event = normalize_qwen_prompt_response(request.session_id, &message);
             event_sender.send(event).ok();
+            tracing::info!(session_id = %request.session_id, "qwen prompt completed");
             server.shutdown().await?;
             return Ok(());
         }
@@ -224,6 +270,12 @@ pub async fn run_qwen_turn(
                 .lock()
                 .await
                 .insert(approval_id, PendingQwenApproval { response: sender });
+            tracing::info!(
+                session_id = %request.session_id,
+                %approval_id,
+                native_request_id = ?native_request_id,
+                "qwen permission request pending"
+            );
             event_sender.send(event).ok();
             if let Ok(decision) = receiver.await {
                 server
@@ -240,6 +292,7 @@ pub async fn run_qwen_turn(
             let completed = matches!(event, AppEvent::AgentMessageCompleted(_));
             event_sender.send(event).ok();
             if completed {
+                tracing::info!(session_id = %request.session_id, "qwen turn completed");
                 server.shutdown().await?;
                 return Ok(());
             }

@@ -26,13 +26,16 @@ const DEFAULT_DEV_RUNNER_TOKEN: &str = "dev-runner-token";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _ = tracing_subscriber::fmt::try_init();
+    agenter_core::logging::init_tracing("agenter-runner");
 
     if fake_mode_requested() {
+        tracing::info!("starting fake runner mode");
         run_fake_runner().await?;
     } else if codex_mode_requested() {
+        tracing::info!("starting codex runner mode");
         run_codex_runner().await?;
     } else if qwen_mode_requested() {
+        tracing::info!("starting qwen runner mode");
         run_qwen_runner().await?;
     } else {
         println!("agenter runner");
@@ -65,9 +68,11 @@ async fn run_codex_runner() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or(env::current_dir()?);
     let workspace_path = workspace_path.canonicalize().unwrap_or(workspace_path);
+    tracing::info!(url = %url, workspace = %workspace_path.display(), "connecting codex runner to control plane");
     let (socket, _) = connect_async(&url).await?;
     let (mut sender, mut receiver) = socket.split();
     let hello = codex_hello(token, workspace_path.clone());
+    tracing::info!(runner_id = %hello.runner_id, "sending codex runner hello");
     send_runner_message(&mut sender, RunnerClientMessage::Hello(hello)).await?;
 
     let pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingCodexApproval>>> =
@@ -97,6 +102,7 @@ async fn run_codex_runner() -> anyhow::Result<()> {
             }
             message = receiver.next() => {
                 let Some(message) = message else {
+                    tracing::info!("control plane websocket closed for codex runner");
                     break;
                 };
                 let Message::Text(text) = message? else {
@@ -105,11 +111,13 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                 let Ok(agenter_protocol::RunnerServerMessage::Command(envelope)) =
                     serde_json::from_str::<agenter_protocol::RunnerServerMessage>(&text)
                 else {
+                    tracing::warn!("codex runner ignored undecodable control-plane message");
                     continue;
                 };
 
                 match envelope.command {
                     RunnerCommand::AgentSendInput(command) => {
+                        tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, "codex runner received agent input");
                         send_runner_message(
                             &mut sender,
                             RunnerClientMessage::Response(RunnerResponseEnvelope {
@@ -132,6 +140,7 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                         let session_id = request.session_id;
                         tokio::spawn(async move {
                             if let Err(error) = run_codex_turn(request, event_sender.clone(), pending).await {
+                                tracing::error!(%session_id, %error, "codex turn failed");
                                 event_sender.send(AppEvent::Error(AgentErrorEvent {
                                     session_id: Some(session_id),
                                     code: Some("codex_adapter_error".to_owned()),
@@ -142,6 +151,7 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                         });
                     }
                     RunnerCommand::AnswerApproval(command) => {
+                        tracing::info!(session_id = %command.session_id, approval_id = %command.approval_id, "codex runner received approval answer");
                         let pending = pending_approvals.lock().await.remove(&command.approval_id);
                         let outcome = if let Some(pending) = pending {
                             pending.response.send(command.decision).ok();
@@ -149,6 +159,7 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                                 result: RunnerCommandResult::Accepted,
                             }
                         } else {
+                            tracing::warn!(approval_id = %command.approval_id, "codex approval answer had no pending provider request");
                             RunnerResponseOutcome::Error {
                                 error: agenter_protocol::runner::RunnerError {
                                     code: "approval_not_found".to_owned(),
@@ -169,6 +180,7 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                     | RunnerCommand::ResumeSession(_)
                     | RunnerCommand::InterruptSession { .. }
                     | RunnerCommand::ShutdownSession(_) => {
+                        tracing::debug!(request_id = %envelope.request_id, "codex runner accepted lifecycle command placeholder");
                         send_runner_message(
                             &mut sender,
                             RunnerClientMessage::Response(RunnerResponseEnvelope {
@@ -197,13 +209,12 @@ async fn run_qwen_runner() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or(env::current_dir()?);
     let workspace_path = workspace_path.canonicalize().unwrap_or(workspace_path);
+    tracing::info!(url = %url, workspace = %workspace_path.display(), "connecting qwen runner to control plane");
     let (socket, _) = connect_async(&url).await?;
     let (mut sender, mut receiver) = socket.split();
-    send_runner_message(
-        &mut sender,
-        RunnerClientMessage::Hello(qwen_hello(token, workspace_path.clone())),
-    )
-    .await?;
+    let hello = qwen_hello(token, workspace_path.clone());
+    tracing::info!(runner_id = %hello.runner_id, "sending qwen runner hello");
+    send_runner_message(&mut sender, RunnerClientMessage::Hello(hello)).await?;
 
     let pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingQwenApproval>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -232,6 +243,7 @@ async fn run_qwen_runner() -> anyhow::Result<()> {
             }
             message = receiver.next() => {
                 let Some(message) = message else {
+                    tracing::info!("control plane websocket closed for qwen runner");
                     break;
                 };
                 let Message::Text(text) = message? else {
@@ -240,11 +252,13 @@ async fn run_qwen_runner() -> anyhow::Result<()> {
                 let Ok(agenter_protocol::RunnerServerMessage::Command(envelope)) =
                     serde_json::from_str::<agenter_protocol::RunnerServerMessage>(&text)
                 else {
+                    tracing::warn!("qwen runner ignored undecodable control-plane message");
                     continue;
                 };
 
                 match envelope.command {
                     RunnerCommand::AgentSendInput(command) => {
+                        tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, "qwen runner received agent input");
                         send_runner_message(
                             &mut sender,
                             RunnerClientMessage::Response(RunnerResponseEnvelope {
@@ -266,6 +280,7 @@ async fn run_qwen_runner() -> anyhow::Result<()> {
                         let session_id = request.session_id;
                         tokio::spawn(async move {
                             if let Err(error) = run_qwen_turn(request, event_sender.clone(), pending).await {
+                                tracing::error!(%session_id, %error, "qwen turn failed");
                                 event_sender.send(AppEvent::Error(AgentErrorEvent {
                                     session_id: Some(session_id),
                                     code: Some("qwen_adapter_error".to_owned()),
@@ -276,6 +291,7 @@ async fn run_qwen_runner() -> anyhow::Result<()> {
                         });
                     }
                     RunnerCommand::AnswerApproval(command) => {
+                        tracing::info!(session_id = %command.session_id, approval_id = %command.approval_id, "qwen runner received approval answer");
                         let pending = pending_approvals.lock().await.remove(&command.approval_id);
                         let outcome = if let Some(pending) = pending {
                             pending.response.send(command.decision).ok();
@@ -283,6 +299,7 @@ async fn run_qwen_runner() -> anyhow::Result<()> {
                                 result: RunnerCommandResult::Accepted,
                             }
                         } else {
+                            tracing::warn!(approval_id = %command.approval_id, "qwen approval answer had no pending provider request");
                             RunnerResponseOutcome::Error {
                                 error: agenter_protocol::runner::RunnerError {
                                     code: "approval_not_found".to_owned(),
@@ -303,6 +320,7 @@ async fn run_qwen_runner() -> anyhow::Result<()> {
                     | RunnerCommand::ResumeSession(_)
                     | RunnerCommand::InterruptSession { .. }
                     | RunnerCommand::ShutdownSession(_) => {
+                        tracing::debug!(request_id = %envelope.request_id, "qwen runner accepted lifecycle command placeholder");
                         send_runner_message(
                             &mut sender,
                             RunnerClientMessage::Response(RunnerResponseEnvelope {
@@ -327,10 +345,13 @@ async fn run_fake_runner() -> anyhow::Result<()> {
         .unwrap_or_else(|_| DEFAULT_CONTROL_PLANE_WS.to_owned());
     let token = env::var("AGENTER_DEV_RUNNER_TOKEN")
         .unwrap_or_else(|_| DEFAULT_DEV_RUNNER_TOKEN.to_owned());
+    tracing::info!(url = %url, "connecting fake runner to control plane");
     let (socket, _) = connect_async(&url).await?;
     let (mut sender, mut receiver) = socket.split();
 
-    send_runner_message(&mut sender, RunnerClientMessage::Hello(fake_hello(token))).await?;
+    let hello = fake_hello(token);
+    tracing::info!(runner_id = %hello.runner_id, "sending fake runner hello");
+    send_runner_message(&mut sender, RunnerClientMessage::Hello(hello)).await?;
 
     while let Some(message) = receiver.next().await {
         let Message::Text(text) = message? else {
@@ -339,10 +360,12 @@ async fn run_fake_runner() -> anyhow::Result<()> {
         let Ok(agenter_protocol::RunnerServerMessage::Command(envelope)) =
             serde_json::from_str::<agenter_protocol::RunnerServerMessage>(&text)
         else {
+            tracing::warn!("fake runner ignored undecodable control-plane message");
             continue;
         };
 
         if let RunnerCommand::AgentSendInput(command) = envelope.command {
+            tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, "fake runner received agent input");
             send_runner_message(
                 &mut sender,
                 RunnerClientMessage::Response(RunnerResponseEnvelope {
@@ -355,6 +378,7 @@ async fn run_fake_runner() -> anyhow::Result<()> {
             .await?;
 
             for event in deterministic_fake_events(command.session_id, &command.input) {
+                tracing::debug!(session_id = %command.session_id, "fake runner emitting event");
                 send_runner_message(
                     &mut sender,
                     RunnerClientMessage::Event(RunnerEventEnvelope {

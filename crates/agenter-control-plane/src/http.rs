@@ -9,6 +9,7 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
+use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::{
@@ -49,12 +50,11 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/api/runner/ws", get(runner_ws::handler))
         .route("/api/browser/ws", get(browser_ws_authenticated))
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
 pub async fn serve() -> anyhow::Result<()> {
-    let _ = tracing_subscriber::fmt::try_init();
-
     let bind_addr = env::var("AGENTER_BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_owned());
     let bind_addr: SocketAddr = bind_addr.parse()?;
     let runner_token = env::var("AGENTER_DEV_RUNNER_TOKEN")
@@ -68,11 +68,23 @@ pub async fn serve() -> anyhow::Result<()> {
         _ => None,
     };
 
+    tracing::info!(
+        %bind_addr,
+        cookie_secure = !matches!(cookie_security, CookieSecurity::DevelopmentInsecure),
+        has_bootstrap_admin = bootstrap_admin.is_some(),
+        has_database_url = env::var("DATABASE_URL").is_ok(),
+        "starting agenter control plane"
+    );
+
     let state = if let Ok(database_url) = env::var("DATABASE_URL") {
+        tracing::info!("connecting to postgres");
         let pool = sqlx::PgPool::connect(&database_url).await?;
+        tracing::info!("running database migrations");
         sqlx::migrate!("../../migrations").run(&pool).await?;
+        tracing::info!("database migrations completed");
         AppState::new_with_database(runner_token, cookie_security, pool, bootstrap_admin).await?
     } else {
+        tracing::warn!("DATABASE_URL not set; using in-memory development state");
         match bootstrap_admin {
             Some((email, password)) => {
                 AppState::new_with_bootstrap_admin(runner_token, email, password, cookie_security)?
@@ -160,12 +172,15 @@ async fn auth_login(
     State(state): State<AppState>,
     Json(request): Json<PasswordLoginRequest>,
 ) -> Response {
+    tracing::debug!(email = %request.email, "password login requested");
     let Some(token) = state
         .login_password(&request.email, &request.password)
         .await
     else {
+        tracing::warn!(email = %request.email, "password login rejected");
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    tracing::info!(email = %request.email, "password login accepted");
 
     (
         StatusCode::OK,
@@ -179,8 +194,10 @@ async fn auth_login(
 }
 
 async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    tracing::debug!("logout requested");
     if let Some(token) = auth::session_token_from_headers(&headers) {
         state.logout(token).await;
+        tracing::info!("session logged out");
     }
 
     (
@@ -195,17 +212,22 @@ async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Respo
 
 async fn auth_me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        tracing::debug!("auth me rejected missing or invalid session");
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    tracing::debug!(user_id = %user.user_id, "auth me accepted");
 
     Json(user).into_response()
 }
 
 async fn oidc_login(State(state): State<AppState>, Path(provider_id): Path<String>) -> Response {
+    tracing::debug!(%provider_id, "oidc login requested");
     let Some(pool) = state.db_pool() else {
+        tracing::warn!(%provider_id, "oidc login requested without database");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let Ok(Some(provider)) = agenter_db::find_oidc_provider(pool, &provider_id).await else {
+        tracing::warn!(%provider_id, "oidc provider not found");
         return StatusCode::NOT_FOUND.into_response();
     };
     let state_token = Uuid::new_v4().to_string();
@@ -223,6 +245,7 @@ async fn oidc_login(State(state): State<AppState>, Path(provider_id): Path<Strin
     .await
     .is_err()
     {
+        tracing::error!(%provider_id, "failed to create oidc login state");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     let authorization_url = oidc_authorization_url(&provider, &state_token, &nonce);
@@ -241,17 +264,21 @@ async fn oidc_callback(
     Json(request): Json<OidcCallbackRequest>,
 ) -> Response {
     if !unsafe_dev_oidc_callback_enabled() {
+        tracing::warn!(%provider_id, "unsafe development oidc callback rejected because flag is disabled");
         return StatusCode::NOT_IMPLEMENTED.into_response();
     }
     let Some(pool) = state.db_pool() else {
+        tracing::warn!(%provider_id, "oidc callback requested without database");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let Ok(Some(login_state)) =
         agenter_db::consume_oidc_login_state(pool, &provider_id, &request.state, Utc::now()).await
     else {
+        tracing::warn!(%provider_id, "oidc callback state rejected");
         return StatusCode::UNAUTHORIZED.into_response();
     };
     if login_state.provider_id != provider_id {
+        tracing::warn!(%provider_id, login_state_provider_id = %login_state.provider_id, "oidc callback provider mismatch");
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let Ok(user) = agenter_db::upsert_oidc_identity(
@@ -263,6 +290,7 @@ async fn oidc_callback(
     )
     .await
     else {
+        tracing::error!(%provider_id, "failed to bind oidc identity");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let token = state
@@ -289,9 +317,11 @@ async fn create_link_code(
     Json(request): Json<CreateLinkCodeRequest>,
 ) -> Response {
     if !unsafe_dev_link_code_creation_enabled() {
+        tracing::warn!("unsafe development link-code creation rejected because flag is disabled");
         return StatusCode::NOT_IMPLEMENTED.into_response();
     }
     let Some(pool) = state.db_pool() else {
+        tracing::warn!("link-code creation requested without database");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let code = Uuid::new_v4().to_string();
@@ -306,6 +336,7 @@ async fn create_link_code(
     )
     .await
     else {
+        tracing::error!(connector_id = %request.connector_id, "failed to create connector link code");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
 
@@ -325,20 +356,35 @@ async fn consume_link_code(
     Path(code): Path<String>,
 ) -> Response {
     let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        tracing::debug!("link-code consume rejected missing or invalid session");
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let Some(pool) = state.db_pool() else {
+        tracing::warn!(user_id = %user.user_id, "link-code consume requested without database");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match agenter_db::consume_connector_link_code(pool, &code, user.user_id, Utc::now()).await {
-        Ok(Some(account)) => Json(serde_json::json!({
-            "connector_id": account.connector_id,
-            "external_account_id": account.external_account_id,
-            "display_name": account.display_name
-        }))
-        .into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok(Some(account)) => {
+            tracing::info!(
+                user_id = %user.user_id,
+                connector_id = %account.connector_id,
+                "connector account linked"
+            );
+            Json(serde_json::json!({
+                "connector_id": account.connector_id,
+                "external_account_id": account.external_account_id,
+                "display_name": account.display_name
+            }))
+            .into_response()
+        }
+        Ok(None) => {
+            tracing::warn!(user_id = %user.user_id, "link-code consume rejected");
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(error) => {
+            tracing::error!(user_id = %user.user_id, %error, "failed to consume connector link code");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -374,6 +420,7 @@ async fn list_runners(State(state): State<AppState>, headers: HeaderMap) -> Resp
         .await
         .is_none()
     {
+        tracing::debug!("list runners rejected missing or invalid session");
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -399,6 +446,7 @@ async fn list_runners(State(state): State<AppState>, headers: HeaderMap) -> Resp
             last_seen_at: None,
         })
         .collect();
+    tracing::debug!(runner_count = runners.len(), "listed runners");
     Json(runners).into_response()
 }
 
@@ -411,21 +459,31 @@ async fn list_runner_workspaces(
         .await
         .is_none()
     {
+        tracing::debug!(%runner_id, "list runner workspaces rejected missing or invalid session");
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
     match state.list_runner_workspaces(runner_id).await {
-        Some(workspaces) => Json(workspaces).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+        Some(workspaces) => {
+            tracing::debug!(%runner_id, workspace_count = workspaces.len(), "listed runner workspaces");
+            Json(workspaces).into_response()
+        }
+        None => {
+            tracing::warn!(%runner_id, "runner workspaces not found");
+            StatusCode::NOT_FOUND.into_response()
+        }
     }
 }
 
 async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        tracing::debug!("list sessions rejected missing or invalid session");
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
-    Json(state.list_sessions(user.user_id).await).into_response()
+    let sessions = state.list_sessions(user.user_id).await;
+    tracing::debug!(user_id = %user.user_id, session_count = sessions.len(), "listed sessions");
+    Json(sessions).into_response()
 }
 
 async fn get_session(
@@ -434,10 +492,12 @@ async fn get_session(
     Path(session_id): Path<agenter_core::SessionId>,
 ) -> Response {
     let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        tracing::debug!(%session_id, "get session rejected missing or invalid session");
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
     let Some(session) = state.session(user.user_id, session_id).await else {
+        tracing::warn!(user_id = %user.user_id, %session_id, "session not found or forbidden");
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -460,20 +520,37 @@ async fn create_session(
     Json(request): Json<CreateSessionRequest>,
 ) -> Response {
     let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        tracing::debug!("create session rejected missing or invalid session");
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    let workspace_id = request.workspace_id;
+    let provider_id = request.provider_id;
 
     let Some(session) = state
         .create_session_for_workspace(
             user.user_id,
-            request.workspace_id,
-            request.provider_id,
+            workspace_id,
+            provider_id.clone(),
             request.title,
         )
         .await
     else {
+        tracing::warn!(
+            user_id = %user.user_id,
+            %workspace_id,
+            provider_id = %provider_id,
+            "session creation failed: no connected runner workspace/provider match"
+        );
         return StatusCode::NOT_FOUND.into_response();
     };
+    tracing::info!(
+        user_id = %user.user_id,
+        session_id = %session.session_id,
+        runner_id = %session.runner_id,
+        workspace_id = %session.workspace.workspace_id,
+        provider_id = %session.provider_id,
+        "session created"
+    );
 
     let info = agenter_core::SessionInfo {
         session_id: session.session_id,
@@ -502,14 +579,17 @@ async fn send_session_message(
     Json(request): Json<SendMessageRequest>,
 ) -> Response {
     let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        tracing::debug!(%session_id, "send session message rejected missing or invalid session");
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
     let Some(session) = state.session(user.user_id, session_id).await else {
+        tracing::warn!(user_id = %user.user_id, %session_id, "send session message rejected session not found");
         return StatusCode::NOT_FOUND.into_response();
     };
     let content = request.content.trim();
     if content.is_empty() {
+        tracing::debug!(user_id = %user.user_id, %session_id, "send session message rejected empty content");
         return StatusCode::BAD_REQUEST.into_response();
     }
 
@@ -534,12 +614,29 @@ async fn send_session_message(
     ));
 
     match state.send_runner_message(session.runner_id, message).await {
-        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Ok(()) => {
+            tracing::info!(
+                user_id = %user.user_id,
+                %session_id,
+                runner_id = %session.runner_id,
+                content_len = content.len(),
+                "session message accepted by runner channel"
+            );
+            StatusCode::ACCEPTED.into_response()
+        }
         Err(
             RunnerSendError::NotConnected
             | RunnerSendError::Closed
             | RunnerSendError::StaleApproval,
-        ) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        ) => {
+            tracing::warn!(
+                user_id = %user.user_id,
+                %session_id,
+                runner_id = %session.runner_id,
+                "session message failed because runner is unavailable"
+            );
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
     }
 }
 
@@ -549,13 +646,16 @@ async fn session_history(
     Path(session_id): Path<agenter_core::SessionId>,
 ) -> Response {
     let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        tracing::debug!(%session_id, "session history rejected missing or invalid session");
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
     let Some(history) = state.session_history(user.user_id, session_id).await else {
+        tracing::warn!(user_id = %user.user_id, %session_id, "session history rejected session not found");
         return StatusCode::NOT_FOUND.into_response();
     };
 
+    tracing::debug!(user_id = %user.user_id, %session_id, event_count = history.len(), "returned session history");
     Json(history).into_response()
 }
 
@@ -577,6 +677,7 @@ async fn decide_approval(
     Json(decision): Json<agenter_core::ApprovalDecision>,
 ) -> Response {
     let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        tracing::debug!(%approval_id, "approval decision rejected missing or invalid session");
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let session_id = match state.begin_approval_resolution(approval_id).await {
@@ -590,11 +691,18 @@ async fn decide_approval(
             }
             return Json(*envelope).into_response();
         }
-        ApprovalResolutionStart::InProgress => return StatusCode::CONFLICT.into_response(),
-        ApprovalResolutionStart::Missing => return StatusCode::NOT_FOUND.into_response(),
+        ApprovalResolutionStart::InProgress => {
+            tracing::warn!(%approval_id, "approval decision rejected because resolution is already in progress");
+            return StatusCode::CONFLICT.into_response();
+        }
+        ApprovalResolutionStart::Missing => {
+            tracing::warn!(%approval_id, "approval decision rejected missing approval");
+            return StatusCode::NOT_FOUND.into_response();
+        }
     };
     let Some(session) = state.session(user.user_id, session_id).await else {
         state.cancel_approval_resolution(approval_id).await;
+        tracing::warn!(user_id = %user.user_id, %approval_id, %session_id, "approval decision rejected session not found");
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -614,9 +722,17 @@ async fn decide_approval(
         Ok(()) => {}
         Err(RunnerSendError::NotConnected | RunnerSendError::Closed) => {
             state.cancel_approval_resolution(approval_id).await;
+            tracing::warn!(
+                user_id = %user.user_id,
+                %approval_id,
+                %session_id,
+                runner_id = %session.runner_id,
+                "approval decision failed because runner is unavailable"
+            );
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
         Err(RunnerSendError::StaleApproval) => {
+            tracing::warn!(%approval_id, %session_id, "approval decision raced with runner-side resolution");
             return match state.begin_approval_resolution(approval_id).await {
                 ApprovalResolutionStart::AlreadyResolved {
                     session_id,
@@ -645,9 +761,11 @@ async fn decide_approval(
         .finish_approval_resolution(approval_id, session_id, resolved)
         .await
     else {
+        tracing::warn!(%approval_id, %session_id, "approval decision could not finish resolution");
         return StatusCode::CONFLICT.into_response();
     };
 
+    tracing::info!(user_id = %user.user_id, %approval_id, %session_id, "approval decision resolved");
     Json(envelope).into_response()
 }
 
@@ -657,9 +775,11 @@ async fn browser_ws_authenticated(
     headers: HeaderMap,
 ) -> Response {
     let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        tracing::debug!("browser websocket rejected missing or invalid session");
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
+    tracing::debug!(user_id = %user.user_id, "browser websocket accepted");
     browser_ws::handler(ws, State(state), user.user_id).await
 }
 

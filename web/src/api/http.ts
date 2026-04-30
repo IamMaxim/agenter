@@ -1,3 +1,5 @@
+import { debugLog } from './debug';
+
 export class ApiError extends Error {
   readonly status: number;
 
@@ -9,6 +11,8 @@ export class ApiError extends Error {
 }
 
 export async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const method = init.method ?? 'GET';
+  debugLog('api:start', { method, path });
   const response = await fetch(path, {
     credentials: 'include',
     headers: {
@@ -19,8 +23,11 @@ export async function requestJson<T>(path: string, init: RequestInit = {}): Prom
   });
 
   if (!response.ok) {
-    throw new ApiError(response.status, `${init.method ?? 'GET'} ${path} failed`);
+    debugLog('api:error', { method, path, status: response.status });
+    throw new ApiError(response.status, `${method} ${path} failed`);
   }
+
+  debugLog('api:ok', { method, path, status: response.status });
 
   if (response.status === 204) {
     return undefined as T;
