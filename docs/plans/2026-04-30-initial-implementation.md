@@ -29,11 +29,11 @@ Exit criterion: both provider protocols have local spike runbooks and either wor
 - Create: `docs/runbooks/qwen-acp-spike.md`
 - Modify: `docs/harness/MEMORY.md`
 
-- [ ] Write the Codex runbook with prerequisites, exact commands to locate `codex`, start `codex app-server`, send initialize, create/resume a thread, send a turn, trigger one approval request, and record observed JSON-RPC shapes.
-- [ ] Write the Qwen runbook with prerequisites, exact commands to locate `qwen`, start `qwen --acp`, initialize ACP, create/resume a session when supported, send a prompt, trigger one permission request, and record observed JSON-RPC shapes.
-- [ ] Add a recent note to `docs/harness/MEMORY.md` linking both runbooks.
-- [ ] Run `find . -maxdepth 4 -type f | sort` and check that docs have no placeholder sections.
-- [ ] Commit with `docs: add provider protocol spike runbooks`.
+- [x] Write the Codex runbook with prerequisites, exact commands to locate `codex`, start `codex app-server`, send initialize, create/resume a thread, send a turn, trigger one approval request, and record observed JSON-RPC shapes.
+- [x] Write the Qwen runbook with prerequisites, exact commands to locate `qwen`, start `qwen --acp`, initialize ACP, create/resume a session when supported, send a prompt, trigger one permission request, and record observed JSON-RPC shapes.
+- [x] Add a recent note to `docs/harness/MEMORY.md` linking both runbooks.
+- [x] Run `find . -maxdepth 4 -type f | sort` and check that docs have no placeholder sections.
+- [x] Commit with `docs: add provider protocol spike runbooks`.
 
 ### Task 0.2: Create Rust Workspace Skeleton
 

@@ -35,5 +35,5 @@ Do not store large transcripts here. Link to specs, plans, decisions, and runboo
 
 ## Recent Notes
 
+- 2026-04-30: Added protocol spike runbooks for Codex app-server (`docs/runbooks/codex-app-server-spike.md`) and Qwen ACP (`docs/runbooks/qwen-acp-spike.md`) so provider JSON-RPC shapes can be captured before adapter APIs are finalized.
 - 2026-04-30: Created initial harness documentation and preserved the initial technical discussion in `docs/chatgpt/001_initial.md`.
-
