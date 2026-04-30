@@ -85,8 +85,21 @@ pub async fn find_password_credential_by_email(
 pub async fn update_password_credential(
     pool: &PgPool,
     user_id: UserId,
+    email: &str,
     password_hash: &str,
 ) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "insert into auth_identities (user_id, provider_kind, provider_id, subject)
+         values ($1, 'password', 'local', $2)
+         on conflict (provider_kind, provider_id, subject)
+         do update set user_id = excluded.user_id, updated_at = now()",
+    )
+    .bind(user_id.as_uuid())
+    .bind(email)
+    .execute(&mut *tx)
+    .await?;
+
     sqlx::query(
         "insert into password_credentials (user_id, password_hash)
          values ($1, $2)
@@ -97,9 +110,10 @@ pub async fn update_password_credential(
     )
     .bind(user_id.as_uuid())
     .bind(password_hash)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
+    tx.commit().await?;
     Ok(())
 }
 
@@ -537,7 +551,7 @@ mod tests {
         assert_eq!(found_user.user_id, user.user_id);
         assert_eq!(password_hash, "hash-1");
 
-        update_password_credential(&pool, user.user_id, "hash-2")
+        update_password_credential(&pool, user.user_id, &email, "hash-2")
             .await
             .expect("update password credential");
 

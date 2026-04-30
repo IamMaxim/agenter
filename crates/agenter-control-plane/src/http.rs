@@ -9,7 +9,11 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::{auth, browser_ws, runner_ws, state::AppState};
+use crate::{
+    auth::{self, CookieSecurity},
+    browser_ws, runner_ws,
+    state::AppState,
+};
 
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:7777";
 pub const DEFAULT_DEV_RUNNER_TOKEN: &str = "dev-runner-token";
@@ -32,15 +36,16 @@ pub async fn serve() -> anyhow::Result<()> {
     let bind_addr: SocketAddr = bind_addr.parse()?;
     let runner_token = env::var("AGENTER_DEV_RUNNER_TOKEN")
         .unwrap_or_else(|_| DEFAULT_DEV_RUNNER_TOKEN.to_owned());
+    let cookie_security = cookie_security_from_env();
 
     let state = match (
         env::var("AGENTER_BOOTSTRAP_ADMIN_EMAIL"),
         env::var("AGENTER_BOOTSTRAP_ADMIN_PASSWORD"),
     ) {
         (Ok(email), Ok(password)) => {
-            AppState::new_with_bootstrap_admin(runner_token, email, password)?
+            AppState::new_with_bootstrap_admin(runner_token, email, password, cookie_security)?
         }
-        _ => AppState::new(runner_token),
+        _ => AppState::new(runner_token, cookie_security),
     };
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
@@ -48,6 +53,15 @@ pub async fn serve() -> anyhow::Result<()> {
     axum::serve(listener, app(state)).await?;
 
     Ok(())
+}
+
+fn cookie_security_from_env() -> CookieSecurity {
+    match env::var("AGENTER_COOKIE_SECURE") {
+        Ok(value) if matches!(value.as_str(), "0" | "false" | "FALSE" | "False") => {
+            CookieSecurity::DevelopmentInsecure
+        }
+        _ => CookieSecurity::Secure,
+    }
 }
 
 async fn healthz() -> &'static str {
@@ -73,7 +87,10 @@ async fn auth_login(
 
     (
         StatusCode::OK,
-        [(axum::http::header::SET_COOKIE, auth::session_cookie(&token))],
+        [(
+            axum::http::header::SET_COOKIE,
+            auth::session_cookie_with_policy(&token, state.cookie_security()),
+        )],
         Json(serde_json::json!({ "ok": true })),
     )
         .into_response()
@@ -88,7 +105,7 @@ async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Respo
         StatusCode::NO_CONTENT,
         [(
             axum::http::header::SET_COOKIE,
-            auth::expired_session_cookie(),
+            auth::expired_session_cookie_with_policy(state.cookie_security()),
         )],
     )
         .into_response()
@@ -107,14 +124,11 @@ async fn browser_ws_authenticated(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
-    if authenticated_user_from_headers(&state, &headers)
-        .await
-        .is_none()
-    {
+    let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
+    };
 
-    browser_ws::handler(ws, State(state)).await
+    browser_ws::handler(ws, State(state), user.user_id).await
 }
 
 async fn authenticated_user_from_headers(
@@ -128,7 +142,8 @@ async fn authenticated_user_from_headers(
 #[cfg(test)]
 mod tests {
     use agenter_core::{
-        AgentCapabilities, AgentMessageDeltaEvent, AgentProviderId, AppEvent, RunnerId, WorkspaceId,
+        AgentCapabilities, AgentMessageDeltaEvent, AgentProviderId, AppEvent, RunnerId, SessionId,
+        WorkspaceId,
     };
     use agenter_protocol::{
         browser::{BrowserClientMessage, BrowserServerMessage, SubscribeSession},
@@ -159,6 +174,7 @@ mod tests {
             "dev-token".to_owned(),
             "admin@example.test".to_owned(),
             "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
         )
         .expect("create bootstrap admin");
         let browser_session_token = state
@@ -277,22 +293,25 @@ mod tests {
 
     #[tokio::test]
     async fn auth_me_rejects_missing_session_cookie() {
-        let response = app(AppState::new("dev-token".to_owned()))
-            .oneshot(
-                Request::builder()
-                    .uri("/api/auth/me")
-                    .body(Body::empty())
-                    .expect("build request"),
-            )
-            .await
-            .expect("route request");
+        let response = app(AppState::new(
+            "dev-token".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/me")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("route request");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn browser_websocket_rejects_missing_session_cookie() {
-        let state = AppState::new("dev-token".to_owned());
+        let state = AppState::new("dev-token".to_owned(), CookieSecurity::DevelopmentInsecure);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
@@ -312,6 +331,7 @@ mod tests {
             "dev-token".to_owned(),
             "admin@example.test".to_owned(),
             "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
         )
         .expect("create bootstrap admin");
         let app = app(state);
@@ -345,6 +365,7 @@ mod tests {
             .to_owned();
         assert!(cookie.contains("agenter_session="));
         assert!(cookie.contains("HttpOnly"));
+        assert!(!cookie.contains("Secure"));
 
         let me_response = app
             .oneshot(
@@ -363,6 +384,160 @@ mod tests {
             .expect("read me body");
         let body: serde_json::Value = serde_json::from_slice(&body).expect("json response");
         assert_eq!(body["email"], "admin@example.test");
+    }
+
+    #[tokio::test]
+    async fn password_login_rejects_wrong_password() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/password/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "email": "admin@example.test",
+                            "password": "wrong password"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build login request"),
+            )
+            .await
+            .expect("route login request");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logout_invalidates_session_cookie() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let app = app(state);
+
+        let login_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/password/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "email": "admin@example.test",
+                            "password": "correct horse battery staple"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build login request"),
+            )
+            .await
+            .expect("route login request");
+        let cookie = login_response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("login sets cookie")
+            .to_str()
+            .expect("cookie is ascii")
+            .to_owned();
+
+        let logout_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/password/logout")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .expect("build logout request"),
+            )
+            .await
+            .expect("route logout request");
+        assert_eq!(logout_response.status(), StatusCode::NO_CONTENT);
+
+        let me_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/me")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .expect("build me request"),
+            )
+            .await
+            .expect("route me request");
+        assert_eq!(me_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn browser_websocket_rejects_session_not_owned_by_user() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let browser_session_token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("read listener address");
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.expect("serve app");
+        });
+
+        let mut browser_request = format!("ws://{addr}/api/browser/ws")
+            .into_client_request()
+            .expect("build browser websocket request");
+        browser_request.headers_mut().insert(
+            header::COOKIE,
+            format!("{}={browser_session_token}", auth::SESSION_COOKIE_NAME)
+                .parse()
+                .expect("cookie header"),
+        );
+        let (browser_socket, _) = connect_async(browser_request)
+            .await
+            .expect("connect browser");
+        let (mut browser_sender, mut browser_receiver) = browser_socket.split();
+        browser_sender
+            .send(Message::Text(
+                serde_json::to_string(&BrowserClientMessage::SubscribeSession(SubscribeSession {
+                    request_id: Some(RequestId::from("sub-forbidden")),
+                    session_id: SessionId::new(),
+                }))
+                .expect("serialize subscribe")
+                .into(),
+            ))
+            .await
+            .expect("send browser subscription");
+
+        let browser_error = browser_receiver
+            .next()
+            .await
+            .expect("browser error frame")
+            .expect("browser error websocket result");
+        let BrowserServerMessage::Error(error) =
+            serde_json::from_str::<BrowserServerMessage>(browser_error.to_text().unwrap())
+                .expect("decode browser error")
+        else {
+            panic!("expected browser error");
+        };
+        assert_eq!(error.code, "forbidden");
     }
 
     fn fake_hello() -> RunnerHello {

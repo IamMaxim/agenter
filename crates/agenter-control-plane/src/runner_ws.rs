@@ -59,9 +59,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         return;
     };
     let session_id = smoke_session_id();
+    let owner_user_id = state.bootstrap_user_id().unwrap_or_else(UserId::nil);
     let session = state
         .create_session(
             session_id,
+            owner_user_id,
             runner.runner_id,
             workspace.clone(),
             provider.provider_id.clone(),
@@ -72,7 +74,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             session_id,
             AppEvent::SessionStarted(SessionInfo {
                 session_id: session.session_id,
-                owner_user_id: UserId::nil(),
+                owner_user_id: session.owner_user_id,
                 runner_id: session.runner_id,
                 workspace_id: session.workspace.workspace_id,
                 provider_id: session.provider_id.clone(),

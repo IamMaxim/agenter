@@ -1,10 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
-use agenter_core::{AgentProviderId, AppEvent, RunnerId, SessionId, WorkspaceRef};
+use agenter_core::{AgentProviderId, AppEvent, RunnerId, SessionId, UserId, WorkspaceRef};
 use agenter_protocol::runner::RunnerCapabilities;
 use tokio::sync::{broadcast, Mutex};
 use uuid::Uuid;
 
+use crate::auth::CookieSecurity;
 use crate::auth::{self, AuthenticatedUser, BootstrapAdmin};
 
 const SESSION_EVENT_CACHE_LIMIT: usize = 128;
@@ -17,6 +18,7 @@ pub struct AppState {
 #[derive(Debug)]
 struct AppStateInner {
     runner_token: String,
+    cookie_security: CookieSecurity,
     bootstrap_admin: Option<BootstrapAdmin>,
     auth_sessions: Mutex<HashMap<String, AuthenticatedUser>>,
     registry: Mutex<Registry>,
@@ -39,6 +41,7 @@ pub struct RegisteredRunner {
 #[derive(Clone, Debug)]
 pub struct RegisteredSession {
     pub session_id: SessionId,
+    pub owner_user_id: UserId,
     pub runner_id: RunnerId,
     pub workspace: WorkspaceRef,
     pub provider_id: AgentProviderId,
@@ -52,10 +55,11 @@ struct SessionEvents {
 
 impl AppState {
     #[must_use]
-    pub fn new(runner_token: String) -> Self {
+    pub fn new(runner_token: String, cookie_security: CookieSecurity) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
                 runner_token,
+                cookie_security,
                 bootstrap_admin: None,
                 auth_sessions: Mutex::new(HashMap::new()),
                 registry: Mutex::new(Registry::default()),
@@ -68,6 +72,7 @@ impl AppState {
         runner_token: String,
         email: String,
         password: String,
+        cookie_security: CookieSecurity,
     ) -> anyhow::Result<Self> {
         let password_hash = auth::hash_password(&password)?;
         let user = AuthenticatedUser {
@@ -78,6 +83,7 @@ impl AppState {
         Ok(Self {
             inner: Arc::new(AppStateInner {
                 runner_token,
+                cookie_security,
                 bootstrap_admin: Some(BootstrapAdmin {
                     user,
                     password_hash,
@@ -92,6 +98,11 @@ impl AppState {
     #[must_use]
     pub fn is_runner_token_valid(&self, token: &str) -> bool {
         self.inner.runner_token == token
+    }
+
+    #[must_use]
+    pub fn cookie_security(&self) -> CookieSecurity {
+        self.inner.cookie_security
     }
 
     pub async fn login_password(&self, email: &str, password: &str) -> Option<String> {
@@ -111,6 +122,13 @@ impl AppState {
 
     pub async fn authenticated_user(&self, token: &str) -> Option<AuthenticatedUser> {
         self.inner.auth_sessions.lock().await.get(token).cloned()
+    }
+
+    pub fn bootstrap_user_id(&self) -> Option<UserId> {
+        self.inner
+            .bootstrap_admin
+            .as_ref()
+            .map(|admin| admin.user.user_id)
     }
 
     pub async fn logout(&self, token: &str) {
@@ -140,12 +158,14 @@ impl AppState {
     pub async fn create_session(
         &self,
         session_id: SessionId,
+        owner_user_id: UserId,
         runner_id: RunnerId,
         workspace: WorkspaceRef,
         provider_id: AgentProviderId,
     ) -> RegisteredSession {
         let session = RegisteredSession {
             session_id,
+            owner_user_id,
             runner_id,
             workspace,
             provider_id,
@@ -157,6 +177,16 @@ impl AppState {
             .sessions
             .insert(session_id, session.clone());
         session
+    }
+
+    pub async fn can_access_session(&self, user_id: UserId, session_id: SessionId) -> bool {
+        self.inner
+            .registry
+            .lock()
+            .await
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.owner_user_id == user_id)
     }
 
     pub async fn subscribe_session(
@@ -207,7 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribers_receive_published_session_events() {
-        let state = AppState::new("dev-token".to_owned());
+        let state = AppState::new("dev-token".to_owned(), CookieSecurity::DevelopmentInsecure);
         let session_id = SessionId::new();
         let (cached, mut subscription) = state.subscribe_session(session_id).await;
         assert!(cached.is_empty());
@@ -230,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_snapshots_cached_events_and_live_receiver_atomically() {
-        let state = AppState::new("dev-token".to_owned());
+        let state = AppState::new("dev-token".to_owned(), CookieSecurity::DevelopmentInsecure);
         let session_id = SessionId::new();
         let event = AppEvent::UserMessage(UserMessageEvent {
             session_id,
@@ -262,7 +292,7 @@ mod tests {
 
     #[test]
     fn runner_token_uses_dev_secret() {
-        let state = AppState::new("dev-token".to_owned());
+        let state = AppState::new("dev-token".to_owned(), CookieSecurity::DevelopmentInsecure);
 
         assert!(state.is_runner_token_valid("dev-token"));
         assert!(!state.is_runner_token_valid("wrong-token"));

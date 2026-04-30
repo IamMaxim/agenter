@@ -44,12 +44,26 @@ pub fn session_token_from_headers(headers: &HeaderMap) -> Option<&str> {
     })
 }
 
-pub fn session_cookie(token: &str) -> String {
-    format!("{SESSION_COOKIE_NAME}={token}; HttpOnly; SameSite=Lax; Path=/")
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CookieSecurity {
+    Secure,
+    DevelopmentInsecure,
 }
 
-pub fn expired_session_cookie() -> String {
-    format!("{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
+pub fn session_cookie_with_policy(token: &str, security: CookieSecurity) -> String {
+    let secure = match security {
+        CookieSecurity::Secure => "; Secure",
+        CookieSecurity::DevelopmentInsecure => "",
+    };
+    format!("{SESSION_COOKIE_NAME}={token}; HttpOnly; SameSite=Lax; Path=/{secure}")
+}
+
+pub fn expired_session_cookie_with_policy(security: CookieSecurity) -> String {
+    let secure = match security {
+        CookieSecurity::Secure => "; Secure",
+        CookieSecurity::DevelopmentInsecure => "",
+    };
+    format!("{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure}")
 }
 
 #[cfg(test)]
@@ -64,5 +78,16 @@ mod tests {
         assert!(hash.starts_with("$argon2id$"));
         assert!(verify_password("correct horse battery staple", &hash));
         assert!(!verify_password("wrong password", &hash));
+    }
+
+    #[test]
+    fn session_cookie_defaults_to_secure_and_supports_explicit_dev_policy() {
+        let secure = session_cookie_with_policy("token-1", CookieSecurity::Secure);
+        assert!(secure.contains("Secure"));
+        assert!(secure.contains("HttpOnly"));
+        assert!(secure.contains("SameSite=Lax"));
+
+        let dev = session_cookie_with_policy("token-1", CookieSecurity::DevelopmentInsecure);
+        assert!(!dev.contains("Secure"));
     }
 }

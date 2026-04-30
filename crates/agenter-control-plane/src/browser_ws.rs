@@ -1,3 +1,4 @@
+use agenter_core::UserId;
 use agenter_protocol::browser::{
     BrowserAck, BrowserClientMessage, BrowserError, BrowserEventEnvelope, BrowserServerMessage,
 };
@@ -13,11 +14,15 @@ use tokio::sync::broadcast;
 
 use crate::state::AppState;
 
-pub async fn handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+pub async fn handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    user_id: UserId,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_socket(socket, state, user_id))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState, user_id: UserId) {
     let (mut sender, mut receiver) = socket.split();
     let Some(first) = receiver.next().await else {
         return;
@@ -41,6 +46,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         .await;
         return;
     };
+
+    if !state
+        .can_access_session(user_id, subscription.session_id)
+        .await
+    {
+        let _ = send_server_message(
+            &mut sender,
+            BrowserServerMessage::Error(BrowserError {
+                request_id: subscription.request_id,
+                code: "forbidden".to_owned(),
+                message: "session is not accessible by this user".to_owned(),
+            }),
+        )
+        .await;
+        return;
+    }
 
     if send_server_message(
         &mut sender,
