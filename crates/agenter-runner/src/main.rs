@@ -11,10 +11,12 @@ use agenter_core::{
 };
 use agenter_protocol::runner::{
     AgentInput, AgentProviderAdvertisement, RunnerCapabilities, RunnerClientMessage, RunnerCommand,
-    RunnerCommandResult, RunnerEvent, RunnerEventEnvelope, RunnerHello, RunnerResponseEnvelope,
-    RunnerResponseOutcome, PROTOCOL_VERSION,
+    RunnerCommandResult, RunnerError, RunnerEvent, RunnerEventEnvelope, RunnerHello,
+    RunnerResponseEnvelope, RunnerResponseOutcome, PROTOCOL_VERSION,
 };
-use agents::codex::{run_codex_turn, CodexTurnRequest, PendingCodexApproval};
+use agents::codex::{
+    run_codex_turn_on_server, CodexAppServer, CodexTurnRequest, PendingCodexApproval,
+};
 use agents::qwen_acp::{run_qwen_turn, PendingQwenApproval, QwenTurnRequest};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, Mutex};
@@ -23,6 +25,65 @@ use uuid::Uuid;
 
 const DEFAULT_CONTROL_PLANE_WS: &str = "ws://127.0.0.1:7777/api/runner/ws";
 const DEFAULT_DEV_RUNNER_TOKEN: &str = "dev-runner-token";
+
+#[derive(Clone)]
+struct CodexRunnerRuntime {
+    workspace_path: PathBuf,
+    server: Arc<Mutex<Option<CodexAppServer>>>,
+}
+
+impl CodexRunnerRuntime {
+    fn new(workspace_path: PathBuf) -> Self {
+        Self {
+            workspace_path,
+            server: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    async fn create_session(&self) -> anyhow::Result<String> {
+        let mut guard = self.server.lock().await;
+        let server = ensure_codex_server(&mut guard, self.workspace_path.clone()).await?;
+        server.start_thread(&self.workspace_path).await
+    }
+
+    async fn resume_session(&self, external_session_id: &str) -> anyhow::Result<String> {
+        let mut guard = self.server.lock().await;
+        let server = ensure_codex_server(&mut guard, self.workspace_path.clone()).await?;
+        server
+            .resume_thread(external_session_id, &self.workspace_path)
+            .await?;
+        Ok(external_session_id.to_owned())
+    }
+
+    async fn run_turn(
+        &self,
+        request: CodexTurnRequest,
+        event_sender: mpsc::UnboundedSender<AppEvent>,
+        pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingCodexApproval>>>,
+    ) -> anyhow::Result<()> {
+        let mut guard = self.server.lock().await;
+        let server = ensure_codex_server(&mut guard, self.workspace_path.clone()).await?;
+        if let Some(thread_id) = &request.external_session_id {
+            server.set_active_thread(thread_id.clone());
+        } else {
+            let thread_id = server.start_thread(&self.workspace_path).await?;
+            server.set_active_thread(thread_id);
+        }
+        run_codex_turn_on_server(server, request, event_sender, pending_approvals).await
+    }
+}
+
+async fn ensure_codex_server(
+    server: &mut Option<CodexAppServer>,
+    workspace_path: PathBuf,
+) -> anyhow::Result<&mut CodexAppServer> {
+    if server.is_none() {
+        let mut app_server = CodexAppServer::spawn(workspace_path)?;
+        app_server.initialize().await?;
+        *server = Some(app_server);
+    }
+    Ok(server.as_mut().expect("codex server was initialized"))
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -78,6 +139,7 @@ async fn run_codex_runner() -> anyhow::Result<()> {
     let pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingCodexApproval>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let (codex_event_sender, mut codex_event_receiver) = mpsc::unbounded_channel::<AppEvent>();
+    let codex_runtime = CodexRunnerRuntime::new(workspace_path.clone());
 
     loop {
         tokio::select! {
@@ -116,6 +178,50 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                 };
 
                 match envelope.command {
+                    RunnerCommand::CreateSession(command) => {
+                        tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, "codex runner received create session");
+                        let outcome = match codex_runtime.create_session().await {
+                            Ok(external_session_id) => RunnerResponseOutcome::Ok {
+                                result: RunnerCommandResult::SessionCreated {
+                                    session_id: command.session_id,
+                                    external_session_id,
+                                },
+                            },
+                            Err(error) => RunnerResponseOutcome::Error {
+                                error: runner_error("codex_create_session_failed", error),
+                            },
+                        };
+                        send_runner_message(
+                            &mut sender,
+                            RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                request_id: envelope.request_id,
+                                outcome,
+                            }),
+                        )
+                        .await?;
+                    }
+                    RunnerCommand::ResumeSession(command) => {
+                        tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, "codex runner received resume session");
+                        let outcome = match codex_runtime.resume_session(&command.external_session_id).await {
+                            Ok(external_session_id) => RunnerResponseOutcome::Ok {
+                                result: RunnerCommandResult::SessionResumed {
+                                    session_id: command.session_id,
+                                    external_session_id,
+                                },
+                            },
+                            Err(error) => RunnerResponseOutcome::Error {
+                                error: runner_error("codex_resume_session_failed", error),
+                            },
+                        };
+                        send_runner_message(
+                            &mut sender,
+                            RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                request_id: envelope.request_id,
+                                outcome,
+                            }),
+                        )
+                        .await?;
+                    }
                     RunnerCommand::AgentSendInput(command) => {
                         tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, "codex runner received agent input");
                         send_runner_message(
@@ -137,9 +243,10 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                         };
                         let event_sender = codex_event_sender.clone();
                         let pending = pending_approvals.clone();
+                        let runtime = codex_runtime.clone();
                         let session_id = request.session_id;
                         tokio::spawn(async move {
-                            if let Err(error) = run_codex_turn(request, event_sender.clone(), pending).await {
+                            if let Err(error) = runtime.run_turn(request, event_sender.clone(), pending).await {
                                 tracing::error!(%session_id, %error, "codex turn failed");
                                 event_sender.send(AppEvent::Error(AgentErrorEvent {
                                     session_id: Some(session_id),
@@ -176,9 +283,7 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                         )
                         .await?;
                     }
-                    RunnerCommand::CreateSession(_)
-                    | RunnerCommand::ResumeSession(_)
-                    | RunnerCommand::InterruptSession { .. }
+                    RunnerCommand::InterruptSession { .. }
                     | RunnerCommand::ShutdownSession(_) => {
                         tracing::debug!(request_id = %envelope.request_id, "codex runner accepted lifecycle command placeholder");
                         send_runner_message(
@@ -410,6 +515,13 @@ async fn send_runner_message(
         .send(Message::Text(serde_json::to_string(&message)?.into()))
         .await?;
     Ok(())
+}
+
+fn runner_error(code: &str, error: anyhow::Error) -> RunnerError {
+    RunnerError {
+        code: code.to_owned(),
+        message: error.to_string(),
+    }
 }
 
 fn fake_hello(token: String) -> RunnerHello {

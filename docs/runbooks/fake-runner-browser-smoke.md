@@ -24,7 +24,7 @@ Expected output shape:
 test http::tests::smoke_routes_runner_events_to_subscribed_browser ... ok
 ```
 
-The test starts the Axum app on an ephemeral local port, connects a runner WebSocket, sends `runner_hello`, receives the control-plane `agent_send_input` command, connects a browser WebSocket, subscribes to the fixed smoke session, emits a runner event, and asserts that the browser receives an `app_event`.
+The test starts the Axum app on an ephemeral local port, connects a runner WebSocket, sends `runner_hello`, asserts the handshake does not send unsolicited work, creates a browser session through the runner `CreateSession` command, connects a browser WebSocket, subscribes to that session, emits a runner event, and asserts that the browser receives an `app_event`.
 
 ## Manual Smoke
 

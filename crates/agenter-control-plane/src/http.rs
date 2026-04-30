@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr};
+use std::{env, net::SocketAddr, time::Duration as StdDuration};
 
 use axum::{
     extract::{ws::WebSocketUpgrade, Path, State},
@@ -15,11 +15,15 @@ use uuid::Uuid;
 use crate::{
     auth::{self, CookieSecurity},
     browser_ws, runner_ws,
-    state::{AppState, ApprovalResolutionStart, RunnerSendError},
+    state::{
+        AppState, ApprovalResolutionStart, RunnerCommandWaitError, RunnerSendError,
+        SessionRegistration,
+    },
 };
 
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:7777";
 pub const DEFAULT_DEV_RUNNER_TOKEN: &str = "dev-runner-token";
+const RUNNER_COMMAND_RESPONSE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 pub fn app(state: AppState) -> Router {
     Router::new()
@@ -526,13 +530,8 @@ async fn create_session(
     let workspace_id = request.workspace_id;
     let provider_id = request.provider_id;
 
-    let Some(session) = state
-        .create_session_for_workspace(
-            user.user_id,
-            workspace_id,
-            provider_id.clone(),
-            request.title,
-        )
+    let Some((runner_id, workspace)) = state
+        .resolve_runner_workspace(workspace_id, &provider_id)
         .await
     else {
         tracing::warn!(
@@ -543,6 +542,116 @@ async fn create_session(
         );
         return StatusCode::NOT_FOUND.into_response();
     };
+    let session_id = agenter_core::SessionId::new();
+    if provider_id.as_str() != agenter_core::AgentProviderId::CODEX {
+        let session = state
+            .register_session(SessionRegistration {
+                session_id,
+                owner_user_id: user.user_id,
+                runner_id,
+                workspace,
+                provider_id,
+                title: request.title,
+                external_session_id: None,
+            })
+            .await;
+        let info = agenter_core::SessionInfo {
+            session_id: session.session_id,
+            owner_user_id: session.owner_user_id,
+            runner_id: session.runner_id,
+            workspace_id: session.workspace.workspace_id,
+            provider_id: session.provider_id,
+            status: session.status,
+            external_session_id: session.external_session_id,
+            title: session.title,
+        };
+        state
+            .publish_event(
+                session.session_id,
+                agenter_core::AppEvent::SessionStarted(info.clone()),
+            )
+            .await;
+        return (StatusCode::CREATED, Json(info)).into_response();
+    }
+
+    let request_id = agenter_protocol::RequestId::from(Uuid::new_v4().to_string());
+    let title = request.title;
+    let command = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
+        agenter_protocol::runner::RunnerCommandEnvelope {
+            request_id: request_id.clone(),
+            command: agenter_protocol::runner::RunnerCommand::CreateSession(
+                agenter_protocol::runner::CreateSessionCommand {
+                    session_id,
+                    workspace: workspace.clone(),
+                    provider_id: provider_id.clone(),
+                    initial_input: None,
+                },
+            ),
+        },
+    ));
+    let outcome = match state
+        .send_runner_command_and_wait(
+            runner_id,
+            request_id,
+            command,
+            RUNNER_COMMAND_RESPONSE_TIMEOUT,
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(
+                user_id = %user.user_id,
+                %session_id,
+                %runner_id,
+                ?error,
+                "session creation failed while waiting for runner"
+            );
+            return runner_wait_error_status(error).into_response();
+        }
+    };
+    let external_session_id = match outcome {
+        agenter_protocol::runner::RunnerResponseOutcome::Ok {
+            result:
+                agenter_protocol::runner::RunnerCommandResult::SessionCreated {
+                    session_id: returned_session_id,
+                    external_session_id,
+                },
+        } if returned_session_id == session_id => external_session_id,
+        agenter_protocol::runner::RunnerResponseOutcome::Error { error } => {
+            tracing::warn!(
+                user_id = %user.user_id,
+                %session_id,
+                %runner_id,
+                code = %error.code,
+                message = %error.message,
+                "runner rejected session creation"
+            );
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+        other => {
+            tracing::warn!(
+                user_id = %user.user_id,
+                %session_id,
+                %runner_id,
+                ?other,
+                "runner returned unexpected create-session response"
+            );
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+
+    let session = state
+        .register_session(SessionRegistration {
+            session_id,
+            owner_user_id: user.user_id,
+            runner_id,
+            workspace,
+            provider_id,
+            title,
+            external_session_id: Some(external_session_id),
+        })
+        .await;
     tracing::info!(
         user_id = %user.user_id,
         session_id = %session.session_id,
@@ -612,9 +721,25 @@ async fn send_session_message(
             ),
         },
     ));
+    let request_id = match &message {
+        agenter_protocol::runner::RunnerServerMessage::Command(command) => {
+            command.request_id.clone()
+        }
+        _ => unreachable!("constructed runner command"),
+    };
 
-    match state.send_runner_message(session.runner_id, message).await {
-        Ok(()) => {
+    match state
+        .send_runner_command_and_wait(
+            session.runner_id,
+            request_id,
+            message,
+            RUNNER_COMMAND_RESPONSE_TIMEOUT,
+        )
+        .await
+    {
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok {
+            result: agenter_protocol::runner::RunnerCommandResult::Accepted,
+        }) => {
             tracing::info!(
                 user_id = %user.user_id,
                 %session_id,
@@ -624,19 +749,46 @@ async fn send_session_message(
             );
             StatusCode::ACCEPTED.into_response()
         }
-        Err(
-            RunnerSendError::NotConnected
-            | RunnerSendError::Closed
-            | RunnerSendError::StaleApproval,
-        ) => {
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Error { error }) => {
             tracing::warn!(
                 user_id = %user.user_id,
                 %session_id,
                 runner_id = %session.runner_id,
+                code = %error.code,
+                message = %error.message,
+                "session message rejected by runner"
+            );
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+        Ok(other) => {
+            tracing::warn!(
+                user_id = %user.user_id,
+                %session_id,
+                runner_id = %session.runner_id,
+                ?other,
+                "session message received unexpected runner response"
+            );
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+        Err(error) => {
+            tracing::warn!(
+                user_id = %user.user_id,
+                %session_id,
+                runner_id = %session.runner_id,
+                ?error,
                 "session message failed because runner is unavailable"
             );
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
+            runner_wait_error_status(error).into_response()
         }
+    }
+}
+
+fn runner_wait_error_status(error: RunnerCommandWaitError) -> StatusCode {
+    match error {
+        RunnerCommandWaitError::NotConnected
+        | RunnerCommandWaitError::Closed
+        | RunnerCommandWaitError::StaleApproval => StatusCode::SERVICE_UNAVAILABLE,
+        RunnerCommandWaitError::TimedOut => StatusCode::GATEWAY_TIMEOUT,
     }
 }
 
@@ -847,6 +999,21 @@ mod tests {
         *command
     }
 
+    async fn expect_no_runner_command(
+        receiver: &mut futures_util::stream::SplitStream<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        >,
+    ) {
+        assert!(
+            timeout(Duration::from_millis(100), receiver.next())
+                .await
+                .is_err(),
+            "runner should not receive an unsolicited command"
+        );
+    }
+
     async fn send_runner_response(
         sender: &mut futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<
@@ -856,14 +1023,30 @@ mod tests {
         >,
         request_id: RequestId,
     ) {
+        send_runner_response_result(
+            sender,
+            request_id,
+            agenter_protocol::runner::RunnerCommandResult::Accepted,
+        )
+        .await;
+    }
+
+    async fn send_runner_response_result(
+        sender: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
+        request_id: RequestId,
+        result: agenter_protocol::runner::RunnerCommandResult,
+    ) {
         sender
             .send(Message::Text(
                 serde_json::to_string(&RunnerClientMessage::Response(
                     agenter_protocol::runner::RunnerResponseEnvelope {
                         request_id,
-                        outcome: agenter_protocol::runner::RunnerResponseOutcome::Ok {
-                            result: agenter_protocol::runner::RunnerCommandResult::Accepted,
-                        },
+                        outcome: agenter_protocol::runner::RunnerResponseOutcome::Ok { result },
                     },
                 ))
                 .expect("serialize runner response")
@@ -871,6 +1054,193 @@ mod tests {
             ))
             .await
             .expect("send runner response");
+    }
+
+    async fn create_session_through_runner(
+        app_service: axum::Router,
+        cookie: &str,
+        workspace_id: WorkspaceId,
+        runner_sender: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
+        runner_receiver: &mut futures_util::stream::SplitStream<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        >,
+    ) -> SessionInfo {
+        let create_response = tokio::spawn({
+            let cookie = cookie.to_owned();
+            async move {
+                app_service
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/sessions")
+                            .header(header::COOKIE, &cookie)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                serde_json::json!({
+                                    "workspace_id": workspace_id,
+                                    "provider_id": AgentProviderId::from(AgentProviderId::CODEX),
+                                    "title": "test session"
+                                })
+                                .to_string(),
+                            ))
+                            .expect("build create session request"),
+                    )
+                    .await
+                    .expect("route create session request")
+            }
+        });
+
+        let create_command = next_runner_command(runner_receiver).await;
+        let agenter_protocol::runner::RunnerCommand::CreateSession(command) =
+            &create_command.command
+        else {
+            panic!("expected create session command");
+        };
+        send_runner_response_result(
+            runner_sender,
+            create_command.request_id,
+            agenter_protocol::runner::RunnerCommandResult::SessionCreated {
+                session_id: command.session_id,
+                external_session_id: "codex-thread-1".to_owned(),
+            },
+        )
+        .await;
+
+        let response = create_response.await.expect("create response task");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read create session body");
+        serde_json::from_slice(&body).expect("session info json")
+    }
+
+    #[tokio::test]
+    async fn runner_handshake_does_not_send_unsolicited_smoke_command() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("read listener address");
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.expect("serve app");
+        });
+
+        let (runner_socket, _) = connect_async(format!("ws://{addr}/api/runner/ws"))
+            .await
+            .expect("connect runner");
+        let (mut runner_sender, mut runner_receiver) = runner_socket.split();
+        runner_sender
+            .send(Message::Text(
+                serde_json::to_string(&RunnerClientMessage::Hello(fake_hello()))
+                    .expect("serialize hello")
+                    .into(),
+            ))
+            .await
+            .expect("send runner hello");
+
+        expect_no_runner_command(&mut runner_receiver).await;
+    }
+
+    #[tokio::test]
+    async fn create_session_waits_for_runner_thread_and_stores_external_id() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let browser_session_token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let app_service = app(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("read listener address");
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.expect("serve app");
+        });
+
+        let (runner_socket, _) = connect_async(format!("ws://{addr}/api/runner/ws"))
+            .await
+            .expect("connect runner");
+        let (mut runner_sender, mut runner_receiver) = runner_socket.split();
+        let hello = fake_hello();
+        let workspace_id = hello.workspaces[0].workspace_id;
+        runner_sender
+            .send(Message::Text(
+                serde_json::to_string(&RunnerClientMessage::Hello(hello))
+                    .expect("serialize hello")
+                    .into(),
+            ))
+            .await
+            .expect("send runner hello");
+        expect_no_runner_command(&mut runner_receiver).await;
+
+        let cookie = format!("{}={browser_session_token}", auth::SESSION_COOKIE_NAME);
+        let create_response = tokio::spawn(async move {
+            app_service
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/sessions")
+                        .header(header::COOKIE, &cookie)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "workspace_id": workspace_id,
+                                "provider_id": AgentProviderId::from(AgentProviderId::CODEX),
+                                "title": "codex real session"
+                            })
+                            .to_string(),
+                        ))
+                        .expect("build create session request"),
+                )
+                .await
+                .expect("route create session request")
+        });
+
+        let create_command = next_runner_command(&mut runner_receiver).await;
+        let agenter_protocol::runner::RunnerCommand::CreateSession(command) =
+            &create_command.command
+        else {
+            panic!("expected create session command");
+        };
+        assert_eq!(command.workspace.workspace_id, workspace_id);
+        let session_id = command.session_id;
+        send_runner_response_result(
+            &mut runner_sender,
+            create_command.request_id,
+            agenter_protocol::runner::RunnerCommandResult::SessionCreated {
+                session_id,
+                external_session_id: "codex-thread-1".to_owned(),
+            },
+        )
+        .await;
+
+        let response = create_response.await.expect("create response task");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read create session body");
+        let info: agenter_core::SessionInfo =
+            serde_json::from_slice(&body).expect("session info json");
+        assert_eq!(info.external_session_id.as_deref(), Some("codex-thread-1"));
     }
 
     async fn send_runner_app_event(
@@ -881,16 +1251,14 @@ mod tests {
             Message,
         >,
         request_id: Option<RequestId>,
+        session_id: SessionId,
         event: AppEvent,
     ) {
         sender
             .send(Message::Text(
                 serde_json::to_string(&RunnerClientMessage::Event(RunnerEventEnvelope {
                     request_id,
-                    event: RunnerEvent::AgentEvent(AgentEvent {
-                        session_id: smoke_session_id(),
-                        event,
-                    }),
+                    event: RunnerEvent::AgentEvent(AgentEvent { session_id, event }),
                 }))
                 .expect("serialize runner event")
                 .into(),
@@ -938,6 +1306,7 @@ mod tests {
             .login_password("admin@example.test", "correct horse battery staple")
             .await
             .expect("login bootstrap admin");
+        let app_service = app(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
@@ -950,39 +1319,34 @@ mod tests {
             .await
             .expect("connect runner");
         let (mut runner_sender, mut runner_receiver) = runner_socket.split();
+        let hello = fake_hello();
+        let workspace_id = hello.workspaces[0].workspace_id;
         runner_sender
             .send(Message::Text(
-                serde_json::to_string(&RunnerClientMessage::Hello(fake_hello()))
+                serde_json::to_string(&RunnerClientMessage::Hello(hello))
                     .expect("serialize hello")
                     .into(),
             ))
             .await
             .expect("send runner hello");
+        expect_no_runner_command(&mut runner_receiver).await;
 
-        let runner_command = runner_receiver
-            .next()
-            .await
-            .expect("runner command frame")
-            .expect("runner command websocket result");
-        let Message::Text(runner_command) = runner_command else {
-            panic!("expected text runner command");
-        };
-        let RunnerServerMessage::Command(command) =
-            serde_json::from_str::<RunnerServerMessage>(&runner_command)
-                .expect("decode runner command")
-        else {
-            panic!("expected runner command");
-        };
+        let cookie = format!("{}={browser_session_token}", auth::SESSION_COOKIE_NAME);
+        let session = create_session_through_runner(
+            app_service,
+            &cookie,
+            workspace_id,
+            &mut runner_sender,
+            &mut runner_receiver,
+        )
+        .await;
 
         let mut browser_request = format!("ws://{addr}/api/browser/ws")
             .into_client_request()
             .expect("build browser websocket request");
-        browser_request.headers_mut().insert(
-            header::COOKIE,
-            format!("{}={browser_session_token}", auth::SESSION_COOKIE_NAME)
-                .parse()
-                .expect("cookie header"),
-        );
+        browser_request
+            .headers_mut()
+            .insert(header::COOKIE, cookie.parse().expect("cookie header"));
         let (browser_socket, _) = connect_async(browser_request)
             .await
             .expect("connect browser");
@@ -991,7 +1355,7 @@ mod tests {
             .send(Message::Text(
                 serde_json::to_string(&BrowserClientMessage::SubscribeSession(SubscribeSession {
                     request_id: Some(RequestId::from("sub-1")),
-                    session_id: smoke_session_id(),
+                    session_id: session.session_id,
                 }))
                 .expect("serialize subscribe")
                 .into(),
@@ -1012,11 +1376,11 @@ mod tests {
         runner_sender
             .send(Message::Text(
                 serde_json::to_string(&RunnerClientMessage::Event(RunnerEventEnvelope {
-                    request_id: Some(command.request_id),
+                    request_id: Some(RequestId::from("event-1")),
                     event: RunnerEvent::AgentEvent(AgentEvent {
-                        session_id: smoke_session_id(),
+                        session_id: session.session_id,
                         event: AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {
-                            session_id: smoke_session_id(),
+                            session_id: session.session_id,
                             message_id: "agent-1".to_owned(),
                             delta: "hello browser".to_owned(),
                             provider_payload: None,
@@ -1074,21 +1438,27 @@ mod tests {
             .await
             .expect("connect runner");
         let (mut runner_sender, mut runner_receiver) = runner_socket.split();
+        let hello = fake_hello();
+        let workspace_id = hello.workspaces[0].workspace_id;
         runner_sender
             .send(Message::Text(
-                serde_json::to_string(&RunnerClientMessage::Hello(fake_hello()))
+                serde_json::to_string(&RunnerClientMessage::Hello(hello))
                     .expect("serialize hello")
                     .into(),
             ))
             .await
             .expect("send runner hello");
-        runner_receiver
-            .next()
-            .await
-            .expect("initial runner command")
-            .expect("runner websocket result");
+        expect_no_runner_command(&mut runner_receiver).await;
 
         let cookie = format!("{}={browser_session_token}", auth::SESSION_COOKIE_NAME);
+        let session = create_session_through_runner(
+            app_service.clone(),
+            &cookie,
+            workspace_id,
+            &mut runner_sender,
+            &mut runner_receiver,
+        )
+        .await;
         let sessions_response = app_service
             .clone()
             .oneshot(
@@ -1107,50 +1477,49 @@ mod tests {
         let sessions: Vec<SessionInfo> =
             serde_json::from_slice(&sessions_body).expect("sessions json");
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].session_id, smoke_session_id());
+        assert_eq!(sessions[0].session_id, session.session_id);
 
-        let send_response = app_service
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/sessions/{}/messages", smoke_session_id()))
-                    .header(header::COOKIE, &cookie)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({ "content": "from browser" }).to_string(),
-                    ))
-                    .expect("build message request"),
-            )
-            .await
-            .expect("route message request");
-        assert_eq!(send_response.status(), StatusCode::ACCEPTED);
+        let send_response = tokio::spawn({
+            let app_service = app_service.clone();
+            let cookie = cookie.clone();
+            let session_id = session.session_id;
+            async move {
+                app_service
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(format!("/api/sessions/{session_id}/messages"))
+                            .header(header::COOKIE, &cookie)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                serde_json::json!({ "content": "from browser" }).to_string(),
+                            ))
+                            .expect("build message request"),
+                    )
+                    .await
+                    .expect("route message request")
+            }
+        });
 
-        let command_frame = runner_receiver
-            .next()
-            .await
-            .expect("runner receives browser command")
-            .expect("runner command websocket result");
-        let Message::Text(command_text) = command_frame else {
-            panic!("expected text runner command");
-        };
-        let RunnerServerMessage::Command(command) =
-            serde_json::from_str::<RunnerServerMessage>(&command_text)
-                .expect("decode runner command")
-        else {
-            panic!("expected runner command");
-        };
+        let command = next_runner_command(&mut runner_receiver).await;
         let agenter_protocol::runner::RunnerCommand::AgentSendInput(input_command) =
-            command.command
+            &command.command
         else {
             panic!("expected agent send input command");
         };
-        assert_eq!(input_command.session_id, smoke_session_id());
+        assert_eq!(input_command.session_id, session.session_id);
+        assert_eq!(
+            input_command.external_session_id.as_deref(),
+            Some("codex-thread-1")
+        );
+        send_runner_response(&mut runner_sender, command.request_id).await;
+        let send_response = send_response.await.expect("send response task");
+        assert_eq!(send_response.status(), StatusCode::ACCEPTED);
 
         let history_response = app_service
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/sessions/{}/history", smoke_session_id()))
+                    .uri(format!("/api/sessions/{}/history", session.session_id))
                     .header(header::COOKIE, &cookie)
                     .body(Body::empty())
                     .expect("build history request"),
@@ -1194,18 +1563,27 @@ mod tests {
             .await
             .expect("connect runner");
         let (mut runner_sender, mut runner_receiver) = runner_socket.split();
+        let hello = fake_hello();
+        let workspace_id = hello.workspaces[0].workspace_id;
         runner_sender
             .send(Message::Text(
-                serde_json::to_string(&RunnerClientMessage::Hello(fake_hello()))
+                serde_json::to_string(&RunnerClientMessage::Hello(hello))
                     .expect("serialize hello")
                     .into(),
             ))
             .await
             .expect("send runner hello");
-        let smoke_command = next_runner_command(&mut runner_receiver).await;
-        send_runner_response(&mut runner_sender, smoke_command.request_id).await;
+        expect_no_runner_command(&mut runner_receiver).await;
 
         let cookie = format!("{}={browser_session_token}", auth::SESSION_COOKIE_NAME);
+        let session = create_session_through_runner(
+            app_service.clone(),
+            &cookie,
+            workspace_id,
+            &mut runner_sender,
+            &mut runner_receiver,
+        )
+        .await;
         let runners_response = app_service
             .clone()
             .oneshot(
@@ -1239,7 +1617,7 @@ mod tests {
             .send(Message::Text(
                 serde_json::to_string(&BrowserClientMessage::SubscribeSession(SubscribeSession {
                     request_id: Some(RequestId::from("sub-full")),
-                    session_id: smoke_session_id(),
+                    session_id: session.session_id,
                 }))
                 .expect("serialize subscribe")
                 .into(),
@@ -1248,22 +1626,28 @@ mod tests {
             .expect("send browser subscription");
         let _session_started = next_browser_event(&mut browser_receiver).await;
 
-        let send_response = app_service
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/sessions/{}/messages", smoke_session_id()))
-                    .header(header::COOKIE, &cookie)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({ "content": "full pipeline message" }).to_string(),
-                    ))
-                    .expect("build message request"),
-            )
-            .await
-            .expect("route message request");
-        assert_eq!(send_response.status(), StatusCode::ACCEPTED);
+        let send_response = tokio::spawn({
+            let app_service = app_service.clone();
+            let cookie = cookie.clone();
+            let session_id = session.session_id;
+            async move {
+                app_service
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(format!("/api/sessions/{session_id}/messages"))
+                            .header(header::COOKIE, &cookie)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                serde_json::json!({ "content": "full pipeline message" })
+                                    .to_string(),
+                            ))
+                            .expect("build message request"),
+                    )
+                    .await
+                    .expect("route message request")
+            }
+        });
 
         let message_command = next_runner_command(&mut runner_receiver).await;
         let agenter_protocol::runner::RunnerCommand::AgentSendInput(input_command) =
@@ -1271,15 +1655,22 @@ mod tests {
         else {
             panic!("expected agent input command");
         };
-        assert_eq!(input_command.session_id, smoke_session_id());
+        assert_eq!(input_command.session_id, session.session_id);
+        assert_eq!(
+            input_command.external_session_id.as_deref(),
+            Some("codex-thread-1")
+        );
         send_runner_response(&mut runner_sender, message_command.request_id.clone()).await;
+        let send_response = send_response.await.expect("send response task");
+        assert_eq!(send_response.status(), StatusCode::ACCEPTED);
 
         let approval_id = ApprovalId::new();
         send_runner_app_event(
             &mut runner_sender,
             Some(message_command.request_id.clone()),
+            session.session_id,
             AppEvent::UserMessage(agenter_core::UserMessageEvent {
-                session_id: smoke_session_id(),
+                session_id: session.session_id,
                 message_id: Some("user-full-1".to_owned()),
                 author_user_id: None,
                 content: "full pipeline message".to_owned(),
@@ -1289,8 +1680,9 @@ mod tests {
         send_runner_app_event(
             &mut runner_sender,
             Some(message_command.request_id.clone()),
+            session.session_id,
             AppEvent::ApprovalRequested(ApprovalRequestEvent {
-                session_id: smoke_session_id(),
+                session_id: session.session_id,
                 approval_id,
                 kind: ApprovalKind::Command,
                 title: "Approve full pipeline command".to_owned(),
@@ -1303,8 +1695,9 @@ mod tests {
         send_runner_app_event(
             &mut runner_sender,
             Some(message_command.request_id.clone()),
+            session.session_id,
             AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {
-                session_id: smoke_session_id(),
+                session_id: session.session_id,
                 message_id: "agent-full-1".to_owned(),
                 delta: "full pipeline response".to_owned(),
                 provider_payload: None,
@@ -1361,7 +1754,7 @@ mod tests {
         let history_response = app_service
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/sessions/{}/history", smoke_session_id()))
+                    .uri(format!("/api/sessions/{}/history", session.session_id))
                     .header(header::COOKIE, &cookie)
                     .body(Body::empty())
                     .expect("build history request"),

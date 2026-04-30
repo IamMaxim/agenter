@@ -1,10 +1,8 @@
-use agenter_core::{AppEvent, SessionId, SessionInfo, SessionStatus, UserId};
+use agenter_core::{AppEvent, SessionId};
 use agenter_protocol::runner::{
-    AgentEvent, AgentInput, AgentInputCommand, RunnerClientMessage, RunnerCommand,
-    RunnerCommandEnvelope, RunnerEvent, RunnerHeartbeat, RunnerResponseEnvelope,
-    RunnerServerMessage, PROTOCOL_VERSION,
+    AgentEvent, RunnerClientMessage, RunnerCommand, RunnerEvent, RunnerHeartbeat,
+    RunnerResponseEnvelope, RunnerServerMessage, PROTOCOL_VERSION,
 };
-use agenter_protocol::RequestId;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -14,14 +12,12 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
 use crate::state::AppState;
 
-const SMOKE_REQUEST_ID: &str = "smoke-input-1";
-
+#[cfg(test)]
 pub fn smoke_session_id() -> SessionId {
-    SessionId::from_uuid(Uuid::from_u128(0x11111111111111111111111111111111))
+    SessionId::from_uuid(uuid::Uuid::from_u128(0x11111111111111111111111111111111))
 }
 
 pub async fn handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
@@ -58,11 +54,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         return;
     }
 
-    let Some(workspace) = hello.workspaces.first().cloned() else {
+    if hello.workspaces.is_empty() {
         tracing::warn!(runner_id = %hello.runner_id, "runner hello rejected without workspaces");
         return;
     };
-    let Some(provider) = hello.capabilities.agent_providers.first().cloned() else {
+    if hello.capabilities.agent_providers.is_empty() {
         tracing::warn!(runner_id = %hello.runner_id, "runner hello rejected without providers");
         return;
     };
@@ -83,54 +79,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let connection_id = state
         .connect_runner(runner.runner_id, outbound_sender)
         .await;
-    let session_id = smoke_session_id();
-    let owner_user_id = state.bootstrap_user_id().unwrap_or_else(UserId::nil);
-    let session = state
-        .create_session(
-            session_id,
-            owner_user_id,
-            runner.runner_id,
-            workspace.clone(),
-            provider.provider_id.clone(),
-        )
-        .await;
-    state
-        .publish_event(
-            session_id,
-            AppEvent::SessionStarted(SessionInfo {
-                session_id: session.session_id,
-                owner_user_id: session.owner_user_id,
-                runner_id: session.runner_id,
-                workspace_id: session.workspace.workspace_id,
-                provider_id: session.provider_id.clone(),
-                status: SessionStatus::Running,
-                external_session_id: None,
-                title: Some(format!(
-                    "Smoke session on {}",
-                    session
-                        .workspace
-                        .display_name
-                        .as_deref()
-                        .unwrap_or(&session.workspace.path)
-                )),
-            }),
-        )
-        .await;
-    let command = RunnerServerMessage::Command(Box::new(RunnerCommandEnvelope {
-        request_id: RequestId::from(SMOKE_REQUEST_ID),
-        command: RunnerCommand::AgentSendInput(AgentInputCommand {
-            session_id,
-            external_session_id: None,
-            input: AgentInput::Text {
-                text: "hello from control plane".to_owned(),
-            },
-        }),
-    }));
-
-    if send_server_message(&mut sender, command).await.is_err() {
-        tracing::warn!(runner_id = %runner.runner_id, "failed to send smoke command to runner");
-        return;
-    }
 
     loop {
         tokio::select! {
@@ -152,13 +100,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     state.publish_event(session_id, event).await;
                                 }
                             }
-                            Ok(RunnerClientFrame::Response(response)) => {
-                                tracing::debug!(
-                                    runner_id = %runner.runner_id,
-                                    request_id = %response.request_id,
-                                    "runner command response received"
-                                );
-                            }
+                                Ok(RunnerClientFrame::Response(response)) => {
+                                    tracing::debug!(
+                                        runner_id = %runner.runner_id,
+                                        request_id = %response.request_id,
+                                        "runner command response received"
+                                    );
+                                    state
+                                        .finish_runner_response(
+                                            runner.runner_id,
+                                            response.request_id,
+                                            response.outcome,
+                                        )
+                                        .await;
+                                }
                             Ok(RunnerClientFrame::Heartbeat(heartbeat)) => {
                                 tracing::debug!(
                                     runner_id = %runner.runner_id,
@@ -278,8 +233,11 @@ fn app_event_session_id(event: &AppEvent) -> Option<SessionId> {
 
 #[cfg(test)]
 mod tests {
-    use agenter_protocol::runner::{
-        RunnerClientMessage, RunnerCommandResult, RunnerResponseEnvelope, RunnerResponseOutcome,
+    use agenter_protocol::{
+        runner::{
+            RunnerClientMessage, RunnerCommandResult, RunnerResponseEnvelope, RunnerResponseOutcome,
+        },
+        RequestId,
     };
 
     use super::*;

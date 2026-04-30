@@ -59,7 +59,9 @@ AGENTER_DEV_RUNNER_TOKEN=dev-runner-token \
   cargo run -p agenter-runner
 ```
 
-The adapter advertises a single configured workspace and the `codex` provider, starts `codex app-server --listen stdio://` per browser turn, starts a thread, starts a turn with read-only sandbox policy, normalizes known message, command, file, tool, error, and approval request events, and routes approval answers back to the JSON-RPC server request id. Live Codex 0.125 agent text currently arrives as `item/agentMessage/delta` and `item/completed` with `params.item.type == "agentMessage"`; echoed `userMessage` and `reasoning` item events are intentionally ignored by the adapter. The adapter can use an external thread id if the runner command supplies one, but the current control plane does not yet persist native thread ids between browser prompts.
+The adapter advertises a single configured workspace and the `codex` provider, lazily starts one persistent `codex app-server --listen stdio://` process for that runner workspace, starts a native thread when the browser creates an Agenter session, starts turns with read-only sandbox policy, normalizes known message, command, file, tool, error, and approval request events, and routes approval answers back to the JSON-RPC server request id. Live Codex 0.125 agent text currently arrives as `item/agentMessage/delta` and `item/completed` with `params.item.type == "agentMessage"`; echoed `userMessage` and `reasoning` item events are intentionally ignored by the adapter. The control plane stores the native Codex thread id as `external_session_id` in its session registry and sends that id on later browser messages.
+
+Codex 0.125 validates `thread/start.params.sessionStartSource` as a provider-owned enum. Use `"startup"` for normal Agenter-created sessions. Do not send arbitrary client labels such as `"agenter"`; live Codex rejects those with `unknown variant ..., expected startup or clear`.
 
 Use either an extra CLI argument or `AGENTER_SPIKE_PROMPT` to override the default approval-probing prompt:
 

@@ -19,7 +19,6 @@ use tokio::{
     time::timeout,
 };
 
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const RECENT_STDERR_LINES: usize = 20;
 
@@ -45,12 +44,13 @@ pub enum CodexApprovalKind {
 
 #[derive(Debug)]
 pub struct CodexAppServer {
-    child: Child,
+    _child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
     thread_id: Option<String>,
     turn_id: Option<String>,
+    initialized: bool,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
@@ -63,6 +63,7 @@ impl CodexAppServer {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .context("failed to start `codex app-server --listen stdio://`")?;
 
@@ -86,25 +87,21 @@ impl CodexAppServer {
         }
 
         Ok(Self {
-            child,
+            _child: child,
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
             thread_id: None,
             turn_id: None,
+            initialized: false,
             stderr_tail,
         })
     }
 
-    pub async fn initialize_and_start_thread(
-        &mut self,
-        request: &CodexTurnRequest,
-    ) -> anyhow::Result<()> {
-        tracing::debug!(
-            session_id = %request.session_id,
-            has_external_session_id = request.external_session_id.is_some(),
-            "initializing codex app-server"
-        );
+    pub async fn initialize(&mut self) -> anyhow::Result<()> {
+        if self.initialized {
+            return Ok(());
+        }
         let initialize_id = self
             .send_request(
                 "initialize",
@@ -119,51 +116,57 @@ impl CodexAppServer {
             )
             .await?;
         self.read_response(initialize_id, "initialize").await?;
-
-        if let Some(thread_id) = &request.external_session_id {
-            self.thread_id = Some(thread_id.clone());
-            tracing::info!(session_id = %request.session_id, provider_thread_id = %thread_id, "resuming codex thread");
-            let resume_id = self
-                .send_request(
-                    "thread/resume",
-                    json!({
-                        "threadId": thread_id,
-                        "cwd": request.workspace_path,
-                        "approvalPolicy": "on-request",
-                        "approvalsReviewer": "user",
-                        "excludeTurns": false
-                    }),
-                )
-                .await?;
-            self.read_response(resume_id, "thread/resume").await?;
-        } else {
-            tracing::info!(session_id = %request.session_id, "starting codex thread");
-            let start_id = self
-                .send_request(
-                    "thread/start",
-                    json!({
-                        "cwd": request.workspace_path,
-                        "approvalPolicy": "on-request",
-                        "approvalsReviewer": "user",
-                        "sandbox": "read-only",
-                        "sessionStartSource": "agenter"
-                    }),
-                )
-                .await?;
-            let response = self.read_response(start_id, "thread/start").await?;
-            if let Some(thread_id) = codex_thread_id(&response) {
-                self.thread_id = Some(thread_id.to_owned());
-            }
-            if self.thread_id.is_none() {
-                return Err(anyhow!(missing_thread_id_error(
-                    "thread/start",
-                    &response,
-                    &self.recent_stderr()
-                )));
-            }
-        }
-
+        self.initialized = true;
         Ok(())
+    }
+
+    pub async fn start_thread(&mut self, workspace_path: &PathBuf) -> anyhow::Result<String> {
+        self.initialize().await?;
+        tracing::info!("starting codex thread");
+        let start_id = self
+            .send_request("thread/start", codex_thread_start_params(workspace_path))
+            .await?;
+        let response = self.read_response(start_id, "thread/start").await?;
+        if let Some(thread_id) = codex_thread_id(&response) {
+            self.thread_id = Some(thread_id.to_owned());
+        }
+        let Some(thread_id) = self.thread_id.clone() else {
+            return Err(anyhow!(missing_thread_id_error(
+                "thread/start",
+                &response,
+                &self.recent_stderr()
+            )));
+        };
+        Ok(thread_id)
+    }
+
+    pub async fn resume_thread(
+        &mut self,
+        thread_id: &str,
+        workspace_path: &PathBuf,
+    ) -> anyhow::Result<()> {
+        self.initialize().await?;
+        self.thread_id = Some(thread_id.to_owned());
+        tracing::info!(provider_thread_id = %thread_id, "resuming codex thread");
+        let resume_id = self
+            .send_request(
+                "thread/resume",
+                json!({
+                    "threadId": thread_id,
+                    "cwd": workspace_path,
+                    "approvalPolicy": "on-request",
+                    "approvalsReviewer": "user",
+                    "excludeTurns": false
+                }),
+            )
+            .await?;
+        self.read_response(resume_id, "thread/resume").await?;
+        Ok(())
+    }
+
+    pub fn set_active_thread(&mut self, thread_id: impl Into<String>) {
+        self.thread_id = Some(thread_id.into());
+        self.turn_id = None;
     }
 
     pub async fn send_turn(&mut self, request: &CodexTurnRequest) -> anyhow::Result<()> {
@@ -311,35 +314,26 @@ impl CodexAppServer {
             .map(|tail| tail.iter().cloned().collect())
             .unwrap_or_default()
     }
-
-    pub async fn shutdown(mut self) -> anyhow::Result<()> {
-        tracing::debug!("shutting down codex app-server");
-        self.stdin.shutdown().await.ok();
-        match timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await {
-            Ok(result) => {
-                result?;
-                tracing::debug!("codex app-server exited");
-            }
-            Err(_) => {
-                self.child.kill().await.ok();
-                tracing::warn!("killed codex app-server after shutdown timeout");
-            }
-        }
-        Ok(())
-    }
 }
 
-pub async fn run_codex_turn(
+pub fn codex_thread_start_params(workspace_path: &PathBuf) -> Value {
+    json!({
+        "cwd": workspace_path,
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "sandbox": "read-only",
+        "sessionStartSource": "startup"
+    })
+}
+
+pub async fn run_codex_turn_on_server(
+    server: &mut CodexAppServer,
     request: CodexTurnRequest,
     event_sender: mpsc::UnboundedSender<AppEvent>,
     pending_approvals: std::sync::Arc<
         tokio::sync::Mutex<HashMap<ApprovalId, PendingCodexApproval>>,
     >,
 ) -> anyhow::Result<()> {
-    tracing::info!(session_id = %request.session_id, "codex turn task started");
-    let mut server = CodexAppServer::spawn(request.workspace_path.clone())?;
-    server.initialize_and_start_thread(&request).await?;
-
     while server.thread_id.is_none() {
         let Some(message) = server.next_message().await? else {
             return Err(anyhow!("codex exited before returning a thread id"));
@@ -393,7 +387,6 @@ pub async fn run_codex_turn(
             event_sender.send(event).ok();
             if completed {
                 tracing::info!(session_id = %request.session_id, "codex turn completed");
-                server.shutdown().await?;
                 return Ok(());
             }
         }
@@ -1030,6 +1023,14 @@ mod tests {
             codex_thread_id(&flat_result),
             Some("thread-from-flat-result")
         );
+    }
+
+    #[test]
+    fn thread_start_request_uses_provider_owned_startup_source() {
+        let params = codex_thread_start_params(&PathBuf::from("/work/agenter"));
+
+        assert_eq!(params["sessionStartSource"], "startup");
+        assert_ne!(params["sessionStartSource"], "agenter");
     }
 
     #[test]

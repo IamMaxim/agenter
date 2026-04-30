@@ -102,7 +102,9 @@ just codex-runner /path/to/workspace
 just qwen-runner /path/to/workspace
 ```
 
-The real provider runners require authenticated local `codex` or `qwen` CLIs and currently start fresh native provider sessions for each browser prompt until native session ID persistence is implemented.
+The real provider runners require authenticated local `codex` or `qwen` CLIs. Codex runner mode keeps one persistent app-server process per runner workspace and stores the native thread id on Agenter session creation; Qwen resume behavior is still provider-spike dependent.
+
+Codex runner mode now creates the native Codex thread when the browser creates an Agenter session. A successful create-session flow should log `CreateSession`, `thread/start`, and a `SessionCreated` runner response with the Codex thread id stored as `external_session_id`; browser messages should then include that stored external id.
 
 If Codex sessions accept messages but never stream a response, run the direct provider diagnostic:
 

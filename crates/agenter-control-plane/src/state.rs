@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use agenter_core::{
     AgentProviderId, AppEvent, ApprovalId, RunnerId, SessionId, SessionInfo, SessionStatus, UserId,
@@ -6,9 +6,13 @@ use agenter_core::{
 };
 use agenter_protocol::{
     browser::BrowserEventEnvelope,
-    runner::{RunnerCapabilities, RunnerServerMessage},
+    runner::{RunnerCapabilities, RunnerResponseOutcome, RunnerServerMessage},
+    RequestId,
 };
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::{
+    sync::{broadcast, mpsc, oneshot, Mutex},
+    time::timeout,
+};
 use uuid::Uuid;
 
 use crate::auth::CookieSecurity;
@@ -31,6 +35,8 @@ struct AppStateInner {
     registry: Mutex<Registry>,
     sessions: Mutex<HashMap<SessionId, SessionEvents>>,
     runner_connections: Mutex<HashMap<RunnerId, RunnerConnection>>,
+    pending_runner_responses:
+        Mutex<HashMap<(RunnerId, RequestId), oneshot::Sender<RunnerResponseOutcome>>>,
 }
 
 #[derive(Debug, Default)]
@@ -85,6 +91,17 @@ pub struct RegisteredSession {
     pub external_session_id: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SessionRegistration {
+    pub session_id: SessionId,
+    pub owner_user_id: UserId,
+    pub runner_id: RunnerId,
+    pub workspace: WorkspaceRef,
+    pub provider_id: AgentProviderId,
+    pub title: Option<String>,
+    pub external_session_id: Option<String>,
+}
+
 #[derive(Debug)]
 struct SessionEvents {
     sender: broadcast::Sender<BrowserEventEnvelope>,
@@ -110,6 +127,14 @@ pub enum RunnerSendError {
     StaleApproval,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunnerCommandWaitError {
+    NotConnected,
+    Closed,
+    StaleApproval,
+    TimedOut,
+}
+
 impl AppState {
     #[must_use]
     pub fn new(runner_token: String, cookie_security: CookieSecurity) -> Self {
@@ -123,6 +148,7 @@ impl AppState {
                 registry: Mutex::new(Registry::default()),
                 sessions: Mutex::new(HashMap::new()),
                 runner_connections: Mutex::new(HashMap::new()),
+                pending_runner_responses: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -152,6 +178,7 @@ impl AppState {
                 registry: Mutex::new(Registry::default()),
                 sessions: Mutex::new(HashMap::new()),
                 runner_connections: Mutex::new(HashMap::new()),
+                pending_runner_responses: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -193,6 +220,7 @@ impl AppState {
                 registry: Mutex::new(Registry::default()),
                 sessions: Mutex::new(HashMap::new()),
                 runner_connections: Mutex::new(HashMap::new()),
+                pending_runner_responses: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -264,6 +292,7 @@ impl AppState {
         token
     }
 
+    #[cfg(test)]
     pub fn bootstrap_user_id(&self) -> Option<UserId> {
         self.inner
             .bootstrap_admin
@@ -373,6 +402,64 @@ impl AppState {
         result
     }
 
+    pub async fn send_runner_command_and_wait(
+        &self,
+        runner_id: RunnerId,
+        request_id: RequestId,
+        message: RunnerServerMessage,
+        wait_for: Duration,
+    ) -> Result<RunnerResponseOutcome, RunnerCommandWaitError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.inner
+            .pending_runner_responses
+            .lock()
+            .await
+            .insert((runner_id, request_id.clone()), response_sender);
+
+        if let Err(error) = self.send_runner_message(runner_id, message).await {
+            self.inner
+                .pending_runner_responses
+                .lock()
+                .await
+                .remove(&(runner_id, request_id));
+            return Err(match error {
+                RunnerSendError::NotConnected => RunnerCommandWaitError::NotConnected,
+                RunnerSendError::Closed => RunnerCommandWaitError::Closed,
+                RunnerSendError::StaleApproval => RunnerCommandWaitError::StaleApproval,
+            });
+        }
+
+        match timeout(wait_for, response_receiver).await {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(_)) => Err(RunnerCommandWaitError::Closed),
+            Err(_) => {
+                self.inner
+                    .pending_runner_responses
+                    .lock()
+                    .await
+                    .remove(&(runner_id, request_id));
+                Err(RunnerCommandWaitError::TimedOut)
+            }
+        }
+    }
+
+    pub async fn finish_runner_response(
+        &self,
+        runner_id: RunnerId,
+        request_id: RequestId,
+        outcome: RunnerResponseOutcome,
+    ) {
+        let sender = self
+            .inner
+            .pending_runner_responses
+            .lock()
+            .await
+            .remove(&(runner_id, request_id));
+        if let Some(sender) = sender {
+            sender.send(outcome).ok();
+        }
+    }
+
     pub async fn list_runners(&self) -> Vec<RegisteredRunner> {
         self.inner
             .registry
@@ -394,6 +481,7 @@ impl AppState {
             .map(|runner| runner.workspaces.clone())
     }
 
+    #[cfg(test)]
     pub async fn create_session(
         &self,
         session_id: SessionId,
@@ -413,6 +501,7 @@ impl AppState {
         .await
     }
 
+    #[cfg(test)]
     pub async fn create_session_with_title(
         &self,
         session_id: SessionId,
@@ -422,26 +511,39 @@ impl AppState {
         provider_id: AgentProviderId,
         title: Option<String>,
     ) -> RegisteredSession {
-        let session = RegisteredSession {
+        self.register_session(SessionRegistration {
             session_id,
             owner_user_id,
             runner_id,
             workspace,
             provider_id,
-            status: SessionStatus::Running,
             title,
             external_session_id: None,
+        })
+        .await
+    }
+
+    pub async fn register_session(&self, registration: SessionRegistration) -> RegisteredSession {
+        let session = RegisteredSession {
+            session_id: registration.session_id,
+            owner_user_id: registration.owner_user_id,
+            runner_id: registration.runner_id,
+            workspace: registration.workspace,
+            provider_id: registration.provider_id,
+            status: SessionStatus::Running,
+            title: registration.title,
+            external_session_id: registration.external_session_id,
         };
         self.inner
             .registry
             .lock()
             .await
             .sessions
-            .insert(session_id, session.clone());
+            .insert(session.session_id, session.clone());
         tracing::info!(
-            %session_id,
-            %owner_user_id,
-            %runner_id,
+            session_id = %session.session_id,
+            owner_user_id = %session.owner_user_id,
+            runner_id = %session.runner_id,
             workspace_id = %session.workspace.workspace_id,
             provider_id = %session.provider_id,
             "session registered"
@@ -449,44 +551,28 @@ impl AppState {
         session
     }
 
-    pub async fn create_session_for_workspace(
+    pub async fn resolve_runner_workspace(
         &self,
-        owner_user_id: UserId,
         workspace_id: WorkspaceId,
-        provider_id: AgentProviderId,
-        title: Option<String>,
-    ) -> Option<RegisteredSession> {
-        let (runner_id, workspace) = {
-            let registry = self.inner.registry.lock().await;
-            registry.runners.values().find_map(|runner| {
-                let supports_provider = runner
-                    .capabilities
-                    .agent_providers
-                    .iter()
-                    .any(|provider| provider.provider_id == provider_id);
-                if !supports_provider {
-                    return None;
-                }
-                runner
-                    .workspaces
-                    .iter()
-                    .find(|workspace| workspace.workspace_id == workspace_id)
-                    .cloned()
-                    .map(|workspace| (runner.runner_id, workspace))
-            })
-        }?;
-
-        Some(
-            self.create_session_with_title(
-                SessionId::new(),
-                owner_user_id,
-                runner_id,
-                workspace,
-                provider_id,
-                title,
-            )
-            .await,
-        )
+        provider_id: &AgentProviderId,
+    ) -> Option<(RunnerId, WorkspaceRef)> {
+        let registry = self.inner.registry.lock().await;
+        registry.runners.values().find_map(|runner| {
+            let supports_provider = runner
+                .capabilities
+                .agent_providers
+                .iter()
+                .any(|provider| &provider.provider_id == provider_id);
+            if !supports_provider {
+                return None;
+            }
+            runner
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == workspace_id)
+                .cloned()
+                .map(|workspace| (runner.runner_id, workspace))
+        })
     }
 
     pub async fn can_access_session(&self, user_id: UserId, session_id: SessionId) -> bool {
