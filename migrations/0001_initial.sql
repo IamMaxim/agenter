@@ -67,7 +67,13 @@ create table workspaces (
     display_name text,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
+    unique (workspace_id, runner_id),
     unique (runner_id, path)
+);
+
+create table event_cache_cursors (
+    session_id uuid primary key,
+    next_event_index bigint not null default 1
 );
 
 create table agent_sessions (
@@ -93,8 +99,16 @@ create table agent_sessions (
     title text,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
-    unique (provider_id, external_session_id)
+    foreign key (workspace_id, runner_id) references workspaces(workspace_id, runner_id) on delete restrict
 );
+
+create unique index idx_agent_sessions_external_provider
+    on agent_sessions(runner_id, workspace_id, provider_id, external_session_id)
+    where external_session_id is not null;
+
+alter table event_cache_cursors
+    add constraint event_cache_cursors_session_id_fkey
+    foreign key (session_id) references agent_sessions(session_id) on delete cascade;
 
 create table connector_accounts (
     connector_account_id uuid primary key default gen_random_uuid(),
@@ -116,9 +130,16 @@ create table session_bindings (
     external_chat_id text not null,
     external_thread_id text,
     created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now(),
-    unique (connector_id, external_chat_id, external_thread_id)
+    updated_at timestamptz not null default now()
 );
+
+create unique index idx_session_bindings_threaded
+    on session_bindings(connector_id, external_chat_id, external_thread_id)
+    where external_thread_id is not null;
+
+create unique index idx_session_bindings_unthreaded
+    on session_bindings(connector_id, external_chat_id)
+    where external_thread_id is null;
 
 create table pending_approvals (
     approval_id uuid primary key default gen_random_uuid(),

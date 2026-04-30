@@ -82,7 +82,7 @@ Active execution notes:
 - Live Codex/Qwen provider execution remains manual because it requires installed and authenticated local provider CLIs; runbooks record the exact spike commands and expected output shape.
 - Task 1.1 defines shared core IDs as UUID newtypes and normalized app events as adjacently tagged serde JSON for later runner/browser protocol envelopes.
 - Task 1.2 defines typed runner and browser WebSocket payload DTOs only; actual WebSocket server/client behavior remains Task 1.4.
-- Task 1.3 added SQLx Postgres migration and repository primitives. `DATABASE_URL` was not configured locally, so `agenter-db` SQLx integration tests compiled and early-skipped their database bodies; run with `DATABASE_URL=postgres://... cargo test -p agenter-db` to execute migrations and repository assertions against Postgres.
+- Task 1.3 added SQLx Postgres migration and repository primitives. `DATABASE_URL` was not configured locally, so `agenter-db` SQLx integration tests are marked ignored; run with `DATABASE_URL=postgres://... cargo test -p agenter-db -- --ignored` to execute migrations and repository assertions against a disposable Postgres database.
 
 ## Milestone 1: Core Domain, Storage, and Runner Protocol
 

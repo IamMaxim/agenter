@@ -105,18 +105,29 @@ pub async fn append_event_cache(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown")
         .to_owned();
+    let mut tx = pool.begin().await?;
+    let event_index: i64 = sqlx::query_scalar(
+        "insert into event_cache_cursors (session_id, next_event_index)
+         values ($1, 2)
+         on conflict (session_id)
+         do update set next_event_index = event_cache_cursors.next_event_index + 1
+         returning next_event_index - 1",
+    )
+    .bind(session_id.as_uuid())
+    .fetch_one(&mut *tx)
+    .await?;
     let row = sqlx::query(
         "insert into event_cache (session_id, event_index, event_type, payload)
-         select $1, coalesce(max(event_index), 0) + 1, $2, $3
-         from event_cache
-         where session_id = $1
+         values ($1, $2, $3, $4)
          returning event_id, session_id, event_index, event_type, payload, created_at",
     )
     .bind(session_id.as_uuid())
+    .bind(event_index)
     .bind(&event_type)
     .bind(payload)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     cached_event_from_row(&row)
 }
@@ -328,14 +339,9 @@ mod tests {
 
     use super::*;
 
-    async fn test_pool() -> Option<PgPool> {
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(value) if !value.trim().is_empty() => value,
-            _ => {
-                eprintln!("skipping SQLx integration test: DATABASE_URL is not configured");
-                return None;
-            }
-        };
+    async fn test_pool() -> PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set to run ignored SQLx integration tests");
 
         let pool = PgPool::connect(&database_url)
             .await
@@ -344,14 +350,13 @@ mod tests {
             .run(&pool)
             .await
             .expect("run migrations");
-        Some(pool)
+        pool
     }
 
     #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
     async fn creates_registry_rows_and_appends_event_cache() {
-        let Some(pool) = test_pool().await else {
-            return;
-        };
+        let pool = test_pool().await;
 
         let suffix = uuid::Uuid::new_v4();
         let user = create_user(
@@ -433,10 +438,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
     async fn creates_and_resolves_approval_once() {
-        let Some(pool) = test_pool().await else {
-            return;
-        };
+        let pool = test_pool().await;
 
         let suffix = uuid::Uuid::new_v4();
         let user = create_user(
@@ -510,10 +514,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
     async fn migration_creates_required_tables() {
-        let Some(pool) = test_pool().await else {
-            return;
-        };
+        let pool = test_pool().await;
 
         for table_name in [
             "users",
@@ -523,6 +526,7 @@ mod tests {
             "runners",
             "runner_tokens",
             "workspaces",
+            "event_cache_cursors",
             "agent_sessions",
             "connector_accounts",
             "session_bindings",
