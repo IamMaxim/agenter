@@ -139,19 +139,23 @@ mod tests {
             .await
             .expect("send runner event");
 
-        let browser_event = browser_receiver
-            .next()
-            .await
-            .expect("browser event frame")
-            .expect("browser event websocket result");
-        let BrowserServerMessage::Event(event) =
-            serde_json::from_str::<BrowserServerMessage>(browser_event.to_text().unwrap())
-                .expect("decode browser event")
-        else {
-            panic!("expected browser app event");
-        };
+        loop {
+            let browser_event = browser_receiver
+                .next()
+                .await
+                .expect("browser event frame")
+                .expect("browser event websocket result");
+            let BrowserServerMessage::Event(event) =
+                serde_json::from_str::<BrowserServerMessage>(browser_event.to_text().unwrap())
+                    .expect("decode browser event")
+            else {
+                panic!("expected browser app event");
+            };
 
-        assert!(matches!(event.event, AppEvent::AgentMessageDelta(_)));
+            if matches!(event.event, AppEvent::AgentMessageDelta(_)) {
+                break;
+            }
+        }
     }
 
     fn fake_hello() -> RunnerHello {

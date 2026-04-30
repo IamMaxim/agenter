@@ -54,7 +54,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         return;
     }
 
-    for event in state.cached_events(subscription.session_id).await {
+    let (cached_events, mut events) = state.subscribe_session(subscription.session_id).await;
+    for event in cached_events {
         if send_server_message(
             &mut sender,
             BrowserServerMessage::Event(BrowserEventEnvelope {
@@ -69,7 +70,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
 
-    let mut events = state.subscribe_session(subscription.session_id).await;
     loop {
         tokio::select! {
             message = receiver.next() => {
@@ -103,7 +103,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             return;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        let _ = send_server_message(
+                            &mut sender,
+                            BrowserServerMessage::Error(BrowserError {
+                                request_id: None,
+                                code: "event_lagged".to_owned(),
+                                message: format!(
+                                    "browser event stream lagged by {skipped} messages; resubscribe to replay cache"
+                                ),
+                            }),
+                        )
+                        .await;
+                        return;
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }

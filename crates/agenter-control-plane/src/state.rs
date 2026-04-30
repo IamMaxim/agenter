@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
-use agenter_core::{AppEvent, SessionId};
+use agenter_core::{AgentProviderId, AppEvent, RunnerId, SessionId, WorkspaceRef};
+use agenter_protocol::runner::RunnerCapabilities;
 use tokio::sync::{broadcast, Mutex};
 
 const SESSION_EVENT_CACHE_LIMIT: usize = 128;
@@ -13,7 +14,29 @@ pub struct AppState {
 #[derive(Debug)]
 struct AppStateInner {
     runner_token: String,
+    registry: Mutex<Registry>,
     sessions: Mutex<HashMap<SessionId, SessionEvents>>,
+}
+
+#[derive(Debug, Default)]
+struct Registry {
+    runners: HashMap<RunnerId, RegisteredRunner>,
+    sessions: HashMap<SessionId, RegisteredSession>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RegisteredRunner {
+    pub runner_id: RunnerId,
+    pub capabilities: RunnerCapabilities,
+    pub workspaces: Vec<WorkspaceRef>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RegisteredSession {
+    pub session_id: SessionId,
+    pub runner_id: RunnerId,
+    pub workspace: WorkspaceRef,
+    pub provider_id: AgentProviderId,
 }
 
 #[derive(Debug)]
@@ -28,6 +51,7 @@ impl AppState {
         Self {
             inner: Arc::new(AppStateInner {
                 runner_token,
+                registry: Mutex::new(Registry::default()),
                 sessions: Mutex::new(HashMap::new()),
             }),
         }
@@ -38,23 +62,58 @@ impl AppState {
         self.inner.runner_token == token
     }
 
-    pub async fn subscribe_session(&self, session_id: SessionId) -> broadcast::Receiver<AppEvent> {
-        let mut sessions = self.inner.sessions.lock().await;
-        sessions
-            .entry(session_id)
-            .or_insert_with(SessionEvents::new)
-            .sender
-            .subscribe()
-    }
-
-    pub async fn cached_events(&self, session_id: SessionId) -> Vec<AppEvent> {
+    pub async fn register_runner(
+        &self,
+        runner_id: RunnerId,
+        capabilities: RunnerCapabilities,
+        workspaces: Vec<WorkspaceRef>,
+    ) -> RegisteredRunner {
+        let runner = RegisteredRunner {
+            runner_id,
+            capabilities,
+            workspaces,
+        };
         self.inner
-            .sessions
+            .registry
             .lock()
             .await
-            .get(&session_id)
-            .map(|events| events.cache.clone())
-            .unwrap_or_default()
+            .runners
+            .insert(runner_id, runner.clone());
+        runner
+    }
+
+    pub async fn create_session(
+        &self,
+        session_id: SessionId,
+        runner_id: RunnerId,
+        workspace: WorkspaceRef,
+        provider_id: AgentProviderId,
+    ) -> RegisteredSession {
+        let session = RegisteredSession {
+            session_id,
+            runner_id,
+            workspace,
+            provider_id,
+        };
+        self.inner
+            .registry
+            .lock()
+            .await
+            .sessions
+            .insert(session_id, session.clone());
+        session
+    }
+
+    pub async fn subscribe_session(
+        &self,
+        session_id: SessionId,
+    ) -> (Vec<AppEvent>, broadcast::Receiver<AppEvent>) {
+        let mut sessions = self.inner.sessions.lock().await;
+        let events = sessions
+            .entry(session_id)
+            .or_insert_with(SessionEvents::new);
+        let receiver = events.sender.subscribe();
+        (events.cache.clone(), receiver)
     }
 
     pub async fn publish_event(&self, session_id: SessionId, event: AppEvent) {
@@ -95,7 +154,8 @@ mod tests {
     async fn subscribers_receive_published_session_events() {
         let state = AppState::new("dev-token".to_owned());
         let session_id = SessionId::new();
-        let mut subscription = state.subscribe_session(session_id).await;
+        let (cached, mut subscription) = state.subscribe_session(session_id).await;
+        assert!(cached.is_empty());
 
         state
             .publish_event(
@@ -111,6 +171,38 @@ mod tests {
 
         let received = subscription.recv().await.expect("event is broadcast");
         assert!(matches!(received, AppEvent::UserMessage(_)));
+    }
+
+    #[tokio::test]
+    async fn subscribe_snapshots_cached_events_and_live_receiver_atomically() {
+        let state = AppState::new("dev-token".to_owned());
+        let session_id = SessionId::new();
+        let event = AppEvent::UserMessage(UserMessageEvent {
+            session_id,
+            message_id: Some("cached".to_owned()),
+            author_user_id: None,
+            content: "cached".to_owned(),
+        });
+        state.publish_event(session_id, event.clone()).await;
+
+        let (cached, mut subscription) = state.subscribe_session(session_id).await;
+        assert_eq!(cached, vec![event]);
+
+        state
+            .publish_event(
+                session_id,
+                AppEvent::UserMessage(UserMessageEvent {
+                    session_id,
+                    message_id: Some("live".to_owned()),
+                    author_user_id: None,
+                    content: "live".to_owned(),
+                }),
+            )
+            .await;
+        assert!(matches!(
+            subscription.recv().await.expect("live event"),
+            AppEvent::UserMessage(_)
+        ));
     }
 
     #[test]
