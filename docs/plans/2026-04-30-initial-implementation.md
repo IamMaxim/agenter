@@ -225,6 +225,7 @@ Active execution notes:
 - Browser history and WebSocket payloads now carry event IDs so reconnect can reload cached events and avoid duplicate rendering.
 - Fake runner events now include representative command, tool, file, approval, error, user, and streaming assistant events for the browser cards.
 - Verification passed with `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`, `npm run check`, `npm run lint`, `npm run test`, and `npm run build`.
+- Follow-up review fixes are committed in `fix: harden browser chat event flow`: approval decisions are now delivered to the runner before resolved events are published, duplicate resolved decisions return the cached event without re-sending runner commands, runner connections are not registered until required capabilities/workspaces are present, and empty `202 Accepted` responses no longer break the browser API client.
 
 ## Milestone 3: Real Agent Adapters
 
