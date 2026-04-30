@@ -20,6 +20,7 @@ struct AppStateInner {
     runner_token: String,
     cookie_security: CookieSecurity,
     bootstrap_admin: Option<BootstrapAdmin>,
+    db_pool: Option<sqlx::PgPool>,
     auth_sessions: Mutex<HashMap<String, AuthenticatedUser>>,
     registry: Mutex<Registry>,
     sessions: Mutex<HashMap<SessionId, SessionEvents>>,
@@ -61,6 +62,7 @@ impl AppState {
                 runner_token,
                 cookie_security,
                 bootstrap_admin: None,
+                db_pool: None,
                 auth_sessions: Mutex::new(HashMap::new()),
                 registry: Mutex::new(Registry::default()),
                 sessions: Mutex::new(HashMap::new()),
@@ -88,6 +90,47 @@ impl AppState {
                     user,
                     password_hash,
                 }),
+                db_pool: None,
+                auth_sessions: Mutex::new(HashMap::new()),
+                registry: Mutex::new(Registry::default()),
+                sessions: Mutex::new(HashMap::new()),
+            }),
+        })
+    }
+
+    pub async fn new_with_database(
+        runner_token: String,
+        cookie_security: CookieSecurity,
+        pool: sqlx::PgPool,
+        bootstrap_admin: Option<(String, String)>,
+    ) -> anyhow::Result<Self> {
+        let bootstrap_admin = if let Some((email, password)) = bootstrap_admin {
+            let password_hash = auth::hash_password(&password)?;
+            let user = agenter_db::bootstrap_password_admin(
+                &pool,
+                &email,
+                Some("Local Admin"),
+                &password_hash,
+            )
+            .await?;
+            Some(BootstrapAdmin {
+                user: AuthenticatedUser {
+                    user_id: user.user_id,
+                    email: user.email,
+                    display_name: user.display_name,
+                },
+                password_hash,
+            })
+        } else {
+            None
+        };
+
+        Ok(Self {
+            inner: Arc::new(AppStateInner {
+                runner_token,
+                cookie_security,
+                bootstrap_admin,
+                db_pool: Some(pool),
                 auth_sessions: Mutex::new(HashMap::new()),
                 registry: Mutex::new(Registry::default()),
                 sessions: Mutex::new(HashMap::new()),
@@ -106,6 +149,27 @@ impl AppState {
     }
 
     pub async fn login_password(&self, email: &str, password: &str) -> Option<String> {
+        if let Some(pool) = &self.inner.db_pool {
+            let (user, password_hash) = agenter_db::find_password_credential_by_email(pool, email)
+                .await
+                .ok()??;
+            if !auth::verify_password(password, &password_hash) {
+                return None;
+            }
+            let user = AuthenticatedUser {
+                user_id: user.user_id,
+                email: user.email,
+                display_name: user.display_name,
+            };
+            let token = Uuid::new_v4().to_string();
+            self.inner
+                .auth_sessions
+                .lock()
+                .await
+                .insert(token.clone(), user);
+            return Some(token);
+        }
+
         let admin = self.inner.bootstrap_admin.as_ref()?;
         if admin.user.email != email || !auth::verify_password(password, &admin.password_hash) {
             return None;

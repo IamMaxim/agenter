@@ -62,6 +62,73 @@ pub async fn create_user_with_password_credential(
     Ok(user)
 }
 
+pub async fn bootstrap_password_admin(
+    pool: &PgPool,
+    email: &str,
+    display_name: Option<&str>,
+    password_hash: &str,
+) -> Result<User> {
+    let mut tx = pool.begin().await?;
+    let existing: Option<PgRow> = sqlx::query(
+        "select u.user_id, u.email, u.display_name, u.created_at, u.updated_at
+         from users u
+         join auth_identities ai on ai.user_id = u.user_id
+         where ai.provider_kind = 'password'
+           and ai.provider_id = 'local'
+           and ai.subject = $1",
+    )
+    .bind(email)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let user = if let Some(row) = existing {
+        let user = user_from_row(&row)?;
+        sqlx::query(
+            "update password_credentials
+             set password_hash = $2,
+                 password_updated_at = now(),
+                 updated_at = now()
+             where user_id = $1",
+        )
+        .bind(user.user_id.as_uuid())
+        .bind(password_hash)
+        .execute(&mut *tx)
+        .await?;
+        user
+    } else {
+        let row = sqlx::query(
+            "insert into users (email, display_name)
+             values ($1, $2)
+             returning user_id, email, display_name, created_at, updated_at",
+        )
+        .bind(email)
+        .bind(display_name)
+        .fetch_one(&mut *tx)
+        .await?;
+        let user = user_from_row(&row)?;
+        sqlx::query(
+            "insert into auth_identities (user_id, provider_kind, provider_id, subject)
+             values ($1, 'password', 'local', $2)",
+        )
+        .bind(user.user_id.as_uuid())
+        .bind(email)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "insert into password_credentials (user_id, password_hash)
+             values ($1, $2)",
+        )
+        .bind(user.user_id.as_uuid())
+        .bind(password_hash)
+        .execute(&mut *tx)
+        .await?;
+        user
+    };
+
+    tx.commit().await?;
+    Ok(user)
+}
+
 pub async fn find_password_credential_by_email(
     pool: &PgPool,
     email: &str,

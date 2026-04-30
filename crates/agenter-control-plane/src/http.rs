@@ -37,15 +37,25 @@ pub async fn serve() -> anyhow::Result<()> {
     let runner_token = env::var("AGENTER_DEV_RUNNER_TOKEN")
         .unwrap_or_else(|_| DEFAULT_DEV_RUNNER_TOKEN.to_owned());
     let cookie_security = cookie_security_from_env();
-
-    let state = match (
+    let bootstrap_admin = match (
         env::var("AGENTER_BOOTSTRAP_ADMIN_EMAIL"),
         env::var("AGENTER_BOOTSTRAP_ADMIN_PASSWORD"),
     ) {
-        (Ok(email), Ok(password)) => {
-            AppState::new_with_bootstrap_admin(runner_token, email, password, cookie_security)?
+        (Ok(email), Ok(password)) => Some((email, password)),
+        _ => None,
+    };
+
+    let state = if let Ok(database_url) = env::var("DATABASE_URL") {
+        let pool = sqlx::PgPool::connect(&database_url).await?;
+        sqlx::migrate!("../../migrations").run(&pool).await?;
+        AppState::new_with_database(runner_token, cookie_security, pool, bootstrap_admin).await?
+    } else {
+        match bootstrap_admin {
+            Some((email, password)) => {
+                AppState::new_with_bootstrap_admin(runner_token, email, password, cookie_security)?
+            }
+            None => AppState::new(runner_token, cookie_security),
         }
-        _ => AppState::new(runner_token, cookie_security),
     };
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
