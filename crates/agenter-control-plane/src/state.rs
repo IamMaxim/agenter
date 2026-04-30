@@ -8,7 +8,7 @@ use agenter_protocol::{
     browser::BrowserEventEnvelope,
     runner::{RunnerCapabilities, RunnerServerMessage},
 };
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use uuid::Uuid;
 
 use crate::auth::CookieSecurity;
@@ -30,7 +30,7 @@ struct AppStateInner {
     auth_sessions: Mutex<HashMap<String, AuthenticatedUser>>,
     registry: Mutex<Registry>,
     sessions: Mutex<HashMap<SessionId, SessionEvents>>,
-    runner_connections: Mutex<HashMap<RunnerId, mpsc::UnboundedSender<RunnerServerMessage>>>,
+    runner_connections: Mutex<HashMap<RunnerId, RunnerConnection>>,
 }
 
 #[derive(Debug, Default)]
@@ -89,6 +89,18 @@ pub struct RegisteredSession {
 struct SessionEvents {
     sender: broadcast::Sender<BrowserEventEnvelope>,
     cache: Vec<BrowserEventEnvelope>,
+}
+
+#[derive(Clone, Debug)]
+struct RunnerConnection {
+    connection_id: Uuid,
+    sender: mpsc::UnboundedSender<OutboundRunnerMessage>,
+}
+
+#[derive(Debug)]
+pub struct OutboundRunnerMessage {
+    pub message: RunnerServerMessage,
+    pub(crate) delivered: oneshot::Sender<Result<(), RunnerSendError>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -268,21 +280,27 @@ impl AppState {
     pub async fn connect_runner(
         &self,
         runner_id: RunnerId,
-        sender: mpsc::UnboundedSender<RunnerServerMessage>,
-    ) {
-        self.inner
-            .runner_connections
-            .lock()
-            .await
-            .insert(runner_id, sender);
+        sender: mpsc::UnboundedSender<OutboundRunnerMessage>,
+    ) -> Uuid {
+        let connection_id = Uuid::new_v4();
+        self.inner.runner_connections.lock().await.insert(
+            runner_id,
+            RunnerConnection {
+                connection_id,
+                sender,
+            },
+        );
+        connection_id
     }
 
-    pub async fn disconnect_runner(&self, runner_id: RunnerId) {
-        self.inner
-            .runner_connections
-            .lock()
-            .await
-            .remove(&runner_id);
+    pub async fn disconnect_runner(&self, runner_id: RunnerId, connection_id: Uuid) {
+        let mut connections = self.inner.runner_connections.lock().await;
+        if connections
+            .get(&runner_id)
+            .is_some_and(|connection| connection.connection_id == connection_id)
+        {
+            connections.remove(&runner_id);
+        }
     }
 
     pub async fn send_runner_message(
@@ -290,18 +308,26 @@ impl AppState {
         runner_id: RunnerId,
         message: RunnerServerMessage,
     ) -> Result<(), RunnerSendError> {
-        let Some(sender) = self
-            .inner
-            .runner_connections
-            .lock()
-            .await
-            .get(&runner_id)
-            .cloned()
-        else {
-            return Err(RunnerSendError::NotConnected);
+        let sender = {
+            let Some(connection) = self
+                .inner
+                .runner_connections
+                .lock()
+                .await
+                .get(&runner_id)
+                .cloned()
+            else {
+                return Err(RunnerSendError::NotConnected);
+            };
+            connection.sender
         };
-
-        sender.send(message).map_err(|_| RunnerSendError::Closed)
+        let (delivered, delivered_receiver) = oneshot::channel();
+        sender
+            .send(OutboundRunnerMessage { message, delivered })
+            .map_err(|_| RunnerSendError::Closed)?;
+        delivered_receiver
+            .await
+            .unwrap_or(Err(RunnerSendError::Closed))
     }
 
     pub async fn list_runners(&self) -> Vec<RegisteredRunner> {
@@ -379,21 +405,31 @@ impl AppState {
         provider_id: AgentProviderId,
         title: Option<String>,
     ) -> Option<RegisteredSession> {
-        let workspace = {
+        let (runner_id, workspace) = {
             let registry = self.inner.registry.lock().await;
-            registry
-                .runners
-                .values()
-                .flat_map(|runner| runner.workspaces.iter())
-                .find(|workspace| workspace.workspace_id == workspace_id)
-                .cloned()
+            registry.runners.values().find_map(|runner| {
+                let supports_provider = runner
+                    .capabilities
+                    .agent_providers
+                    .iter()
+                    .any(|provider| provider.provider_id == provider_id);
+                if !supports_provider {
+                    return None;
+                }
+                runner
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == workspace_id)
+                    .cloned()
+                    .map(|workspace| (runner.runner_id, workspace))
+            })
         }?;
 
         Some(
             self.create_session_with_title(
                 SessionId::new(),
                 owner_user_id,
-                workspace.runner_id,
+                runner_id,
                 workspace,
                 provider_id,
                 title,
@@ -479,35 +515,44 @@ impl AppState {
         session_id: SessionId,
         event: AppEvent,
     ) -> BrowserEventEnvelope {
-        if let AppEvent::ApprovalRequested(request) = &event {
-            self.inner.registry.lock().await.approvals.insert(
-                request.approval_id,
-                RegisteredApproval {
-                    session_id,
-                    status: ApprovalStatus::Pending,
-                },
-            );
-        }
-
         let envelope = BrowserEventEnvelope {
             event_id: Some(Uuid::new_v4().to_string().into()),
             event,
         };
-        let sender = {
-            let mut sessions = self.inner.sessions.lock().await;
-            let events = sessions
-                .entry(session_id)
-                .or_insert_with(SessionEvents::new);
-            events.cache.push(envelope.clone());
-            if events.cache.len() > SESSION_EVENT_CACHE_LIMIT {
-                let overflow = events.cache.len() - SESSION_EVENT_CACHE_LIMIT;
-                events.cache.drain(..overflow);
+        match &envelope.event {
+            AppEvent::ApprovalRequested(request) => {
+                self.inner.registry.lock().await.approvals.insert(
+                    request.approval_id,
+                    RegisteredApproval {
+                        session_id,
+                        status: ApprovalStatus::Pending,
+                    },
+                );
             }
-            events.sender.clone()
-        };
+            AppEvent::ApprovalResolved(resolved) => {
+                let mut registry = self.inner.registry.lock().await;
+                match registry.approvals.get_mut(&resolved.approval_id) {
+                    Some(approval) => match &approval.status {
+                        ApprovalStatus::Resolved(existing) => return *existing.clone(),
+                        ApprovalStatus::Pending | ApprovalStatus::Resolving => {
+                            approval.status = ApprovalStatus::Resolved(Box::new(envelope.clone()));
+                        }
+                    },
+                    None => {
+                        registry.approvals.insert(
+                            resolved.approval_id,
+                            RegisteredApproval {
+                                session_id,
+                                status: ApprovalStatus::Resolved(Box::new(envelope.clone())),
+                            },
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
 
-        let _ = sender.send(envelope.clone());
-        envelope
+        self.store_event(session_id, envelope).await
     }
 
     pub async fn begin_approval_resolution(
@@ -620,7 +665,8 @@ fn session_info(session: &RegisteredSession) -> SessionInfo {
 
 #[cfg(test)]
 mod tests {
-    use agenter_core::{AppEvent, SessionId, UserMessageEvent};
+    use agenter_core::{AppEvent, RunnerId, SessionId, UserMessageEvent};
+    use agenter_protocol::runner::{RunnerHeartbeatAck, RunnerServerMessage};
 
     use super::*;
 
@@ -687,5 +733,49 @@ mod tests {
 
         assert!(state.is_runner_token_valid("dev-token"));
         assert!(!state.is_runner_token_valid("wrong-token"));
+    }
+
+    #[tokio::test]
+    async fn stale_runner_disconnect_does_not_remove_new_connection() {
+        let state = AppState::new("dev-token".to_owned(), CookieSecurity::DevelopmentInsecure);
+        let runner_id = RunnerId::new();
+        let (old_sender, mut old_receiver) = mpsc::unbounded_channel();
+        let old_connection_id = state.connect_runner(runner_id, old_sender).await;
+        let (new_sender, mut new_receiver) = mpsc::unbounded_channel();
+        let new_connection_id = state.connect_runner(runner_id, new_sender).await;
+
+        state.disconnect_runner(runner_id, old_connection_id).await;
+
+        let send_state = state.clone();
+        let send_task = tokio::spawn(async move {
+            send_state
+                .send_runner_message(
+                    runner_id,
+                    RunnerServerMessage::HeartbeatAck(RunnerHeartbeatAck { sequence: 1 }),
+                )
+                .await
+        });
+        let outbound = new_receiver
+            .recv()
+            .await
+            .expect("new connection receives message");
+        assert!(old_receiver.try_recv().is_err());
+        assert!(matches!(
+            outbound.message,
+            RunnerServerMessage::HeartbeatAck(RunnerHeartbeatAck { sequence: 1 })
+        ));
+        outbound.delivered.send(Ok(())).expect("ack delivery");
+        assert!(send_task.await.expect("send task joins").is_ok());
+
+        state.disconnect_runner(runner_id, new_connection_id).await;
+        assert!(matches!(
+            state
+                .send_runner_message(
+                    runner_id,
+                    RunnerServerMessage::HeartbeatAck(RunnerHeartbeatAck { sequence: 2 }),
+                )
+                .await,
+            Err(RunnerSendError::NotConnected)
+        ));
     }
 }

@@ -750,6 +750,16 @@ mod tests {
             .await;
         let (runner_sender, mut runner_receiver) = tokio::sync::mpsc::unbounded_channel();
         state.connect_runner(runner.runner_id, runner_sender).await;
+        let (observed_sender, mut observed_receiver) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(outbound) = runner_receiver.recv().await {
+                observed_sender.send(outbound.message).ok();
+                outbound
+                    .delivered
+                    .send(Ok(()))
+                    .expect("report websocket delivery");
+            }
+        });
         state
             .create_session(
                 session_id,
@@ -808,7 +818,7 @@ mod tests {
             serde_json::from_slice(&body).expect("approval response json");
         assert!(matches!(envelope.event, AppEvent::ApprovalResolved(_)));
 
-        let RunnerServerMessage::Command(command) = runner_receiver
+        let RunnerServerMessage::Command(command) = observed_receiver
             .try_recv()
             .expect("runner receives approval answer")
         else {
@@ -846,8 +856,153 @@ mod tests {
             serde_json::from_slice(&duplicate_body).expect("duplicate approval response json");
         assert_eq!(duplicate_envelope.event_id, envelope.event_id);
         assert!(
-            runner_receiver.try_recv().is_err(),
+            observed_receiver.try_recv().is_err(),
             "duplicate decisions must not send another runner command"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_provider_not_advertised_by_workspace_runner() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let mut runner = fake_hello();
+        runner.capabilities.agent_providers[0].provider_id =
+            AgentProviderId::from(AgentProviderId::QWEN);
+        let workspace_id = runner.workspaces[0].workspace_id;
+        state
+            .register_runner(
+                runner.runner_id,
+                runner.capabilities.clone(),
+                runner.workspaces.clone(),
+            )
+            .await;
+        let browser_session_token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions")
+                    .header(
+                        header::COOKIE,
+                        format!("{}={browser_session_token}", auth::SESSION_COOKIE_NAME),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workspace_id": workspace_id,
+                            "provider_id": AgentProviderId::from(AgentProviderId::CODEX),
+                            "title": "wrong provider"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build create session request"),
+            )
+            .await
+            .expect("route create session request");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn runner_resolved_approval_is_idempotent_for_browser_decision() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let user_id = state.bootstrap_user_id().expect("bootstrap user");
+        let session_id = smoke_session_id();
+        let runner = fake_hello();
+        let workspace = runner.workspaces[0].clone();
+        state
+            .register_runner(
+                runner.runner_id,
+                runner.capabilities.clone(),
+                runner.workspaces.clone(),
+            )
+            .await;
+        let (runner_sender, mut runner_receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.connect_runner(runner.runner_id, runner_sender).await;
+        state
+            .create_session(
+                session_id,
+                user_id,
+                runner.runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let approval_id = ApprovalId::new();
+        state
+            .publish_event(
+                session_id,
+                AppEvent::ApprovalRequested(ApprovalRequestEvent {
+                    session_id,
+                    approval_id,
+                    kind: ApprovalKind::Command,
+                    title: "Run tests".to_owned(),
+                    details: Some("cargo test".to_owned()),
+                    expires_at: None,
+                    provider_payload: None,
+                }),
+            )
+            .await;
+        let resolved = state
+            .publish_event(
+                session_id,
+                AppEvent::ApprovalResolved(agenter_core::ApprovalResolvedEvent {
+                    session_id,
+                    approval_id,
+                    decision: ApprovalDecision::Decline,
+                    resolved_by_user_id: None,
+                    resolved_at: Utc::now(),
+                    provider_payload: None,
+                }),
+            )
+            .await;
+        let browser_session_token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/approvals/{approval_id}/decision"))
+                    .header(
+                        header::COOKIE,
+                        format!("{}={browser_session_token}", auth::SESSION_COOKIE_NAME),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&ApprovalDecision::Accept)
+                            .expect("serialize decision"),
+                    ))
+                    .expect("build stale approval decision request"),
+            )
+            .await
+            .expect("route stale approval decision");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read stale approval response");
+        let envelope: BrowserEventEnvelope =
+            serde_json::from_slice(&body).expect("stale approval response json");
+        assert_eq!(envelope.event_id, resolved.event_id);
+        assert!(
+            runner_receiver.try_recv().is_err(),
+            "stale browser decisions must not send runner commands"
         );
     }
 

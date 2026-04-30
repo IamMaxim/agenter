@@ -60,7 +60,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         )
         .await;
     let (outbound_sender, mut outbound_receiver) = mpsc::unbounded_channel();
-    state
+    let connection_id = state
         .connect_runner(runner.runner_id, outbound_sender)
         .await;
     let session_id = smoke_session_id();
@@ -107,11 +107,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }),
     }));
 
-    if state
-        .send_runner_message(runner.runner_id, command)
-        .await
-        .is_err()
-    {
+    if send_server_message(&mut sender, command).await.is_err() {
         return;
     }
 
@@ -146,14 +142,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 let Some(outbound) = outbound else {
                     break;
                 };
-                if send_server_message(&mut sender, outbound).await.is_err() {
+                let result = send_server_message(&mut sender, outbound.message).await;
+                let should_break = result.is_err();
+                let _ = outbound.delivered.send(result.map_err(|_| crate::state::RunnerSendError::Closed));
+                if should_break {
                     break;
                 }
             }
         }
     }
 
-    state.disconnect_runner(runner.runner_id).await;
+    state
+        .disconnect_runner(runner.runner_id, connection_id)
+        .await;
 }
 
 async fn send_server_message(
