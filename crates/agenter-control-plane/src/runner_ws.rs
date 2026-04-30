@@ -46,6 +46,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         return;
     }
 
+    let Some(workspace) = hello.workspaces.first().cloned() else {
+        return;
+    };
+    let Some(provider) = hello.capabilities.agent_providers.first().cloned() else {
+        return;
+    };
     let runner = state
         .register_runner(
             hello.runner_id,
@@ -57,12 +63,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     state
         .connect_runner(runner.runner_id, outbound_sender)
         .await;
-    let Some(workspace) = runner.workspaces.first().cloned() else {
-        return;
-    };
-    let Some(provider) = runner.capabilities.agent_providers.first().cloned() else {
-        return;
-    };
     let session_id = smoke_session_id();
     let owner_user_id = state.bootstrap_user_id().unwrap_or_else(UserId::nil);
     let session = state

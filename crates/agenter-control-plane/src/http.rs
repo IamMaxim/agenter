@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::{
     auth::{self, CookieSecurity},
     browser_ws, runner_ws,
-    state::{AppState, RunnerSendError},
+    state::{AppState, ApprovalResolutionStart, RunnerSendError},
 };
 
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:7777";
@@ -186,6 +186,13 @@ async fn list_runners(State(state): State<AppState>, headers: HeaderMap) -> Resp
                 .workspaces
                 .first()
                 .and_then(|workspace| workspace.display_name.clone())
+                .or_else(|| {
+                    runner
+                        .capabilities
+                        .agent_providers
+                        .first()
+                        .map(|provider| provider.provider_id.to_string())
+                })
                 .unwrap_or_else(|| runner.runner_id.to_string()),
             status: "connected",
             last_seen_at: None,
@@ -369,12 +376,44 @@ async fn decide_approval(
     let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let Some(session_id) = state.approval_session(approval_id).await else {
-        return StatusCode::NOT_FOUND.into_response();
+    let session_id = match state.begin_approval_resolution(approval_id).await {
+        ApprovalResolutionStart::Started { session_id } => session_id,
+        ApprovalResolutionStart::AlreadyResolved {
+            session_id,
+            envelope,
+        } => {
+            if state.session(user.user_id, session_id).await.is_none() {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            return Json(*envelope).into_response();
+        }
+        ApprovalResolutionStart::InProgress => return StatusCode::CONFLICT.into_response(),
+        ApprovalResolutionStart::Missing => return StatusCode::NOT_FOUND.into_response(),
     };
     let Some(session) = state.session(user.user_id, session_id).await else {
+        state.cancel_approval_resolution(approval_id).await;
         return StatusCode::NOT_FOUND.into_response();
     };
+
+    let command = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
+        agenter_protocol::runner::RunnerCommandEnvelope {
+            request_id: agenter_protocol::RequestId::from(Uuid::new_v4().to_string()),
+            command: agenter_protocol::runner::RunnerCommand::AnswerApproval(
+                agenter_protocol::runner::ApprovalAnswerCommand {
+                    session_id,
+                    approval_id,
+                    decision: decision.clone(),
+                },
+            ),
+        },
+    ));
+    match state.send_runner_message(session.runner_id, command).await {
+        Ok(()) => {}
+        Err(RunnerSendError::NotConnected | RunnerSendError::Closed) => {
+            state.cancel_approval_resolution(approval_id).await;
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
 
     let resolved = agenter_core::AppEvent::ApprovalResolved(agenter_core::ApprovalResolvedEvent {
         session_id,
@@ -384,20 +423,12 @@ async fn decide_approval(
         resolved_at: Utc::now(),
         provider_payload: None,
     });
-    let envelope = state.publish_event(session_id, resolved).await;
-    let command = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
-        agenter_protocol::runner::RunnerCommandEnvelope {
-            request_id: agenter_protocol::RequestId::from(Uuid::new_v4().to_string()),
-            command: agenter_protocol::runner::RunnerCommand::AnswerApproval(
-                agenter_protocol::runner::ApprovalAnswerCommand {
-                    session_id,
-                    approval_id,
-                    decision,
-                },
-            ),
-        },
-    ));
-    let _ = state.send_runner_message(session.runner_id, command).await;
+    let Some(envelope) = state
+        .finish_approval_resolution(approval_id, session_id, resolved)
+        .await
+    else {
+        return StatusCode::CONFLICT.into_response();
+    };
 
     Json(envelope).into_response()
 }
@@ -717,6 +748,8 @@ mod tests {
                 runner.workspaces.clone(),
             )
             .await;
+        let (runner_sender, mut runner_receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.connect_runner(runner.runner_id, runner_sender).await;
         state
             .create_session(
                 session_id,
@@ -748,6 +781,7 @@ mod tests {
         let app = app(state);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -773,6 +807,48 @@ mod tests {
         let envelope: BrowserEventEnvelope =
             serde_json::from_slice(&body).expect("approval response json");
         assert!(matches!(envelope.event, AppEvent::ApprovalResolved(_)));
+
+        let RunnerServerMessage::Command(command) = runner_receiver
+            .try_recv()
+            .expect("runner receives approval answer")
+        else {
+            panic!("expected runner command");
+        };
+        let agenter_protocol::runner::RunnerCommand::AnswerApproval(answer) = command.command
+        else {
+            panic!("expected approval answer command");
+        };
+        assert_eq!(answer.approval_id, approval_id);
+
+        let duplicate_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/approvals/{approval_id}/decision"))
+                    .header(
+                        header::COOKIE,
+                        format!("{}={browser_session_token}", auth::SESSION_COOKIE_NAME),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&ApprovalDecision::Accept)
+                            .expect("serialize decision"),
+                    ))
+                    .expect("build duplicate approval decision request"),
+            )
+            .await
+            .expect("route duplicate approval decision");
+        assert_eq!(duplicate_response.status(), StatusCode::OK);
+        let duplicate_body = to_bytes(duplicate_response.into_body(), usize::MAX)
+            .await
+            .expect("read duplicate approval response");
+        let duplicate_envelope: BrowserEventEnvelope =
+            serde_json::from_slice(&duplicate_body).expect("duplicate approval response json");
+        assert_eq!(duplicate_envelope.event_id, envelope.event_id);
+        assert!(
+            runner_receiver.try_recv().is_err(),
+            "duplicate decisions must not send another runner command"
+        );
     }
 
     #[tokio::test]

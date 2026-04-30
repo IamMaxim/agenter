@@ -37,7 +37,33 @@ struct AppStateInner {
 struct Registry {
     runners: HashMap<RunnerId, RegisteredRunner>,
     sessions: HashMap<SessionId, RegisteredSession>,
-    approvals: HashMap<ApprovalId, SessionId>,
+    approvals: HashMap<ApprovalId, RegisteredApproval>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RegisteredApproval {
+    pub session_id: SessionId,
+    status: ApprovalStatus,
+}
+
+#[derive(Clone, Debug)]
+enum ApprovalStatus {
+    Pending,
+    Resolving,
+    Resolved(Box<BrowserEventEnvelope>),
+}
+
+#[derive(Clone, Debug)]
+pub enum ApprovalResolutionStart {
+    Missing,
+    InProgress,
+    AlreadyResolved {
+        session_id: SessionId,
+        envelope: Box<BrowserEventEnvelope>,
+    },
+    Started {
+        session_id: SessionId,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -454,12 +480,13 @@ impl AppState {
         event: AppEvent,
     ) -> BrowserEventEnvelope {
         if let AppEvent::ApprovalRequested(request) = &event {
-            self.inner
-                .registry
-                .lock()
-                .await
-                .approvals
-                .insert(request.approval_id, session_id);
+            self.inner.registry.lock().await.approvals.insert(
+                request.approval_id,
+                RegisteredApproval {
+                    session_id,
+                    status: ApprovalStatus::Pending,
+                },
+            );
         }
 
         let envelope = BrowserEventEnvelope {
@@ -483,14 +510,88 @@ impl AppState {
         envelope
     }
 
-    pub async fn approval_session(&self, approval_id: ApprovalId) -> Option<SessionId> {
-        self.inner
-            .registry
-            .lock()
-            .await
-            .approvals
-            .get(&approval_id)
-            .copied()
+    pub async fn begin_approval_resolution(
+        &self,
+        approval_id: ApprovalId,
+    ) -> ApprovalResolutionStart {
+        let mut registry = self.inner.registry.lock().await;
+        let Some(approval) = registry.approvals.get_mut(&approval_id) else {
+            return ApprovalResolutionStart::Missing;
+        };
+        match &approval.status {
+            ApprovalStatus::Pending => {
+                approval.status = ApprovalStatus::Resolving;
+                ApprovalResolutionStart::Started {
+                    session_id: approval.session_id,
+                }
+            }
+            ApprovalStatus::Resolving => ApprovalResolutionStart::InProgress,
+            ApprovalStatus::Resolved(envelope) => ApprovalResolutionStart::AlreadyResolved {
+                session_id: approval.session_id,
+                envelope: envelope.clone(),
+            },
+        }
+    }
+
+    pub async fn cancel_approval_resolution(&self, approval_id: ApprovalId) {
+        let mut registry = self.inner.registry.lock().await;
+        let Some(approval) = registry.approvals.get_mut(&approval_id) else {
+            return;
+        };
+        if matches!(approval.status, ApprovalStatus::Resolving) {
+            approval.status = ApprovalStatus::Pending;
+        }
+    }
+
+    pub async fn finish_approval_resolution(
+        &self,
+        approval_id: ApprovalId,
+        session_id: SessionId,
+        event: AppEvent,
+    ) -> Option<BrowserEventEnvelope> {
+        let envelope = BrowserEventEnvelope {
+            event_id: Some(Uuid::new_v4().to_string().into()),
+            event,
+        };
+        {
+            let mut registry = self.inner.registry.lock().await;
+            let approval = registry.approvals.get_mut(&approval_id)?;
+            if approval.session_id != session_id {
+                return None;
+            }
+            match &approval.status {
+                ApprovalStatus::Resolved(existing) => return Some(*existing.clone()),
+                ApprovalStatus::Pending => return None,
+                ApprovalStatus::Resolving => {
+                    approval.status = ApprovalStatus::Resolved(Box::new(envelope.clone()));
+                }
+            }
+        }
+
+        self.store_event(session_id, envelope.clone()).await;
+        Some(envelope)
+    }
+
+    async fn store_event(
+        &self,
+        session_id: SessionId,
+        envelope: BrowserEventEnvelope,
+    ) -> BrowserEventEnvelope {
+        let sender = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let events = sessions
+                .entry(session_id)
+                .or_insert_with(SessionEvents::new);
+            events.cache.push(envelope.clone());
+            if events.cache.len() > SESSION_EVENT_CACHE_LIMIT {
+                let overflow = events.cache.len() - SESSION_EVENT_CACHE_LIMIT;
+                events.cache.drain(..overflow);
+            }
+            events.sender.clone()
+        };
+
+        let _ = sender.send(envelope.clone());
+        envelope
     }
 }
 

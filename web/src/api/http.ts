@@ -26,5 +26,10 @@ export async function requestJson<T>(path: string, init: RequestInit = {}): Prom
     return undefined as T;
   }
 
-  return (await response.json()) as T;
+  const text = await response.text();
+  if (text.length === 0) {
+    return undefined as T;
+  }
+
+  return JSON.parse(text) as T;
 }
