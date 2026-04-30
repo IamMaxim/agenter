@@ -173,9 +173,14 @@ pub struct AgentErrorEvent {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
+    use chrono::{TimeZone, Utc};
+
     use crate::{
-        AppEvent, ApprovalId, ApprovalKind, ApprovalRequestEvent, CommandEvent, SessionId,
-        UserMessageEvent,
+        AgentCapabilities, AgentProviderId, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind,
+        ApprovalRequestEvent, ApprovalResolvedEvent, CommandEvent, RunnerId, SessionId,
+        SessionInfo, SessionStatus, UserId, UserMessageEvent, WorkspaceId,
     };
 
     #[test]
@@ -235,5 +240,87 @@ mod tests {
             json["payload"]["provider_payload"]["native_id"],
             "approval-1"
         );
+    }
+
+    #[test]
+    fn round_trips_session_started_event_with_provider_context() {
+        let event = AppEvent::SessionStarted(SessionInfo {
+            session_id: SessionId::nil(),
+            owner_user_id: UserId::nil(),
+            runner_id: RunnerId::nil(),
+            workspace_id: WorkspaceId::nil(),
+            provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+            status: SessionStatus::Running,
+            external_session_id: Some("thread-1".to_owned()),
+            title: Some("Initial setup".to_owned()),
+        });
+
+        let json = serde_json::to_value(&event).expect("serialize event");
+        let decoded: AppEvent = serde_json::from_value(json.clone()).expect("deserialize event");
+
+        assert_eq!(json["type"], "session_started");
+        assert_eq!(json["payload"]["provider_id"], AgentProviderId::CODEX);
+        assert_eq!(json["payload"]["status"], "running");
+        assert_eq!(decoded, event);
+
+        let capabilities = AgentCapabilities {
+            streaming: true,
+            session_resume: true,
+            session_history: true,
+            approvals: true,
+            file_changes: true,
+            command_execution: true,
+            plan_updates: true,
+            interrupt: true,
+        };
+        let capabilities_json = serde_json::to_value(capabilities).expect("serialize caps");
+        assert_eq!(capabilities_json["session_history"], true);
+    }
+
+    #[test]
+    fn round_trips_approval_resolved_with_provider_specific_decision() {
+        let event = AppEvent::ApprovalResolved(ApprovalResolvedEvent {
+            session_id: SessionId::nil(),
+            approval_id: ApprovalId::nil(),
+            decision: ApprovalDecision::ProviderSpecific {
+                payload: serde_json::json!({
+                    "native_decision": "reject_once",
+                    "option_id": "deny-1"
+                }),
+            },
+            resolved_by_user_id: Some(UserId::nil()),
+            resolved_at: Utc
+                .with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
+                .single()
+                .expect("valid timestamp"),
+            provider_payload: None,
+        });
+
+        let json = serde_json::to_value(&event).expect("serialize event");
+        let decoded: AppEvent = serde_json::from_value(json.clone()).expect("deserialize event");
+
+        assert_eq!(json["type"], "approval_resolved");
+        assert_eq!(
+            json["payload"]["decision"],
+            serde_json::json!({
+                "decision": "provider_specific",
+                "payload": {
+                    "native_decision": "reject_once",
+                    "option_id": "deny-1"
+                }
+            })
+        );
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn parses_and_serializes_uuid_id_newtypes_without_default_generation() {
+        let raw = "00000000-0000-0000-0000-000000000042";
+        let session_id = SessionId::from_str(raw).expect("parse session id");
+        let json = serde_json::to_value(session_id).expect("serialize session id");
+        let decoded: SessionId = serde_json::from_value(json.clone()).expect("deserialize id");
+
+        assert_eq!(json, raw);
+        assert_eq!(decoded.to_string(), raw);
     }
 }

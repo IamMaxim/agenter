@@ -4,13 +4,13 @@ use serde::{Deserialize, Serialize};
 use crate::{ApprovalId, SessionId, UserId};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "decision", rename_all = "snake_case")]
 pub enum ApprovalDecision {
     Accept,
     AcceptForSession,
     Decline,
     Cancel,
-    ProviderSpecific(serde_json::Value),
+    ProviderSpecific { payload: serde_json::Value },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

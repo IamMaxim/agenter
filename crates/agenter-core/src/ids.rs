@@ -12,6 +12,10 @@ macro_rules! uuid_id {
         pub struct $name(Uuid);
 
         impl $name {
+            #[allow(
+                clippy::new_without_default,
+                reason = "default IDs must not be implicit"
+            )]
             #[must_use]
             pub fn new() -> Self {
                 Self(Uuid::new_v4())
@@ -30,12 +34,6 @@ macro_rules! uuid_id {
             #[must_use]
             pub const fn as_uuid(self) -> Uuid {
                 self.0
-            }
-        }
-
-        impl Default for $name {
-            fn default() -> Self {
-                Self::new()
             }
         }
 
