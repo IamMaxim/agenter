@@ -51,7 +51,7 @@ AGENTER_DEV_RUNNER_TOKEN=dev-runner-token \
   cargo run -p agenter-runner
 ```
 
-The adapter advertises a single configured workspace and the `qwen` provider, starts `qwen --acp --approval-mode default` per browser turn, initializes ACP, creates or resumes a session when an external session id is present, sends one prompt, normalizes known `session/update` message/error notifications and `session/request_permission` requests, routes approval answers to ACP option selections, and answers basic ACP fs/terminal client requests with inert responses.
+The adapter advertises a single configured workspace and the `qwen` provider, starts `qwen --acp --approval-mode default` per browser turn, initializes ACP, creates a session, sends one prompt, normalizes known `session/update` message/error notifications and `session/request_permission` requests, routes approval answers to ACP option selections, and answers basic ACP fs/terminal client requests with inert responses. The adapter can use an external session id if the runner command supplies one, but the current control plane does not yet persist native Qwen session ids between browser prompts.
 
 Use either an extra CLI argument or `AGENTER_SPIKE_PROMPT` to override the default permission-probing prompt:
 

@@ -242,15 +242,16 @@ Exit criterion: browser can create or resume Codex and Qwen sessions in a config
 - Update: `docs/runbooks/codex-app-server-spike.md`
 
 - [x] Promote observed Codex spike payloads into a typed adapter.
-- [x] Implement process supervision, initialize, thread create/resume, turn start, event normalization, and approval answer.
+- [x] Implement process supervision, initialize, thread start, turn start, event normalization, and approval answer.
 - [x] Add adapter tests using recorded JSON fixtures where possible.
 - [x] Run Rust verification and local Codex CLI detection when `codex` is installed.
 - [x] Commit with `feat: add codex app-server adapter`.
-- [ ] Add thread/read history replay and real interrupt cancellation once live Codex transcript confirms method names.
+- [ ] Add native thread id persistence, thread/resume, thread/read history replay, and real interrupt cancellation once live Codex transcript confirms method names.
 
 Active execution notes:
 
-- Task 3.1 adds `AGENTER_RUNNER_MODE=codex` runner mode. It advertises the configured `AGENTER_WORKSPACE`, launches `codex app-server --listen stdio://` per browser turn, initializes or resumes a thread, starts a read-only turn, normalizes known Codex JSON-RPC notifications/requests into `AppEvent`s, and forwards approval answers back to the provider request id.
+- Task 3.1 adds `AGENTER_RUNNER_MODE=codex` runner mode. It advertises the configured `AGENTER_WORKSPACE`, launches `codex app-server --listen stdio://` per browser turn, initializes a thread, starts a read-only turn, normalizes known Codex JSON-RPC notifications/requests into `AppEvent`s, and forwards approval answers back to the provider request id.
+- Native Codex thread ids are observed inside the adapter but are not persisted by the control plane yet; later browser prompts currently start fresh native threads until the session persistence/recovery work stores external session ids.
 - Adapter tests cover representative message delta, command approval, and approval decision response fixtures. Live Codex smoke was limited to installed CLI detection with `command -v codex` and `codex --version`; a real turn still requires an authenticated provider session and model/network availability.
 - Follow-up review fixes add the runner crate's explicit Tokio `sync` feature and map Codex permission approvals to the permission-specific JSON-RPC result shape from the spike runbook.
 - Task 3.1 verification passed with `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace`; local CLI detection returned `codex-cli 0.125.0`.
@@ -264,15 +265,16 @@ Active execution notes:
 - Update: `docs/runbooks/qwen-acp-spike.md`
 
 - [x] Promote observed Qwen ACP payloads into a typed adapter.
-- [x] Implement process supervision, initialize, session create/resume probe, prompt, event normalization, and permission answer.
+- [x] Implement process supervision, initialize, session create, prompt, event normalization, and permission answer.
 - [x] Add adapter tests using recorded JSON fixtures where possible.
 - [x] Run Rust verification and local Qwen CLI detection when `qwen` is installed.
 - [x] Commit with `feat: add qwen acp adapter`.
-- [ ] Add live capability-gated resume/load selection and interrupt support once live Qwen transcripts confirm supported methods.
+- [ ] Add native session id persistence, live capability-gated resume/load selection, and interrupt support once live Qwen transcripts confirm supported methods.
 
 Active execution notes:
 
-- Task 3.2 adds `AGENTER_RUNNER_MODE=qwen` runner mode. It advertises the configured `AGENTER_WORKSPACE`, launches `qwen --acp --approval-mode default` per browser turn, initializes ACP, creates or resumes a session, sends a prompt, normalizes known `session/update` and `session/request_permission` payloads, maps approval answers to ACP option selections, and answers basic fs/terminal client requests with inert responses.
+- Task 3.2 adds `AGENTER_RUNNER_MODE=qwen` runner mode. It advertises the configured `AGENTER_WORKSPACE`, launches `qwen --acp --approval-mode default` per browser turn, initializes ACP, creates a session, sends a prompt, normalizes known `session/update` and `session/request_permission` payloads, maps approval answers to ACP option selections, and answers basic fs/terminal client requests with inert responses.
+- Native Qwen session ids are observed inside the adapter but are not persisted by the control plane yet; later browser prompts currently start fresh native sessions until the session persistence/recovery work stores external session ids.
 - Adapter tests cover representative message chunk, permission request, and permission decision response fixtures. Live Qwen smoke was limited to installed CLI detection with `command -v qwen` and `qwen --version`; a real turn still requires an authenticated provider session and model/network availability.
 - Task 3.2 verification passed with `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace`; local CLI detection returned `qwen 0.15.6`.
 - Follow-up review fixes make the adapter treat the `session/prompt` JSON-RPC response as the end-of-turn completion signal, so a normal ACP turn can shut down the child process after receiving `stopReason`.

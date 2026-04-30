@@ -51,7 +51,7 @@ AGENTER_DEV_RUNNER_TOKEN=dev-runner-token \
   cargo run -p agenter-runner
 ```
 
-The adapter advertises a single configured workspace and the `codex` provider, starts `codex app-server --listen stdio://` per browser turn, initializes or resumes a thread when an external session id is present on the runner command, starts a turn with read-only sandbox policy, normalizes known message, command, file, tool, error, and approval request events, and routes approval answers back to the JSON-RPC server request id.
+The adapter advertises a single configured workspace and the `codex` provider, starts `codex app-server --listen stdio://` per browser turn, starts a thread, starts a turn with read-only sandbox policy, normalizes known message, command, file, tool, error, and approval request events, and routes approval answers back to the JSON-RPC server request id. The adapter can use an external thread id if the runner command supplies one, but the current control plane does not yet persist native thread ids between browser prompts.
 
 Use either an extra CLI argument or `AGENTER_SPIKE_PROMPT` to override the default approval-probing prompt:
 
