@@ -82,6 +82,7 @@ Active execution notes:
 - Live Codex/Qwen provider execution remains manual because it requires installed and authenticated local provider CLIs; runbooks record the exact spike commands and expected output shape.
 - Task 1.1 defines shared core IDs as UUID newtypes and normalized app events as adjacently tagged serde JSON for later runner/browser protocol envelopes.
 - Task 1.2 defines typed runner and browser WebSocket payload DTOs only; actual WebSocket server/client behavior remains Task 1.4.
+- Task 1.3 added SQLx Postgres migration and repository primitives. `DATABASE_URL` was not configured locally, so `agenter-db` SQLx integration tests compiled and early-skipped their database bodies; run with `DATABASE_URL=postgres://... cargo test -p agenter-db` to execute migrations and repository assertions against Postgres.
 
 ## Milestone 1: Core Domain, Storage, and Runner Protocol
 
@@ -127,11 +128,11 @@ Exit criterion: the control plane and runner can register a runner, register wor
 - Create: `crates/agenter-db/src/models.rs`
 - Create: `crates/agenter-db/src/repositories.rs`
 
-- [ ] Create the initial Postgres schema for users, auth identities, password credentials, OIDC providers, runners, runner tokens, workspaces, agent sessions, connector accounts, session bindings, pending approvals, event cache, and connector deliveries.
-- [ ] Implement repository functions for creating a user, registering a runner, upserting a workspace, creating a session, appending an event cache row, and creating/resolving an approval.
-- [ ] Add SQLx-backed tests that can run against `DATABASE_URL`, and mark them ignored when no database is configured.
-- [ ] Run `cargo test -p agenter-db`; if no database is configured, record the skipped integration status in the active plan.
-- [ ] Commit with `feat: add initial postgres schema`.
+- [x] Create the initial Postgres schema for users, auth identities, password credentials, OIDC providers, runners, runner tokens, workspaces, agent sessions, connector accounts, session bindings, pending approvals, event cache, and connector deliveries.
+- [x] Implement repository functions for creating a user, registering a runner, upserting a workspace, creating a session, appending an event cache row, and creating/resolving an approval.
+- [x] Add SQLx-backed tests that can run against `DATABASE_URL`, and mark them ignored when no database is configured.
+- [x] Run `cargo test -p agenter-db`; if no database is configured, record the skipped integration status in the active plan.
+- [x] Commit with `feat: add initial postgres schema`.
 
 ### Task 1.4: Build Minimal Control Plane and Fake Runner Flow
 
