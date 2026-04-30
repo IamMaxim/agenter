@@ -257,6 +257,7 @@ Active execution notes:
 - Follow-up review fixes add the runner crate's explicit Tokio `sync` feature and map Codex permission approvals to the permission-specific JSON-RPC result shape from the spike runbook.
 - Task 3.1 verification passed with `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace`; local CLI detection returned `codex-cli 0.125.0`.
 - Codex debugging follow-up adds request/response correlation for `initialize`, `thread/start`, and `thread/resume`, fails fast when startup responses contain errors or no thread id, records recent provider stderr in adapter errors, and adds `just codex-spike` for payload-enabled direct provider diagnostics. Local sandbox evidence showed `codex app-server` can fail to access `~/.codex/sessions` or write `~/.codex/shell_snapshots/...` with `Operation not permitted`.
+- Live Codex 0.125 follow-up normalizes `item/agentMessage/delta` and `item/completed` agent-message payloads, ignores echoed `userMessage` and `reasoning` item events, scopes provider messages to the active native thread/turn, and treats `turn/completed` as the adapter/spike completion signal. Outside-sandbox smoke with `just codex-spike /tmp/agenter-codex-debug 'Reply with OK only. Do not use tools.'` succeeded and observed `OK` followed by `turn/completed` with `error: null`.
 
 ### Task 3.2: Qwen ACP Adapter
 

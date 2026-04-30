@@ -47,7 +47,7 @@ Payload-logging diagnostic command:
 just codex-spike /path/to/spike-workspace
 ```
 
-Expected early success markers are a JSON-RPC response for `initialize`, a JSON-RPC response or notification containing a Codex thread id for `thread/start`, then a sent `turn/start` request. If the spike times out before `turn/start`, inspect the provider stderr lines above the timeout first.
+Expected success markers are a JSON-RPC response for `initialize`, a JSON-RPC response or notification containing a Codex thread id for `thread/start`, a sent `turn/start` request, one or more item events such as `item/agentMessage/delta`, then `turn/completed` with a null error. If the spike times out before `turn/start`, inspect the provider stderr lines above the timeout first.
 
 Agenter runner adapter command:
 
@@ -59,7 +59,7 @@ AGENTER_DEV_RUNNER_TOKEN=dev-runner-token \
   cargo run -p agenter-runner
 ```
 
-The adapter advertises a single configured workspace and the `codex` provider, starts `codex app-server --listen stdio://` per browser turn, starts a thread, starts a turn with read-only sandbox policy, normalizes known message, command, file, tool, error, and approval request events, and routes approval answers back to the JSON-RPC server request id. The adapter can use an external thread id if the runner command supplies one, but the current control plane does not yet persist native thread ids between browser prompts.
+The adapter advertises a single configured workspace and the `codex` provider, starts `codex app-server --listen stdio://` per browser turn, starts a thread, starts a turn with read-only sandbox policy, normalizes known message, command, file, tool, error, and approval request events, and routes approval answers back to the JSON-RPC server request id. Live Codex 0.125 agent text currently arrives as `item/agentMessage/delta` and `item/completed` with `params.item.type == "agentMessage"`; echoed `userMessage` and `reasoning` item events are intentionally ignored by the adapter. The adapter can use an external thread id if the runner command supplies one, but the current control plane does not yet persist native thread ids between browser prompts.
 
 Use either an extra CLI argument or `AGENTER_SPIKE_PROMPT` to override the default approval-probing prompt:
 
@@ -68,7 +68,7 @@ AGENTER_SPIKE_PROMPT='Reply briefly and request approval for one harmless comman
   cargo run -p agenter-runner --bin codex_app_server_spike -- /path/to/spike-workspace
 ```
 
-The Rust spike starts `codex app-server --listen stdio://` in the supplied workspace, sends JSON-RPC requests over stdin, reads JSONL from stdout, logs request/notification method names, declines the first observed approval request, then closes stdin and kills the child if it does not exit promptly. If `codex` is missing or the account is not authenticated, the binary should fail with a local setup error without affecting compilation.
+The Rust spike starts `codex app-server --listen stdio://` in the supplied workspace, sends JSON-RPC requests over stdin, reads JSONL from stdout, logs request/notification method names, declines the first observed approval request, and exits successfully when the active turn emits `turn/completed` with a null error. If `codex` is missing or the account is not authenticated, the binary should fail with a local setup error without affecting compilation.
 
 Observed local failure on 2026-04-30: under the Codex-controlled sandbox, `codex app-server` reached `thread/start` but returned a JSON-RPC error saying it could not access `~/.codex/sessions`; related stderr may also mention `~/.codex/shell_snapshots/...` and `Operation not permitted`. When this appears, rerun `just codex-spike /path/to/workspace` from a normal terminal to distinguish an Agenter adapter issue from a Codex runtime permission issue.
 
@@ -284,7 +284,7 @@ Approval decisions observed in the generated schema include `accept`, `acceptFor
 Manual provider run status:
 
 - Command: `cargo run -p agenter-runner --bin codex_app_server_spike -- /path/to/spike-workspace`
-- Status: not run during Task 0.3 verification; live execution requires an installed and authenticated local `codex` CLI.
+- Status: live execution requires an installed and authenticated local `codex` CLI. Outside-sandbox smoke on 2026-04-30 succeeded with `just codex-spike /tmp/agenter-codex-debug 'Reply with OK only. Do not use tools.'`.
 - Expected log shape:
 
 ```text
@@ -293,9 +293,10 @@ json-rpc request direction="send" method="initialize" id=1
 json-rpc request direction="send" method="thread/start" id=2
 json-rpc method direction="recv" provider="codex" method="..."
 json-rpc request direction="send" method="turn/start" id=3
-json-rpc method direction="recv" provider="codex" method="item/commandExecution/requestApproval"
-json-rpc response direction="send" id=...
-codex app-server spike finished approval_seen=true thread_id=...
+json-rpc method direction="recv" provider="codex" method="item/agentMessage/delta"
+json-rpc method direction="recv" provider="codex" method="item/completed"
+json-rpc method direction="recv" provider="codex" method="turn/completed"
+codex app-server spike finished approval_seen=false thread_id=...
 ```
 
 ## Cleanup

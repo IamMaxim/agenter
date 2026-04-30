@@ -95,7 +95,7 @@ async fn run_spike(
     )
     .await?;
 
-    while Instant::now() < deadline && !approval_seen {
+    while Instant::now() < deadline {
         let active_deadline = if turn_started {
             deadline
         } else {
@@ -116,8 +116,21 @@ async fn run_spike(
 
         let message: Value = serde_json::from_str(&line)
             .with_context(|| format!("codex app-server emitted invalid JSON line: {line}"))?;
+        if !message_belongs_to_thread(&message, thread_id.as_deref()) {
+            continue;
+        }
         log_message("codex", &message);
 
+        if thread_id.is_none() {
+            if let Some(observed_thread_id) = codex_thread_id(&message) {
+                thread_id = Some(observed_thread_id.to_owned());
+            }
+        }
+        if let Some(completion) = spike_turn_completion(&message) {
+            completion.map_err(anyhow::Error::msg)?;
+            info!(approval_seen, thread_id, "codex app-server spike finished");
+            return Ok(());
+        }
         if let Some(observed_thread_id) = codex_thread_id(&message) {
             thread_id = Some(observed_thread_id.to_owned());
         }
@@ -157,12 +170,9 @@ async fn run_spike(
         }
     }
 
-    if !approval_seen {
-        warn!("codex spike timed out before observing an approval request");
-    }
-
-    info!(approval_seen, thread_id, "codex app-server spike finished");
-    Ok(())
+    Err(anyhow!(
+        "timed out waiting for codex turn completion; approval_seen={approval_seen}"
+    ))
 }
 
 fn parse_args() -> Result<(PathBuf, String)> {
@@ -292,6 +302,43 @@ fn thread_start_error_summary(message: &Value, thread_start_id: u64) -> Option<S
     Some(format!("codex thread/start failed: {code} {message}"))
 }
 
+fn message_belongs_to_thread(message: &Value, target_thread_id: Option<&str>) -> bool {
+    let Some(target_thread_id) = target_thread_id else {
+        return true;
+    };
+    let Some(message_thread_id) = message_thread_id(message) else {
+        return true;
+    };
+    message_thread_id == target_thread_id
+}
+
+fn message_thread_id(message: &Value) -> Option<&str> {
+    string_at(
+        message,
+        &[
+            "/params/threadId",
+            "/params/thread/id",
+            "/result/threadId",
+            "/result/thread/id",
+        ],
+    )
+}
+
+fn spike_turn_completion(message: &Value) -> Option<std::result::Result<(), String>> {
+    if jsonrpc_method(message) != Some("turn/completed") {
+        return None;
+    }
+    let error = message.pointer("/params/turn/error");
+    if matches!(error, None | Some(Value::Null)) {
+        return Some(Ok(()));
+    }
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown provider error");
+    Some(Err(format!("codex turn failed: {message}")))
+}
+
 fn is_approval_request(message: &Value) -> bool {
     matches!(
         jsonrpc_method(message),
@@ -301,6 +348,12 @@ fn is_approval_request(message: &Value) -> bool {
                 | "item/permissions/requestApproval"
         )
     ) && message.get("id").is_some()
+}
+
+fn string_at<'a>(message: &'a Value, pointers: &[&str]) -> Option<&'a str> {
+    pointers
+        .iter()
+        .find_map(|pointer| message.pointer(pointer).and_then(Value::as_str))
 }
 
 fn codex_approval_response(message: &Value) -> Value {
@@ -378,6 +431,65 @@ mod tests {
             thread_start_error_summary(&message, 2),
             Some("codex thread/start failed: -32603 permission denied".to_owned())
         );
+    }
+
+    #[test]
+    fn treats_successful_turn_completed_as_spike_completion() {
+        let message = json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "completed",
+                    "error": null
+                }
+            }
+        });
+
+        assert_eq!(spike_turn_completion(&message), Some(Ok(())));
+    }
+
+    #[test]
+    fn treats_failed_turn_completed_as_spike_error() {
+        let message = json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "failed",
+                    "error": {"message": "model failed"}
+                }
+            }
+        });
+
+        assert_eq!(
+            spike_turn_completion(&message),
+            Some(Err("codex turn failed: model failed".to_owned()))
+        );
+    }
+
+    #[test]
+    fn filters_spike_events_to_target_thread() {
+        let target = Some("thread-1");
+        let matching = json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread-1",
+                "delta": "ok"
+            }
+        });
+        let unrelated = json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread-2",
+                "delta": "wrong"
+            }
+        });
+
+        assert!(message_belongs_to_thread(&matching, target));
+        assert!(!message_belongs_to_thread(&unrelated, target));
     }
 
     #[test]

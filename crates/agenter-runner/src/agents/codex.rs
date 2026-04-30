@@ -50,6 +50,7 @@ pub struct CodexAppServer {
     stdout: BufReader<ChildStdout>,
     next_id: u64,
     thread_id: Option<String>,
+    turn_id: Option<String>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
@@ -90,6 +91,7 @@ impl CodexAppServer {
             stdout: BufReader::new(stdout),
             next_id: 1,
             thread_id: None,
+            turn_id: None,
             stderr_tail,
         })
     }
@@ -180,18 +182,23 @@ impl CodexAppServer {
             ).as_deref(),
             "starting codex turn"
         );
-        self.send_request(
-            "turn/start",
-            json!({
-                "threadId": thread_id,
-                "cwd": request.workspace_path,
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
-                "sandboxPolicy": {"type": "readOnly", "networkAccess": false},
-                "input": [{"type": "text", "text": request.prompt}]
-            }),
-        )
-        .await?;
+        let turn_start_id = self
+            .send_request(
+                "turn/start",
+                json!({
+                    "threadId": thread_id,
+                    "cwd": request.workspace_path,
+                    "approvalPolicy": "on-request",
+                    "approvalsReviewer": "user",
+                    "sandboxPolicy": {"type": "readOnly", "networkAccess": false},
+                    "input": [{"type": "text", "text": request.prompt}]
+                }),
+            )
+            .await?;
+        let response = self.read_response(turn_start_id, "turn/start").await?;
+        if let Some(turn_id) = codex_turn_id(&response) {
+            self.turn_id = Some(turn_id.to_owned());
+        }
         Ok(())
     }
 
@@ -214,6 +221,10 @@ impl CodexAppServer {
         if let Some(thread_id) = codex_thread_id(&message) {
             self.thread_id = Some(thread_id.to_owned());
             tracing::info!(provider_thread_id = %thread_id, "observed codex thread id");
+        }
+        if let Some(turn_id) = codex_turn_id(&message) {
+            self.turn_id = Some(turn_id.to_owned());
+            tracing::debug!(provider_turn_id = %turn_id, "observed codex turn id");
         }
         Ok(Some(message))
     }
@@ -339,7 +350,20 @@ pub async fn run_codex_turn(
     }
 
     server.send_turn(&request).await?;
+    let mut scope = CodexTurnScope {
+        thread_id: server.thread_id.clone(),
+        turn_id: server.turn_id.clone(),
+    };
     while let Some(message) = server.next_message().await? {
+        scope.observe(&message);
+        if !codex_message_belongs_to_scope(&message, &scope) {
+            tracing::debug!(
+                provider_thread_id = message_thread_id(&message),
+                provider_turn_id = message_turn_id(&message),
+                "ignored codex message outside active turn scope"
+            );
+            continue;
+        }
         if let Some((approval_id, native_request_id, approval_kind, event)) =
             normalize_codex_approval_request(request.session_id, &message)
         {
@@ -364,8 +388,8 @@ pub async fn run_codex_turn(
             continue;
         }
 
-        for event in normalize_codex_message(request.session_id, &message) {
-            let completed = matches!(event, AppEvent::AgentMessageCompleted(_));
+        for event in normalize_codex_message_for_scope(request.session_id, &message, &scope) {
+            let completed = jsonrpc_method(&message) == Some("turn/completed");
             event_sender.send(event).ok();
             if completed {
                 tracing::info!(session_id = %request.session_id, "codex turn completed");
@@ -387,11 +411,28 @@ async fn write_json(stdin: &mut ChildStdin, message: &Value) -> anyhow::Result<(
 }
 
 pub fn normalize_codex_message(session_id: SessionId, message: &Value) -> Vec<AppEvent> {
+    normalize_codex_message_inner(session_id, message)
+}
+
+fn normalize_codex_message_for_scope(
+    session_id: SessionId,
+    message: &Value,
+    scope: &CodexTurnScope,
+) -> Vec<AppEvent> {
+    if !codex_message_belongs_to_scope(message, scope) {
+        return Vec::new();
+    }
+    normalize_codex_message_inner(session_id, message)
+}
+
+fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<AppEvent> {
     let Some(method) = jsonrpc_method(message) else {
         return Vec::new();
     };
     match method {
-        "agentMessage/delta" => text_delta(session_id, message).into_iter().collect(),
+        "agentMessage/delta" | "item/agentMessage/delta" => {
+            text_delta(session_id, message).into_iter().collect()
+        }
         "agentMessage/completed" | "agentMessage/complete" => {
             message_completed(session_id, message).into_iter().collect()
         }
@@ -520,6 +561,7 @@ fn message_completed(session_id: SessionId, message: &Value) -> Option<AppEvent>
                 "/params/content",
                 "/params/text",
                 "/params/message",
+                "/params/item/text",
                 "/params/item/content",
             ],
         )
@@ -529,6 +571,10 @@ fn message_completed(session_id: SessionId, message: &Value) -> Option<AppEvent>
 }
 
 fn item_started(session_id: SessionId, message: &Value) -> Option<AppEvent> {
+    if should_ignore_item_event(message) {
+        return None;
+    }
+
     if let Some(command) = string_at(message, &["/params/command", "/params/item/command"]) {
         return Some(AppEvent::CommandStarted(CommandEvent {
             session_id,
@@ -553,6 +599,13 @@ fn item_started(session_id: SessionId, message: &Value) -> Option<AppEvent> {
 }
 
 fn item_completed(session_id: SessionId, message: &Value) -> Option<AppEvent> {
+    if item_type(message) == Some("agentMessage") {
+        return message_completed(session_id, message);
+    }
+    if should_ignore_item_event(message) {
+        return None;
+    }
+
     if string_at(message, &["/params/command", "/params/item/command"]).is_some() {
         return Some(AppEvent::CommandCompleted(CommandCompletedEvent {
             session_id,
@@ -600,6 +653,62 @@ fn jsonrpc_method(message: &Value) -> Option<&str> {
     message.get("method")?.as_str()
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CodexTurnScope {
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+}
+
+impl CodexTurnScope {
+    fn observe(&mut self, message: &Value) {
+        if self.thread_id.is_none() {
+            self.thread_id = codex_thread_id(message).map(str::to_owned);
+        }
+        if self.turn_id.is_none() {
+            self.turn_id = codex_turn_id(message).map(str::to_owned);
+        }
+    }
+}
+
+fn codex_message_belongs_to_scope(message: &Value, scope: &CodexTurnScope) -> bool {
+    if let (Some(expected), Some(actual)) = (scope.thread_id.as_deref(), message_thread_id(message))
+    {
+        if actual != expected {
+            return false;
+        }
+    }
+    if let (Some(expected), Some(actual)) = (scope.turn_id.as_deref(), message_turn_id(message)) {
+        if actual != expected {
+            return false;
+        }
+    }
+    true
+}
+
+fn message_thread_id(message: &Value) -> Option<&str> {
+    string_at(
+        message,
+        &[
+            "/params/threadId",
+            "/params/thread/id",
+            "/result/threadId",
+            "/result/thread/id",
+        ],
+    )
+}
+
+fn message_turn_id(message: &Value) -> Option<&str> {
+    string_at(
+        message,
+        &[
+            "/params/turnId",
+            "/params/turn/id",
+            "/result/turnId",
+            "/result/turn/id",
+        ],
+    )
+}
+
 fn codex_thread_id(message: &Value) -> Option<&str> {
     message
         .pointer("/result/thread/id")
@@ -608,6 +717,10 @@ fn codex_thread_id(message: &Value) -> Option<&str> {
         .or_else(|| message.pointer("/result/threadId").and_then(Value::as_str))
         .or_else(|| message.pointer("/params/thread/id").and_then(Value::as_str))
         .or_else(|| message.pointer("/params/threadId").and_then(Value::as_str))
+}
+
+fn codex_turn_id(message: &Value) -> Option<&str> {
+    message_turn_id(message)
 }
 
 fn codex_jsonrpc_error_summary(method: &str, message: &Value) -> Option<String> {
@@ -661,6 +774,7 @@ fn message_id(message: &Value) -> String {
         &[
             "/params/messageId",
             "/params/message_id",
+            "/params/itemId",
             "/params/item/id",
             "/params/id",
             "/params/turnId",
@@ -682,6 +796,14 @@ fn item_id(message: &Value) -> String {
     )
     .unwrap_or("codex-item")
     .to_owned()
+}
+
+fn item_type(message: &Value) -> Option<&str> {
+    string_at(message, &["/params/item/type", "/params/type"])
+}
+
+fn should_ignore_item_event(message: &Value) -> bool {
+    matches!(item_type(message), Some("userMessage" | "reasoning"))
 }
 
 fn string_at<'a>(message: &'a Value, pointers: &[&str]) -> Option<&'a str> {
@@ -724,6 +846,126 @@ mod tests {
         };
         assert_eq!(delta.message_id, "msg-1");
         assert_eq!(delta.delta, "hello");
+    }
+
+    #[test]
+    fn normalizes_live_codex_item_agent_message_delta() {
+        let message = json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "msg-live-1",
+                "delta": "Under"
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        assert_eq!(events.len(), 1);
+        let AppEvent::AgentMessageDelta(delta) = &events[0] else {
+            panic!("expected message delta");
+        };
+        assert_eq!(delta.message_id, "msg-live-1");
+        assert_eq!(delta.delta, "Under");
+    }
+
+    #[test]
+    fn normalizes_live_codex_completed_agent_message_item() {
+        let message = json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "msg-live-1",
+                    "type": "agentMessage",
+                    "text": "Done."
+                }
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        assert_eq!(events.len(), 1);
+        let AppEvent::AgentMessageCompleted(completed) = &events[0] else {
+            panic!("expected message completed");
+        };
+        assert_eq!(completed.message_id, "msg-live-1");
+        assert_eq!(completed.content.as_deref(), Some("Done."));
+    }
+
+    #[test]
+    fn ignores_live_codex_user_and_reasoning_items() {
+        let user_message = json!({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "id": "user-1",
+                    "type": "userMessage",
+                    "content": [{"type": "text", "text": "hello"}]
+                }
+            }
+        });
+        let reasoning = json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "id": "reasoning-1",
+                    "type": "reasoning",
+                    "content": []
+                }
+            }
+        });
+
+        assert!(normalize_codex_message(SessionId::nil(), &user_message).is_empty());
+        assert!(normalize_codex_message(SessionId::nil(), &reasoning).is_empty());
+    }
+
+    #[test]
+    fn filters_live_codex_messages_to_target_thread_and_turn() {
+        let target = CodexTurnScope {
+            thread_id: Some("thread-1".to_owned()),
+            turn_id: Some("turn-1".to_owned()),
+        };
+        let matching = json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "msg-live-1",
+                "delta": "ok"
+            }
+        });
+        let other_thread = json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread-2",
+                "turnId": "turn-1",
+                "itemId": "msg-live-2",
+                "delta": "wrong"
+            }
+        });
+        let other_turn = json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-2",
+                "itemId": "msg-live-3",
+                "delta": "wrong"
+            }
+        });
+
+        assert_eq!(
+            normalize_codex_message_for_scope(SessionId::nil(), &matching, &target).len(),
+            1
+        );
+        assert!(
+            normalize_codex_message_for_scope(SessionId::nil(), &other_thread, &target).is_empty()
+        );
+        assert!(
+            normalize_codex_message_for_scope(SessionId::nil(), &other_turn, &target).is_empty()
+        );
     }
 
     #[test]

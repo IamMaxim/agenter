@@ -111,6 +111,7 @@ just codex-spike /path/to/workspace
 ```
 
 The spike logs raw JSON-RPC previews with `AGENTER_LOG_PAYLOADS=1`. A failure mentioning `~/.codex/sessions`, `~/.codex/shell_snapshots`, or `Operation not permitted` points at local Codex runtime permissions rather than the browser or control-plane pipeline.
+For live Codex 0.125, a successful no-tool diagnostic should show `item/agentMessage/delta`, `item/completed`, and `turn/completed` with a null error for the active thread. When this tool sandbox blocks access to `~/.codex`, rerun the same `just codex-spike` command from a normal terminal or approve the outside-sandbox command.
 
 Runner logs are written to:
 
