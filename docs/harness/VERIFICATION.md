@@ -1,6 +1,6 @@
 # Verification Policy
 
-Verification should scale with the current phase. This repository currently has no application code, so documentation verification is the only available check.
+Verification should scale with the current phase. Rust workspace verification is active once the workspace skeleton exists.
 
 ## Documentation Phase
 
@@ -19,7 +19,7 @@ Review:
 
 ## Rust Phase
 
-Once Rust crates exist, expected baseline verification is:
+Run the Rust baseline verification after any Rust workspace, crate, or source change:
 
 ```sh
 cargo fmt --all -- --check
@@ -62,4 +62,3 @@ When verification cannot run, record:
 - failure output summary;
 - whether it is a product failure, missing dependency, or environment limitation;
 - next step to make the verification runnable.
-

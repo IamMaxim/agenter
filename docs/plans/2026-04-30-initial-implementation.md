@@ -52,12 +52,12 @@ Exit criterion: both provider protocols have local spike runbooks and either wor
 - Create: `crates/agenter-runner/src/main.rs`
 - Modify: `docs/harness/VERIFICATION.md`
 
-- [ ] Add a workspace root `Cargo.toml` with resolver 2 and shared workspace dependency versions.
-- [ ] Add minimal library crates for `agenter-core`, `agenter-protocol`, and `agenter-db`.
-- [ ] Add minimal binary crates for `agenter-control-plane` and `agenter-runner`.
-- [ ] Add `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace` as active Rust phase verification in `docs/harness/VERIFICATION.md`.
-- [ ] Run the Rust verification commands and fix failures.
-- [ ] Commit with `chore: scaffold rust workspace`.
+- [x] Add a workspace root `Cargo.toml` with resolver 2 and shared workspace dependency versions.
+- [x] Add minimal library crates for `agenter-core`, `agenter-protocol`, and `agenter-db`.
+- [x] Add minimal binary crates for `agenter-control-plane` and `agenter-runner`.
+- [x] Add `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace` as active Rust phase verification in `docs/harness/VERIFICATION.md`.
+- [x] Run the Rust verification commands and fix failures.
+- [x] Commit with `chore: scaffold rust workspace`.
 
 ### Task 0.3: Implement Provider Spike Binaries
 
