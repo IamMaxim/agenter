@@ -69,12 +69,17 @@ Exit criterion: both provider protocols have local spike runbooks and either wor
 - Modify: `docs/runbooks/codex-app-server-spike.md`
 - Modify: `docs/runbooks/qwen-acp-spike.md`
 
-- [ ] Add a Codex spike binary that starts `codex app-server` in a supplied workspace path, writes JSON-RPC requests on stdin, reads JSONL responses, logs method names, and exits cleanly.
-- [ ] Add a Qwen spike binary that starts `qwen --acp` in a supplied workspace path, writes ACP JSON-RPC requests on stdin, reads responses/notifications, logs method names, and exits cleanly.
-- [ ] Keep provider method names and payloads isolated in the spike binaries until observed behavior is recorded.
-- [ ] Update each runbook with the command to run the corresponding spike binary and a section for observed output.
-- [ ] Run `cargo fmt --all -- --check` and `cargo check --workspace`.
-- [ ] Commit with `test: add provider protocol spike binaries`.
+- [x] Add a Codex spike binary that starts `codex app-server` in a supplied workspace path, writes JSON-RPC requests on stdin, reads JSONL responses, logs method names, and exits cleanly.
+- [x] Add a Qwen spike binary that starts `qwen --acp` in a supplied workspace path, writes ACP JSON-RPC requests on stdin, reads responses/notifications, logs method names, and exits cleanly.
+- [x] Keep provider method names and payloads isolated in the spike binaries until observed behavior is recorded.
+- [x] Update each runbook with the command to run the corresponding spike binary and a section for observed output.
+- [x] Run `cargo fmt --all -- --check` and `cargo check --workspace`.
+- [x] Commit with `test: add provider protocol spike binaries`.
+
+Active execution notes:
+
+- Task 0.3 added runner-only Tokio/serde_json spike binaries and kept provider payloads local to those binaries.
+- Live Codex/Qwen provider execution remains manual because it requires installed and authenticated local provider CLIs; runbooks record the exact spike commands and expected output shape.
 
 ## Milestone 1: Core Domain, Storage, and Runner Protocol
 

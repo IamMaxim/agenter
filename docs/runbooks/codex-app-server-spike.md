@@ -35,6 +35,21 @@ cd /path/to/spike-workspace
 codex app-server --listen stdio://
 ```
 
+Rust spike binary command:
+
+```sh
+cargo run -p agenter-runner --bin codex_app_server_spike -- /path/to/spike-workspace
+```
+
+Use either an extra CLI argument or `AGENTER_SPIKE_PROMPT` to override the default approval-probing prompt:
+
+```sh
+AGENTER_SPIKE_PROMPT='Reply briefly and request approval for one harmless command.' \
+  cargo run -p agenter-runner --bin codex_app_server_spike -- /path/to/spike-workspace
+```
+
+The Rust spike starts `codex app-server --listen stdio://` in the supplied workspace, sends JSON-RPC requests over stdin, reads JSONL from stdout, logs request/notification method names, declines the first observed approval request, then closes stdin and kills the child if it does not exit promptly. If `codex` is missing or the account is not authenticated, the binary should fail with a local setup error without affecting compilation.
+
 For an executable spike, use the JSONL client below. It starts the server, sends initialize, creates a thread, sends one turn, logs all responses/notifications/requests, and auto-denies the first approval request so the turn can continue.
 
 ```sh
@@ -241,6 +256,25 @@ These names were seen from the locally generated app-server schema on 2026-04-30
 ```
 
 Approval decisions observed in the generated schema include `accept`, `acceptForSession`, `decline`, and `cancel` for command and file-change approval requests. Command approvals also include provider-specific policy amendment decisions.
+
+## Observed Rust Spike Output
+
+Manual provider run status:
+
+- Command: `cargo run -p agenter-runner --bin codex_app_server_spike -- /path/to/spike-workspace`
+- Status: not run during Task 0.3 verification; live execution requires an installed and authenticated local `codex` CLI.
+- Expected log shape:
+
+```text
+starting codex app-server spike
+json-rpc request direction="send" method="initialize" id=1
+json-rpc request direction="send" method="thread/start" id=2
+json-rpc method direction="recv" provider="codex" method="..."
+json-rpc request direction="send" method="turn/start" id=3
+json-rpc method direction="recv" provider="codex" method="item/commandExecution/requestApproval"
+json-rpc response direction="send" id=...
+codex app-server spike finished approval_seen=true thread_id=...
+```
 
 ## Cleanup
 

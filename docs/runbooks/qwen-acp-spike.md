@@ -35,6 +35,21 @@ cd /path/to/spike-workspace
 qwen --acp --approval-mode default
 ```
 
+Rust spike binary command:
+
+```sh
+cargo run -p agenter-runner --bin qwen_acp_spike -- /path/to/spike-workspace
+```
+
+Use either an extra CLI argument or `AGENTER_SPIKE_PROMPT` to override the default permission-probing prompt:
+
+```sh
+AGENTER_SPIKE_PROMPT='Reply briefly and request permission for one harmless command.' \
+  cargo run -p agenter-runner --bin qwen_acp_spike -- /path/to/spike-workspace
+```
+
+The Rust spike starts `qwen --acp --approval-mode default` in the supplied workspace, sends ACP JSON-RPC requests over stdin, reads JSONL from stdout, logs response/notification/request method names, answers the first permission request with a reject option when available, handles basic ACP file-system and terminal client requests with inert responses, then closes stdin and kills the child if it does not exit promptly. If `qwen` is missing or the account is not authenticated, the binary should fail with a local setup error without affecting compilation.
+
 For an executable spike, use the JSONL client below. It starts Qwen in ACP mode, sends `initialize`, creates a session, sends one prompt, logs all responses/notifications/requests, and answers the first permission request with a reject option when the agent offers one.
 
 ```sh
@@ -266,6 +281,25 @@ Permission option kinds in the bundled SDK are `allow_once`, `allow_always`, `re
 
 ```json
 {"id":"agent-request-id","result":{"outcome":{"outcome":"cancelled"}}}
+```
+
+## Observed Rust Spike Output
+
+Manual provider run status:
+
+- Command: `cargo run -p agenter-runner --bin qwen_acp_spike -- /path/to/spike-workspace`
+- Status: not run during Task 0.3 verification; live execution requires an installed and authenticated local `qwen` CLI.
+- Expected log shape:
+
+```text
+starting qwen ACP spike
+json-rpc request direction="send" method="initialize" id=1
+json-rpc request direction="send" method="session/new" id=2
+json-rpc method direction="recv" provider="qwen" method="..."
+json-rpc request direction="send" method="session/prompt" id=3
+json-rpc method direction="recv" provider="qwen" method="session/request_permission"
+json-rpc response direction="send" id=...
+qwen ACP spike finished permission_seen=true session_id=...
 ```
 
 ## Cleanup
