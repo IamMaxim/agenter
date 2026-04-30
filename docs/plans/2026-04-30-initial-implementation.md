@@ -81,6 +81,7 @@ Active execution notes:
 - Task 0.3 added runner-only Tokio/serde_json spike binaries and kept provider payloads local to those binaries.
 - Live Codex/Qwen provider execution remains manual because it requires installed and authenticated local provider CLIs; runbooks record the exact spike commands and expected output shape.
 - Task 1.1 defines shared core IDs as UUID newtypes and normalized app events as adjacently tagged serde JSON for later runner/browser protocol envelopes.
+- Task 1.2 defines typed runner and browser WebSocket payload DTOs only; actual WebSocket server/client behavior remains Task 1.4.
 
 ## Milestone 1: Core Domain, Storage, and Runner Protocol
 
@@ -111,11 +112,11 @@ Exit criterion: the control plane and runner can register a runner, register wor
 - Create: `crates/agenter-protocol/src/runner.rs`
 - Create: `crates/agenter-protocol/src/browser.rs`
 
-- [ ] Define runner handshake, heartbeat, command, response, and event envelopes with request IDs.
-- [ ] Define browser WebSocket subscribe and event envelopes.
-- [ ] Add serde round-trip tests for runner hello, agent input command, approval answer command, and agent event.
-- [ ] Run `cargo test -p agenter-protocol`.
-- [ ] Commit with `feat: define runner protocol`.
+- [x] Define runner handshake, heartbeat, command, response, and event envelopes with request IDs.
+- [x] Define browser WebSocket subscribe and event envelopes.
+- [x] Add serde round-trip tests for runner hello, agent input command, approval answer command, and agent event.
+- [x] Run `cargo test -p agenter-protocol`.
+- [x] Commit with `feat: define runner protocol`.
 
 ### Task 1.3: Add Database Migrations and Repository Layer
 

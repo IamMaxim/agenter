@@ -28,6 +28,8 @@ name = "agenter-protocol"
 version = "0.1.0"
 dependencies = [
  "agenter-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
