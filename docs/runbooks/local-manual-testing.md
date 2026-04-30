@@ -104,6 +104,14 @@ just qwen-runner /path/to/workspace
 
 The real provider runners require authenticated local `codex` or `qwen` CLIs and currently start fresh native provider sessions for each browser prompt until native session ID persistence is implemented.
 
+If Codex sessions accept messages but never stream a response, run the direct provider diagnostic:
+
+```sh
+just codex-spike /path/to/workspace
+```
+
+The spike logs raw JSON-RPC previews with `AGENTER_LOG_PAYLOADS=1`. A failure mentioning `~/.codex/sessions`, `~/.codex/shell_snapshots`, or `Operation not permitted` points at local Codex runtime permissions rather than the browser or control-plane pipeline.
+
 Runner logs are written to:
 
 ```text

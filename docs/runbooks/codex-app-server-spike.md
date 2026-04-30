@@ -41,6 +41,14 @@ Rust spike binary command:
 cargo run -p agenter-runner --bin codex_app_server_spike -- /path/to/spike-workspace
 ```
 
+Payload-logging diagnostic command:
+
+```sh
+just codex-spike /path/to/spike-workspace
+```
+
+Expected early success markers are a JSON-RPC response for `initialize`, a JSON-RPC response or notification containing a Codex thread id for `thread/start`, then a sent `turn/start` request. If the spike times out before `turn/start`, inspect the provider stderr lines above the timeout first.
+
 Agenter runner adapter command:
 
 ```sh
@@ -61,6 +69,8 @@ AGENTER_SPIKE_PROMPT='Reply briefly and request approval for one harmless comman
 ```
 
 The Rust spike starts `codex app-server --listen stdio://` in the supplied workspace, sends JSON-RPC requests over stdin, reads JSONL from stdout, logs request/notification method names, declines the first observed approval request, then closes stdin and kills the child if it does not exit promptly. If `codex` is missing or the account is not authenticated, the binary should fail with a local setup error without affecting compilation.
+
+Observed local failure on 2026-04-30: under the Codex-controlled sandbox, `codex app-server` reached `thread/start` but returned a JSON-RPC error saying it could not access `~/.codex/sessions`; related stderr may also mention `~/.codex/shell_snapshots/...` and `Operation not permitted`. When this appears, rerun `just codex-spike /path/to/workspace` from a normal terminal to distinguish an Agenter adapter issue from a Codex runtime permission issue.
 
 For an executable spike, use the JSONL client below. It starts the server, sends initialize, creates a thread, sends one turn, logs all responses/notifications/requests, and auto-denies the first approval request so the turn can continue.
 

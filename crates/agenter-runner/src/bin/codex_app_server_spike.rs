@@ -11,6 +11,7 @@ use tracing::{info, warn};
 
 const DEFAULT_PROMPT: &str = "Protocol spike: reply briefly, then try to run `pwd` and try to create `agenter-codex-approval-probe.txt`. Ask for approval when required.";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+const THREAD_START_TIMEOUT: Duration = Duration::from_secs(15);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
@@ -62,6 +63,7 @@ async fn run_spike(
     let mut turn_started = false;
     let mut approval_seen = false;
     let deadline = Instant::now() + REQUEST_TIMEOUT;
+    let thread_start_deadline = Instant::now() + THREAD_START_TIMEOUT;
 
     send_request(
         stdin,
@@ -78,9 +80,10 @@ async fn run_spike(
     )
     .await?;
 
+    let thread_start_id = next_jsonrpc_id(&mut next_id);
     send_request(
         stdin,
-        next_jsonrpc_id(&mut next_id),
+        thread_start_id,
         "thread/start",
         json!({
             "cwd": workspace,
@@ -93,10 +96,21 @@ async fn run_spike(
     .await?;
 
     while Instant::now() < deadline && !approval_seen {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let active_deadline = if turn_started {
+            deadline
+        } else {
+            deadline.min(thread_start_deadline)
+        };
+        let remaining = active_deadline.saturating_duration_since(Instant::now());
         let line = timeout(remaining, lines.next_line())
             .await
-            .context("timed out waiting for codex app-server output")?
+            .with_context(|| {
+                if turn_started {
+                    "timed out waiting for codex app-server output".to_owned()
+                } else {
+                    "timed out waiting for codex thread/start response with a thread id".to_owned()
+                }
+            })?
             .context("failed to read codex app-server stdout")?
             .ok_or_else(|| anyhow!("codex app-server exited before approval was observed"))?;
 
@@ -106,6 +120,14 @@ async fn run_spike(
 
         if let Some(observed_thread_id) = codex_thread_id(&message) {
             thread_id = Some(observed_thread_id.to_owned());
+        }
+        if let Some(error) = thread_start_error_summary(&message, thread_start_id) {
+            return Err(anyhow!(error));
+        }
+        if thread_start_response_missing_thread_id(&message, thread_start_id) {
+            return Err(anyhow!(
+                "codex thread/start response did not include a thread id; rerun with RUST_LOG=codex_app_server_spike=info and inspect the response payload"
+            ));
         }
 
         if is_approval_request(&message) {
@@ -215,12 +237,22 @@ async fn write_json(stdin: &mut ChildStdin, message: &Value) -> Result<()> {
 }
 
 fn log_message(provider: &str, message: &Value) {
+    let payload_preview = agenter_core::logging::payload_preview(
+        message,
+        agenter_core::logging::payload_logging_enabled(),
+    );
     if let Some(method) = jsonrpc_method(message) {
-        info!(direction = "recv", provider, method, "json-rpc method");
+        info!(
+            direction = "recv",
+            provider,
+            method,
+            payload_preview = payload_preview.as_deref(),
+            "json-rpc method"
+        );
     } else if message.get("id").is_some() && message.get("error").is_some() {
-        warn!(direction = "recv", provider, id = %message["id"], "json-rpc error response");
+        warn!(direction = "recv", provider, id = %message["id"], payload_preview = payload_preview.as_deref(), "json-rpc error response");
     } else if message.get("id").is_some() {
-        info!(direction = "recv", provider, id = %message["id"], "json-rpc response");
+        info!(direction = "recv", provider, id = %message["id"], payload_preview = payload_preview.as_deref(), "json-rpc response");
     }
 }
 
@@ -232,7 +264,32 @@ fn codex_thread_id(message: &Value) -> Option<&str> {
     message
         .pointer("/result/thread/id")
         .and_then(Value::as_str)
+        .or_else(|| message.pointer("/result/id").and_then(Value::as_str))
         .or_else(|| message.pointer("/result/threadId").and_then(Value::as_str))
+        .or_else(|| message.pointer("/params/thread/id").and_then(Value::as_str))
+        .or_else(|| message.pointer("/params/threadId").and_then(Value::as_str))
+}
+
+fn thread_start_response_missing_thread_id(message: &Value, thread_start_id: u64) -> bool {
+    message.get("id").and_then(Value::as_u64) == Some(thread_start_id)
+        && message.get("result").is_some()
+        && codex_thread_id(message).is_none()
+}
+
+fn thread_start_error_summary(message: &Value, thread_start_id: u64) -> Option<String> {
+    if message.get("id").and_then(Value::as_u64) != Some(thread_start_id) {
+        return None;
+    }
+    let error = message.get("error")?;
+    let code = error
+        .get("code")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "unknown".to_owned());
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown provider error");
+    Some(format!("codex thread/start failed: {code} {message}"))
 }
 
 fn is_approval_request(message: &Value) -> bool {
@@ -291,9 +348,36 @@ mod tests {
     fn extracts_codex_thread_id_from_known_response_shapes() {
         let nested = json!({"result": {"thread": {"id": "thread-nested"}}});
         let flat = json!({"result": {"threadId": "thread-flat"}});
+        let notification = json!({"method": "thread/started", "params": {"thread": {"id": "thread-notification"}}});
+        let result_id = json!({"result": {"id": "thread-result-id"}});
 
         assert_eq!(codex_thread_id(&nested), Some("thread-nested"));
         assert_eq!(codex_thread_id(&flat), Some("thread-flat"));
+        assert_eq!(codex_thread_id(&notification), Some("thread-notification"));
+        assert_eq!(codex_thread_id(&result_id), Some("thread-result-id"));
+    }
+
+    #[test]
+    fn identifies_thread_start_response_without_thread_id() {
+        let message = json!({"id": 2, "result": {"thread": {"status": "failed"}}});
+
+        assert!(thread_start_response_missing_thread_id(&message, 2));
+    }
+
+    #[test]
+    fn summarizes_thread_start_error_response() {
+        let message = json!({
+            "id": 2,
+            "error": {
+                "code": -32603,
+                "message": "permission denied"
+            }
+        });
+
+        assert_eq!(
+            thread_start_error_summary(&message, 2),
+            Some("codex thread/start failed: -32603 permission denied".to_owned())
+        );
     }
 
     #[test]

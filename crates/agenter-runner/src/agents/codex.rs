@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use agenter_core::{
     AgentErrorEvent, AgentMessageDeltaEvent, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind,
@@ -15,6 +20,8 @@ use tokio::{
 };
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+const RECENT_STDERR_LINES: usize = 20;
 
 #[derive(Debug)]
 pub struct CodexTurnRequest {
@@ -43,6 +50,7 @@ pub struct CodexAppServer {
     stdout: BufReader<ChildStdout>,
     next_id: u64,
     thread_id: Option<String>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl CodexAppServer {
@@ -59,10 +67,18 @@ impl CodexAppServer {
 
         let stdin = child.stdin.take().context("codex stdin was not piped")?;
         let stdout = child.stdout.take().context("codex stdout was not piped")?;
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
         if let Some(stderr) = child.stderr.take() {
+            let stderr_tail = stderr_tail.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    if let Ok(mut tail) = stderr_tail.lock() {
+                        if tail.len() == RECENT_STDERR_LINES {
+                            tail.pop_front();
+                        }
+                        tail.push_back(line.clone());
+                    }
                     tracing::warn!(target: "codex-stderr", "{line}");
                 }
             });
@@ -74,6 +90,7 @@ impl CodexAppServer {
             stdout: BufReader::new(stdout),
             next_id: 1,
             thread_id: None,
+            stderr_tail,
         })
     }
 
@@ -86,46 +103,62 @@ impl CodexAppServer {
             has_external_session_id = request.external_session_id.is_some(),
             "initializing codex app-server"
         );
-        self.send_request(
-            "initialize",
-            json!({
-                "clientInfo": {
-                    "name": "agenter-runner",
-                    "title": "Agenter Runner",
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "capabilities": {"experimentalApi": true}
-            }),
-        )
-        .await?;
+        let initialize_id = self
+            .send_request(
+                "initialize",
+                json!({
+                    "clientInfo": {
+                        "name": "agenter-runner",
+                        "title": "Agenter Runner",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "capabilities": {"experimentalApi": true}
+                }),
+            )
+            .await?;
+        self.read_response(initialize_id, "initialize").await?;
 
         if let Some(thread_id) = &request.external_session_id {
             self.thread_id = Some(thread_id.clone());
             tracing::info!(session_id = %request.session_id, provider_thread_id = %thread_id, "resuming codex thread");
-            self.send_request(
-                "thread/resume",
-                json!({
-                    "threadId": thread_id,
-                    "cwd": request.workspace_path,
-                    "approvalPolicy": "on-request",
-                    "approvalsReviewer": "user",
-                    "excludeTurns": false
-                }),
-            )
-            .await?;
+            let resume_id = self
+                .send_request(
+                    "thread/resume",
+                    json!({
+                        "threadId": thread_id,
+                        "cwd": request.workspace_path,
+                        "approvalPolicy": "on-request",
+                        "approvalsReviewer": "user",
+                        "excludeTurns": false
+                    }),
+                )
+                .await?;
+            self.read_response(resume_id, "thread/resume").await?;
         } else {
             tracing::info!(session_id = %request.session_id, "starting codex thread");
-            self.send_request(
-                "thread/start",
-                json!({
-                    "cwd": request.workspace_path,
-                    "approvalPolicy": "on-request",
-                    "approvalsReviewer": "user",
-                    "sandbox": "read-only",
-                    "sessionStartSource": "agenter"
-                }),
-            )
-            .await?;
+            let start_id = self
+                .send_request(
+                    "thread/start",
+                    json!({
+                        "cwd": request.workspace_path,
+                        "approvalPolicy": "on-request",
+                        "approvalsReviewer": "user",
+                        "sandbox": "read-only",
+                        "sessionStartSource": "agenter"
+                    }),
+                )
+                .await?;
+            let response = self.read_response(start_id, "thread/start").await?;
+            if let Some(thread_id) = codex_thread_id(&response) {
+                self.thread_id = Some(thread_id.to_owned());
+            }
+            if self.thread_id.is_none() {
+                return Err(anyhow!(missing_thread_id_error(
+                    "thread/start",
+                    &response,
+                    &self.recent_stderr()
+                )));
+            }
         }
 
         Ok(())
@@ -207,7 +240,7 @@ impl CodexAppServer {
         .await
     }
 
-    async fn send_request(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
+    async fn send_request(&mut self, method: &str, params: Value) -> anyhow::Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
         tracing::debug!(
@@ -229,7 +262,43 @@ impl CodexAppServer {
             }),
         )
         .await?;
-        Ok(json!(id))
+        Ok(id)
+    }
+
+    async fn read_response(&mut self, request_id: u64, method: &str) -> anyhow::Result<Value> {
+        loop {
+            let message = timeout(STARTUP_RESPONSE_TIMEOUT, self.next_message())
+                .await
+                .with_context(|| {
+                    startup_error_with_stderr(
+                        format!("timed out waiting for codex {method} response"),
+                        &self.recent_stderr(),
+                    )
+                })??;
+            let Some(message) = message else {
+                return Err(anyhow!(startup_error_with_stderr(
+                    format!("codex exited before {method} response"),
+                    &self.recent_stderr()
+                )));
+            };
+            if message.get("id").and_then(Value::as_u64) != Some(request_id) {
+                continue;
+            }
+            if let Some(summary) = codex_jsonrpc_error_summary(method, &message) {
+                return Err(anyhow!(startup_error_with_stderr(
+                    summary,
+                    &self.recent_stderr()
+                )));
+            }
+            return Ok(message);
+        }
+    }
+
+    fn recent_stderr(&self) -> Vec<String> {
+        self.stderr_tail
+            .lock()
+            .map(|tail| tail.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
@@ -535,9 +604,55 @@ fn codex_thread_id(message: &Value) -> Option<&str> {
     message
         .pointer("/result/thread/id")
         .and_then(Value::as_str)
+        .or_else(|| message.pointer("/result/id").and_then(Value::as_str))
         .or_else(|| message.pointer("/result/threadId").and_then(Value::as_str))
         .or_else(|| message.pointer("/params/thread/id").and_then(Value::as_str))
         .or_else(|| message.pointer("/params/threadId").and_then(Value::as_str))
+}
+
+fn codex_jsonrpc_error_summary(method: &str, message: &Value) -> Option<String> {
+    let error = message.get("error")?;
+    let code = error
+        .get("code")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "unknown".to_owned());
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown provider error");
+    Some(format!("codex {method} failed: {code} {message}"))
+}
+
+fn missing_thread_id_error(method: &str, message: &Value, stderr: &[String]) -> String {
+    let mut error = format!("codex {method} response did not include a thread id");
+    let stderr_label = recent_stderr_label(stderr);
+    if !stderr_label.is_empty() {
+        error.push_str("; ");
+        error.push_str(&stderr_label);
+    } else if let Some(payload) = agenter_core::logging::payload_preview(
+        message,
+        agenter_core::logging::payload_logging_enabled(),
+    ) {
+        error.push_str("; response preview: ");
+        error.push_str(&payload);
+    }
+    error
+}
+
+fn recent_stderr_label(stderr: &[String]) -> String {
+    stderr
+        .last()
+        .map(|line| format!("recent stderr: {line}"))
+        .unwrap_or_default()
+}
+
+fn startup_error_with_stderr(message: String, stderr: &[String]) -> String {
+    let stderr_label = recent_stderr_label(stderr);
+    if stderr_label.is_empty() {
+        message
+    } else {
+        format!("{message}; {stderr_label}")
+    }
 }
 
 fn message_id(message: &Value) -> String {
@@ -634,6 +749,79 @@ mod tests {
         };
         assert_eq!(request.kind, ApprovalKind::Command);
         assert_eq!(request.details.as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn extracts_codex_thread_id_from_start_response_and_notification_shapes() {
+        let start_response = json!({
+            "id": 2,
+            "result": {
+                "thread": {
+                    "id": "thread-from-start-response"
+                }
+            }
+        });
+        let started_notification = json!({
+            "method": "thread/started",
+            "params": {
+                "thread": {
+                    "id": "thread-from-notification"
+                }
+            }
+        });
+        let flat_result = json!({
+            "id": 2,
+            "result": {
+                "id": "thread-from-flat-result"
+            }
+        });
+
+        assert_eq!(
+            codex_thread_id(&start_response),
+            Some("thread-from-start-response")
+        );
+        assert_eq!(
+            codex_thread_id(&started_notification),
+            Some("thread-from-notification")
+        );
+        assert_eq!(
+            codex_thread_id(&flat_result),
+            Some("thread-from-flat-result")
+        );
+    }
+
+    #[test]
+    fn summarizes_codex_jsonrpc_errors_with_method_context() {
+        let message = json!({
+            "id": 2,
+            "error": {
+                "code": -32602,
+                "message": "invalid thread/start params"
+            }
+        });
+
+        assert_eq!(
+            codex_jsonrpc_error_summary("thread/start", &message),
+            Some("codex thread/start failed: -32602 invalid thread/start params".to_owned())
+        );
+    }
+
+    #[test]
+    fn missing_thread_id_error_includes_recent_stderr() {
+        let message = json!({
+            "id": 2,
+            "result": {
+                "thread": {
+                    "status": "failed"
+                }
+            }
+        });
+        let stderr = vec!["Failed to create shell snapshot".to_owned()];
+
+        assert_eq!(
+            missing_thread_id_error("thread/start", &message, &stderr),
+            "codex thread/start response did not include a thread id; recent stderr: Failed to create shell snapshot"
+        );
     }
 
     #[test]
