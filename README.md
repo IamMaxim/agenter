@@ -4,6 +4,19 @@ Agenter is a planned self-hostable remote wrapper for coding agents. It will let
 
 The project is currently in harness/documentation initialization. Application code should come after the technical spec and implementation plan are finalized.
 
+## Local Manual Testing
+
+Use the checked-in `justfile` for the common local commands:
+
+```sh
+just db-up
+just control-plane
+just fake-runner
+just web
+```
+
+See `docs/runbooks/local-manual-testing.md` for the full terminal sequence, default credentials, and troubleshooting notes.
+
 ## Documentation Map
 
 - `docs/chatgpt/001_initial.md` - initial product discussion and technical direction.
@@ -17,4 +30,3 @@ The project is currently in harness/documentation initialization. Application co
 - `docs/runbooks/` - operational and spike procedures.
 
 Start with `AGENTS.md` when working in this repository.
-

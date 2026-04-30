@@ -5,7 +5,10 @@ export default defineConfig({
   plugins: [svelte()],
   server: {
     proxy: {
-      '/api': 'http://127.0.0.1:7777',
+      '/api': {
+        target: 'http://127.0.0.1:7777',
+        ws: true
+      },
       '/healthz': 'http://127.0.0.1:7777'
     }
   }

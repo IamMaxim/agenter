@@ -405,6 +405,13 @@ Exit criterion: the system can be run locally through documented commands and ha
 - [ ] Run end-to-end local smoke verification.
 - [ ] Commit with `docs: add deployment runbook`.
 
+Active execution notes:
+
+- Local manual testing support now includes `docker-compose.yml` for the development Postgres database, `justfile` recipes for database/control-plane/runner/web/verification commands, and `docs/runbooks/local-manual-testing.md`.
+- The current Compose file intentionally starts only Postgres. Control plane, runner, and web UI still run as local developer processes so manual testing can inspect logs and provider CLI behavior directly.
+- The control plane runs migrations automatically on startup when `DATABASE_URL` is set; `just control-plane` sets the development database URL, insecure local HTTP cookies, bootstrap admin credentials, and the runner token.
+- Full deployment Compose for the control plane, optional runner containers, reverse proxy, and secret handling remains open under Task 7.3.
+
 ## Verification Policy
 
 Run the strongest applicable verification after each task:
