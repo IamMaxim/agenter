@@ -275,6 +275,7 @@ Active execution notes:
 - Task 3.2 adds `AGENTER_RUNNER_MODE=qwen` runner mode. It advertises the configured `AGENTER_WORKSPACE`, launches `qwen --acp --approval-mode default` per browser turn, initializes ACP, creates or resumes a session, sends a prompt, normalizes known `session/update` and `session/request_permission` payloads, maps approval answers to ACP option selections, and answers basic fs/terminal client requests with inert responses.
 - Adapter tests cover representative message chunk, permission request, and permission decision response fixtures. Live Qwen smoke was limited to installed CLI detection with `command -v qwen` and `qwen --version`; a real turn still requires an authenticated provider session and model/network availability.
 - Task 3.2 verification passed with `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace`; local CLI detection returned `qwen 0.15.6`.
+- Follow-up review fixes make the adapter treat the `session/prompt` JSON-RPC response as the end-of-turn completion signal, so a normal ACP turn can shut down the child process after receiving `stopReason`.
 
 ## Milestone 4: OIDC and Messenger Linking
 

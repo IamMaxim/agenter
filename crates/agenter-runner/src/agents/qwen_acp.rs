@@ -114,21 +114,22 @@ impl QwenAcp {
         Ok(())
     }
 
-    pub async fn send_prompt(&mut self, request: &QwenTurnRequest) -> anyhow::Result<()> {
+    pub async fn send_prompt(&mut self, request: &QwenTurnRequest) -> anyhow::Result<Value> {
         let Some(session_id) = &self.provider_session_id else {
             return Err(anyhow!(
                 "qwen session id was not observed before prompt start"
             ));
         };
-        self.send_request(
-            "session/prompt",
-            json!({
-                "sessionId": session_id,
-                "prompt": [{"type": "text", "text": request.prompt}]
-            }),
-        )
-        .await?;
-        Ok(())
+        let request_id = self
+            .send_request(
+                "session/prompt",
+                json!({
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": request.prompt}]
+                }),
+            )
+            .await?;
+        Ok(request_id)
     }
 
     pub async fn next_message(&mut self) -> anyhow::Result<Option<Value>> {
@@ -201,11 +202,18 @@ pub async fn run_qwen_turn(
         }
     }
 
-    server.send_prompt(&request).await?;
+    let prompt_request_id = server.send_prompt(&request).await?;
     while let Some(message) = server.next_message().await? {
         if let Some(response) = inert_client_response(&message) {
             server.respond(message["id"].clone(), response).await?;
             continue;
+        }
+
+        if is_response_to(&message, &prompt_request_id) {
+            let event = normalize_qwen_prompt_response(request.session_id, &message);
+            event_sender.send(event).ok();
+            server.shutdown().await?;
+            return Ok(());
         }
 
         if let Some((approval_id, native_request_id, event)) =
@@ -310,6 +318,34 @@ pub fn normalize_qwen_message(session_id: SessionId, message: &Value) -> Vec<App
     }
 }
 
+pub fn normalize_qwen_prompt_response(session_id: SessionId, message: &Value) -> AppEvent {
+    AppEvent::AgentMessageCompleted(MessageCompletedEvent {
+        session_id,
+        message_id: string_at(
+            message,
+            &[
+                "/result/messageId",
+                "/result/sessionId",
+                "/result/turnId",
+                "/id",
+            ],
+        )
+        .unwrap_or("qwen-prompt")
+        .to_owned(),
+        content: string_at(
+            message,
+            &[
+                "/result/content/text",
+                "/result/content",
+                "/result/message/text",
+                "/result/message",
+            ],
+        )
+        .map(str::to_owned),
+        provider_payload: Some(message.clone()),
+    })
+}
+
 pub fn normalize_qwen_permission_request(
     session_id: SessionId,
     message: &Value,
@@ -397,6 +433,11 @@ fn jsonrpc_method(message: &Value) -> Option<&str> {
     message.get("method")?.as_str()
 }
 
+fn is_response_to(message: &Value, request_id: &Value) -> bool {
+    message.get("id") == Some(request_id)
+        && (message.get("result").is_some() || message.get("error").is_some())
+}
+
 fn qwen_session_id(message: &Value) -> Option<&str> {
     message
         .pointer("/result/sessionId")
@@ -472,6 +513,25 @@ mod tests {
         };
         assert_eq!(request.kind, ApprovalKind::ProviderSpecific);
         assert_eq!(request.details.as_deref(), Some("shell"));
+    }
+
+    #[test]
+    fn normalizes_qwen_prompt_response_as_completion() {
+        let message = json!({
+            "id": 3,
+            "result": {
+                "sessionId": "session-1",
+                "stopReason": "end_turn"
+            }
+        });
+
+        let event = normalize_qwen_prompt_response(SessionId::nil(), &message);
+
+        let AppEvent::AgentMessageCompleted(completed) = event else {
+            panic!("expected qwen completion");
+        };
+        assert_eq!(completed.message_id, "session-1");
+        assert!(completed.content.is_none());
     }
 
     #[test]
