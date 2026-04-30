@@ -14,8 +14,9 @@
 
 - Repository contains harness documentation and the initial source discussion in `docs/chatgpt/001_initial.md`.
 - Approved architecture decisions are recorded in `docs/decisions/`.
-- Application code has not been scaffolded.
-- Baseline verification is documentation-only until Rust crates exist.
+- Rust workspace skeleton exists with control-plane, runner, core, protocol, and db crates.
+- Baseline Rust verification is active: `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace`.
+- Provider protocol spike binaries are the next implementation target.
 
 ## Milestone 0: Protocol Spikes and Repo Baseline
 
