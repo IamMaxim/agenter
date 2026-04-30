@@ -1,0 +1,239 @@
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    ApprovalRequestEvent, ApprovalResolvedEvent, SessionId, SessionInfo, SessionStatus, UserId,
+};
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum AppEvent {
+    SessionStarted(SessionInfo),
+    SessionStatusChanged(SessionStatusChangedEvent),
+    UserMessage(UserMessageEvent),
+    AgentMessageDelta(AgentMessageDeltaEvent),
+    AgentMessageCompleted(MessageCompletedEvent),
+    PlanUpdated(PlanEvent),
+    ToolStarted(ToolEvent),
+    ToolUpdated(ToolEvent),
+    ToolCompleted(ToolEvent),
+    CommandStarted(CommandEvent),
+    CommandOutputDelta(CommandOutputEvent),
+    CommandCompleted(CommandCompletedEvent),
+    FileChangeProposed(FileChangeEvent),
+    FileChangeApplied(FileChangeEvent),
+    FileChangeRejected(FileChangeEvent),
+    ApprovalRequested(ApprovalRequestEvent),
+    ApprovalResolved(ApprovalResolvedEvent),
+    Error(AgentErrorEvent),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionStatusChangedEvent {
+    pub session_id: SessionId,
+    pub status: SessionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UserMessageEvent {
+    pub session_id: SessionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_user_id: Option<UserId>,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AgentMessageDeltaEvent {
+    pub session_id: SessionId,
+    pub message_id: String,
+    pub delta: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_payload: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct MessageCompletedEvent {
+    pub session_id: SessionId,
+    pub message_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_payload: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PlanEvent {
+    pub session_id: SessionId,
+    pub entries: Vec<PlanEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_payload: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanEntry {
+    pub label: String,
+    pub status: PlanEntryStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanEntryStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ToolEvent {
+    pub session_id: SessionId,
+    pub tool_call_id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_payload: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CommandEvent {
+    pub session_id: SessionId,
+    pub command_id: String,
+    pub command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_payload: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CommandOutputEvent {
+    pub session_id: SessionId,
+    pub command_id: String,
+    pub stream: CommandOutputStream,
+    pub delta: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_payload: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOutputStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CommandCompletedEvent {
+    pub session_id: SessionId,
+    pub command_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_payload: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FileChangeEvent {
+    pub session_id: SessionId,
+    pub path: String,
+    pub change_kind: FileChangeKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_payload: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeKind {
+    Create,
+    Modify,
+    Delete,
+    Rename,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AgentErrorEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_payload: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        AppEvent, ApprovalId, ApprovalKind, ApprovalRequestEvent, CommandEvent, SessionId,
+        UserMessageEvent,
+    };
+
+    #[test]
+    fn serializes_user_message_event_with_adjacent_tag() {
+        let event = AppEvent::UserMessage(UserMessageEvent {
+            session_id: SessionId::nil(),
+            message_id: Some("msg-1".to_owned()),
+            author_user_id: None,
+            content: "hello".to_owned(),
+        });
+
+        let json = serde_json::to_value(event).expect("serialize event");
+
+        assert_eq!(json["type"], "user_message");
+        assert_eq!(json["payload"]["session_id"], SessionId::nil().to_string());
+        assert_eq!(json["payload"]["message_id"], "msg-1");
+        assert_eq!(json["payload"]["content"], "hello");
+    }
+
+    #[test]
+    fn serializes_command_started_event_with_stable_shape() {
+        let event = AppEvent::CommandStarted(CommandEvent {
+            session_id: SessionId::nil(),
+            command_id: "cmd-1".to_owned(),
+            command: "cargo test -p agenter-core".to_owned(),
+            cwd: Some("/work/agenter".to_owned()),
+            provider_payload: None,
+        });
+
+        let json = serde_json::to_value(event).expect("serialize event");
+
+        assert_eq!(json["type"], "command_started");
+        assert_eq!(json["payload"]["command_id"], "cmd-1");
+        assert_eq!(json["payload"]["cwd"], "/work/agenter");
+        assert!(json["payload"].get("provider_payload").is_none());
+    }
+
+    #[test]
+    fn serializes_approval_requested_event_with_uuid_ids() {
+        let approval_id = ApprovalId::nil();
+        let event = AppEvent::ApprovalRequested(ApprovalRequestEvent {
+            session_id: SessionId::nil(),
+            approval_id,
+            kind: ApprovalKind::Command,
+            title: "Run command".to_owned(),
+            details: Some("cargo test".to_owned()),
+            expires_at: None,
+            provider_payload: Some(serde_json::json!({ "native_id": "approval-1" })),
+        });
+
+        let json = serde_json::to_value(event).expect("serialize event");
+
+        assert_eq!(json["type"], "approval_requested");
+        assert_eq!(json["payload"]["approval_id"], approval_id.to_string());
+        assert_eq!(json["payload"]["kind"], "command");
+        assert_eq!(
+            json["payload"]["provider_payload"]["native_id"],
+            "approval-1"
+        );
+    }
+}

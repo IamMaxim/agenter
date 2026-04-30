@@ -80,6 +80,7 @@ Active execution notes:
 
 - Task 0.3 added runner-only Tokio/serde_json spike binaries and kept provider payloads local to those binaries.
 - Live Codex/Qwen provider execution remains manual because it requires installed and authenticated local provider CLIs; runbooks record the exact spike commands and expected output shape.
+- Task 1.1 defines shared core IDs as UUID newtypes and normalized app events as adjacently tagged serde JSON for later runner/browser protocol envelopes.
 
 ## Milestone 1: Core Domain, Storage, and Runner Protocol
 
@@ -96,11 +97,11 @@ Exit criterion: the control plane and runner can register a runner, register wor
 - Create: `crates/agenter-core/src/workspace.rs`
 - Create: `crates/agenter-core/src/approval.rs`
 
-- [ ] Define typed IDs for users, runners, workspaces, sessions, approvals, and connector bindings.
-- [ ] Define `AppEvent`, `SessionStatus`, `AgentProviderId`, `AgentCapabilities`, `ApprovalDecision`, and event payload structs from the spec.
-- [ ] Add serde serialization tests for representative `AppEvent` variants.
-- [ ] Run `cargo test -p agenter-core`.
-- [ ] Commit with `feat: define core domain events`.
+- [x] Define typed IDs for users, runners, workspaces, sessions, approvals, and connector bindings.
+- [x] Define `AppEvent`, `SessionStatus`, `AgentProviderId`, `AgentCapabilities`, `ApprovalDecision`, and event payload structs from the spec.
+- [x] Add serde serialization tests for representative `AppEvent` variants.
+- [x] Run `cargo test -p agenter-core`.
+- [x] Commit with `feat: define core domain events`.
 
 ### Task 1.2: Define Runner Protocol Messages
 
