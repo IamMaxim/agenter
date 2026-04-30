@@ -38,6 +38,18 @@ async fn main() -> Result<()> {
         }
     });
 
+    let run_result = run_spike(&workspace, &prompt, &mut stdin, stdout).await;
+    let shutdown_result = shutdown_child(child, stdin).await;
+    run_result.and(shutdown_result)?;
+    Ok(())
+}
+
+async fn run_spike(
+    workspace: &PathBuf,
+    prompt: &str,
+    stdin: &mut ChildStdin,
+    stdout: impl tokio::io::AsyncRead + Unpin,
+) -> Result<()> {
     let mut lines = BufReader::new(stdout).lines();
     let mut next_id = 1_u64;
     let mut session_id: Option<String> = None;
@@ -46,7 +58,7 @@ async fn main() -> Result<()> {
     let deadline = Instant::now() + REQUEST_TIMEOUT;
 
     send_request(
-        &mut stdin,
+        stdin,
         next_jsonrpc_id(&mut next_id),
         "initialize",
         json!({
@@ -65,7 +77,7 @@ async fn main() -> Result<()> {
     .await?;
 
     send_request(
-        &mut stdin,
+        stdin,
         next_jsonrpc_id(&mut next_id),
         "session/new",
         json!({
@@ -94,25 +106,20 @@ async fn main() -> Result<()> {
         match jsonrpc_method(&message) {
             Some("session/request_permission") if message.get("id").is_some() => {
                 permission_seen = true;
-                respond(
-                    &mut stdin,
-                    &message["id"],
-                    qwen_permission_response(&message),
-                )
-                .await?;
+                respond(stdin, &message["id"], qwen_permission_response(&message)).await?;
                 continue;
             }
             Some("fs/read_text_file") if message.get("id").is_some() => {
-                respond(&mut stdin, &message["id"], json!({"content": ""})).await?;
+                respond(stdin, &message["id"], json!({"content": ""})).await?;
                 continue;
             }
             Some("fs/write_text_file") if message.get("id").is_some() => {
-                respond(&mut stdin, &message["id"], json!({})).await?;
+                respond(stdin, &message["id"], json!({})).await?;
                 continue;
             }
             Some("terminal/create") if message.get("id").is_some() => {
                 respond(
-                    &mut stdin,
+                    stdin,
                     &message["id"],
                     json!({"terminalId": "agenter-spike-terminal-denied"}),
                 )
@@ -121,7 +128,7 @@ async fn main() -> Result<()> {
             }
             Some("terminal/output") if message.get("id").is_some() => {
                 respond(
-                    &mut stdin,
+                    stdin,
                     &message["id"],
                     json!({"output": "", "truncated": false, "exitStatus": {"exitCode": 1}}),
                 )
@@ -129,11 +136,11 @@ async fn main() -> Result<()> {
                 continue;
             }
             Some("terminal/wait_for_exit") if message.get("id").is_some() => {
-                respond(&mut stdin, &message["id"], json!({"exitCode": 1})).await?;
+                respond(stdin, &message["id"], json!({"exitCode": 1})).await?;
                 continue;
             }
             Some("terminal/release" | "terminal/kill") if message.get("id").is_some() => {
-                respond(&mut stdin, &message["id"], json!({})).await?;
+                respond(stdin, &message["id"], json!({})).await?;
                 continue;
             }
             _ => {}
@@ -142,7 +149,7 @@ async fn main() -> Result<()> {
         if !prompt_sent {
             if let Some(session_id) = session_id.as_deref() {
                 send_request(
-                    &mut stdin,
+                    stdin,
                     next_jsonrpc_id(&mut next_id),
                     "session/prompt",
                     json!({
@@ -160,7 +167,6 @@ async fn main() -> Result<()> {
         warn!("qwen spike timed out before observing a permission request");
     }
 
-    shutdown_child(child, stdin).await?;
     info!(permission_seen, session_id, "qwen ACP spike finished");
     Ok(())
 }

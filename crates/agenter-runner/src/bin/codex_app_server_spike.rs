@@ -47,6 +47,18 @@ async fn main() -> Result<()> {
         }
     });
 
+    let run_result = run_spike(&workspace, &prompt, &mut stdin, stdout).await;
+    let shutdown_result = shutdown_child(child, stdin).await;
+    run_result.and(shutdown_result)?;
+    Ok(())
+}
+
+async fn run_spike(
+    workspace: &PathBuf,
+    prompt: &str,
+    stdin: &mut ChildStdin,
+    stdout: impl tokio::io::AsyncRead + Unpin,
+) -> Result<()> {
     let mut lines = BufReader::new(stdout).lines();
     let mut next_id = 1_u64;
     let mut thread_id: Option<String> = None;
@@ -55,7 +67,7 @@ async fn main() -> Result<()> {
     let deadline = Instant::now() + REQUEST_TIMEOUT;
 
     send_request(
-        &mut stdin,
+        stdin,
         next_jsonrpc_id(&mut next_id),
         "initialize",
         json!({
@@ -70,7 +82,7 @@ async fn main() -> Result<()> {
     .await?;
 
     send_request(
-        &mut stdin,
+        stdin,
         next_jsonrpc_id(&mut next_id),
         "thread/start",
         json!({
@@ -101,14 +113,14 @@ async fn main() -> Result<()> {
 
         if is_approval_request(&message) {
             approval_seen = true;
-            respond(&mut stdin, &message["id"], json!({"decision": "decline"})).await?;
+            respond(stdin, &message["id"], codex_approval_response(&message)).await?;
             continue;
         }
 
         if !turn_started {
             if let Some(thread_id) = thread_id.as_deref() {
                 send_request(
-                    &mut stdin,
+                    stdin,
                     next_jsonrpc_id(&mut next_id),
                     "turn/start",
                     json!({
@@ -130,7 +142,6 @@ async fn main() -> Result<()> {
         warn!("codex spike timed out before observing an approval request");
     }
 
-    shutdown_child(child, stdin).await?;
     info!(approval_seen, thread_id, "codex app-server spike finished");
     Ok(())
 }
@@ -238,6 +249,14 @@ fn is_approval_request(message: &Value) -> bool {
     ) && message.get("id").is_some()
 }
 
+fn codex_approval_response(message: &Value) -> Value {
+    if jsonrpc_method(message) == Some("item/permissions/requestApproval") {
+        json!({"permissions": {"fileSystem": null, "network": null}, "scope": "turn"})
+    } else {
+        json!({"decision": "decline"})
+    }
+}
+
 async fn shutdown_child(mut child: Child, mut stdin: ChildStdin) -> Result<()> {
     stdin
         .shutdown()
@@ -278,5 +297,15 @@ mod tests {
 
         assert_eq!(codex_thread_id(&nested), Some("thread-nested"));
         assert_eq!(codex_thread_id(&flat), Some("thread-flat"));
+    }
+
+    #[test]
+    fn uses_permissions_response_shape_for_codex_permission_approval() {
+        let message = json!({"id": 7, "method": "item/permissions/requestApproval"});
+
+        assert_eq!(
+            codex_approval_response(&message),
+            json!({"permissions": {"fileSystem": null, "network": null}, "scope": "turn"})
+        );
     }
 }
