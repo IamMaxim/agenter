@@ -1,5 +1,5 @@
 import { requestJson } from './http';
-import type { SessionInfo, WorkspaceRef } from './types';
+import type { RunnerInfo, SessionInfo, WorkspaceRef } from './types';
 
 export interface CreateSessionRequest {
   workspace_id: string;
@@ -11,8 +11,14 @@ export interface SendMessageRequest {
   content: string;
 }
 
-export async function listWorkspaces(): Promise<WorkspaceRef[]> {
-  return requestJson<WorkspaceRef[]>('/api/workspaces');
+export async function listRunners(): Promise<RunnerInfo[]> {
+  return requestJson<RunnerInfo[]>('/api/runners');
+}
+
+export async function listRunnerWorkspaces(runnerId: string): Promise<WorkspaceRef[]> {
+  return requestJson<WorkspaceRef[]>(
+    `/api/runners/${encodeURIComponent(runnerId)}/workspaces`
+  );
 }
 
 export async function listSessions(): Promise<SessionInfo[]> {

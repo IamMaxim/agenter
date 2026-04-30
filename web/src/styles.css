@@ -209,6 +209,11 @@ nav a:hover {
   background: #ffffff;
 }
 
+.row-card.inset {
+  margin-left: 1rem;
+  background: #f8faf8;
+}
+
 .row-card div,
 .empty-state {
   display: grid;

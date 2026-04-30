@@ -11,6 +11,13 @@ export interface WorkspaceRef {
   display_name?: string | null;
 }
 
+export interface RunnerInfo {
+  runner_id: string;
+  name: string;
+  status?: string;
+  last_seen_at?: string | null;
+}
+
 export type AgentProviderId = 'codex' | 'qwen' | string;
 
 export type SessionStatus =

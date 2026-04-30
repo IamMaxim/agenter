@@ -1,17 +1,25 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { ApiError } from '../api/http';
-  import { listWorkspaces } from '../api/sessions';
-  import type { WorkspaceRef } from '../api/types';
+  import { listRunners, listRunnerWorkspaces } from '../api/sessions';
+  import type { RunnerInfo, WorkspaceRef } from '../api/types';
 
-  let workspaces: WorkspaceRef[] = [];
+  let runners: RunnerInfo[] = [];
+  let workspacesByRunner: Record<string, WorkspaceRef[]> = {};
   let loading = true;
   let unavailable = false;
   let error = '';
 
   onMount(async () => {
     try {
-      workspaces = await listWorkspaces();
+      runners = await listRunners();
+      const workspacePairs = await Promise.all(
+        runners.map(async (runner) => [
+          runner.runner_id,
+          await listRunnerWorkspaces(runner.runner_id)
+        ] as const)
+      );
+      workspacesByRunner = Object.fromEntries(workspacePairs);
     } catch (err) {
       unavailable = err instanceof ApiError && err.status === 404;
       error = unavailable ? '' : 'Could not load workspaces.';
@@ -38,21 +46,30 @@
       <strong>Workspace API pending</strong>
       <span>The frontend route is ready; backend list endpoints arrive in the next browser MVP tasks.</span>
     </div>
-  {:else if workspaces.length === 0}
+  {:else if runners.length === 0}
     <div class="empty-state">
-      <strong>No workspaces registered</strong>
+      <strong>No runners registered</strong>
       <span>Start a runner to advertise workspace directories.</span>
     </div>
   {:else}
     <div class="data-list">
-      {#each workspaces as workspace}
+      {#each runners as runner}
         <article class="row-card">
           <div>
-            <strong>{workspace.display_name ?? workspace.path}</strong>
-            <span>{workspace.path}</span>
+            <strong>{runner.name}</strong>
+            <span>{runner.status ?? 'registered'} · {runner.runner_id}</span>
           </div>
-          <code>{workspace.runner_id}</code>
+          <code>{workspacesByRunner[runner.runner_id]?.length ?? 0} workspaces</code>
         </article>
+        {#each workspacesByRunner[runner.runner_id] ?? [] as workspace}
+          <article class="row-card inset">
+            <div>
+              <strong>{workspace.display_name ?? workspace.path}</strong>
+              <span>{workspace.path}</span>
+            </div>
+            <code>{workspace.workspace_id}</code>
+          </article>
+        {/each}
       {/each}
     </div>
   {/if}
