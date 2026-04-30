@@ -1,3 +1,4 @@
+mod auth;
 mod browser_ws;
 mod http;
 mod runner_ws;

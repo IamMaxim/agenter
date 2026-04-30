@@ -172,12 +172,19 @@ Exit criterion: a user can log in, see workspaces and sessions, open a browser c
 - Create: `crates/agenter-control-plane/src/auth.rs`
 - Modify: `crates/agenter-db/src/repositories.rs`
 
-- [ ] Implement Argon2id password registration bootstrap for the first local admin.
-- [ ] Implement password login, logout, and `GET /api/auth/me`.
-- [ ] Add authorization extraction for protected APIs and WebSockets.
-- [ ] Add tests for password hash verification and unauthorized API rejection.
-- [ ] Run `cargo test --workspace`.
-- [ ] Commit with `feat: add password authentication`.
+- [x] Implement Argon2id password registration bootstrap for the first local admin.
+- [x] Implement password login, logout, and `GET /api/auth/me`.
+- [x] Add authorization extraction for protected APIs and WebSockets.
+- [x] Add tests for password hash verification and unauthorized API rejection.
+- [x] Run `cargo test --workspace`.
+- [x] Commit with `feat: add password authentication`.
+
+Active execution notes:
+
+- Task 2.1 adds Argon2id password hashing and optional dev bootstrap credentials through `AGENTER_BOOTSTRAP_ADMIN_EMAIL` plus `AGENTER_BOOTSTRAP_ADMIN_PASSWORD`.
+- Browser auth currently uses dev-grade opaque in-memory session cookies stored in control-plane process state; restart invalidates sessions and full DB-backed session persistence remains future work.
+- Browser WebSocket now requires the same session cookie extraction as protected browser HTTP APIs. Runner WebSocket continues to use runner token auth.
+- Verification passed with `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace`; SQLx integration tests remain ignored without `DATABASE_URL`.
 
 ### Task 2.2: Scaffold Svelte Browser UI
 

@@ -3,6 +3,9 @@ use std::{collections::HashMap, sync::Arc};
 use agenter_core::{AgentProviderId, AppEvent, RunnerId, SessionId, WorkspaceRef};
 use agenter_protocol::runner::RunnerCapabilities;
 use tokio::sync::{broadcast, Mutex};
+use uuid::Uuid;
+
+use crate::auth::{self, AuthenticatedUser, BootstrapAdmin};
 
 const SESSION_EVENT_CACHE_LIMIT: usize = 128;
 
@@ -14,6 +17,8 @@ pub struct AppState {
 #[derive(Debug)]
 struct AppStateInner {
     runner_token: String,
+    bootstrap_admin: Option<BootstrapAdmin>,
+    auth_sessions: Mutex<HashMap<String, AuthenticatedUser>>,
     registry: Mutex<Registry>,
     sessions: Mutex<HashMap<SessionId, SessionEvents>>,
 }
@@ -51,15 +56,65 @@ impl AppState {
         Self {
             inner: Arc::new(AppStateInner {
                 runner_token,
+                bootstrap_admin: None,
+                auth_sessions: Mutex::new(HashMap::new()),
                 registry: Mutex::new(Registry::default()),
                 sessions: Mutex::new(HashMap::new()),
             }),
         }
     }
 
+    pub fn new_with_bootstrap_admin(
+        runner_token: String,
+        email: String,
+        password: String,
+    ) -> anyhow::Result<Self> {
+        let password_hash = auth::hash_password(&password)?;
+        let user = AuthenticatedUser {
+            user_id: agenter_core::UserId::new(),
+            email,
+            display_name: Some("Local Admin".to_owned()),
+        };
+        Ok(Self {
+            inner: Arc::new(AppStateInner {
+                runner_token,
+                bootstrap_admin: Some(BootstrapAdmin {
+                    user,
+                    password_hash,
+                }),
+                auth_sessions: Mutex::new(HashMap::new()),
+                registry: Mutex::new(Registry::default()),
+                sessions: Mutex::new(HashMap::new()),
+            }),
+        })
+    }
+
     #[must_use]
     pub fn is_runner_token_valid(&self, token: &str) -> bool {
         self.inner.runner_token == token
+    }
+
+    pub async fn login_password(&self, email: &str, password: &str) -> Option<String> {
+        let admin = self.inner.bootstrap_admin.as_ref()?;
+        if admin.user.email != email || !auth::verify_password(password, &admin.password_hash) {
+            return None;
+        }
+
+        let token = Uuid::new_v4().to_string();
+        self.inner
+            .auth_sessions
+            .lock()
+            .await
+            .insert(token.clone(), admin.user.clone());
+        Some(token)
+    }
+
+    pub async fn authenticated_user(&self, token: &str) -> Option<AuthenticatedUser> {
+        self.inner.auth_sessions.lock().await.get(token).cloned()
+    }
+
+    pub async fn logout(&self, token: &str) {
+        self.inner.auth_sessions.lock().await.remove(token);
     }
 
     pub async fn register_runner(

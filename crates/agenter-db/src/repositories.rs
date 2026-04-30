@@ -22,6 +22,87 @@ pub async fn create_user(pool: &PgPool, email: &str, display_name: Option<&str>)
     user_from_row(&row)
 }
 
+pub async fn create_user_with_password_credential(
+    pool: &PgPool,
+    email: &str,
+    display_name: Option<&str>,
+    password_hash: &str,
+) -> Result<User> {
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query(
+        "insert into users (email, display_name)
+         values ($1, $2)
+         returning user_id, email, display_name, created_at, updated_at",
+    )
+    .bind(email)
+    .bind(display_name)
+    .fetch_one(&mut *tx)
+    .await?;
+    let user = user_from_row(&row)?;
+
+    sqlx::query(
+        "insert into auth_identities (user_id, provider_kind, provider_id, subject)
+         values ($1, 'password', 'local', $2)",
+    )
+    .bind(user.user_id.as_uuid())
+    .bind(email)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "insert into password_credentials (user_id, password_hash)
+         values ($1, $2)",
+    )
+    .bind(user.user_id.as_uuid())
+    .bind(password_hash)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(user)
+}
+
+pub async fn find_password_credential_by_email(
+    pool: &PgPool,
+    email: &str,
+) -> Result<Option<(User, String)>> {
+    let row = sqlx::query(
+        "select u.user_id, u.email, u.display_name, u.created_at, u.updated_at,
+                pc.password_hash
+         from users u
+         join password_credentials pc on pc.user_id = u.user_id
+         where u.email = $1",
+    )
+    .bind(email)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref()
+        .map(|row| Ok((user_from_row(row)?, row.try_get("password_hash")?)))
+        .transpose()
+}
+
+pub async fn update_password_credential(
+    pool: &PgPool,
+    user_id: UserId,
+    password_hash: &str,
+) -> Result<()> {
+    sqlx::query(
+        "insert into password_credentials (user_id, password_hash)
+         values ($1, $2)
+         on conflict (user_id)
+         do update set password_hash = excluded.password_hash,
+                       password_updated_at = now(),
+                       updated_at = now()",
+    )
+    .bind(user_id.as_uuid())
+    .bind(password_hash)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 pub async fn register_runner(pool: &PgPool, name: &str, version: Option<&str>) -> Result<Runner> {
     let row = sqlx::query(
         "insert into runners (name, version, last_seen_at)
@@ -435,6 +516,36 @@ mod tests {
         assert_eq!(first_event.event_index, 1);
         assert_eq!(first_event.event_type, "user_message");
         assert_eq!(second_event.event_index, 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
+    async fn persists_and_finds_password_credentials_by_email() {
+        let pool = test_pool().await;
+
+        let suffix = uuid::Uuid::new_v4();
+        let email = format!("password-user-{suffix}@example.test");
+        let user =
+            create_user_with_password_credential(&pool, &email, Some("Password User"), "hash-1")
+                .await
+                .expect("create password user");
+
+        let (found_user, password_hash) = find_password_credential_by_email(&pool, &email)
+            .await
+            .expect("find password credential")
+            .expect("credential exists");
+        assert_eq!(found_user.user_id, user.user_id);
+        assert_eq!(password_hash, "hash-1");
+
+        update_password_credential(&pool, user.user_id, "hash-2")
+            .await
+            .expect("update password credential");
+
+        let (_, updated_hash) = find_password_credential_by_email(&pool, &email)
+            .await
+            .expect("find updated password credential")
+            .expect("credential still exists");
+        assert_eq!(updated_hash, "hash-2");
     }
 
     #[tokio::test]
