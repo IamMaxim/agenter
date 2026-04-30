@@ -29,6 +29,13 @@ pub struct PendingCodexApproval {
     pub response: oneshot::Sender<ApprovalDecision>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexApprovalKind {
+    Command,
+    FileChange,
+    Permissions,
+}
+
 #[derive(Debug)]
 pub struct CodexAppServer {
     child: Child,
@@ -153,13 +160,14 @@ impl CodexAppServer {
     pub async fn send_approval_response(
         &mut self,
         native_request_id: Value,
+        approval_kind: CodexApprovalKind,
         decision: ApprovalDecision,
     ) -> anyhow::Result<()> {
         write_json(
             &mut self.stdin,
             &json!({
                 "id": native_request_id,
-                "result": approval_response_for_decision(decision)
+                "result": approval_response_for_decision(approval_kind, decision)
             }),
         )
         .await
@@ -215,7 +223,7 @@ pub async fn run_codex_turn(
 
     server.send_turn(&request).await?;
     while let Some(message) = server.next_message().await? {
-        if let Some((approval_id, native_request_id, event)) =
+        if let Some((approval_id, native_request_id, approval_kind, event)) =
             normalize_codex_approval_request(request.session_id, &message)
         {
             let (sender, receiver) = oneshot::channel();
@@ -226,7 +234,7 @@ pub async fn run_codex_turn(
             event_sender.send(event).ok();
             if let Ok(decision) = receiver.await {
                 server
-                    .send_approval_response(native_request_id, decision)
+                    .send_approval_response(native_request_id, approval_kind, decision)
                     .await?;
             }
             continue;
@@ -287,12 +295,19 @@ pub fn normalize_codex_message(session_id: SessionId, message: &Value) -> Vec<Ap
 pub fn normalize_codex_approval_request(
     session_id: SessionId,
     message: &Value,
-) -> Option<(ApprovalId, Value, AppEvent)> {
+) -> Option<(ApprovalId, Value, CodexApprovalKind, AppEvent)> {
     let method = jsonrpc_method(message)?;
-    let kind = match method {
-        "item/commandExecution/requestApproval" => ApprovalKind::Command,
-        "item/fileChange/requestApproval" => ApprovalKind::FileChange,
-        "item/permissions/requestApproval" => ApprovalKind::ProviderSpecific,
+    let (kind, approval_kind) = match method {
+        "item/commandExecution/requestApproval" => {
+            (ApprovalKind::Command, CodexApprovalKind::Command)
+        }
+        "item/fileChange/requestApproval" => {
+            (ApprovalKind::FileChange, CodexApprovalKind::FileChange)
+        }
+        "item/permissions/requestApproval" => (
+            ApprovalKind::ProviderSpecific,
+            CodexApprovalKind::Permissions,
+        ),
         _ => return None,
     };
     let native_request_id = message.get("id")?.clone();
@@ -323,10 +338,25 @@ pub fn normalize_codex_approval_request(
         expires_at: None,
         provider_payload: Some(message.clone()),
     });
-    Some((approval_id, native_request_id, event))
+    Some((approval_id, native_request_id, approval_kind, event))
 }
 
-pub fn approval_response_for_decision(decision: ApprovalDecision) -> Value {
+pub fn approval_response_for_decision(
+    approval_kind: CodexApprovalKind,
+    decision: ApprovalDecision,
+) -> Value {
+    if approval_kind == CodexApprovalKind::Permissions {
+        return match decision {
+            ApprovalDecision::ProviderSpecific { payload } => payload,
+            ApprovalDecision::Accept
+            | ApprovalDecision::AcceptForSession
+            | ApprovalDecision::Decline
+            | ApprovalDecision::Cancel => {
+                json!({"permissions": {"fileSystem": null, "network": null}, "scope": "turn"})
+            }
+        };
+    }
+
     match decision {
         ApprovalDecision::Accept => json!({"decision": "accept"}),
         ApprovalDecision::AcceptForSession => json!({"decision": "acceptForSession"}),
@@ -537,11 +567,12 @@ mod tests {
             }
         });
 
-        let (_approval_id, native_request_id, event) =
+        let (_approval_id, native_request_id, approval_kind, event) =
             normalize_codex_approval_request(SessionId::nil(), &message)
                 .expect("approval should normalize");
 
         assert_eq!(native_request_id, json!("approval-1"));
+        assert_eq!(approval_kind, CodexApprovalKind::Command);
         let AppEvent::ApprovalRequested(request) = event else {
             panic!("expected approval request");
         };
@@ -552,16 +583,26 @@ mod tests {
     #[test]
     fn maps_approval_decisions_to_codex_results() {
         assert_eq!(
-            approval_response_for_decision(ApprovalDecision::Accept),
+            approval_response_for_decision(CodexApprovalKind::Command, ApprovalDecision::Accept),
             json!({"decision": "accept"})
         );
         assert_eq!(
-            approval_response_for_decision(ApprovalDecision::AcceptForSession),
+            approval_response_for_decision(
+                CodexApprovalKind::Command,
+                ApprovalDecision::AcceptForSession
+            ),
             json!({"decision": "acceptForSession"})
         );
         assert_eq!(
-            approval_response_for_decision(ApprovalDecision::Decline),
+            approval_response_for_decision(CodexApprovalKind::Command, ApprovalDecision::Decline),
             json!({"decision": "decline"})
+        );
+        assert_eq!(
+            approval_response_for_decision(
+                CodexApprovalKind::Permissions,
+                ApprovalDecision::Accept
+            ),
+            json!({"permissions": {"fileSystem": null, "network": null}, "scope": "turn"})
         );
     }
 }

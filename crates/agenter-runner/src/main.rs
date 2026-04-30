@@ -15,6 +15,7 @@ use agenter_protocol::runner::{
     RunnerResponseOutcome, PROTOCOL_VERSION,
 };
 use agents::codex::{run_codex_turn, CodexTurnRequest, PendingCodexApproval};
+use agents::qwen_acp::{run_qwen_turn, PendingQwenApproval, QwenTurnRequest};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -31,6 +32,8 @@ async fn main() -> anyhow::Result<()> {
         run_fake_runner().await?;
     } else if codex_mode_requested() {
         run_codex_runner().await?;
+    } else if qwen_mode_requested() {
+        run_qwen_runner().await?;
     } else {
         println!("agenter runner");
     }
@@ -46,6 +49,11 @@ fn fake_mode_requested() -> bool {
 fn codex_mode_requested() -> bool {
     env::args().any(|arg| arg == "codex" || arg == "--codex")
         || env::var("AGENTER_RUNNER_MODE").is_ok_and(|mode| mode == "codex")
+}
+
+fn qwen_mode_requested() -> bool {
+    env::args().any(|arg| arg == "qwen" || arg == "--qwen")
+        || env::var("AGENTER_RUNNER_MODE").is_ok_and(|mode| mode == "qwen")
 }
 
 async fn run_codex_runner() -> anyhow::Result<()> {
@@ -145,6 +153,140 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                                 error: agenter_protocol::runner::RunnerError {
                                     code: "approval_not_found".to_owned(),
                                     message: "approval is no longer pending in the Codex adapter".to_owned(),
+                                },
+                            }
+                        };
+                        send_runner_message(
+                            &mut sender,
+                            RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                request_id: envelope.request_id,
+                                outcome,
+                            }),
+                        )
+                        .await?;
+                    }
+                    RunnerCommand::CreateSession(_)
+                    | RunnerCommand::ResumeSession(_)
+                    | RunnerCommand::InterruptSession { .. }
+                    | RunnerCommand::ShutdownSession(_) => {
+                        send_runner_message(
+                            &mut sender,
+                            RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                request_id: envelope.request_id,
+                                outcome: RunnerResponseOutcome::Ok {
+                                    result: RunnerCommandResult::Accepted,
+                                },
+                            }),
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_qwen_runner() -> anyhow::Result<()> {
+    let url = env::var("AGENTER_CONTROL_PLANE_WS")
+        .unwrap_or_else(|_| DEFAULT_CONTROL_PLANE_WS.to_owned());
+    let token = env::var("AGENTER_DEV_RUNNER_TOKEN")
+        .unwrap_or_else(|_| DEFAULT_DEV_RUNNER_TOKEN.to_owned());
+    let workspace_path = env::var("AGENTER_WORKSPACE")
+        .map(PathBuf::from)
+        .unwrap_or(env::current_dir()?);
+    let workspace_path = workspace_path.canonicalize().unwrap_or(workspace_path);
+    let (socket, _) = connect_async(&url).await?;
+    let (mut sender, mut receiver) = socket.split();
+    send_runner_message(
+        &mut sender,
+        RunnerClientMessage::Hello(qwen_hello(token, workspace_path.clone())),
+    )
+    .await?;
+
+    let pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingQwenApproval>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let (qwen_event_sender, mut qwen_event_receiver) = mpsc::unbounded_channel::<AppEvent>();
+
+    loop {
+        tokio::select! {
+            event = qwen_event_receiver.recv() => {
+                let Some(event) = event else {
+                    continue;
+                };
+                let Some(session_id) = app_event_session_id(&event) else {
+                    continue;
+                };
+                send_runner_message(
+                    &mut sender,
+                    RunnerClientMessage::Event(RunnerEventEnvelope {
+                        request_id: None,
+                        event: RunnerEvent::AgentEvent(agenter_protocol::AgentEvent {
+                            session_id,
+                            event,
+                        }),
+                    }),
+                )
+                .await?;
+            }
+            message = receiver.next() => {
+                let Some(message) = message else {
+                    break;
+                };
+                let Message::Text(text) = message? else {
+                    continue;
+                };
+                let Ok(agenter_protocol::RunnerServerMessage::Command(envelope)) =
+                    serde_json::from_str::<agenter_protocol::RunnerServerMessage>(&text)
+                else {
+                    continue;
+                };
+
+                match envelope.command {
+                    RunnerCommand::AgentSendInput(command) => {
+                        send_runner_message(
+                            &mut sender,
+                            RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                request_id: envelope.request_id.clone(),
+                                outcome: RunnerResponseOutcome::Ok {
+                                    result: RunnerCommandResult::Accepted,
+                                },
+                            }),
+                        )
+                        .await?;
+                        let request = QwenTurnRequest {
+                            session_id: command.session_id,
+                            workspace_path: workspace_path.clone(),
+                            external_session_id: command.external_session_id,
+                            prompt: agent_input_text(&command.input),
+                        };
+                        let event_sender = qwen_event_sender.clone();
+                        let pending = pending_approvals.clone();
+                        let session_id = request.session_id;
+                        tokio::spawn(async move {
+                            if let Err(error) = run_qwen_turn(request, event_sender.clone(), pending).await {
+                                event_sender.send(AppEvent::Error(AgentErrorEvent {
+                                    session_id: Some(session_id),
+                                    code: Some("qwen_adapter_error".to_owned()),
+                                    message: error.to_string(),
+                                    provider_payload: None,
+                                })).ok();
+                            }
+                        });
+                    }
+                    RunnerCommand::AnswerApproval(command) => {
+                        let pending = pending_approvals.lock().await.remove(&command.approval_id);
+                        let outcome = if let Some(pending) = pending {
+                            pending.response.send(command.decision).ok();
+                            RunnerResponseOutcome::Ok {
+                                result: RunnerCommandResult::Accepted,
+                            }
+                        } else {
+                            RunnerResponseOutcome::Error {
+                                error: agenter_protocol::runner::RunnerError {
+                                    code: "approval_not_found".to_owned(),
+                                    message: "approval is no longer pending in the Qwen adapter".to_owned(),
                                 },
                             }
                         };
@@ -280,6 +422,35 @@ fn fake_hello(token: String) -> RunnerHello {
 }
 
 fn codex_hello(token: String, workspace_path: PathBuf) -> RunnerHello {
+    provider_hello(
+        token,
+        workspace_path,
+        AgentProviderId::from(AgentProviderId::CODEX),
+        "codex-app-server",
+        "codex workspace",
+        true,
+    )
+}
+
+fn qwen_hello(token: String, workspace_path: PathBuf) -> RunnerHello {
+    provider_hello(
+        token,
+        workspace_path,
+        AgentProviderId::from(AgentProviderId::QWEN),
+        "qwen-acp",
+        "qwen workspace",
+        false,
+    )
+}
+
+fn provider_hello(
+    token: String,
+    workspace_path: PathBuf,
+    provider_id: AgentProviderId,
+    transport: &str,
+    fallback_name: &str,
+    session_resume: bool,
+) -> RunnerHello {
     let runner_id = RunnerId::new();
     RunnerHello {
         runner_id,
@@ -287,17 +458,17 @@ fn codex_hello(token: String, workspace_path: PathBuf) -> RunnerHello {
         token,
         capabilities: RunnerCapabilities {
             agent_providers: vec![AgentProviderAdvertisement {
-                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                provider_id,
                 capabilities: AgentCapabilities {
                     streaming: true,
                     approvals: true,
                     file_changes: true,
                     command_execution: true,
-                    session_resume: true,
+                    session_resume,
                     ..AgentCapabilities::default()
                 },
             }],
-            transports: vec!["codex-app-server".to_owned()],
+            transports: vec![transport.to_owned()],
             workspace_discovery: false,
         },
         workspaces: vec![WorkspaceRef {
@@ -308,7 +479,7 @@ fn codex_hello(token: String, workspace_path: PathBuf) -> RunnerHello {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .map(str::to_owned)
-                .or_else(|| Some("codex workspace".to_owned())),
+                .or_else(|| Some(fallback_name.to_owned())),
         }],
     }
 }

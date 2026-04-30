@@ -41,6 +41,18 @@ Rust spike binary command:
 cargo run -p agenter-runner --bin qwen_acp_spike -- /path/to/spike-workspace
 ```
 
+Agenter runner adapter command:
+
+```sh
+AGENTER_RUNNER_MODE=qwen \
+AGENTER_WORKSPACE=/path/to/workspace \
+AGENTER_CONTROL_PLANE_WS=ws://127.0.0.1:7777/api/runner/ws \
+AGENTER_DEV_RUNNER_TOKEN=dev-runner-token \
+  cargo run -p agenter-runner
+```
+
+The adapter advertises a single configured workspace and the `qwen` provider, starts `qwen --acp --approval-mode default` per browser turn, initializes ACP, creates or resumes a session when an external session id is present, sends one prompt, normalizes known `session/update` message/error notifications and `session/request_permission` requests, routes approval answers to ACP option selections, and answers basic ACP fs/terminal client requests with inert responses.
+
 Use either an extra CLI argument or `AGENTER_SPIKE_PROMPT` to override the default permission-probing prompt:
 
 ```sh

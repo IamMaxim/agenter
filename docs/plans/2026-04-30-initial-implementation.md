@@ -252,7 +252,8 @@ Active execution notes:
 
 - Task 3.1 adds `AGENTER_RUNNER_MODE=codex` runner mode. It advertises the configured `AGENTER_WORKSPACE`, launches `codex app-server --listen stdio://` per browser turn, initializes or resumes a thread, starts a read-only turn, normalizes known Codex JSON-RPC notifications/requests into `AppEvent`s, and forwards approval answers back to the provider request id.
 - Adapter tests cover representative message delta, command approval, and approval decision response fixtures. Live Codex smoke was limited to installed CLI detection with `command -v codex` and `codex --version`; a real turn still requires an authenticated provider session and model/network availability.
-- Task 3.1 verification passed with `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace`.
+- Follow-up review fixes add the runner crate's explicit Tokio `sync` feature and map Codex permission approvals to the permission-specific JSON-RPC result shape from the spike runbook.
+- Task 3.1 verification passed with `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace`; local CLI detection returned `codex-cli 0.125.0`.
 
 ### Task 3.2: Qwen ACP Adapter
 
@@ -262,11 +263,18 @@ Active execution notes:
 - Modify runner state and command handling modules
 - Update: `docs/runbooks/qwen-acp-spike.md`
 
-- [ ] Promote observed Qwen ACP payloads into a typed adapter.
-- [ ] Implement process supervision, initialize, capability detection, session create/resume when supported, prompt, event normalization, interrupt if supported, and permission answer.
-- [ ] Add adapter tests using recorded JSON fixtures where possible.
-- [ ] Run Rust verification and a local Qwen smoke test when `qwen` is installed.
-- [ ] Commit with `feat: add qwen acp adapter`.
+- [x] Promote observed Qwen ACP payloads into a typed adapter.
+- [x] Implement process supervision, initialize, session create/resume probe, prompt, event normalization, and permission answer.
+- [x] Add adapter tests using recorded JSON fixtures where possible.
+- [x] Run Rust verification and local Qwen CLI detection when `qwen` is installed.
+- [x] Commit with `feat: add qwen acp adapter`.
+- [ ] Add live capability-gated resume/load selection and interrupt support once live Qwen transcripts confirm supported methods.
+
+Active execution notes:
+
+- Task 3.2 adds `AGENTER_RUNNER_MODE=qwen` runner mode. It advertises the configured `AGENTER_WORKSPACE`, launches `qwen --acp --approval-mode default` per browser turn, initializes ACP, creates or resumes a session, sends a prompt, normalizes known `session/update` and `session/request_permission` payloads, maps approval answers to ACP option selections, and answers basic fs/terminal client requests with inert responses.
+- Adapter tests cover representative message chunk, permission request, and permission decision response fixtures. Live Qwen smoke was limited to installed CLI detection with `command -v qwen` and `qwen --version`; a real turn still requires an authenticated provider session and model/network availability.
+- Task 3.2 verification passed with `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace`; local CLI detection returned `qwen 0.15.6`.
 
 ## Milestone 4: OIDC and Messenger Linking
 
