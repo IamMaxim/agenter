@@ -1,4 +1,6 @@
-use std::env;
+mod agents;
+
+use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
 
 use agenter_core::{
     AgentCapabilities, AgentErrorEvent, AgentMessageDeltaEvent, AgentProviderId, AppEvent,
@@ -12,7 +14,9 @@ use agenter_protocol::runner::{
     RunnerCommandResult, RunnerEvent, RunnerEventEnvelope, RunnerHello, RunnerResponseEnvelope,
     RunnerResponseOutcome, PROTOCOL_VERSION,
 };
+use agents::codex::{run_codex_turn, CodexTurnRequest, PendingCodexApproval};
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 
@@ -25,6 +29,8 @@ async fn main() -> anyhow::Result<()> {
 
     if fake_mode_requested() {
         run_fake_runner().await?;
+    } else if codex_mode_requested() {
+        run_codex_runner().await?;
     } else {
         println!("agenter runner");
     }
@@ -35,6 +41,143 @@ async fn main() -> anyhow::Result<()> {
 fn fake_mode_requested() -> bool {
     env::args().any(|arg| arg == "fake" || arg == "--fake")
         || env::var("AGENTER_RUNNER_MODE").is_ok_and(|mode| mode == "fake")
+}
+
+fn codex_mode_requested() -> bool {
+    env::args().any(|arg| arg == "codex" || arg == "--codex")
+        || env::var("AGENTER_RUNNER_MODE").is_ok_and(|mode| mode == "codex")
+}
+
+async fn run_codex_runner() -> anyhow::Result<()> {
+    let url = env::var("AGENTER_CONTROL_PLANE_WS")
+        .unwrap_or_else(|_| DEFAULT_CONTROL_PLANE_WS.to_owned());
+    let token = env::var("AGENTER_DEV_RUNNER_TOKEN")
+        .unwrap_or_else(|_| DEFAULT_DEV_RUNNER_TOKEN.to_owned());
+    let workspace_path = env::var("AGENTER_WORKSPACE")
+        .map(PathBuf::from)
+        .unwrap_or(env::current_dir()?);
+    let workspace_path = workspace_path.canonicalize().unwrap_or(workspace_path);
+    let (socket, _) = connect_async(&url).await?;
+    let (mut sender, mut receiver) = socket.split();
+    let hello = codex_hello(token, workspace_path.clone());
+    send_runner_message(&mut sender, RunnerClientMessage::Hello(hello)).await?;
+
+    let pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingCodexApproval>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let (codex_event_sender, mut codex_event_receiver) = mpsc::unbounded_channel::<AppEvent>();
+
+    loop {
+        tokio::select! {
+            event = codex_event_receiver.recv() => {
+                let Some(event) = event else {
+                    continue;
+                };
+                let Some(session_id) = app_event_session_id(&event) else {
+                    continue;
+                };
+                send_runner_message(
+                    &mut sender,
+                    RunnerClientMessage::Event(RunnerEventEnvelope {
+                        request_id: None,
+                        event: RunnerEvent::AgentEvent(agenter_protocol::AgentEvent {
+                            session_id,
+                            event,
+                        }),
+                    }),
+                )
+                .await?;
+            }
+            message = receiver.next() => {
+                let Some(message) = message else {
+                    break;
+                };
+                let Message::Text(text) = message? else {
+                    continue;
+                };
+                let Ok(agenter_protocol::RunnerServerMessage::Command(envelope)) =
+                    serde_json::from_str::<agenter_protocol::RunnerServerMessage>(&text)
+                else {
+                    continue;
+                };
+
+                match envelope.command {
+                    RunnerCommand::AgentSendInput(command) => {
+                        send_runner_message(
+                            &mut sender,
+                            RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                request_id: envelope.request_id.clone(),
+                                outcome: RunnerResponseOutcome::Ok {
+                                    result: RunnerCommandResult::Accepted,
+                                },
+                            }),
+                        )
+                        .await?;
+                        let prompt = agent_input_text(&command.input);
+                        let request = CodexTurnRequest {
+                            session_id: command.session_id,
+                            workspace_path: workspace_path.clone(),
+                            external_session_id: command.external_session_id,
+                            prompt,
+                        };
+                        let event_sender = codex_event_sender.clone();
+                        let pending = pending_approvals.clone();
+                        let session_id = request.session_id;
+                        tokio::spawn(async move {
+                            if let Err(error) = run_codex_turn(request, event_sender.clone(), pending).await {
+                                event_sender.send(AppEvent::Error(AgentErrorEvent {
+                                    session_id: Some(session_id),
+                                    code: Some("codex_adapter_error".to_owned()),
+                                    message: error.to_string(),
+                                    provider_payload: None,
+                                })).ok();
+                            }
+                        });
+                    }
+                    RunnerCommand::AnswerApproval(command) => {
+                        let pending = pending_approvals.lock().await.remove(&command.approval_id);
+                        let outcome = if let Some(pending) = pending {
+                            pending.response.send(command.decision).ok();
+                            RunnerResponseOutcome::Ok {
+                                result: RunnerCommandResult::Accepted,
+                            }
+                        } else {
+                            RunnerResponseOutcome::Error {
+                                error: agenter_protocol::runner::RunnerError {
+                                    code: "approval_not_found".to_owned(),
+                                    message: "approval is no longer pending in the Codex adapter".to_owned(),
+                                },
+                            }
+                        };
+                        send_runner_message(
+                            &mut sender,
+                            RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                request_id: envelope.request_id,
+                                outcome,
+                            }),
+                        )
+                        .await?;
+                    }
+                    RunnerCommand::CreateSession(_)
+                    | RunnerCommand::ResumeSession(_)
+                    | RunnerCommand::InterruptSession { .. }
+                    | RunnerCommand::ShutdownSession(_) => {
+                        send_runner_message(
+                            &mut sender,
+                            RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                request_id: envelope.request_id,
+                                outcome: RunnerResponseOutcome::Ok {
+                                    result: RunnerCommandResult::Accepted,
+                                },
+                            }),
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_fake_runner() -> anyhow::Result<()> {
@@ -136,8 +279,72 @@ fn fake_hello(token: String) -> RunnerHello {
     }
 }
 
+fn codex_hello(token: String, workspace_path: PathBuf) -> RunnerHello {
+    let runner_id = RunnerId::new();
+    RunnerHello {
+        runner_id,
+        protocol_version: PROTOCOL_VERSION.to_owned(),
+        token,
+        capabilities: RunnerCapabilities {
+            agent_providers: vec![AgentProviderAdvertisement {
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                capabilities: AgentCapabilities {
+                    streaming: true,
+                    approvals: true,
+                    file_changes: true,
+                    command_execution: true,
+                    session_resume: true,
+                    ..AgentCapabilities::default()
+                },
+            }],
+            transports: vec!["codex-app-server".to_owned()],
+            workspace_discovery: false,
+        },
+        workspaces: vec![WorkspaceRef {
+            workspace_id: WorkspaceId::new(),
+            runner_id,
+            path: workspace_path.display().to_string(),
+            display_name: workspace_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .or_else(|| Some("codex workspace".to_owned())),
+        }],
+    }
+}
+
 fn fake_runner_id() -> RunnerId {
     RunnerId::from_uuid(Uuid::from_u128(0x33333333333333333333333333333333))
+}
+
+fn agent_input_text(input: &AgentInput) -> String {
+    match input {
+        AgentInput::Text { text } => text.clone(),
+        AgentInput::UserMessage { payload } => payload.content.clone(),
+    }
+}
+
+fn app_event_session_id(event: &AppEvent) -> Option<SessionId> {
+    match event {
+        AppEvent::SessionStarted(info) => Some(info.session_id),
+        AppEvent::SessionStatusChanged(event) => Some(event.session_id),
+        AppEvent::UserMessage(event) => Some(event.session_id),
+        AppEvent::AgentMessageDelta(event) => Some(event.session_id),
+        AppEvent::AgentMessageCompleted(event) => Some(event.session_id),
+        AppEvent::PlanUpdated(event) => Some(event.session_id),
+        AppEvent::ToolStarted(event)
+        | AppEvent::ToolUpdated(event)
+        | AppEvent::ToolCompleted(event) => Some(event.session_id),
+        AppEvent::CommandStarted(event) => Some(event.session_id),
+        AppEvent::CommandOutputDelta(event) => Some(event.session_id),
+        AppEvent::CommandCompleted(event) => Some(event.session_id),
+        AppEvent::FileChangeProposed(event)
+        | AppEvent::FileChangeApplied(event)
+        | AppEvent::FileChangeRejected(event) => Some(event.session_id),
+        AppEvent::ApprovalRequested(event) => Some(event.session_id),
+        AppEvent::ApprovalResolved(event) => Some(event.session_id),
+        AppEvent::Error(event) => event.session_id,
+    }
 }
 
 fn deterministic_fake_events(session_id: SessionId, input: &AgentInput) -> Vec<AppEvent> {

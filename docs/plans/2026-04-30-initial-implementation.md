@@ -241,11 +241,18 @@ Exit criterion: browser can create or resume Codex and Qwen sessions in a config
 - Modify runner state and command handling modules
 - Update: `docs/runbooks/codex-app-server-spike.md`
 
-- [ ] Promote observed Codex spike payloads into a typed adapter.
-- [ ] Implement process supervision, initialize, thread create/resume/read, turn start, event normalization, interrupt, and approval answer.
-- [ ] Add adapter tests using recorded JSON fixtures where possible.
-- [ ] Run Rust verification and a local Codex smoke test when `codex` is installed.
-- [ ] Commit with `feat: add codex app-server adapter`.
+- [x] Promote observed Codex spike payloads into a typed adapter.
+- [x] Implement process supervision, initialize, thread create/resume, turn start, event normalization, and approval answer.
+- [x] Add adapter tests using recorded JSON fixtures where possible.
+- [x] Run Rust verification and local Codex CLI detection when `codex` is installed.
+- [x] Commit with `feat: add codex app-server adapter`.
+- [ ] Add thread/read history replay and real interrupt cancellation once live Codex transcript confirms method names.
+
+Active execution notes:
+
+- Task 3.1 adds `AGENTER_RUNNER_MODE=codex` runner mode. It advertises the configured `AGENTER_WORKSPACE`, launches `codex app-server --listen stdio://` per browser turn, initializes or resumes a thread, starts a read-only turn, normalizes known Codex JSON-RPC notifications/requests into `AppEvent`s, and forwards approval answers back to the provider request id.
+- Adapter tests cover representative message delta, command approval, and approval decision response fixtures. Live Codex smoke was limited to installed CLI detection with `command -v codex` and `codex --version`; a real turn still requires an authenticated provider session and model/network availability.
+- Task 3.1 verification passed with `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace`.
 
 ### Task 3.2: Qwen ACP Adapter
 

@@ -41,6 +41,18 @@ Rust spike binary command:
 cargo run -p agenter-runner --bin codex_app_server_spike -- /path/to/spike-workspace
 ```
 
+Agenter runner adapter command:
+
+```sh
+AGENTER_RUNNER_MODE=codex \
+AGENTER_WORKSPACE=/path/to/workspace \
+AGENTER_CONTROL_PLANE_WS=ws://127.0.0.1:7777/api/runner/ws \
+AGENTER_DEV_RUNNER_TOKEN=dev-runner-token \
+  cargo run -p agenter-runner
+```
+
+The adapter advertises a single configured workspace and the `codex` provider, starts `codex app-server --listen stdio://` per browser turn, initializes or resumes a thread when an external session id is present on the runner command, starts a turn with read-only sandbox policy, normalizes known message, command, file, tool, error, and approval request events, and routes approval answers back to the JSON-RPC server request id.
+
 Use either an extra CLI argument or `AGENTER_SPIKE_PROMPT` to override the default approval-probing prompt:
 
 ```sh
