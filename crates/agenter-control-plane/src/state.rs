@@ -107,6 +107,7 @@ pub struct OutboundRunnerMessage {
 pub enum RunnerSendError {
     NotConnected,
     Closed,
+    StaleApproval,
 }
 
 impl AppState {
@@ -586,6 +587,16 @@ impl AppState {
         if matches!(approval.status, ApprovalStatus::Resolving) {
             approval.status = ApprovalStatus::Pending;
         }
+    }
+
+    pub async fn approval_is_resolving(&self, approval_id: ApprovalId) -> bool {
+        self.inner
+            .registry
+            .lock()
+            .await
+            .approvals
+            .get(&approval_id)
+            .is_some_and(|approval| matches!(approval.status, ApprovalStatus::Resolving))
     }
 
     pub async fn finish_approval_resolution(

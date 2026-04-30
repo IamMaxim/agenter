@@ -142,6 +142,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 let Some(outbound) = outbound else {
                     break;
                 };
+                if let Some(approval_id) = approval_answer_id(&outbound.message) {
+                    if !state.approval_is_resolving(approval_id).await {
+                        let _ = outbound.delivered.send(Err(crate::state::RunnerSendError::StaleApproval));
+                        continue;
+                    }
+                }
                 let result = send_server_message(&mut sender, outbound.message).await;
                 let should_break = result.is_err();
                 let _ = outbound.delivered.send(result.map_err(|_| crate::state::RunnerSendError::Closed));
@@ -155,6 +161,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     state
         .disconnect_runner(runner.runner_id, connection_id)
         .await;
+}
+
+fn approval_answer_id(message: &RunnerServerMessage) -> Option<agenter_core::ApprovalId> {
+    let RunnerServerMessage::Command(command) = message else {
+        return None;
+    };
+    let RunnerCommand::AnswerApproval(answer) = &command.command else {
+        return None;
+    };
+    Some(answer.approval_id)
 }
 
 async fn send_server_message(

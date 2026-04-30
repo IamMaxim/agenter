@@ -334,9 +334,11 @@ async fn send_session_message(
 
     match state.send_runner_message(session.runner_id, message).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
-        Err(RunnerSendError::NotConnected | RunnerSendError::Closed) => {
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
-        }
+        Err(
+            RunnerSendError::NotConnected
+            | RunnerSendError::Closed
+            | RunnerSendError::StaleApproval,
+        ) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
@@ -412,6 +414,21 @@ async fn decide_approval(
         Err(RunnerSendError::NotConnected | RunnerSendError::Closed) => {
             state.cancel_approval_resolution(approval_id).await;
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        Err(RunnerSendError::StaleApproval) => {
+            return match state.begin_approval_resolution(approval_id).await {
+                ApprovalResolutionStart::AlreadyResolved {
+                    session_id,
+                    envelope,
+                } => {
+                    if state.session(user.user_id, session_id).await.is_none() {
+                        StatusCode::NOT_FOUND.into_response()
+                    } else {
+                        Json(*envelope).into_response()
+                    }
+                }
+                _ => StatusCode::CONFLICT.into_response(),
+            };
         }
     }
 
