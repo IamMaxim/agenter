@@ -291,10 +291,11 @@ Exit criterion: browser supports password and Authentik OIDC login, and a Telegr
 - Modify: `crates/agenter-db/src/repositories.rs`
 - Add OIDC config docs under `docs/runbooks/`
 
-- [ ] Implement OIDC provider config loading with Authentik-compatible defaults.
-- [ ] Implement login redirect, callback, identity binding, and session creation.
-- [ ] Add tests for callback state validation and identity upsert.
-- [ ] Commit with `feat: add oidc authentication`.
+- [x] Implement OIDC provider config loading with Authentik-compatible defaults.
+- [x] Implement login redirect, callback, identity binding, and session creation.
+- [x] Add tests for callback state validation and identity upsert.
+- [x] Commit with `feat: add oidc authentication`.
+- [ ] Replace the development callback body with real authorization-code exchange and ID-token validation.
 
 ### Task 4.2: Add Messenger Link Flow
 
@@ -303,11 +304,19 @@ Exit criterion: browser supports password and Authentik OIDC login, and a Telegr
 - Modify control-plane auth/link modules
 - Modify DB repositories
 
-- [ ] Implement short-lived link code creation.
-- [ ] Implement `/link/{code}` browser landing and completion API.
-- [ ] Bind Telegram or Mattermost external identity to an authenticated user.
-- [ ] Add tests for expired, reused, and unauthorized link codes.
-- [ ] Commit with `feat: add connector account linking`.
+- [x] Implement short-lived link code creation.
+- [x] Implement `/link/{code}` browser landing and completion API.
+- [x] Bind Telegram or Mattermost external identity to an authenticated user.
+- [x] Add tests for expired, reused, and unauthorized link codes.
+- [x] Commit with `feat: add connector account linking`.
+
+Active execution notes:
+
+- Task 4.1/4.2 added durable OIDC provider/state, OIDC identity, connector account, and connector link code repository primitives plus HTTP endpoints for OIDC login/callback and connector link-code create/consume.
+- Current OIDC callback is a disabled-by-default development contract gated by `AGENTER_UNSAFE_DEV_OIDC_CALLBACK=1`; it accepts validated identity fields from the caller after state consumption, so production authorization-code exchange and ID-token validation remain explicitly open before enabling normal OIDC login.
+- Link-code creation from HTTP is also disabled by default and gated by `AGENTER_UNSAFE_DEV_LINK_CODE_CREATION=1`; production connector transports must create link codes only after proving possession of the external account.
+- Connector link codes enforce one active code per external connector account, can be retried idempotently by the same authenticated user after completion, and bind to `connector_accounts`.
+- Verification passed with `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`, `npm run check`, `npm run lint`, `npm run test`, and `npm run build`. DB integration tests remain ignored without `DATABASE_URL`.
 
 ## Milestone 5: Telegram Connector
 

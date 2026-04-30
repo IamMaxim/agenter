@@ -240,6 +240,9 @@ async fn oidc_callback(
     Path(provider_id): Path<String>,
     Json(request): Json<OidcCallbackRequest>,
 ) -> Response {
+    if !unsafe_dev_oidc_callback_enabled() {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
     let Some(pool) = state.db_pool() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -285,6 +288,9 @@ async fn create_link_code(
     State(state): State<AppState>,
     Json(request): Json<CreateLinkCodeRequest>,
 ) -> Response {
+    if !unsafe_dev_link_code_creation_enabled() {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
     let Some(pool) = state.db_pool() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -349,6 +355,18 @@ fn oidc_authorization_url(
         state,
         nonce
     )
+}
+
+fn unsafe_dev_oidc_callback_enabled() -> bool {
+    env_flag_enabled("AGENTER_UNSAFE_DEV_OIDC_CALLBACK")
+}
+
+fn unsafe_dev_link_code_creation_enabled() -> bool {
+    env_flag_enabled("AGENTER_UNSAFE_DEV_LINK_CODE_CREATION")
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    env::var(name).is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "True"))
 }
 
 async fn list_runners(State(state): State<AppState>, headers: HeaderMap) -> Response {
