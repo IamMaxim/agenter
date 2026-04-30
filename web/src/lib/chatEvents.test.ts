@@ -31,6 +31,7 @@ describe('chat event state', () => {
         kind: 'assistant',
         messageId: 'm1',
         content: 'hello world',
+        markdown: true,
         completed: false
       }
     ]);
@@ -71,6 +72,379 @@ describe('chat event state', () => {
       kind: 'approval',
       approvalId: 'a1',
       resolvedDecision: 'accept'
+    });
+  });
+
+  test('keeps user and assistant messages as markdown-capable transcript items', () => {
+    let state = createChatState();
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-user-markdown',
+      event: {
+        type: 'user_message',
+        payload: {
+          session_id: 's1',
+          message_id: 'u1',
+          content: 'Please run **frontend verification**.'
+        }
+      }
+    });
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-agent-markdown',
+      event: {
+        type: 'agent_message_completed',
+        payload: {
+          session_id: 's1',
+          message_id: 'a1',
+          content: '- Added markdown\n- Updated event rows'
+        }
+      }
+    });
+
+    expect(state.items).toEqual([
+      {
+        id: 'user:u1',
+        kind: 'user',
+        messageId: 'u1',
+        content: 'Please run **frontend verification**.',
+        markdown: true
+      },
+      {
+        id: 'agent:a1',
+        kind: 'assistant',
+        messageId: 'a1',
+        content: '- Added markdown\n- Updated event rows',
+        completed: true,
+        markdown: true
+      }
+    ]);
+  });
+
+  test('maps command tool and file activity to inline expandable event rows', () => {
+    let state = createChatState();
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-command-start',
+      event: {
+        type: 'command_started',
+        payload: {
+          session_id: 's1',
+          command_id: 'cmd1',
+          command: 'npm run check',
+          cwd: 'web/'
+        }
+      }
+    });
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-tool',
+      event: {
+        type: 'tool_started',
+        payload: {
+          session_id: 's1',
+          tool_call_id: 'tool1',
+          name: 'codex_item',
+          input: { item_id: 'i1' }
+        }
+      }
+    });
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-file',
+      event: {
+        type: 'file_change_applied',
+        payload: {
+          session_id: 's1',
+          path: 'web/src/App.svelte',
+          diff: '+ dark shell'
+        }
+      }
+    });
+
+    expect(state.items).toEqual([
+      {
+        id: 'event:command:cmd1',
+        kind: 'inlineEvent',
+        eventKind: 'command',
+        title: 'npm run check',
+        detail: 'web/',
+        output: '',
+        status: 'running',
+        success: undefined,
+        processId: undefined,
+        source: undefined,
+        actions: []
+      },
+      {
+        id: 'event:tool:tool1',
+        kind: 'inlineEvent',
+        eventKind: 'tool',
+        title: 'codex_item',
+        detail: '{\n  "item_id": "i1"\n}',
+        status: 'running'
+      },
+      {
+        id: 'event:file:web/src/App.svelte',
+        kind: 'inlineEvent',
+        eventKind: 'file',
+        title: 'web/src/App.svelte',
+        detail: '+ dark shell',
+        status: 'applied'
+      }
+    ]);
+  });
+
+  test('renders plan updates as dedicated plan cards', () => {
+    let state = createChatState();
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-plan',
+      event: {
+        type: 'plan_updated',
+        payload: {
+          session_id: 's1',
+          title: 'Implementation plan',
+          content: '1. Add markdown\n2. Restyle chat'
+        }
+      }
+    });
+
+    expect(state.items).toEqual([
+      {
+        id: 'plan:evt-plan',
+        kind: 'plan',
+        title: 'Implementation plan',
+        content: '1. Add markdown\n2. Restyle chat'
+      }
+    ]);
+  });
+
+  test('preserves command title while streaming output and exposes command metadata', () => {
+    let state = createChatState();
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-command-start',
+      event: {
+        type: 'command_started',
+        payload: {
+          session_id: 's1',
+          command_id: 'cmd1',
+          command: "sed -n '1,20p' SKILL.md",
+          cwd: '/work/agenter',
+          source: 'unifiedExecStartup',
+          process_id: '123',
+          actions: [
+            {
+              kind: 'read',
+              command: "sed -n '1,20p' /tmp/skills/demo/SKILL.md",
+              name: 'SKILL.md',
+              path: '/tmp/skills/demo/SKILL.md'
+            }
+          ]
+        }
+      }
+    });
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-command-output',
+      event: {
+        type: 'command_output_delta',
+        payload: {
+          session_id: 's1',
+          command_id: 'cmd1',
+          delta: 'hello\n'
+        }
+      }
+    });
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-command-completed',
+      event: {
+        type: 'command_completed',
+        payload: {
+          session_id: 's1',
+          command_id: 'cmd1',
+          exit_code: 0,
+          duration_ms: 17,
+          success: true
+        }
+      }
+    });
+
+    expect(state.items[0]).toMatchObject({
+      id: 'event:command:cmd1',
+      kind: 'inlineEvent',
+      eventKind: 'command',
+      title: "sed -n '1,20p' SKILL.md",
+      detail: '/work/agenter · unifiedExecStartup · pid 123',
+      output: 'hello\n',
+      status: 'completed',
+      exitCode: 0,
+      durationMs: 17,
+      processId: '123',
+      source: 'unifiedExecStartup',
+      actions: [
+        {
+          kind: 'skill',
+          label: 'Skill: demo',
+          detail: '/tmp/skills/demo/SKILL.md',
+          path: '/tmp/skills/demo/SKILL.md'
+        }
+      ]
+    });
+  });
+
+  test('maps codex spawn agent tools to structured subagent rows', () => {
+    let state = createChatState();
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-spawn',
+      event: {
+        type: 'tool_completed',
+        payload: {
+          session_id: 's1',
+          tool_call_id: 'tool1',
+          name: 'spawnAgent',
+          provider_payload: {
+            type: 'collabAgentToolCall',
+            tool: 'spawnAgent',
+            receiverThreadIds: ['agent-1'],
+            model: 'gpt-5.5',
+            reasoningEffort: 'medium',
+            prompt: 'Implement task'
+          }
+        }
+      }
+    });
+
+    expect(state.items[0]).toMatchObject({
+      id: 'subagent:tool1',
+      kind: 'subagent',
+      operation: 'spawn',
+      title: 'Spawn subagent',
+      status: 'completed',
+      agentIds: ['agent-1'],
+      model: 'gpt-5.5',
+      reasoningEffort: 'medium',
+      prompt: 'Implement task'
+    });
+  });
+
+  test('maps codex wait and close tools to subagent result rows', () => {
+    let state = createChatState();
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-wait',
+      event: {
+        type: 'tool_completed',
+        payload: {
+          session_id: 's1',
+          tool_call_id: 'tool-wait',
+          name: 'wait',
+          provider_payload: {
+            type: 'collabAgentToolCall',
+            tool: 'wait',
+            receiverThreadIds: ['agent-1'],
+            agentsStates: {
+              'agent-1': {
+                status: 'completed',
+                message: 'DONE\n\nVerification passed.'
+              }
+            }
+          }
+        }
+      }
+    });
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-close',
+      event: {
+        type: 'tool_completed',
+        payload: {
+          session_id: 's1',
+          tool_call_id: 'tool-close',
+          name: 'closeAgent',
+          provider_payload: {
+            type: 'collabAgentToolCall',
+            tool: 'closeAgent',
+            receiverThreadIds: ['agent-2'],
+            agentsStates: {
+              'agent-2': {
+                status: 'completed',
+                message: 'APPROVED'
+              }
+            }
+          }
+        }
+      }
+    });
+
+    expect(state.items[0]).toMatchObject({
+      id: 'subagent:tool-wait',
+      kind: 'subagent',
+      operation: 'wait',
+      title: 'Wait for subagent',
+      agentIds: ['agent-1'],
+      states: [
+        {
+          agentId: 'agent-1',
+          status: 'completed',
+          message: 'DONE\n\nVerification passed.'
+        }
+      ]
+    });
+    expect(state.items[1]).toMatchObject({
+      id: 'subagent:tool-close',
+      kind: 'subagent',
+      operation: 'close',
+      title: 'Close subagent',
+      agentIds: ['agent-2'],
+      states: [
+        {
+          agentId: 'agent-2',
+          status: 'completed',
+          message: 'APPROVED'
+        }
+      ]
+    });
+  });
+
+  test('keeps empty codex wait tools as harmless subagent lifecycle rows', () => {
+    let state = createChatState();
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-empty-wait',
+      event: {
+        type: 'tool_completed',
+        payload: {
+          session_id: 's1',
+          tool_call_id: 'tool-empty-wait',
+          name: 'wait',
+          provider_payload: {
+            type: 'collabAgentToolCall',
+            tool: 'wait',
+            receiverThreadIds: [],
+            agentsStates: {}
+          }
+        }
+      }
+    });
+
+    expect(state.items[0]).toMatchObject({
+      id: 'subagent:tool-empty-wait',
+      kind: 'subagent',
+      operation: 'wait',
+      title: 'Wait for subagent',
+      agentIds: [],
+      states: []
     });
   });
 });

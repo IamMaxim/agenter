@@ -1,12 +1,15 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use agenter_core::{
-    AgentProviderId, AppEvent, ApprovalId, RunnerId, SessionId, SessionInfo, SessionStatus, UserId,
-    WorkspaceId, WorkspaceRef,
+    AgentProviderId, AppEvent, ApprovalId, CommandAction, CommandOutputStream, RunnerId, SessionId,
+    SessionInfo, SessionStatus, UserId, WorkspaceId, WorkspaceRef,
 };
 use agenter_protocol::{
     browser::BrowserEventEnvelope,
-    runner::{RunnerCapabilities, RunnerResponseOutcome, RunnerServerMessage},
+    runner::{
+        DiscoveredFileChangeStatus, DiscoveredSessionHistoryItem, DiscoveredSessions,
+        DiscoveredToolStatus, RunnerCapabilities, RunnerResponseOutcome, RunnerServerMessage,
+    },
     RequestId,
 };
 use tokio::{
@@ -317,6 +320,36 @@ impl AppState {
         capabilities: RunnerCapabilities,
         workspaces: Vec<WorkspaceRef>,
     ) -> RegisteredRunner {
+        if let Some(pool) = &self.inner.db_pool {
+            if let Err(error) = agenter_db::upsert_runner_with_id(
+                pool,
+                runner_id,
+                &format!("runner-{runner_id}"),
+                None,
+            )
+            .await
+            {
+                tracing::warn!(%runner_id, %error, "failed to persist runner registry row");
+            }
+            for workspace in &workspaces {
+                if let Err(error) = agenter_db::upsert_workspace_with_id(
+                    pool,
+                    workspace.workspace_id,
+                    runner_id,
+                    &workspace.path,
+                    workspace.display_name.as_deref(),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        %runner_id,
+                        workspace_id = %workspace.workspace_id,
+                        %error,
+                        "failed to persist runner workspace row"
+                    );
+                }
+            }
+        }
         let runner = RegisteredRunner {
             runner_id,
             capabilities,
@@ -524,7 +557,7 @@ impl AppState {
     }
 
     pub async fn register_session(&self, registration: SessionRegistration) -> RegisteredSession {
-        let session = RegisteredSession {
+        let mut session = RegisteredSession {
             session_id: registration.session_id,
             owner_user_id: registration.owner_user_id,
             runner_id: registration.runner_id,
@@ -534,6 +567,36 @@ impl AppState {
             title: registration.title,
             external_session_id: registration.external_session_id,
         };
+        if let Some(pool) = &self.inner.db_pool {
+            match agenter_db::create_session_with_id(
+                pool,
+                agenter_db::CreateSessionRecord {
+                    session_id: session.session_id,
+                    owner_user_id: session.owner_user_id,
+                    runner_id: session.runner_id,
+                    workspace_id: session.workspace.workspace_id,
+                    provider_id: session.provider_id.clone(),
+                    external_session_id: session.external_session_id.clone(),
+                    title: session.title.clone(),
+                    status: session.status.clone(),
+                },
+            )
+            .await
+            {
+                Ok(persisted) => {
+                    session.status = persisted.status;
+                    session.title = persisted.title;
+                    session.external_session_id = persisted.external_session_id;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %session.session_id,
+                        %error,
+                        "failed to persist session registry row"
+                    );
+                }
+            }
+        }
         self.inner
             .registry
             .lock()
@@ -576,6 +639,13 @@ impl AppState {
     }
 
     pub async fn can_access_session(&self, user_id: UserId, session_id: SessionId) -> bool {
+        if let Some(pool) = &self.inner.db_pool {
+            return agenter_db::find_session_for_user(pool, user_id, session_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+        }
         self.inner
             .registry
             .lock()
@@ -586,6 +656,29 @@ impl AppState {
     }
 
     pub async fn list_sessions(&self, user_id: UserId) -> Vec<SessionInfo> {
+        if let Some(pool) = &self.inner.db_pool {
+            return agenter_db::list_sessions_for_user(pool, user_id)
+                .await
+                .map(|sessions| {
+                    sessions
+                        .iter()
+                        .map(|session| SessionInfo {
+                            session_id: session.session.session_id,
+                            owner_user_id: session.session.owner_user_id,
+                            runner_id: session.session.runner_id,
+                            workspace_id: session.session.workspace_id,
+                            provider_id: session.session.provider_id.clone(),
+                            status: session.session.status.clone(),
+                            external_session_id: session.session.external_session_id.clone(),
+                            title: session.session.title.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%user_id, %error, "failed to list persisted sessions");
+                    Vec::new()
+                });
+        }
         self.inner
             .registry
             .lock()
@@ -602,6 +695,27 @@ impl AppState {
         user_id: UserId,
         session_id: SessionId,
     ) -> Option<RegisteredSession> {
+        if let Some(pool) = &self.inner.db_pool {
+            return agenter_db::find_session_for_user(pool, user_id, session_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|session| RegisteredSession {
+                    session_id: session.session.session_id,
+                    owner_user_id: session.session.owner_user_id,
+                    runner_id: session.session.runner_id,
+                    workspace: WorkspaceRef {
+                        workspace_id: session.workspace.workspace_id,
+                        runner_id: session.workspace.runner_id,
+                        path: session.workspace.path,
+                        display_name: session.workspace.display_name,
+                    },
+                    provider_id: session.session.provider_id,
+                    status: session.session.status,
+                    title: session.session.title,
+                    external_session_id: session.session.external_session_id,
+                });
+        }
         self.inner
             .registry
             .lock()
@@ -634,6 +748,38 @@ impl AppState {
     ) -> Option<Vec<BrowserEventEnvelope>> {
         if !self.can_access_session(user_id, session_id).await {
             return None;
+        }
+
+        if let Some(pool) = &self.inner.db_pool {
+            return Some(
+                agenter_db::list_event_cache(pool, session_id)
+                    .await
+                    .map(|events| {
+                        events
+                            .into_iter()
+                            .filter_map(|event| {
+                                serde_json::from_value::<AppEvent>(event.payload)
+                                    .map(|app_event| BrowserEventEnvelope {
+                                        event_id: Some(event.event_id.to_string().into()),
+                                        event: app_event,
+                                    })
+                                    .map_err(|error| {
+                                        tracing::warn!(
+                                            %session_id,
+                                            event_id = %event.event_id,
+                                            %error,
+                                            "failed to decode cached app event"
+                                        );
+                                    })
+                                    .ok()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%session_id, %error, "failed to load persisted session history");
+                        Vec::new()
+                    }),
+            );
         }
 
         Some(
@@ -779,8 +925,18 @@ impl AppState {
     async fn store_event(
         &self,
         session_id: SessionId,
-        envelope: BrowserEventEnvelope,
+        mut envelope: BrowserEventEnvelope,
     ) -> BrowserEventEnvelope {
+        if let Some(pool) = &self.inner.db_pool {
+            match agenter_db::append_event_cache(pool, session_id, &envelope.event).await {
+                Ok(cached) => {
+                    envelope.event_id = Some(cached.event_id.to_string().into());
+                }
+                Err(error) => {
+                    tracing::warn!(%session_id, %error, "failed to persist app event cache row");
+                }
+            }
+        }
         let sender = {
             let mut sessions = self.inner.sessions.lock().await;
             let events = sessions
@@ -803,6 +959,282 @@ impl AppState {
         );
         envelope
     }
+
+    pub async fn import_discovered_sessions(
+        &self,
+        runner_id: RunnerId,
+        discovered: DiscoveredSessions,
+    ) {
+        let Some(owner_user_id) = self
+            .inner
+            .bootstrap_admin
+            .as_ref()
+            .map(|admin| admin.user.user_id)
+        else {
+            tracing::warn!(%runner_id, "cannot import discovered sessions without bootstrap admin user");
+            return;
+        };
+
+        if let Some(pool) = &self.inner.db_pool {
+            if let Err(error) = agenter_db::upsert_workspace_with_id(
+                pool,
+                discovered.workspace.workspace_id,
+                runner_id,
+                &discovered.workspace.path,
+                discovered.workspace.display_name.as_deref(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    %runner_id,
+                    workspace_id = %discovered.workspace.workspace_id,
+                    %error,
+                    "failed to persist discovered session workspace"
+                );
+                return;
+            }
+        }
+
+        for discovered_session in discovered.sessions {
+            let session = if let Some(pool) = &self.inner.db_pool {
+                match agenter_db::upsert_session_by_external_id(
+                    pool,
+                    owner_user_id,
+                    runner_id,
+                    discovered.workspace.workspace_id,
+                    discovered.provider_id.clone(),
+                    &discovered_session.external_session_id,
+                    discovered_session.title.as_deref(),
+                )
+                .await
+                {
+                    Ok(session) => RegisteredSession {
+                        session_id: session.session_id,
+                        owner_user_id: session.owner_user_id,
+                        runner_id: session.runner_id,
+                        workspace: discovered.workspace.clone(),
+                        provider_id: session.provider_id,
+                        status: session.status,
+                        title: session.title,
+                        external_session_id: session.external_session_id,
+                    },
+                    Err(error) => {
+                        tracing::warn!(
+                            %runner_id,
+                            external_session_id = %discovered_session.external_session_id,
+                            %error,
+                            "failed to persist discovered session"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                RegisteredSession {
+                    session_id: SessionId::new(),
+                    owner_user_id,
+                    runner_id,
+                    workspace: discovered.workspace.clone(),
+                    provider_id: discovered.provider_id.clone(),
+                    status: SessionStatus::Running,
+                    title: discovered_session.title.clone(),
+                    external_session_id: Some(discovered_session.external_session_id.clone()),
+                }
+            };
+
+            self.inner
+                .registry
+                .lock()
+                .await
+                .sessions
+                .insert(session.session_id, session.clone());
+
+            let discovered_events = discovered_history_events(
+                session.session_id,
+                owner_user_id,
+                &discovered_session.history,
+            );
+            if !discovered_events.is_empty() {
+                if let Some(pool) = &self.inner.db_pool {
+                    if let Err(error) =
+                        agenter_db::clear_event_cache(pool, session.session_id).await
+                    {
+                        tracing::warn!(%session.session_id, %error, "failed to clear discovered session event cache");
+                    }
+                }
+                {
+                    let mut sessions = self.inner.sessions.lock().await;
+                    sessions
+                        .entry(session.session_id)
+                        .or_insert_with(SessionEvents::new)
+                        .cache
+                        .clear();
+                }
+                for event in discovered_events {
+                    self.store_event(
+                        session.session_id,
+                        BrowserEventEnvelope {
+                            event_id: Some(Uuid::new_v4().to_string().into()),
+                            event,
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+}
+
+fn discovered_history_events(
+    session_id: SessionId,
+    owner_user_id: UserId,
+    history: &[DiscoveredSessionHistoryItem],
+) -> Vec<AppEvent> {
+    history
+        .iter()
+        .flat_map(|item| match item {
+            DiscoveredSessionHistoryItem::UserMessage {
+                message_id,
+                content,
+            } => vec![AppEvent::UserMessage(agenter_core::UserMessageEvent {
+                session_id,
+                message_id: message_id.clone(),
+                author_user_id: Some(owner_user_id),
+                content: content.clone(),
+            })],
+            DiscoveredSessionHistoryItem::AgentMessage {
+                message_id,
+                content,
+            } => vec![AppEvent::AgentMessageCompleted(
+                agenter_core::MessageCompletedEvent {
+                    session_id,
+                    message_id: message_id.clone(),
+                    content: Some(content.clone()),
+                    provider_payload: None,
+                },
+            )],
+            DiscoveredSessionHistoryItem::Plan {
+                plan_id,
+                title,
+                content,
+                provider_payload,
+            } => vec![AppEvent::PlanUpdated(agenter_core::PlanEvent {
+                session_id,
+                plan_id: Some(plan_id.clone()),
+                title: title.clone(),
+                content: Some(content.clone()),
+                entries: Vec::new(),
+                provider_payload: provider_payload.clone(),
+            })],
+            DiscoveredSessionHistoryItem::Tool {
+                tool_call_id,
+                name,
+                title,
+                status,
+                input,
+                output,
+                provider_payload,
+            } => {
+                let event = agenter_core::ToolEvent {
+                    session_id,
+                    tool_call_id: tool_call_id.clone(),
+                    name: name.clone(),
+                    title: title.clone(),
+                    input: input.clone(),
+                    output: output.clone(),
+                    provider_payload: provider_payload.clone(),
+                };
+                match status {
+                    DiscoveredToolStatus::Completed | DiscoveredToolStatus::Failed => {
+                        vec![AppEvent::ToolCompleted(event)]
+                    }
+                    DiscoveredToolStatus::Running => vec![AppEvent::ToolStarted(event)],
+                }
+            }
+            DiscoveredSessionHistoryItem::Command {
+                command_id,
+                command,
+                cwd,
+                source,
+                process_id,
+                duration_ms,
+                actions,
+                output,
+                exit_code,
+                success,
+                provider_payload,
+            } => {
+                let mut events = vec![AppEvent::CommandStarted(agenter_core::CommandEvent {
+                    session_id,
+                    command_id: command_id.clone(),
+                    command: command.clone(),
+                    cwd: cwd.clone(),
+                    source: source.clone(),
+                    process_id: process_id.clone(),
+                    actions: actions
+                        .iter()
+                        .map(|action| CommandAction {
+                            kind: action.kind.clone(),
+                            command: action.command.clone(),
+                            path: action.path.clone(),
+                            name: action.name.clone(),
+                            query: action.query.clone(),
+                            provider_payload: action.provider_payload.clone(),
+                        })
+                        .collect(),
+                    provider_payload: provider_payload.clone(),
+                })];
+                if let Some(output) = output {
+                    if !output.is_empty() {
+                        events.push(AppEvent::CommandOutputDelta(
+                            agenter_core::CommandOutputEvent {
+                                session_id,
+                                command_id: command_id.clone(),
+                                stream: CommandOutputStream::Stdout,
+                                delta: output.clone(),
+                                provider_payload: provider_payload.clone(),
+                            },
+                        ));
+                    }
+                }
+                events.push(AppEvent::CommandCompleted(
+                    agenter_core::CommandCompletedEvent {
+                        session_id,
+                        command_id: command_id.clone(),
+                        exit_code: *exit_code,
+                        duration_ms: *duration_ms,
+                        success: *success,
+                        provider_payload: provider_payload.clone(),
+                    },
+                ));
+                events
+            }
+            DiscoveredSessionHistoryItem::FileChange {
+                path,
+                change_kind,
+                status,
+                diff,
+                provider_payload,
+                ..
+            } => {
+                let event = agenter_core::FileChangeEvent {
+                    session_id,
+                    path: path.clone(),
+                    change_kind: change_kind.clone(),
+                    diff: diff.clone(),
+                    provider_payload: provider_payload.clone(),
+                };
+                match status {
+                    DiscoveredFileChangeStatus::Applied => vec![AppEvent::FileChangeApplied(event)],
+                    DiscoveredFileChangeStatus::Rejected => {
+                        vec![AppEvent::FileChangeRejected(event)]
+                    }
+                    DiscoveredFileChangeStatus::Proposed => {
+                        vec![AppEvent::FileChangeProposed(event)]
+                    }
+                }
+            }
+        })
+        .collect()
 }
 
 fn app_event_name(event: &AppEvent) -> &'static str {
@@ -913,6 +1345,78 @@ mod tests {
             subscription.recv().await.expect("live event").event,
             AppEvent::UserMessage(_)
         ));
+    }
+
+    #[test]
+    fn discovered_history_items_are_rewritten_to_app_session_events() {
+        let session_id = SessionId::nil();
+        let owner_user_id = UserId::nil();
+        let events = discovered_history_events(
+            session_id,
+            owner_user_id,
+            &[
+                DiscoveredSessionHistoryItem::UserMessage {
+                    message_id: Some("user-1".to_owned()),
+                    content: "hello".to_owned(),
+                },
+                DiscoveredSessionHistoryItem::AgentMessage {
+                    message_id: "agent-1".to_owned(),
+                    content: "hi".to_owned(),
+                },
+                DiscoveredSessionHistoryItem::Command {
+                    command_id: "cmd-1".to_owned(),
+                    command: "cargo test".to_owned(),
+                    cwd: Some("/work/agenter".to_owned()),
+                    source: Some("unifiedExecStartup".to_owned()),
+                    process_id: Some("123".to_owned()),
+                    duration_ms: Some(17),
+                    actions: vec![agenter_protocol::DiscoveredCommandAction {
+                        kind: "read".to_owned(),
+                        command: Some("sed -n '1,20p' SKILL.md".to_owned()),
+                        path: Some("/tmp/skills/demo/SKILL.md".to_owned()),
+                        name: Some("SKILL.md".to_owned()),
+                        query: None,
+                        provider_payload: None,
+                    }],
+                    output: Some("ok".to_owned()),
+                    exit_code: Some(0),
+                    success: true,
+                    provider_payload: None,
+                },
+                DiscoveredSessionHistoryItem::Tool {
+                    tool_call_id: "tool-1".to_owned(),
+                    name: "spawnAgent".to_owned(),
+                    title: Some("spawnAgent".to_owned()),
+                    status: DiscoveredToolStatus::Completed,
+                    input: None,
+                    output: None,
+                    provider_payload: None,
+                },
+                DiscoveredSessionHistoryItem::FileChange {
+                    change_id: "file-1".to_owned(),
+                    path: "README.md".to_owned(),
+                    change_kind: agenter_core::FileChangeKind::Modify,
+                    status: DiscoveredFileChangeStatus::Applied,
+                    diff: Some("+hello".to_owned()),
+                    provider_payload: None,
+                },
+                DiscoveredSessionHistoryItem::Plan {
+                    plan_id: "plan-1".to_owned(),
+                    title: Some("Implementation plan".to_owned()),
+                    content: "1. Test".to_owned(),
+                    provider_payload: None,
+                },
+            ],
+        );
+
+        assert!(matches!(events[0], AppEvent::UserMessage(_)));
+        assert!(matches!(events[1], AppEvent::AgentMessageCompleted(_)));
+        assert!(matches!(events[2], AppEvent::CommandStarted(_)));
+        assert!(matches!(events[3], AppEvent::CommandOutputDelta(_)));
+        assert!(matches!(events[4], AppEvent::CommandCompleted(_)));
+        assert!(matches!(events[5], AppEvent::ToolCompleted(_)));
+        assert!(matches!(events[6], AppEvent::FileChangeApplied(_)));
+        assert!(matches!(events[7], AppEvent::PlanUpdated(_)));
     }
 
     #[test]

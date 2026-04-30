@@ -87,9 +87,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     Some(Ok(Message::Text(text))) => {
                         match classify_runner_client_text(&text) {
                             Ok(RunnerClientFrame::Event(envelope)) => {
-                                if let RunnerEvent::AgentEvent(AgentEvent { session_id, event }) =
-                                    envelope.event
-                                {
+                                match envelope.event {
+                                    RunnerEvent::AgentEvent(AgentEvent { session_id, event }) => {
                                     if app_event_session_id(&event) != Some(session_id) {
                                         tracing::warn!(
                                             %session_id,
@@ -98,6 +97,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         continue;
                                     }
                                     state.publish_event(session_id, event).await;
+                                    }
+                                    RunnerEvent::SessionsDiscovered(discovered) => {
+                                        state
+                                            .import_discovered_sessions(runner.runner_id, discovered)
+                                            .await;
+                                    }
+                                    RunnerEvent::HealthChanged(_) | RunnerEvent::Error(_) => {}
                                 }
                             }
                                 Ok(RunnerClientFrame::Response(response)) => {

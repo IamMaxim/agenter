@@ -229,6 +229,7 @@ Active execution notes:
 - Second follow-up review fixes ensure runner-originated approval resolutions also close the pending approval, runner sends wait for the WebSocket writer to report delivery, stale runner disconnects cannot remove newer connections for the same runner, and session creation rejects providers not advertised by the selected runner.
 - Final approval-race fix adds a last-mile WebSocket writer guard so a browser approval answer queued before a runner-originated resolution is dropped before it can reach the runner socket.
 - Regression coverage now includes a full in-process browser plus fake-runner pipeline test for login, runner registration, browser subscription, message send, runner responses, streamed events, approval decisions, runner approval commands, and history replay. Runner websocket handling now treats valid command responses and heartbeats as first-class frames instead of logging them as undecodable text.
+- Browser chat redesign follow-up makes the Svelte UI a dark Codex-like workbench: user and assistant messages render sanitized markdown, simple assistant messages stay inline, command/tool/file events render as expandable inline rows, and only user messages, `plan_updated` implementation plans, approvals, and future widgets receive boxed card treatment.
 
 ## Milestone 3: Real Agent Adapters
 
@@ -259,6 +260,7 @@ Active execution notes:
 - Codex debugging follow-up adds request/response correlation for `initialize`, `thread/start`, and `thread/resume`, fails fast when startup responses contain errors or no thread id, records recent provider stderr in adapter errors, and adds `just codex-spike` for payload-enabled direct provider diagnostics. Local sandbox evidence showed `codex app-server` can fail to access `~/.codex/sessions` or write `~/.codex/shell_snapshots/...` with `Operation not permitted`.
 - Live Codex 0.125 follow-up normalizes `item/agentMessage/delta` and `item/completed` agent-message payloads, ignores echoed `userMessage` and `reasoning` item events, scopes provider messages to the active native thread/turn, and treats `turn/completed` as the adapter/spike completion signal. Outside-sandbox smoke with `just codex-spike /tmp/agenter-codex-debug 'Reply with OK only. Do not use tools.'` succeeded and observed `OK` followed by `turn/completed` with `error: null`.
 - Codex session architecture follow-up fixes the 0.125 `sessionStartSource` enum mismatch by using provider-owned `"startup"` instead of `"agenter"`, removes unsolicited runner handshake smoke commands, makes `POST /api/sessions` wait for `RunnerCommandResult::SessionCreated`, makes browser message sends wait for runner `Accepted`/`Error`, and adds regression tests for all three boundaries.
+- Codex persistence follow-up makes Postgres authoritative for session list/get/history when configured, uses stable provider runner/workspace IDs across restarts, imports Codex-native `thread/list` results for the bootstrap admin user, and backfills user/assistant history from `thread/read` when the Agenter event cache is empty.
 
 ### Task 3.2: Qwen ACP Adapter
 
@@ -416,6 +418,9 @@ Active execution notes:
 - The control plane runs migrations automatically on startup when `DATABASE_URL` is set; `just control-plane` sets the development database URL, insecure local HTTP cookies, bootstrap admin credentials, and the runner token.
 - Full deployment Compose for the control plane, optional runner containers, reverse proxy, and secret handling remains open under Task 7.3.
 - Manual testing diagnostics now include structured `tracing` setup for the Rust services, frontend debug logging behind `VITE_AGENTER_DEBUG=1`, local log files under `tmp/agenter-logs`, and optional Loki/Grafana/Promtail services behind the Compose `logging` profile. Logs are metadata-only by default; prompt/provider payload previews require `AGENTER_LOG_PAYLOADS=1`.
+- Codex persistence now imports native `thread/read` history beyond messages: command executions, file changes, collaboration tool calls, and implementation plans are converted into the existing app event cache so restored sessions display inline activity rows and plan cards.
+- Codex command/tool UI follow-up enriches imported shell command events with process metadata and command actions, preserves command titles while output arrives, infers skill/file/search/list actions from Codex command action payloads, and renders `spawnAgent`/`wait`/`closeAgent` as first-party subagent rows in the browser.
+- Codex subagent UX follow-up promotes `spawnAgent`, `wait`, and `closeAgent` to dedicated browser rows with structured agent ids, model/reasoning badges, prompt text, per-agent statuses, result messages, and advanced provider-payload details.
 
 ## Verification Policy
 

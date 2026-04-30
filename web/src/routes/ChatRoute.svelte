@@ -1,5 +1,9 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
+  import InlineEventRow from '../components/InlineEventRow.svelte';
+  import MarkdownBlock from '../components/MarkdownBlock.svelte';
+  import PlanCard from '../components/PlanCard.svelte';
+  import SubagentEventRow from '../components/SubagentEventRow.svelte';
   import { connectSessionEvents, type BrowserEventSocket } from '../api/events';
   import {
     decideApproval,
@@ -14,7 +18,6 @@
     type ChatItem,
     type ChatState
   } from '../lib/chatEvents';
-  import { routeHref } from '../lib/router';
 
   export let sessionId: string;
 
@@ -118,10 +121,10 @@
 
 <section class="chat-layout">
   <header class="chat-header">
+    <span class="chat-title">{session?.title ?? 'New session'}</span>
     <div>
-      <a class="back-link" href={routeHref({ name: 'sessions' })}>Sessions</a>
-      <h1>{session?.title ?? 'Session'}</h1>
-      <p>{sessionId}</p>
+      <!-- <a class="back-link" href={routeHref({ name: 'sessions' })}>Sessions</a> -->
+      <!-- <p>{sessionId}</p> -->
     </div>
     <span class="status-pill">{connectionState}</span>
   </header>
@@ -136,14 +139,20 @@
       {#each items as item (item.id)}
         {#if item.kind === 'user'}
           <article class="message-row user-message">
-            <span>You</span>
-            <p>{item.content}</p>
+            <!-- <span>You</span> -->
+            <MarkdownBlock content={item.content} />
           </article>
         {:else if item.kind === 'assistant'}
           <article class="message-row assistant-message">
-            <span>Agent</span>
-            <p>{item.content}</p>
+            <!-- <span>Agent</span> -->
+            <MarkdownBlock content={item.content} />
           </article>
+        {:else if item.kind === 'inlineEvent'}
+          <InlineEventRow {item} />
+        {:else if item.kind === 'subagent'}
+          <SubagentEventRow {item} />
+        {:else if item.kind === 'plan'}
+          <PlanCard {item} />
         {:else if item.kind === 'approval'}
           <article class="event-card approval-card">
             <div class="card-heading">
@@ -165,55 +174,12 @@
               </div>
             {/if}
           </article>
-        {:else if item.kind === 'command'}
-          <article class="event-card command-card">
-            <div class="card-heading">
-              <span>Command</span>
-              <code>{item.status}{item.success === false ? ' failed' : ''}</code>
-            </div>
-            <strong>{item.title}</strong>
-            {#if item.detail}
-              <code>{item.detail}</code>
-            {/if}
-            {#if item.output}
-              <pre>{item.output}</pre>
-            {/if}
-          </article>
-        {:else if item.kind === 'file'}
-          <article class="event-card file-card">
-            <div class="card-heading">
-              <span>File</span>
-              <code>{item.status}</code>
-            </div>
-            <strong>{item.title}</strong>
-            {#if item.detail}
-              <pre>{item.detail}</pre>
-            {/if}
-          </article>
-        {:else if item.kind === 'tool'}
-          <article class="event-card tool-card">
-            <div class="card-heading">
-              <span>Tool</span>
-              <code>{item.status}</code>
-            </div>
-            <strong>{item.title}</strong>
-            {#if item.detail}
-              <pre>{item.detail}</pre>
-            {/if}
-          </article>
         {:else if item.kind === 'error'}
           <article class="event-card error-card">
             <span>Error</span>
             <strong>{item.title}</strong>
             {#if item.detail}
               <code>{item.detail}</code>
-            {/if}
-          </article>
-        {:else if item.kind === 'event'}
-          <article class="event-card">
-            <span>{item.title}</span>
-            {#if item.detail}
-              <pre>{item.detail}</pre>
             {/if}
           </article>
         {/if}
@@ -223,7 +189,7 @@
 
   <form class="composer" on:submit|preventDefault={submit}>
     <label class="sr-only" for="message">Message</label>
-    <textarea id="message" bind:value={draft} rows="3" placeholder="Message the agent"></textarea>
+    <textarea id="message" bind:value={draft} rows="1" placeholder="Message the agent"></textarea>
     <button type="submit">Send</button>
   </form>
   {#if sendError || decisionError}

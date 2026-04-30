@@ -10,6 +10,10 @@ use agenter_core::{
     ApprovalRequestEvent, CommandCompletedEvent, CommandEvent, FileChangeEvent, FileChangeKind,
     MessageCompletedEvent, SessionId,
 };
+use agenter_protocol::{
+    DiscoveredCommandAction, DiscoveredFileChangeStatus, DiscoveredSessionHistoryItem,
+    DiscoveredToolStatus,
+};
 use anyhow::{anyhow, Context};
 use serde_json::{json, Value};
 use tokio::{
@@ -33,6 +37,12 @@ pub struct CodexTurnRequest {
 #[derive(Debug)]
 pub struct PendingCodexApproval {
     pub response: oneshot::Sender<ApprovalDecision>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexDiscoveredThread {
+    pub external_session_id: String,
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,6 +172,43 @@ impl CodexAppServer {
             .await?;
         self.read_response(resume_id, "thread/resume").await?;
         Ok(())
+    }
+
+    pub async fn list_threads(
+        &mut self,
+        workspace_path: &PathBuf,
+    ) -> anyhow::Result<Vec<CodexDiscoveredThread>> {
+        self.initialize().await?;
+        let list_id = self
+            .send_request(
+                "thread/list",
+                json!({
+                    "cwd": workspace_path,
+                    "includeTurns": false,
+                    "useStateDbOnly": false
+                }),
+            )
+            .await?;
+        let response = self.read_response(list_id, "thread/list").await?;
+        Ok(codex_threads_from_list_response(&response))
+    }
+
+    pub async fn read_thread_history(
+        &mut self,
+        thread_id: &str,
+    ) -> anyhow::Result<Vec<DiscoveredSessionHistoryItem>> {
+        self.initialize().await?;
+        let read_id = self
+            .send_request(
+                "thread/read",
+                json!({
+                    "threadId": thread_id,
+                    "includeTurns": true
+                }),
+            )
+            .await?;
+        let response = self.read_response(read_id, "thread/read").await?;
+        Ok(codex_history_from_thread_read_response(&response))
     }
 
     pub fn set_active_thread(&mut self, thread_id: impl Into<String>) {
@@ -574,6 +621,11 @@ fn item_started(session_id: SessionId, message: &Value) -> Option<AppEvent> {
             command_id: item_id(message),
             command: command.to_owned(),
             cwd: string_at(message, &["/params/cwd", "/params/item/cwd"]).map(str::to_owned),
+            source: string_at(message, &["/params/source", "/params/item/source"])
+                .map(str::to_owned),
+            process_id: string_at(message, &["/params/processId", "/params/item/processId"])
+                .map(str::to_owned),
+            actions: Vec::new(),
             provider_payload: Some(message.clone()),
         }));
     }
@@ -605,6 +657,8 @@ fn item_completed(session_id: SessionId, message: &Value) -> Option<AppEvent> {
             command_id: item_id(message),
             exit_code: integer_at(message, &["/params/exitCode", "/params/item/exitCode"])
                 .map(|value| value as i32),
+            duration_ms: integer_at(message, &["/params/durationMs", "/params/item/durationMs"])
+                .and_then(|value| value.try_into().ok()),
             success: bool_at(message, &["/params/success", "/params/item/success"]).unwrap_or(true),
             provider_payload: Some(message.clone()),
         }));
@@ -710,6 +764,242 @@ fn codex_thread_id(message: &Value) -> Option<&str> {
         .or_else(|| message.pointer("/result/threadId").and_then(Value::as_str))
         .or_else(|| message.pointer("/params/thread/id").and_then(Value::as_str))
         .or_else(|| message.pointer("/params/threadId").and_then(Value::as_str))
+}
+
+fn codex_threads_from_list_response(message: &Value) -> Vec<CodexDiscoveredThread> {
+    let Some(array) = message
+        .pointer("/result/data")
+        .or_else(|| message.pointer("/result/threads"))
+        .or_else(|| message.pointer("/result/items"))
+        .or_else(|| message.pointer("/threads"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    array
+        .iter()
+        .filter_map(|thread| {
+            let external_session_id = string_at(thread, &["/id", "/threadId", "/thread/id"])?;
+            Some(CodexDiscoveredThread {
+                external_session_id: external_session_id.to_owned(),
+                title: string_at(thread, &["/title", "/name", "/summary", "/preview"])
+                    .map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+fn codex_history_from_thread_read_response(message: &Value) -> Vec<DiscoveredSessionHistoryItem> {
+    let mut items = Vec::new();
+    if let Some(turns) = message
+        .pointer("/result/thread/turns")
+        .and_then(Value::as_array)
+    {
+        for turn in turns {
+            if let Some(turn_items) = turn.get("items").and_then(Value::as_array) {
+                for item in turn_items {
+                    collect_codex_history_item(item, &mut items);
+                }
+            }
+        }
+    } else {
+        collect_codex_history_items(message, &mut items);
+    }
+    items
+}
+
+fn collect_codex_history_items(value: &Value, items: &mut Vec<DiscoveredSessionHistoryItem>) {
+    match value {
+        Value::Object(object) => {
+            if object.contains_key("type") {
+                let before = items.len();
+                collect_codex_history_item(value, items);
+                if items.len() != before {
+                    return;
+                }
+            }
+
+            for child in object.values() {
+                collect_codex_history_items(child, items);
+            }
+        }
+        Value::Array(array) => {
+            for child in array {
+                collect_codex_history_items(child, items);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_codex_history_item(value: &Value, items: &mut Vec<DiscoveredSessionHistoryItem>) {
+    match value.get("type").and_then(Value::as_str) {
+        Some("userMessage") => {
+            if let Some(content) = codex_text_content(value) {
+                items.push(DiscoveredSessionHistoryItem::UserMessage {
+                    message_id: string_at(value, &["/id", "/messageId"]).map(str::to_owned),
+                    content,
+                });
+            }
+        }
+        Some("agentMessage") => {
+            if let Some(content) = codex_text_content(value) {
+                items.push(DiscoveredSessionHistoryItem::AgentMessage {
+                    message_id: string_at(value, &["/id", "/messageId"])
+                        .unwrap_or("codex-agent-message")
+                        .to_owned(),
+                    content,
+                });
+            }
+        }
+        Some("commandExecution") => {
+            if let Some(command) = string_at(value, &["/command"]) {
+                let status = string_at(value, &["/status"]);
+                let exit_code = integer_at(value, &["/exitCode"]).map(|value| value as i32);
+                let success = exit_code
+                    .map(|code| code == 0)
+                    .unwrap_or(status != Some("failed"));
+                items.push(DiscoveredSessionHistoryItem::Command {
+                    command_id: string_at(value, &["/id"])
+                        .unwrap_or("codex-command")
+                        .to_owned(),
+                    command: command.to_owned(),
+                    cwd: string_at(value, &["/cwd"]).map(str::to_owned),
+                    source: string_at(value, &["/source"]).map(str::to_owned),
+                    process_id: string_at(value, &["/processId"]).map(str::to_owned),
+                    duration_ms: integer_at(value, &["/durationMs"])
+                        .and_then(|value| value.try_into().ok()),
+                    actions: codex_history_command_actions(value),
+                    output: string_at(value, &["/aggregatedOutput"]).map(str::to_owned),
+                    exit_code,
+                    success,
+                    provider_payload: Some(value.clone()),
+                });
+            }
+        }
+        Some("fileChange") => {
+            if let Some(changes) = value.get("changes").and_then(Value::as_array) {
+                for (index, change) in changes.iter().enumerate() {
+                    let Some(path) = string_at(change, &["/path"]) else {
+                        continue;
+                    };
+                    let change_id = format!(
+                        "{}:{index}",
+                        string_at(value, &["/id"]).unwrap_or("codex-file-change")
+                    );
+                    items.push(DiscoveredSessionHistoryItem::FileChange {
+                        change_id,
+                        path: path.to_owned(),
+                        change_kind: codex_history_file_change_kind(change),
+                        status: codex_history_file_change_status(value),
+                        diff: string_at(change, &["/diff"]).map(str::to_owned),
+                        provider_payload: Some(value.clone()),
+                    });
+                }
+            }
+        }
+        Some("collabAgentToolCall") => {
+            let status = codex_history_tool_status(value);
+            items.push(DiscoveredSessionHistoryItem::Tool {
+                tool_call_id: string_at(value, &["/id"])
+                    .unwrap_or("codex-tool")
+                    .to_owned(),
+                name: string_at(value, &["/tool"])
+                    .unwrap_or("codex_tool")
+                    .to_owned(),
+                title: string_at(value, &["/tool"]).map(str::to_owned),
+                status,
+                input: Some(value.clone()),
+                output: value.get("agentsStates").cloned(),
+                provider_payload: Some(value.clone()),
+            });
+        }
+        Some("plan") => {
+            if let Some(content) = string_at(value, &["/text", "/content"]) {
+                items.push(DiscoveredSessionHistoryItem::Plan {
+                    plan_id: string_at(value, &["/id"])
+                        .unwrap_or("codex-plan")
+                        .to_owned(),
+                    title: Some("Implementation plan".to_owned()),
+                    content: content.to_owned(),
+                    provider_payload: Some(value.clone()),
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn codex_history_command_actions(value: &Value) -> Vec<DiscoveredCommandAction> {
+    value
+        .get("commandActions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|action| DiscoveredCommandAction {
+            kind: string_at(action, &["/type"])
+                .unwrap_or("unknown")
+                .to_owned(),
+            command: string_at(action, &["/command"]).map(str::to_owned),
+            path: string_at(action, &["/path"]).map(str::to_owned),
+            name: string_at(action, &["/name"]).map(str::to_owned),
+            query: string_at(action, &["/query"]).map(str::to_owned),
+            provider_payload: Some(action.clone()),
+        })
+        .collect()
+}
+
+fn codex_history_tool_status(value: &Value) -> DiscoveredToolStatus {
+    match string_at(value, &["/status"]) {
+        Some("completed") => DiscoveredToolStatus::Completed,
+        Some("failed") => DiscoveredToolStatus::Failed,
+        _ => DiscoveredToolStatus::Running,
+    }
+}
+
+fn codex_history_file_change_status(value: &Value) -> DiscoveredFileChangeStatus {
+    match string_at(value, &["/status"]) {
+        Some("applied" | "completed") => DiscoveredFileChangeStatus::Applied,
+        Some("rejected" | "failed") => DiscoveredFileChangeStatus::Rejected,
+        _ => DiscoveredFileChangeStatus::Proposed,
+    }
+}
+
+fn codex_history_file_change_kind(value: &Value) -> FileChangeKind {
+    match string_at(value, &["/kind/type", "/changeKind"]) {
+        Some("add" | "create") => FileChangeKind::Create,
+        Some("delete" | "remove") => FileChangeKind::Delete,
+        Some("rename" | "move") => FileChangeKind::Rename,
+        _ => FileChangeKind::Modify,
+    }
+}
+
+fn codex_text_content(value: &Value) -> Option<String> {
+    string_at(
+        value,
+        &[
+            "/text",
+            "/content",
+            "/message",
+            "/item/text",
+            "/item/content",
+        ],
+    )
+    .map(str::to_owned)
+    .or_else(|| {
+        value
+            .pointer("/content")
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|part| string_at(part, &["/text", "/content"]).map(str::to_owned))
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .filter(|content| !content.is_empty())
+    })
 }
 
 fn codex_turn_id(message: &Value) -> Option<&str> {
@@ -1022,6 +1312,217 @@ mod tests {
         assert_eq!(
             codex_thread_id(&flat_result),
             Some("thread-from-flat-result")
+        );
+    }
+
+    #[test]
+    fn extracts_threads_and_history_from_codex_read_shapes() {
+        let list_response = json!({
+            "id": 4,
+            "result": {
+                "threads": [
+                    {"id": "thread-1", "title": "Imported Thread"}
+                ]
+            }
+        });
+        let read_response = json!({
+            "id": 5,
+            "result": {
+                "thread": {
+                    "turns": [
+                        {
+                            "items": [
+                                {"type": "userMessage", "id": "user-1", "text": "hello"},
+                                {"type": "agentMessage", "id": "agent-1", "text": "hi"},
+                                {
+                                    "type": "commandExecution",
+                                    "id": "cmd-1",
+                                    "command": "cargo test",
+                                    "cwd": "/work/agenter",
+                                    "status": "completed",
+                                    "exitCode": 0,
+                                    "durationMs": 17,
+                                    "source": "unifiedExecStartup",
+                                    "processId": "123",
+                                    "aggregatedOutput": "ok",
+                                    "commandActions": [
+                                        {
+                                            "type": "read",
+                                            "command": "sed -n '1,20p' /tmp/skills/demo/SKILL.md",
+                                            "name": "SKILL.md",
+                                            "path": "/tmp/skills/demo/SKILL.md"
+                                        }
+                                    ]
+                                },
+                                {
+                                    "type": "fileChange",
+                                    "id": "file-1",
+                                    "status": "completed",
+                                    "changes": [
+                                        {
+                                            "path": "/work/agenter/README.md",
+                                            "kind": {"type": "add"},
+                                            "diff": "+hello"
+                                        }
+                                    ]
+                                },
+                                {
+                                    "type": "collabAgentToolCall",
+                                    "id": "tool-1",
+                                    "tool": "spawnAgent",
+                                    "status": "completed",
+                                    "prompt": "Implement task"
+                                },
+                                {
+                                    "type": "plan",
+                                    "id": "plan-1",
+                                    "text": "# Plan\n\n1. Test"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(
+            codex_threads_from_list_response(&list_response),
+            vec![CodexDiscoveredThread {
+                external_session_id: "thread-1".to_owned(),
+                title: Some("Imported Thread".to_owned()),
+            }]
+        );
+
+        let observed_list_response = json!({
+            "id": 4,
+            "result": {
+                "data": [
+                    {
+                        "id": "019ddf92-1e65-7e72-b656-c317a83e0b93",
+                        "preview": "Let's revamp the frontend.",
+                        "cwd": "/Users/maxim/work/agenter",
+                        "source": "cli"
+                    }
+                ],
+                "nextCursor": null,
+                "backwardsCursor": "2026-04-30T18:06:28.547Z"
+            }
+        });
+
+        assert_eq!(
+            codex_threads_from_list_response(&observed_list_response),
+            vec![CodexDiscoveredThread {
+                external_session_id: "019ddf92-1e65-7e72-b656-c317a83e0b93".to_owned(),
+                title: Some("Let's revamp the frontend.".to_owned()),
+            }]
+        );
+
+        assert_eq!(
+            codex_history_from_thread_read_response(&read_response),
+            vec![
+                DiscoveredSessionHistoryItem::UserMessage {
+                    message_id: Some("user-1".to_owned()),
+                    content: "hello".to_owned(),
+                },
+                DiscoveredSessionHistoryItem::AgentMessage {
+                    message_id: "agent-1".to_owned(),
+                    content: "hi".to_owned(),
+                },
+                DiscoveredSessionHistoryItem::Command {
+                    command_id: "cmd-1".to_owned(),
+                    command: "cargo test".to_owned(),
+                    cwd: Some("/work/agenter".to_owned()),
+                    source: Some("unifiedExecStartup".to_owned()),
+                    process_id: Some("123".to_owned()),
+                    duration_ms: Some(17),
+                    actions: vec![DiscoveredCommandAction {
+                        kind: "read".to_owned(),
+                        command: Some("sed -n '1,20p' /tmp/skills/demo/SKILL.md".to_owned()),
+                        path: Some("/tmp/skills/demo/SKILL.md".to_owned()),
+                        name: Some("SKILL.md".to_owned()),
+                        query: None,
+                        provider_payload: Some(json!({
+                            "type": "read",
+                            "command": "sed -n '1,20p' /tmp/skills/demo/SKILL.md",
+                            "name": "SKILL.md",
+                            "path": "/tmp/skills/demo/SKILL.md"
+                        })),
+                    }],
+                    output: Some("ok".to_owned()),
+                    exit_code: Some(0),
+                    success: true,
+                    provider_payload: Some(json!({
+                        "type": "commandExecution",
+                        "id": "cmd-1",
+                        "command": "cargo test",
+                        "cwd": "/work/agenter",
+                        "status": "completed",
+                        "exitCode": 0,
+                        "durationMs": 17,
+                        "source": "unifiedExecStartup",
+                        "processId": "123",
+                        "aggregatedOutput": "ok",
+                        "commandActions": [
+                            {
+                                "type": "read",
+                                "command": "sed -n '1,20p' /tmp/skills/demo/SKILL.md",
+                                "name": "SKILL.md",
+                                "path": "/tmp/skills/demo/SKILL.md"
+                            }
+                        ]
+                    })),
+                },
+                DiscoveredSessionHistoryItem::FileChange {
+                    change_id: "file-1:0".to_owned(),
+                    path: "/work/agenter/README.md".to_owned(),
+                    change_kind: FileChangeKind::Create,
+                    status: DiscoveredFileChangeStatus::Applied,
+                    diff: Some("+hello".to_owned()),
+                    provider_payload: Some(json!({
+                        "type": "fileChange",
+                        "id": "file-1",
+                        "status": "completed",
+                        "changes": [
+                            {
+                                "path": "/work/agenter/README.md",
+                                "kind": {"type": "add"},
+                                "diff": "+hello"
+                            }
+                        ]
+                    })),
+                },
+                DiscoveredSessionHistoryItem::Tool {
+                    tool_call_id: "tool-1".to_owned(),
+                    name: "spawnAgent".to_owned(),
+                    title: Some("spawnAgent".to_owned()),
+                    status: DiscoveredToolStatus::Completed,
+                    input: Some(json!({
+                        "type": "collabAgentToolCall",
+                        "id": "tool-1",
+                        "tool": "spawnAgent",
+                        "status": "completed",
+                        "prompt": "Implement task"
+                    })),
+                    output: None,
+                    provider_payload: Some(json!({
+                        "type": "collabAgentToolCall",
+                        "id": "tool-1",
+                        "tool": "spawnAgent",
+                        "status": "completed",
+                        "prompt": "Implement task"
+                    })),
+                },
+                DiscoveredSessionHistoryItem::Plan {
+                    plan_id: "plan-1".to_owned(),
+                    title: Some("Implementation plan".to_owned()),
+                    content: "# Plan\n\n1. Test".to_owned(),
+                    provider_payload: Some(json!({
+                        "type": "plan",
+                        "id": "plan-1",
+                        "text": "# Plan\n\n1. Test"
+                    })),
+                },
+            ]
         );
     }
 

@@ -6,33 +6,57 @@ export type ChatItem =
       kind: 'user' | 'assistant';
       messageId: string;
       content: string;
+      markdown: true;
       completed?: boolean;
     }
   | {
       id: string;
-      kind: 'command';
-      commandId: string;
+      kind: 'inlineEvent';
+      eventKind: 'command';
       title: string;
       detail?: string;
       output: string;
-      status: 'running' | 'completed';
+      status: string;
       success?: boolean;
+      exitCode?: number;
+      durationMs?: number;
+      processId?: string;
+      source?: string;
+      actions?: CommandActionView[];
     }
   | {
       id: string;
-      kind: 'tool';
-      toolCallId: string;
+      kind: 'inlineEvent';
+      eventKind: 'tool' | 'file' | 'event';
       title: string;
       detail?: string;
-      status: 'running' | 'completed';
+      output?: never;
+      success?: never;
+      status: string;
+      exitCode?: number;
+      durationMs?: number;
+      processId?: string;
+      source?: string;
+      actions?: CommandActionView[];
     }
   | {
       id: string;
-      kind: 'file';
-      path: string;
+      kind: 'plan';
       title: string;
-      detail?: string;
-      status: 'proposed' | 'applied' | 'rejected';
+      content: string;
+    }
+  | {
+      id: string;
+      kind: 'subagent';
+      operation: 'spawn' | 'wait' | 'close';
+      title: string;
+      status: string;
+      agentIds: string[];
+      model?: string;
+      reasoningEffort?: string;
+      prompt?: string;
+      states: SubagentStateView[];
+      providerPayload?: Record<string, unknown>;
     }
   | {
       id: string;
@@ -47,13 +71,20 @@ export type ChatItem =
       kind: 'error';
       title: string;
       detail?: string;
-    }
-  | {
-      id: string;
-      kind: 'event';
-      title: string;
-      detail?: string;
     };
+
+export interface CommandActionView {
+  kind: string;
+  label: string;
+  detail?: string;
+  path?: string;
+}
+
+export interface SubagentStateView {
+  agentId: string;
+  status: string;
+  message?: string;
+}
 
 export interface ChatState {
   seenEventIds: Set<string>;
@@ -79,11 +110,11 @@ export function applyChatEnvelope(state: ChatState, envelope: BrowserEventEnvelo
 
   return {
     seenEventIds,
-    items: applyAppEvent(state.items, envelope.event)
+    items: applyAppEvent(state.items, envelope.event, envelope.event_id)
   };
 }
 
-function applyAppEvent(items: ChatItem[], event: AppEvent): ChatItem[] {
+function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): ChatItem[] {
   const payload = event.payload;
   switch (event.type) {
     case 'user_message':
@@ -91,7 +122,8 @@ function applyAppEvent(items: ChatItem[], event: AppEvent): ChatItem[] {
         id: `user:${stringField(payload, 'message_id') ?? fallbackId(event)}`,
         kind: 'user',
         messageId: stringField(payload, 'message_id') ?? fallbackId(event),
-        content: stringField(payload, 'content') ?? ''
+        content: stringField(payload, 'content') ?? '',
+        markdown: true
       });
     case 'agent_message_delta': {
       const messageId = stringField(payload, 'message_id') ?? fallbackId(event);
@@ -105,6 +137,7 @@ function applyAppEvent(items: ChatItem[], event: AppEvent): ChatItem[] {
           existing?.kind === 'assistant'
             ? `${existing.content}${stringField(payload, 'delta') ?? ''}`
             : stringField(payload, 'delta') ?? '',
+        markdown: true as const,
         completed: existing?.kind === 'assistant' ? existing.completed : false
       };
       return upsert(items, next);
@@ -120,18 +153,30 @@ function applyAppEvent(items: ChatItem[], event: AppEvent): ChatItem[] {
         content:
           stringField(payload, 'content') ??
           (existing?.kind === 'assistant' ? existing.content : ''),
+        markdown: true,
         completed: true
       });
     }
+    case 'plan_updated':
+      return upsert(items, {
+        id: `plan:${stringField(payload, 'plan_id') ?? stringField(payload, 'message_id') ?? eventId ?? eventIdHint(event)}`,
+        kind: 'plan',
+        title: stringField(payload, 'title') ?? 'Implementation plan',
+        content: stringField(payload, 'content') ?? stringField(payload, 'markdown') ?? previewJson(payload) ?? ''
+      });
     case 'command_started':
       return upsert(items, {
-        id: `command:${stringField(payload, 'command_id') ?? fallbackId(event)}`,
-        kind: 'command',
-        commandId: stringField(payload, 'command_id') ?? fallbackId(event),
+        id: `event:command:${stringField(payload, 'command_id') ?? fallbackId(event)}`,
+        kind: 'inlineEvent',
+        eventKind: 'command',
         title: stringField(payload, 'command') ?? 'Command',
-        detail: stringField(payload, 'cwd'),
+        detail: commandDetail(payload),
         output: '',
-        status: 'running'
+        status: 'running',
+        success: undefined,
+        processId: stringField(payload, 'process_id'),
+        source: stringField(payload, 'source'),
+        actions: commandActions(payload)
       });
     case 'command_output_delta':
       return updateCommandOutput(items, payload);
@@ -139,22 +184,27 @@ function applyAppEvent(items: ChatItem[], event: AppEvent): ChatItem[] {
       return updateCommandCompleted(items, payload);
     case 'tool_started':
     case 'tool_updated':
-    case 'tool_completed':
+    case 'tool_completed': {
+      const subagent = subagentItem(payload, event.type === 'tool_completed' ? 'completed' : 'running');
+      if (subagent) {
+        return upsert(items, subagent);
+      }
       return upsert(items, {
-        id: `tool:${stringField(payload, 'tool_call_id') ?? fallbackId(event)}`,
-        kind: 'tool',
-        toolCallId: stringField(payload, 'tool_call_id') ?? fallbackId(event),
-        title: stringField(payload, 'title') ?? stringField(payload, 'name') ?? 'Tool',
-        detail: previewJson(payload.input ?? payload.output),
+        id: `event:tool:${stringField(payload, 'tool_call_id') ?? fallbackId(event)}`,
+        kind: 'inlineEvent',
+        eventKind: 'tool',
+        title: toolTitle(payload),
+        detail: toolDetail(payload),
         status: event.type === 'tool_completed' ? 'completed' : 'running'
       });
+    }
     case 'file_change_proposed':
     case 'file_change_applied':
     case 'file_change_rejected':
       return upsert(items, {
-        id: `file:${event.type}:${stringField(payload, 'path') ?? fallbackId(event)}`,
-        kind: 'file',
-        path: stringField(payload, 'path') ?? '',
+        id: `event:file:${stringField(payload, 'path') ?? fallbackId(event)}`,
+        kind: 'inlineEvent',
+        eventKind: 'file',
         title: stringField(payload, 'path') ?? 'File change',
         detail: stringField(payload, 'diff'),
         status:
@@ -188,9 +238,11 @@ function applyAppEvent(items: ChatItem[], event: AppEvent): ChatItem[] {
       return [
         ...items,
         {
-          id: `event:${event.type}:${items.length}`,
-          kind: 'event',
+          id: `event:generic:${event.type}:${items.length}`,
+          kind: 'inlineEvent',
+          eventKind: 'event',
           title: event.type,
+          status: 'received',
           detail: JSON.stringify(payload, null, 2)
         }
       ];
@@ -199,35 +251,77 @@ function applyAppEvent(items: ChatItem[], event: AppEvent): ChatItem[] {
 
 function updateCommandOutput(items: ChatItem[], payload: Record<string, unknown>): ChatItem[] {
   const commandId = stringField(payload, 'command_id') ?? fallbackId({ type: 'command_output_delta', payload });
-  const id = `command:${commandId}`;
+  const id = `event:command:${commandId}`;
   const existing = items.find((item) => item.id === id);
   const output =
-    existing?.kind === 'command'
+    existing?.kind === 'inlineEvent' && existing.eventKind === 'command'
       ? `${existing.output}${stringField(payload, 'delta') ?? ''}`
       : stringField(payload, 'delta') ?? '';
   return upsert(items, {
     id,
-    kind: 'command',
-    commandId,
-    title: 'Command output',
+    kind: 'inlineEvent',
+    eventKind: 'command',
+    title:
+      existing?.kind === 'inlineEvent' && existing.eventKind === 'command'
+        ? existing.title
+        : 'Command output',
+    detail:
+      existing?.kind === 'inlineEvent' && existing.eventKind === 'command'
+        ? existing.detail
+        : commandDetail(payload),
     output,
-    status: existing?.kind === 'command' ? existing.status : 'running'
+    status: existing?.kind === 'inlineEvent' ? existing.status : 'running',
+    success:
+      existing?.kind === 'inlineEvent' && existing.eventKind === 'command'
+        ? existing.success
+        : undefined,
+    exitCode:
+      existing?.kind === 'inlineEvent' && existing.eventKind === 'command'
+        ? existing.exitCode
+        : numberField(payload, 'exit_code'),
+    durationMs:
+      existing?.kind === 'inlineEvent' && existing.eventKind === 'command'
+        ? existing.durationMs
+        : numberField(payload, 'duration_ms'),
+    processId:
+      existing?.kind === 'inlineEvent' && existing.eventKind === 'command'
+        ? existing.processId
+        : stringField(payload, 'process_id'),
+    source:
+      existing?.kind === 'inlineEvent' && existing.eventKind === 'command'
+        ? existing.source
+        : stringField(payload, 'source'),
+    actions:
+      existing?.kind === 'inlineEvent' && existing.eventKind === 'command'
+        ? existing.actions
+        : commandActions(payload)
   });
 }
 
 function updateCommandCompleted(items: ChatItem[], payload: Record<string, unknown>): ChatItem[] {
   const commandId = stringField(payload, 'command_id') ?? fallbackId({ type: 'command_completed', payload });
-  const id = `command:${commandId}`;
+  const id = `event:command:${commandId}`;
   const existing = items.find((item) => item.id === id);
   return upsert(items, {
     id,
-    kind: 'command',
-    commandId,
-    title: existing?.kind === 'command' ? existing.title : 'Command',
-    detail: existing?.kind === 'command' ? existing.detail : undefined,
-    output: existing?.kind === 'command' ? existing.output : '',
+    kind: 'inlineEvent',
+    eventKind: 'command',
+    title: existing?.kind === 'inlineEvent' ? existing.title : 'Command',
+    detail: existing?.kind === 'inlineEvent' ? existing.detail : undefined,
+    output: existing?.kind === 'inlineEvent' && existing.eventKind === 'command' ? existing.output : '',
     status: 'completed',
-    success: Boolean(payload.success)
+    success: Boolean(payload.success),
+    exitCode: numberField(payload, 'exit_code'),
+    durationMs: numberField(payload, 'duration_ms'),
+    processId:
+      existing?.kind === 'inlineEvent' && existing.eventKind === 'command'
+        ? existing.processId
+        : stringField(payload, 'process_id'),
+    source:
+      existing?.kind === 'inlineEvent' && existing.eventKind === 'command'
+        ? existing.source
+        : stringField(payload, 'source'),
+    actions: existing?.kind === 'inlineEvent' && existing.eventKind === 'command' ? existing.actions : []
   });
 }
 
@@ -263,6 +357,193 @@ function stringField(payload: Record<string, unknown>, field: string): string | 
   return typeof value === 'string' ? value : undefined;
 }
 
+function numberField(payload: Record<string, unknown>, field: string): number | undefined {
+  const value = payload[field];
+  return typeof value === 'number' ? value : undefined;
+}
+
+function commandDetail(payload: Record<string, unknown>): string | undefined {
+  const parts = [
+    stringField(payload, 'cwd'),
+    stringField(payload, 'source'),
+    stringField(payload, 'process_id') ? `pid ${stringField(payload, 'process_id')}` : undefined
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(' · ') : undefined;
+}
+
+function commandActions(payload: Record<string, unknown>): CommandActionView[] {
+  const actions = payload.actions;
+  if (!Array.isArray(actions)) {
+    return [];
+  }
+  return actions
+    .filter((action): action is Record<string, unknown> => typeof action === 'object' && action !== null)
+    .map((action) => {
+      const kind = stringField(action, 'kind') ?? 'unknown';
+      const path = stringField(action, 'path');
+      const query = stringField(action, 'query');
+      const command = stringField(action, 'command');
+      const name = stringField(action, 'name');
+      const skillName = skillNameFromPath(path);
+      if (skillName) {
+        return {
+          kind: 'skill',
+          label: `Skill: ${skillName}`,
+          detail: path,
+          path
+        };
+      }
+      if (kind === 'read') {
+        return {
+          kind,
+          label: `Read ${name ?? basename(path) ?? 'file'}`,
+          detail: path ?? command,
+          path
+        };
+      }
+      if (kind === 'search') {
+        return {
+          kind,
+          label: `Search ${query ?? basename(path) ?? 'workspace'}`,
+          detail: path ?? command
+        };
+      }
+      if (kind === 'listFiles') {
+        return {
+          kind,
+          label: `List ${path ?? 'files'}`,
+          detail: command,
+          path
+        };
+      }
+      return {
+        kind,
+        label: command ?? kind,
+        detail: path ?? query
+      };
+    });
+}
+
+function toolTitle(payload: Record<string, unknown>): string {
+  const provider = providerPayload(payload);
+  const tool = stringField(provider, 'tool') ?? stringField(payload, 'name') ?? stringField(payload, 'title');
+  if (tool === 'spawnAgent') {
+    return 'Spawn subagent';
+  }
+  if (tool === 'wait') {
+    return 'Wait for subagents';
+  }
+  if (tool === 'closeAgent') {
+    return 'Close subagent';
+  }
+  return stringField(payload, 'title') ?? stringField(payload, 'name') ?? tool ?? 'Tool';
+}
+
+function toolDetail(payload: Record<string, unknown>): string | undefined {
+  const provider = providerPayload(payload);
+  const tool = stringField(provider, 'tool') ?? stringField(payload, 'name');
+  if (tool === 'spawnAgent') {
+    return [
+      receiverThreadIds(provider),
+      stringField(provider, 'model'),
+      stringField(provider, 'reasoningEffort'),
+      stringField(provider, 'prompt')
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+  }
+  if (tool === 'wait' || tool === 'closeAgent') {
+    return [receiverThreadIds(provider), previewJson(provider.agentsStates)].filter(Boolean).join('\n\n');
+  }
+  return previewJson(payload.input ?? payload.output);
+}
+
+function providerPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const provider = payload.provider_payload;
+  if (typeof provider === 'object' && provider !== null) {
+    return provider as Record<string, unknown>;
+  }
+  const input = payload.input;
+  if (typeof input === 'object' && input !== null) {
+    return input as Record<string, unknown>;
+  }
+  return payload;
+}
+
+function receiverThreadIds(payload: Record<string, unknown>): string | undefined {
+  const value = payload.receiverThreadIds;
+  return Array.isArray(value) && value.length > 0 ? `Agents: ${value.join(', ')}` : undefined;
+}
+
+function subagentItem(payload: Record<string, unknown>, status: string): ChatItem | undefined {
+  const provider = providerPayload(payload);
+  if (provider.type !== 'collabAgentToolCall') {
+    return undefined;
+  }
+  const tool = stringField(provider, 'tool') ?? stringField(payload, 'name');
+  const operation =
+    tool === 'spawnAgent'
+      ? 'spawn'
+      : tool === 'wait'
+        ? 'wait'
+        : tool === 'closeAgent'
+          ? 'close'
+          : undefined;
+  if (!operation) {
+    return undefined;
+  }
+  const agentIds = arrayOfStrings(provider.receiverThreadIds);
+  const states = subagentStates(provider);
+  return {
+    id: `subagent:${stringField(payload, 'tool_call_id') ?? stringField(provider, 'id') ?? fallbackId({ type: 'tool_completed', payload })}`,
+    kind: 'subagent',
+    operation,
+    title:
+      operation === 'spawn'
+        ? 'Spawn subagent'
+        : operation === 'wait'
+          ? 'Wait for subagent'
+          : 'Close subagent',
+    status,
+    agentIds,
+    model: stringField(provider, 'model'),
+    reasoningEffort: stringField(provider, 'reasoningEffort'),
+    prompt: stringField(provider, 'prompt'),
+    states,
+    providerPayload: provider
+  };
+}
+
+function subagentStates(provider: Record<string, unknown>): SubagentStateView[] {
+  const states = provider.agentsStates;
+  if (typeof states !== 'object' || states === null || Array.isArray(states)) {
+    return [];
+  }
+  return Object.entries(states as Record<string, unknown>)
+    .filter((entry): entry is [string, Record<string, unknown>] => typeof entry[1] === 'object' && entry[1] !== null)
+    .map(([agentId, state]) => ({
+      agentId,
+      status: stringField(state, 'status') ?? 'unknown',
+      message: stringField(state, 'message')
+    }));
+}
+
+function arrayOfStrings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+}
+
+function skillNameFromPath(path: string | undefined): string | undefined {
+  if (!path) {
+    return undefined;
+  }
+  const match = path.match(/\/skills\/([^/]+)\/SKILL\.md$/);
+  return match?.[1];
+}
+
+function basename(path: string | undefined): string | undefined {
+  return path?.split('/').filter(Boolean).at(-1);
+}
+
 function previewJson(value: unknown): string | undefined {
   if (value === undefined || value === null) {
     return undefined;
@@ -272,4 +553,8 @@ function previewJson(value: unknown): string | undefined {
 
 function fallbackId(event: Pick<AppEvent, 'type' | 'payload'>): string {
   return `${event.type}:${JSON.stringify(event.payload)}`;
+}
+
+function eventIdHint(event: AppEvent): string {
+  return fallbackId(event);
 }

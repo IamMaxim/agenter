@@ -1,6 +1,11 @@
 mod agents;
 
-use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    env,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use agenter_core::{
     AgentCapabilities, AgentErrorEvent, AgentMessageDeltaEvent, AgentProviderId, AppEvent,
@@ -10,9 +15,10 @@ use agenter_core::{
     WorkspaceRef,
 };
 use agenter_protocol::runner::{
-    AgentInput, AgentProviderAdvertisement, RunnerCapabilities, RunnerClientMessage, RunnerCommand,
-    RunnerCommandResult, RunnerError, RunnerEvent, RunnerEventEnvelope, RunnerHello,
-    RunnerResponseEnvelope, RunnerResponseOutcome, PROTOCOL_VERSION,
+    AgentInput, AgentProviderAdvertisement, DiscoveredSession, DiscoveredSessions,
+    RunnerCapabilities, RunnerClientMessage, RunnerCommand, RunnerCommandResult, RunnerError,
+    RunnerEvent, RunnerEventEnvelope, RunnerHello, RunnerResponseEnvelope, RunnerResponseOutcome,
+    PROTOCOL_VERSION,
 };
 use agents::codex::{
     run_codex_turn_on_server, CodexAppServer, CodexTurnRequest, PendingCodexApproval,
@@ -53,6 +59,35 @@ impl CodexRunnerRuntime {
             .resume_thread(external_session_id, &self.workspace_path)
             .await?;
         Ok(external_session_id.to_owned())
+    }
+
+    async fn discover_sessions(&self) -> anyhow::Result<Vec<DiscoveredSession>> {
+        let mut guard = self.server.lock().await;
+        let server = ensure_codex_server(&mut guard, self.workspace_path.clone()).await?;
+        let threads = server.list_threads(&self.workspace_path).await?;
+        let mut discovered = Vec::with_capacity(threads.len());
+        for thread in threads {
+            let history = match server
+                .read_thread_history(&thread.external_session_id)
+                .await
+            {
+                Ok(history) => history,
+                Err(error) => {
+                    tracing::warn!(
+                        external_session_id = %thread.external_session_id,
+                        %error,
+                        "failed to read codex thread history during discovery"
+                    );
+                    Vec::new()
+                }
+            };
+            discovered.push(DiscoveredSession {
+                external_session_id: thread.external_session_id,
+                title: thread.title,
+                history,
+            });
+        }
+        Ok(discovered)
     }
 
     async fn run_turn(
@@ -133,6 +168,7 @@ async fn run_codex_runner() -> anyhow::Result<()> {
     let (socket, _) = connect_async(&url).await?;
     let (mut sender, mut receiver) = socket.split();
     let hello = codex_hello(token, workspace_path.clone());
+    let advertised_workspace = hello.workspaces.first().cloned();
     tracing::info!(runner_id = %hello.runner_id, "sending codex runner hello");
     send_runner_message(&mut sender, RunnerClientMessage::Hello(hello)).await?;
 
@@ -140,6 +176,34 @@ async fn run_codex_runner() -> anyhow::Result<()> {
         Arc::new(Mutex::new(HashMap::new()));
     let (codex_event_sender, mut codex_event_receiver) = mpsc::unbounded_channel::<AppEvent>();
     let codex_runtime = CodexRunnerRuntime::new(workspace_path.clone());
+    if let Some(workspace) = advertised_workspace {
+        match codex_runtime.discover_sessions().await {
+            Ok(sessions) if !sessions.is_empty() => {
+                tracing::info!(
+                    session_count = sessions.len(),
+                    "sending discovered codex sessions to control plane"
+                );
+                send_runner_message(
+                    &mut sender,
+                    RunnerClientMessage::Event(RunnerEventEnvelope {
+                        request_id: None,
+                        event: RunnerEvent::SessionsDiscovered(DiscoveredSessions {
+                            workspace,
+                            provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                            sessions,
+                        }),
+                    }),
+                )
+                .await?;
+            }
+            Ok(_) => {
+                tracing::debug!("codex discovery found no native threads");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "codex native session discovery failed");
+            }
+        }
+    }
 
     loop {
         tokio::select! {
@@ -587,7 +651,8 @@ fn provider_hello(
     fallback_name: &str,
     session_resume: bool,
 ) -> RunnerHello {
-    let runner_id = RunnerId::new();
+    let runner_id = configured_runner_id(&provider_id, &workspace_path);
+    let workspace_id = configured_workspace_id(&provider_id, &workspace_path);
     RunnerHello {
         runner_id,
         protocol_version: PROTOCOL_VERSION.to_owned(),
@@ -608,7 +673,7 @@ fn provider_hello(
             workspace_discovery: false,
         },
         workspaces: vec![WorkspaceRef {
-            workspace_id: WorkspaceId::new(),
+            workspace_id,
             runner_id,
             path: workspace_path.display().to_string(),
             display_name: workspace_path
@@ -618,6 +683,34 @@ fn provider_hello(
                 .or_else(|| Some(fallback_name.to_owned())),
         }],
     }
+}
+
+fn configured_runner_id(provider_id: &AgentProviderId, workspace_path: &Path) -> RunnerId {
+    env::var("AGENTER_RUNNER_ID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| {
+            RunnerId::from_uuid(uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_URL,
+                format!("agenter:runner:{provider_id}:{}", workspace_path.display()).as_bytes(),
+            ))
+        })
+}
+
+fn configured_workspace_id(provider_id: &AgentProviderId, workspace_path: &Path) -> WorkspaceId {
+    env::var("AGENTER_WORKSPACE_ID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| {
+            WorkspaceId::from_uuid(uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_URL,
+                format!(
+                    "agenter:workspace:{provider_id}:{}",
+                    workspace_path.display()
+                )
+                .as_bytes(),
+            ))
+        })
 }
 
 fn fake_runner_id() -> RunnerId {
@@ -673,6 +766,9 @@ fn deterministic_fake_events(session_id: SessionId, input: &AgentInput) -> Vec<A
             command_id: "fake-command-1".to_owned(),
             command: "printf fake-runner".to_owned(),
             cwd: Some(".".to_owned()),
+            source: None,
+            process_id: None,
+            actions: Vec::new(),
             provider_payload: None,
         }),
         AppEvent::CommandOutputDelta(CommandOutputEvent {
@@ -686,6 +782,7 @@ fn deterministic_fake_events(session_id: SessionId, input: &AgentInput) -> Vec<A
             session_id,
             command_id: "fake-command-1".to_owned(),
             exit_code: Some(0),
+            duration_ms: None,
             success: true,
             provider_payload: None,
         }),

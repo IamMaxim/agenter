@@ -1,8 +1,9 @@
 use agenter_core::{
-    AgentCapabilities, AgentProviderId, AppEvent, ApprovalDecision, ApprovalId, SessionId,
-    UserMessageEvent, WorkspaceRef,
+    AgentCapabilities, AgentProviderId, AppEvent, ApprovalDecision, ApprovalId, FileChangeKind,
+    SessionId, UserMessageEvent, WorkspaceRef,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub use crate::RequestId;
 
@@ -174,6 +175,7 @@ pub struct RunnerEventEnvelope {
 pub enum RunnerEvent {
     AgentEvent(AgentEvent),
     HealthChanged(RunnerHealthChanged),
+    SessionsDiscovered(DiscoveredSessions),
     Error(RunnerError),
 }
 
@@ -181,6 +183,119 @@ pub enum RunnerEvent {
 pub struct AgentEvent {
     pub session_id: SessionId,
     pub event: AppEvent,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DiscoveredSessions {
+    pub workspace: WorkspaceRef,
+    pub provider_id: AgentProviderId,
+    pub sessions: Vec<DiscoveredSession>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DiscoveredSession {
+    pub external_session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<DiscoveredSessionHistoryItem>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DiscoveredSessionHistoryItem {
+    UserMessage {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        content: String,
+    },
+    AgentMessage {
+        message_id: String,
+        content: String,
+    },
+    Plan {
+        plan_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_payload: Option<Value>,
+    },
+    Tool {
+        tool_call_id: String,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        status: DiscoveredToolStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_payload: Option<Value>,
+    },
+    Command {
+        command_id: String,
+        command: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        process_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        actions: Vec<DiscoveredCommandAction>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        success: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_payload: Option<Value>,
+    },
+    FileChange {
+        change_id: String,
+        path: String,
+        change_kind: FileChangeKind,
+        status: DiscoveredFileChangeStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_payload: Option<Value>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DiscoveredCommandAction {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_payload: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveredToolStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveredFileChangeStatus {
+    Proposed,
+    Applied,
+    Rejected,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -318,6 +433,55 @@ mod tests {
         assert_eq!(json["request_id"], "event-1");
         assert_eq!(json["event"]["type"], "agent_event");
         assert_eq!(json["event"]["event"]["type"], "agent_message_delta");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn round_trips_discovered_sessions_event() {
+        let workspace = WorkspaceRef {
+            workspace_id: WorkspaceId::nil(),
+            runner_id: RunnerId::nil(),
+            path: "/work/agenter".to_owned(),
+            display_name: Some("agenter".to_owned()),
+        };
+        let message = RunnerClientMessage::Event(RunnerEventEnvelope {
+            request_id: None,
+            event: RunnerEvent::SessionsDiscovered(DiscoveredSessions {
+                workspace: workspace.clone(),
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                sessions: vec![DiscoveredSession {
+                    external_session_id: "codex-thread-1".to_owned(),
+                    title: Some("Existing Codex Thread".to_owned()),
+                    history: vec![
+                        DiscoveredSessionHistoryItem::UserMessage {
+                            message_id: Some("user-1".to_owned()),
+                            content: "hello".to_owned(),
+                        },
+                        DiscoveredSessionHistoryItem::AgentMessage {
+                            message_id: "agent-1".to_owned(),
+                            content: "hi".to_owned(),
+                        },
+                    ],
+                }],
+            }),
+        });
+
+        let json = serde_json::to_value(&message).expect("serialize discovered sessions");
+        let decoded: RunnerClientMessage =
+            serde_json::from_value(json.clone()).expect("deserialize discovered sessions");
+
+        assert_eq!(json["type"], "runner_event");
+        assert_eq!(json["event"]["type"], "sessions_discovered");
+        assert_eq!(json["event"]["provider_id"], AgentProviderId::CODEX);
+        assert_eq!(json["event"]["workspace"]["path"], workspace.path);
+        assert_eq!(
+            json["event"]["sessions"][0]["external_session_id"],
+            "codex-thread-1"
+        );
+        assert_eq!(
+            json["event"]["sessions"][0]["history"][0]["type"],
+            "user_message"
+        );
         assert_eq!(decoded, message);
     }
 

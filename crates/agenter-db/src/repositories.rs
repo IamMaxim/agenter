@@ -7,8 +7,8 @@ use sqlx::{postgres::PgRow, PgPool, Result, Row};
 use uuid::Uuid;
 
 use crate::models::{
-    AgentSession, CachedEvent, ConnectorAccount, ConnectorLinkCode, OidcLoginState, OidcProvider,
-    PendingApproval, Runner, User, Workspace,
+    AgentSession, AgentSessionWithWorkspace, CachedEvent, ConnectorAccount, ConnectorLinkCode,
+    OidcLoginState, OidcProvider, PendingApproval, Runner, User, Workspace,
 };
 
 #[derive(Clone, Debug)]
@@ -375,6 +375,31 @@ pub async fn register_runner(pool: &PgPool, name: &str, version: Option<&str>) -
     runner_from_row(&row)
 }
 
+pub async fn upsert_runner_with_id(
+    pool: &PgPool,
+    runner_id: RunnerId,
+    name: &str,
+    version: Option<&str>,
+) -> Result<Runner> {
+    let row = sqlx::query(
+        "insert into runners (runner_id, name, version, last_seen_at)
+         values ($1, $2, $3, now())
+         on conflict (runner_id)
+         do update set name = excluded.name,
+                       version = excluded.version,
+                       last_seen_at = now(),
+                       updated_at = now()
+         returning runner_id, name, version, last_seen_at, created_at, updated_at",
+    )
+    .bind(runner_id.as_uuid())
+    .bind(name)
+    .bind(version)
+    .fetch_one(pool)
+    .await?;
+
+    runner_from_row(&row)
+}
+
 pub async fn upsert_workspace(
     pool: &PgPool,
     runner_id: RunnerId,
@@ -388,6 +413,33 @@ pub async fn upsert_workspace(
          do update set display_name = excluded.display_name, updated_at = now()
          returning workspace_id, runner_id, path, display_name, created_at, updated_at",
     )
+    .bind(runner_id.as_uuid())
+    .bind(path)
+    .bind(display_name)
+    .fetch_one(pool)
+    .await?;
+
+    workspace_from_row(&row)
+}
+
+pub async fn upsert_workspace_with_id(
+    pool: &PgPool,
+    workspace_id: WorkspaceId,
+    runner_id: RunnerId,
+    path: &str,
+    display_name: Option<&str>,
+) -> Result<Workspace> {
+    let row = sqlx::query(
+        "insert into workspaces (workspace_id, runner_id, path, display_name)
+         values ($1, $2, $3, $4)
+         on conflict (workspace_id)
+         do update set runner_id = excluded.runner_id,
+                       path = excluded.path,
+                       display_name = excluded.display_name,
+                       updated_at = now()
+         returning workspace_id, runner_id, path, display_name, created_at, updated_at",
+    )
+    .bind(workspace_id.as_uuid())
     .bind(runner_id.as_uuid())
     .bind(path)
     .bind(display_name)
@@ -431,6 +483,198 @@ pub async fn create_session(
     .await?;
 
     session_from_row(&row)
+}
+
+#[derive(Clone, Debug)]
+pub struct CreateSessionRecord {
+    pub session_id: SessionId,
+    pub owner_user_id: UserId,
+    pub runner_id: RunnerId,
+    pub workspace_id: WorkspaceId,
+    pub provider_id: AgentProviderId,
+    pub external_session_id: Option<String>,
+    pub title: Option<String>,
+    pub status: SessionStatus,
+}
+
+pub async fn create_session_with_id(
+    pool: &PgPool,
+    record: CreateSessionRecord,
+) -> Result<AgentSession> {
+    let row = sqlx::query(
+        "insert into agent_sessions (
+            session_id,
+            owner_user_id,
+            runner_id,
+            workspace_id,
+            provider_id,
+            external_session_id,
+            status,
+            title
+         )
+         values ($1, $2, $3, $4, $5, $6, $7, $8)
+         returning session_id, owner_user_id, runner_id, workspace_id, provider_id,
+             external_session_id, status, title, created_at, updated_at",
+    )
+    .bind(record.session_id.as_uuid())
+    .bind(record.owner_user_id.as_uuid())
+    .bind(record.runner_id.as_uuid())
+    .bind(record.workspace_id.as_uuid())
+    .bind(record.provider_id.as_str())
+    .bind(record.external_session_id)
+    .bind(session_status_to_db(&record.status))
+    .bind(record.title)
+    .fetch_one(pool)
+    .await?;
+
+    session_from_row(&row)
+}
+
+pub async fn upsert_session_by_external_id(
+    pool: &PgPool,
+    owner_user_id: UserId,
+    runner_id: RunnerId,
+    workspace_id: WorkspaceId,
+    provider_id: AgentProviderId,
+    external_session_id: &str,
+    title: Option<&str>,
+) -> Result<AgentSession> {
+    let row = sqlx::query(
+        "insert into agent_sessions (
+            owner_user_id,
+            runner_id,
+            workspace_id,
+            provider_id,
+            external_session_id,
+            status,
+            title
+         )
+         values ($1, $2, $3, $4, $5, $6, $7)
+         on conflict (runner_id, workspace_id, provider_id, external_session_id)
+         where external_session_id is not null
+         do update set title = coalesce(excluded.title, agent_sessions.title),
+                       status = case
+                           when agent_sessions.status = 'archived' then agent_sessions.status
+                           else excluded.status
+                       end,
+                       updated_at = now()
+         returning session_id, owner_user_id, runner_id, workspace_id, provider_id,
+             external_session_id, status, title, created_at, updated_at",
+    )
+    .bind(owner_user_id.as_uuid())
+    .bind(runner_id.as_uuid())
+    .bind(workspace_id.as_uuid())
+    .bind(provider_id.as_str())
+    .bind(external_session_id)
+    .bind(session_status_to_db(&SessionStatus::Running))
+    .bind(title)
+    .fetch_one(pool)
+    .await?;
+
+    session_from_row(&row)
+}
+
+pub async fn list_sessions_for_user(
+    pool: &PgPool,
+    owner_user_id: UserId,
+) -> Result<Vec<AgentSessionWithWorkspace>> {
+    let rows = sqlx::query(
+        "select
+            s.session_id,
+            s.owner_user_id,
+            s.runner_id,
+            s.workspace_id,
+            s.provider_id,
+            s.external_session_id,
+            s.status,
+            s.title,
+            s.created_at,
+            s.updated_at,
+            w.workspace_id as w_workspace_id,
+            w.runner_id as w_runner_id,
+            w.path as w_path,
+            w.display_name as w_display_name,
+            w.created_at as w_created_at,
+            w.updated_at as w_updated_at
+         from agent_sessions s
+         join workspaces w on w.workspace_id = s.workspace_id
+         where s.owner_user_id = $1
+         order by s.updated_at desc, s.created_at desc",
+    )
+    .bind(owner_user_id.as_uuid())
+    .fetch_all(pool)
+    .await?;
+
+    rows.iter()
+        .map(session_with_workspace_from_row)
+        .collect::<Result<Vec<_>>>()
+}
+
+pub async fn find_session_for_user(
+    pool: &PgPool,
+    owner_user_id: UserId,
+    session_id: SessionId,
+) -> Result<Option<AgentSessionWithWorkspace>> {
+    let row = sqlx::query(
+        "select
+            s.session_id,
+            s.owner_user_id,
+            s.runner_id,
+            s.workspace_id,
+            s.provider_id,
+            s.external_session_id,
+            s.status,
+            s.title,
+            s.created_at,
+            s.updated_at,
+            w.workspace_id as w_workspace_id,
+            w.runner_id as w_runner_id,
+            w.path as w_path,
+            w.display_name as w_display_name,
+            w.created_at as w_created_at,
+            w.updated_at as w_updated_at
+         from agent_sessions s
+         join workspaces w on w.workspace_id = s.workspace_id
+         where s.owner_user_id = $1 and s.session_id = $2",
+    )
+    .bind(owner_user_id.as_uuid())
+    .bind(session_id.as_uuid())
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref()
+        .map(session_with_workspace_from_row)
+        .transpose()
+}
+
+pub async fn list_event_cache(pool: &PgPool, session_id: SessionId) -> Result<Vec<CachedEvent>> {
+    let rows = sqlx::query(
+        "select event_id, session_id, event_index, event_type, payload, created_at
+         from event_cache
+         where session_id = $1
+         order by event_index asc",
+    )
+    .bind(session_id.as_uuid())
+    .fetch_all(pool)
+    .await?;
+
+    rows.iter()
+        .map(cached_event_from_row)
+        .collect::<Result<Vec<_>>>()
+}
+
+pub async fn clear_event_cache(pool: &PgPool, session_id: SessionId) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("delete from event_cache where session_id = $1")
+        .bind(session_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from event_cache_cursors where session_id = $1")
+        .bind(session_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 pub async fn append_event_cache(
@@ -717,6 +961,33 @@ fn cached_event_from_row(row: &PgRow) -> Result<CachedEvent> {
     })
 }
 
+fn session_with_workspace_from_row(row: &PgRow) -> Result<AgentSessionWithWorkspace> {
+    let status: String = row.try_get("status")?;
+    let provider_id: String = row.try_get("provider_id")?;
+    Ok(AgentSessionWithWorkspace {
+        session: AgentSession {
+            session_id: SessionId::from_uuid(row.try_get("session_id")?),
+            owner_user_id: UserId::from_uuid(row.try_get("owner_user_id")?),
+            runner_id: RunnerId::from_uuid(row.try_get("runner_id")?),
+            workspace_id: WorkspaceId::from_uuid(row.try_get("workspace_id")?),
+            provider_id: AgentProviderId::from(provider_id),
+            external_session_id: row.try_get("external_session_id")?,
+            status: session_status_from_db(&status)?,
+            title: row.try_get("title")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        },
+        workspace: Workspace {
+            workspace_id: WorkspaceId::from_uuid(row.try_get("w_workspace_id")?),
+            runner_id: RunnerId::from_uuid(row.try_get("w_runner_id")?),
+            path: row.try_get("w_path")?,
+            display_name: row.try_get("w_display_name")?,
+            created_at: row.try_get("w_created_at")?,
+            updated_at: row.try_get("w_updated_at")?,
+        },
+    })
+}
+
 fn approval_from_row(row: &PgRow) -> Result<PendingApproval> {
     let kind: String = row.try_get("kind")?;
     let resolved_decision: Option<serde_json::Value> = row.try_get("resolved_decision")?;
@@ -953,6 +1224,92 @@ mod tests {
         assert_eq!(first_event.event_index, 1);
         assert_eq!(first_event.event_type, "user_message");
         assert_eq!(second_event.event_index, 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
+    async fn upserts_codex_imports_and_replays_cached_events() {
+        let pool = test_pool().await;
+
+        let suffix = uuid::Uuid::new_v4();
+        let user = create_user(
+            &pool,
+            &format!("codex-import-user-{suffix}@example.test"),
+            Some("Codex Import User"),
+        )
+        .await
+        .expect("create user");
+        let runner_id = agenter_core::RunnerId::from_uuid(uuid::Uuid::new_v4());
+        let workspace_id = agenter_core::WorkspaceId::from_uuid(uuid::Uuid::new_v4());
+        let runner = upsert_runner_with_id(
+            &pool,
+            runner_id,
+            &format!("codex-runner-{suffix}"),
+            Some("test"),
+        )
+        .await
+        .expect("upsert runner");
+        let workspace = upsert_workspace_with_id(
+            &pool,
+            workspace_id,
+            runner.runner_id,
+            &format!("/tmp/agenter-codex-import-{suffix}"),
+            Some("Codex Import Workspace"),
+        )
+        .await
+        .expect("upsert workspace");
+
+        let imported = upsert_session_by_external_id(
+            &pool,
+            user.user_id,
+            runner.runner_id,
+            workspace.workspace_id,
+            AgentProviderId::from(AgentProviderId::CODEX),
+            "codex-thread-imported",
+            Some("Imported Codex Thread"),
+        )
+        .await
+        .expect("upsert imported session");
+        let duplicate = upsert_session_by_external_id(
+            &pool,
+            user.user_id,
+            runner.runner_id,
+            workspace.workspace_id,
+            AgentProviderId::from(AgentProviderId::CODEX),
+            "codex-thread-imported",
+            Some("Renamed Codex Thread"),
+        )
+        .await
+        .expect("upsert duplicate imported session");
+
+        assert_eq!(imported.session_id, duplicate.session_id);
+        assert_eq!(duplicate.title.as_deref(), Some("Renamed Codex Thread"));
+
+        append_event_cache(
+            &pool,
+            imported.session_id,
+            &AppEvent::UserMessage(UserMessageEvent {
+                session_id: imported.session_id,
+                message_id: Some("user-message-1".to_owned()),
+                author_user_id: Some(user.user_id),
+                content: "persist me".to_owned(),
+            }),
+        )
+        .await
+        .expect("append cached event");
+
+        let sessions = list_sessions_for_user(&pool, user.user_id)
+            .await
+            .expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session.session_id, imported.session_id);
+        assert_eq!(sessions[0].workspace.workspace_id, workspace.workspace_id);
+
+        let events = list_event_cache(&pool, imported.session_id)
+            .await
+            .expect("list cached events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "user_message");
     }
 
     #[tokio::test]

@@ -49,6 +49,12 @@ pub struct AgentSession {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSessionWithWorkspace {
+    pub session: AgentSession,
+    pub workspace: Workspace,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CachedEvent {
     pub event_id: uuid::Uuid,

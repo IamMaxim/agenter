@@ -8,10 +8,12 @@ use serde::{Deserialize, Serialize};
 pub use browser::{BrowserClientMessage, BrowserEventEnvelope, BrowserServerMessage};
 pub use runner::{
     AgentEvent, AgentInput, AgentInputCommand, AgentProviderAdvertisement, ApprovalAnswerCommand,
-    CreateSessionCommand, ResumeSessionCommand, RunnerCapabilities, RunnerClientMessage,
-    RunnerCommand, RunnerCommandEnvelope, RunnerCommandResult, RunnerError, RunnerEvent,
-    RunnerEventEnvelope, RunnerHeartbeat, RunnerHeartbeatAck, RunnerHello, RunnerResponseEnvelope,
-    RunnerResponseOutcome, RunnerServerMessage, ShutdownSessionCommand,
+    CreateSessionCommand, DiscoveredCommandAction, DiscoveredFileChangeStatus, DiscoveredSession,
+    DiscoveredSessionHistoryItem, DiscoveredSessions, DiscoveredToolStatus, ResumeSessionCommand,
+    RunnerCapabilities, RunnerClientMessage, RunnerCommand, RunnerCommandEnvelope,
+    RunnerCommandResult, RunnerError, RunnerEvent, RunnerEventEnvelope, RunnerHeartbeat,
+    RunnerHeartbeatAck, RunnerHello, RunnerResponseEnvelope, RunnerResponseOutcome,
+    RunnerServerMessage, ShutdownSessionCommand,
 };
 
 macro_rules! string_id {

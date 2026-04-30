@@ -9,8 +9,8 @@ pub mod workspace;
 
 pub use approval::{ApprovalDecision, ApprovalKind, ApprovalRequestEvent, ApprovalResolvedEvent};
 pub use events::{
-    AgentErrorEvent, AgentMessageDeltaEvent, AppEvent, CommandCompletedEvent, CommandEvent,
-    CommandOutputEvent, CommandOutputStream, FileChangeEvent, FileChangeKind,
+    AgentErrorEvent, AgentMessageDeltaEvent, AppEvent, CommandAction, CommandCompletedEvent,
+    CommandEvent, CommandOutputEvent, CommandOutputStream, FileChangeEvent, FileChangeKind,
     MessageCompletedEvent, PlanEntry, PlanEntryStatus, PlanEvent, SessionStatusChangedEvent,
     ToolEvent, UserMessageEvent,
 };

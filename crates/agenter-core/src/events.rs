@@ -67,6 +67,13 @@ pub struct MessageCompletedEvent {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PlanEvent {
     pub session_id: SessionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<PlanEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_payload: Option<serde_json::Value>,
@@ -109,6 +116,27 @@ pub struct CommandEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<CommandAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_payload: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CommandAction {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_payload: Option<serde_json::Value>,
 }
 
@@ -135,6 +163,8 @@ pub struct CommandCompletedEvent {
     pub command_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_payload: Option<serde_json::Value>,
@@ -207,6 +237,9 @@ mod tests {
             command_id: "cmd-1".to_owned(),
             command: "cargo test -p agenter-core".to_owned(),
             cwd: Some("/work/agenter".to_owned()),
+            source: None,
+            process_id: None,
+            actions: Vec::new(),
             provider_payload: None,
         });
 

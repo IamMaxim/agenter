@@ -1,4 +1,5 @@
 /target/
+/.superpowers/
 /web/node_modules/
 /web/dist/
 /tmp/
