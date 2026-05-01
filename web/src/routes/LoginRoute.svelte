@@ -2,6 +2,7 @@
   import { ApiError } from '../api/http';
   import { getCurrentUser, loginPassword } from '../api/auth';
   import type { AuthenticatedUser } from '../api/types';
+  import { pushToast } from '../lib/toasts';
 
   export let onLogin: (user: AuthenticatedUser) => void;
 
@@ -22,6 +23,7 @@
         error = 'Email or password was rejected.';
       } else {
         error = 'Login failed. Check the control plane and try again.';
+        pushToast({ severity: 'error', message: error });
       }
     } finally {
       busy = false;

@@ -70,4 +70,5 @@ uuid_id!(RunnerId);
 uuid_id!(WorkspaceId);
 uuid_id!(SessionId);
 uuid_id!(ApprovalId);
+uuid_id!(QuestionId);
 uuid_id!(ConnectorBindingId);

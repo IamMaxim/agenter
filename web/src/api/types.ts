@@ -11,10 +11,12 @@ export interface WorkspaceRef {
   display_name?: string | null;
 }
 
+export type RunnerStatus = 'online' | 'offline' | 'connected' | string;
+
 export interface RunnerInfo {
   runner_id: string;
   name: string;
-  status?: string;
+  status?: RunnerStatus;
   last_seen_at?: string | null;
 }
 
@@ -42,6 +44,58 @@ export interface SessionInfo {
   title?: string | null;
 }
 
+export type AgentReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+
+export interface AgentModelOption {
+  id: string;
+  display_name: string;
+  description?: string | null;
+  is_default: boolean;
+  default_reasoning_effort?: AgentReasoningEffort | null;
+  supported_reasoning_efforts: AgentReasoningEffort[];
+  input_modalities: string[];
+}
+
+export interface AgentCollaborationMode {
+  id: string;
+  label: string;
+  model?: string | null;
+  reasoning_effort?: AgentReasoningEffort | null;
+}
+
+export interface AgentOptions {
+  models: AgentModelOption[];
+  collaboration_modes: AgentCollaborationMode[];
+}
+
+export interface AgentTurnSettings {
+  model?: string | null;
+  reasoning_effort?: AgentReasoningEffort | null;
+  collaboration_mode?: string | null;
+}
+
+export interface AgentQuestionChoice {
+  value: string;
+  label: string;
+  description?: string | null;
+}
+
+export interface AgentQuestionField {
+  id: string;
+  label: string;
+  prompt?: string | null;
+  kind: string;
+  required: boolean;
+  secret: boolean;
+  choices: AgentQuestionChoice[];
+  default_answers: string[];
+}
+
+export interface AgentQuestionAnswer {
+  question_id: string;
+  answers: Record<string, string[]>;
+}
+
 export type AppEventType =
   | 'session_started'
   | 'session_status_changed'
@@ -60,6 +114,8 @@ export type AppEventType =
   | 'file_change_rejected'
   | 'approval_requested'
   | 'approval_resolved'
+  | 'question_requested'
+  | 'question_answered'
   | 'error';
 
 export interface AppEvent {

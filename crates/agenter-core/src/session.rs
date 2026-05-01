@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::QuestionId;
+
 use crate::{RunnerId, SessionId, UserId, WorkspaceId};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -63,6 +65,16 @@ pub struct AgentCapabilities {
     pub command_execution: bool,
     pub plan_updates: bool,
     pub interrupt: bool,
+    #[serde(default)]
+    pub model_selection: bool,
+    #[serde(default)]
+    pub reasoning_effort: bool,
+    #[serde(default)]
+    pub collaboration_modes: bool,
+    #[serde(default)]
+    pub tool_user_input: bool,
+    #[serde(default)]
+    pub mcp_elicitation: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -77,4 +89,110 @@ pub struct SessionInfo {
     pub external_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentTurnSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<AgentReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collaboration_mode: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentOptions {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<AgentModelOption>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collaboration_modes: Vec<AgentCollaborationMode>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentModelOption {
+    pub id: String,
+    pub display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub is_default: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_effort: Option<AgentReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_reasoning_efforts: Vec<AgentReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_modalities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentCollaborationMode {
+    pub id: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<AgentReasoningEffort>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct QuestionRequestedEvent {
+    pub session_id: crate::SessionId,
+    pub question_id: QuestionId,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<AgentQuestionField>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_payload: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct QuestionAnsweredEvent {
+    pub session_id: crate::SessionId,
+    pub question_id: QuestionId,
+    pub answer: AgentQuestionAnswer,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_payload: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentQuestionField {
+    pub id: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    pub kind: String,
+    pub required: bool,
+    pub secret: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<AgentQuestionChoice>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_answers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentQuestionChoice {
+    pub value: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentQuestionAnswer {
+    pub question_id: QuestionId,
+    #[serde(default)]
+    pub answers: std::collections::BTreeMap<String, Vec<String>>,
 }

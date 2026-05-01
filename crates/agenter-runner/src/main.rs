@@ -11,8 +11,8 @@ use agenter_core::{
     AgentCapabilities, AgentErrorEvent, AgentMessageDeltaEvent, AgentProviderId, AppEvent,
     ApprovalId, ApprovalKind, ApprovalRequestEvent, CommandCompletedEvent, CommandEvent,
     CommandOutputEvent, CommandOutputStream, FileChangeEvent, FileChangeKind,
-    MessageCompletedEvent, RunnerId, SessionId, ToolEvent, UserMessageEvent, WorkspaceId,
-    WorkspaceRef,
+    MessageCompletedEvent, QuestionId, RunnerId, SessionId, ToolEvent, UserMessageEvent,
+    WorkspaceId, WorkspaceRef,
 };
 use agenter_protocol::runner::{
     AgentInput, AgentProviderAdvertisement, DiscoveredSession, DiscoveredSessions,
@@ -22,6 +22,7 @@ use agenter_protocol::runner::{
 };
 use agents::codex::{
     run_codex_turn_on_server, CodexAppServer, CodexTurnRequest, PendingCodexApproval,
+    PendingCodexQuestion,
 };
 use agents::qwen_acp::{run_qwen_turn, PendingQwenApproval, QwenTurnRequest};
 use futures_util::{SinkExt, StreamExt};
@@ -90,11 +91,18 @@ impl CodexRunnerRuntime {
         Ok(discovered)
     }
 
+    async fn agent_options(&self) -> anyhow::Result<agenter_core::AgentOptions> {
+        let mut guard = self.server.lock().await;
+        let server = ensure_codex_server(&mut guard, self.workspace_path.clone()).await?;
+        server.agent_options().await
+    }
+
     async fn run_turn(
         &self,
         request: CodexTurnRequest,
         event_sender: mpsc::UnboundedSender<AppEvent>,
         pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingCodexApproval>>>,
+        pending_questions: Arc<Mutex<HashMap<QuestionId, PendingCodexQuestion>>>,
     ) -> anyhow::Result<()> {
         let mut guard = self.server.lock().await;
         let server = ensure_codex_server(&mut guard, self.workspace_path.clone()).await?;
@@ -104,7 +112,14 @@ impl CodexRunnerRuntime {
             let thread_id = server.start_thread(&self.workspace_path).await?;
             server.set_active_thread(thread_id);
         }
-        run_codex_turn_on_server(server, request, event_sender, pending_approvals).await
+        run_codex_turn_on_server(
+            server,
+            request,
+            event_sender,
+            pending_approvals,
+            pending_questions,
+        )
+        .await
     }
 }
 
@@ -173,6 +188,8 @@ async fn run_codex_runner() -> anyhow::Result<()> {
     send_runner_message(&mut sender, RunnerClientMessage::Hello(hello)).await?;
 
     let pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingCodexApproval>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let pending_questions: Arc<Mutex<HashMap<QuestionId, PendingCodexQuestion>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let (codex_event_sender, mut codex_event_receiver) = mpsc::unbounded_channel::<AppEvent>();
     let codex_runtime = CodexRunnerRuntime::new(workspace_path.clone());
@@ -286,6 +303,25 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                         )
                         .await?;
                     }
+                    RunnerCommand::GetAgentOptions(command) => {
+                        tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, "codex runner received agent options request");
+                        let outcome = match codex_runtime.agent_options().await {
+                            Ok(options) => RunnerResponseOutcome::Ok {
+                                result: RunnerCommandResult::AgentOptions { options },
+                            },
+                            Err(error) => RunnerResponseOutcome::Error {
+                                error: runner_error("codex_agent_options_failed", error),
+                            },
+                        };
+                        send_runner_message(
+                            &mut sender,
+                            RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                request_id: envelope.request_id,
+                                outcome,
+                            }),
+                        )
+                        .await?;
+                    }
                     RunnerCommand::AgentSendInput(command) => {
                         tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, "codex runner received agent input");
                         send_runner_message(
@@ -304,13 +340,15 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                             workspace_path: workspace_path.clone(),
                             external_session_id: command.external_session_id,
                             prompt,
+                            settings: command.settings,
                         };
                         let event_sender = codex_event_sender.clone();
                         let pending = pending_approvals.clone();
+                        let pending_question_answers = pending_questions.clone();
                         let runtime = codex_runtime.clone();
                         let session_id = request.session_id;
                         tokio::spawn(async move {
-                            if let Err(error) = runtime.run_turn(request, event_sender.clone(), pending).await {
+                            if let Err(error) = runtime.run_turn(request, event_sender.clone(), pending, pending_question_answers).await {
                                 tracing::error!(%session_id, %error, "codex turn failed");
                                 event_sender.send(AppEvent::Error(AgentErrorEvent {
                                     session_id: Some(session_id),
@@ -335,6 +373,32 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                                 error: agenter_protocol::runner::RunnerError {
                                     code: "approval_not_found".to_owned(),
                                     message: "approval is no longer pending in the Codex adapter".to_owned(),
+                                },
+                            }
+                        };
+                        send_runner_message(
+                            &mut sender,
+                            RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                request_id: envelope.request_id,
+                                outcome,
+                            }),
+                        )
+                        .await?;
+                    }
+                    RunnerCommand::AnswerQuestion(command) => {
+                        tracing::info!(session_id = %command.session_id, question_id = %command.answer.question_id, "codex runner received question answer");
+                        let pending = pending_questions.lock().await.remove(&command.answer.question_id);
+                        let outcome = if let Some(pending) = pending {
+                            pending.response.send(command.answer).ok();
+                            RunnerResponseOutcome::Ok {
+                                result: RunnerCommandResult::Accepted,
+                            }
+                        } else {
+                            tracing::warn!(question_id = %command.answer.question_id, "codex question answer had no pending provider request");
+                            RunnerResponseOutcome::Error {
+                                error: agenter_protocol::runner::RunnerError {
+                                    code: "question_not_found".to_owned(),
+                                    message: "question is no longer pending in the Codex adapter".to_owned(),
                                 },
                             }
                         };
@@ -487,6 +551,8 @@ async fn run_qwen_runner() -> anyhow::Result<()> {
                     }
                     RunnerCommand::CreateSession(_)
                     | RunnerCommand::ResumeSession(_)
+                    | RunnerCommand::GetAgentOptions(_)
+                    | RunnerCommand::AnswerQuestion(_)
                     | RunnerCommand::InterruptSession { .. }
                     | RunnerCommand::ShutdownSession(_) => {
                         tracing::debug!(request_id = %envelope.request_id, "qwen runner accepted lifecycle command placeholder");
@@ -602,6 +668,11 @@ fn fake_hello(token: String) -> RunnerHello {
                     approvals: true,
                     file_changes: true,
                     command_execution: true,
+                    model_selection: true,
+                    reasoning_effort: true,
+                    collaboration_modes: true,
+                    tool_user_input: true,
+                    mcp_elicitation: true,
                     ..AgentCapabilities::default()
                 },
             }],
@@ -666,6 +737,11 @@ fn provider_hello(
                     file_changes: true,
                     command_execution: true,
                     session_resume,
+                    model_selection: session_resume,
+                    reasoning_effort: session_resume,
+                    collaboration_modes: session_resume,
+                    tool_user_input: session_resume,
+                    mcp_elicitation: session_resume,
                     ..AgentCapabilities::default()
                 },
             }],
@@ -743,6 +819,8 @@ fn app_event_session_id(event: &AppEvent) -> Option<SessionId> {
         | AppEvent::FileChangeRejected(event) => Some(event.session_id),
         AppEvent::ApprovalRequested(event) => Some(event.session_id),
         AppEvent::ApprovalResolved(event) => Some(event.session_id),
+        AppEvent::QuestionRequested(event) => Some(event.session_id),
+        AppEvent::QuestionAnswered(event) => Some(event.session_id),
         AppEvent::Error(event) => event.session_id,
     }
 }

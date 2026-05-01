@@ -233,6 +233,8 @@ fn app_event_session_id(event: &AppEvent) -> Option<SessionId> {
         | AppEvent::FileChangeRejected(event) => Some(event.session_id),
         AppEvent::ApprovalRequested(event) => Some(event.session_id),
         AppEvent::ApprovalResolved(event) => Some(event.session_id),
+        AppEvent::QuestionRequested(event) => Some(event.session_id),
+        AppEvent::QuestionAnswered(event) => Some(event.session_id),
         AppEvent::Error(event) => event.session_id,
     }
 }

@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use agenter_core::{
-    AgentProviderId, ApprovalDecision, ApprovalId, ApprovalKind, RunnerId, SessionId,
-    SessionStatus, UserId, WorkspaceId,
+    AgentProviderId, AgentTurnSettings, ApprovalDecision, ApprovalId, ApprovalKind, RunnerId,
+    SessionId, SessionStatus, UserId, WorkspaceId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,6 +45,7 @@ pub struct AgentSession {
     pub external_session_id: Option<String>,
     pub status: SessionStatus,
     pub title: Option<String>,
+    pub turn_settings: Option<AgentTurnSettings>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

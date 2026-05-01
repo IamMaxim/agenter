@@ -10,6 +10,16 @@ export class ApiError extends Error {
   }
 }
 
+export class ApiParseError extends Error {
+  readonly cause: unknown;
+
+  constructor(message: string, cause: unknown) {
+    super(message);
+    this.name = 'ApiParseError';
+    this.cause = cause;
+  }
+}
+
 export async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
   const method = init.method ?? 'GET';
   debugLog('api:start', { method, path });
@@ -24,7 +34,7 @@ export async function requestJson<T>(path: string, init: RequestInit = {}): Prom
 
   if (!response.ok) {
     debugLog('api:error', { method, path, status: response.status });
-    throw new ApiError(response.status, `${method} ${path} failed`);
+    throw new ApiError(response.status, `${method} ${path} failed with ${response.status}`);
   }
 
   debugLog('api:ok', { method, path, status: response.status });
@@ -38,5 +48,10 @@ export async function requestJson<T>(path: string, init: RequestInit = {}): Prom
     return undefined as T;
   }
 
-  return JSON.parse(text) as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch (error) {
+    debugLog('api:parse-error', { method, path });
+    throw new ApiParseError(`${method} ${path} returned invalid JSON`, error);
+  }
 }

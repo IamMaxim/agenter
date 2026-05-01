@@ -1,8 +1,9 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use agenter_core::{
-    AgentProviderId, AppEvent, ApprovalId, CommandAction, CommandOutputStream, RunnerId, SessionId,
-    SessionInfo, SessionStatus, UserId, WorkspaceId, WorkspaceRef,
+    AgentProviderId, AgentQuestionAnswer, AgentTurnSettings, AppEvent, ApprovalId, CommandAction,
+    CommandOutputStream, QuestionId, RunnerId, SessionId, SessionInfo, SessionStatus, UserId,
+    WorkspaceId, WorkspaceRef,
 };
 use agenter_protocol::{
     browser::BrowserEventEnvelope,
@@ -47,12 +48,19 @@ struct Registry {
     runners: HashMap<RunnerId, RegisteredRunner>,
     sessions: HashMap<SessionId, RegisteredSession>,
     approvals: HashMap<ApprovalId, RegisteredApproval>,
+    questions: HashMap<QuestionId, RegisteredQuestion>,
 }
 
 #[derive(Clone, Debug)]
 pub struct RegisteredApproval {
     pub session_id: SessionId,
     status: ApprovalStatus,
+}
+
+#[derive(Clone, Debug)]
+pub struct RegisteredQuestion {
+    pub session_id: SessionId,
+    pub resolved: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +91,12 @@ pub struct RegisteredRunner {
 }
 
 #[derive(Clone, Debug)]
+pub struct RunnerListEntry {
+    pub runner: RegisteredRunner,
+    pub connected: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct RegisteredSession {
     pub session_id: SessionId,
     pub owner_user_id: UserId,
@@ -92,6 +106,7 @@ pub struct RegisteredSession {
     pub status: SessionStatus,
     pub title: Option<String>,
     pub external_session_id: Option<String>,
+    pub turn_settings: Option<AgentTurnSettings>,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +118,7 @@ pub struct SessionRegistration {
     pub provider_id: AgentProviderId,
     pub title: Option<String>,
     pub external_session_id: Option<String>,
+    pub turn_settings: Option<AgentTurnSettings>,
 }
 
 #[derive(Debug)]
@@ -493,14 +509,23 @@ impl AppState {
         }
     }
 
-    pub async fn list_runners(&self) -> Vec<RegisteredRunner> {
-        self.inner
+    pub async fn list_runners_with_connection_status(&self) -> Vec<RunnerListEntry> {
+        let runners: Vec<_> = self
+            .inner
             .registry
             .lock()
             .await
             .runners
             .values()
             .cloned()
+            .collect();
+        let connections = self.inner.runner_connections.lock().await;
+        runners
+            .into_iter()
+            .map(|runner| RunnerListEntry {
+                connected: connections.contains_key(&runner.runner_id),
+                runner,
+            })
             .collect()
     }
 
@@ -552,6 +577,7 @@ impl AppState {
             provider_id,
             title,
             external_session_id: None,
+            turn_settings: None,
         })
         .await
     }
@@ -566,6 +592,7 @@ impl AppState {
             status: SessionStatus::Running,
             title: registration.title,
             external_session_id: registration.external_session_id,
+            turn_settings: registration.turn_settings,
         };
         if let Some(pool) = &self.inner.db_pool {
             match agenter_db::create_session_with_id(
@@ -579,6 +606,7 @@ impl AppState {
                     external_session_id: session.external_session_id.clone(),
                     title: session.title.clone(),
                     status: session.status.clone(),
+                    turn_settings: session.turn_settings.clone(),
                 },
             )
             .await
@@ -587,6 +615,7 @@ impl AppState {
                     session.status = persisted.status;
                     session.title = persisted.title;
                     session.external_session_id = persisted.external_session_id;
+                    session.turn_settings = persisted.turn_settings;
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -714,6 +743,7 @@ impl AppState {
                     status: session.session.status,
                     title: session.session.title,
                     external_session_id: session.session.external_session_id,
+                    turn_settings: session.session.turn_settings,
                 });
         }
         self.inner
@@ -793,6 +823,54 @@ impl AppState {
         )
     }
 
+    pub async fn session_turn_settings(
+        &self,
+        user_id: UserId,
+        session_id: SessionId,
+    ) -> Option<AgentTurnSettings> {
+        if let Some(pool) = &self.inner.db_pool {
+            return agenter_db::session_turn_settings(pool, user_id, session_id)
+                .await
+                .ok()
+                .flatten();
+        }
+        self.inner
+            .registry
+            .lock()
+            .await
+            .sessions
+            .get(&session_id)
+            .filter(|session| session.owner_user_id == user_id)
+            .and_then(|session| session.turn_settings.clone())
+    }
+
+    pub async fn update_session_turn_settings(
+        &self,
+        user_id: UserId,
+        session_id: SessionId,
+        settings: AgentTurnSettings,
+    ) -> Option<AgentTurnSettings> {
+        if let Some(pool) = &self.inner.db_pool {
+            let updated = agenter_db::update_session_turn_settings(
+                pool,
+                user_id,
+                session_id,
+                Some(&settings),
+            )
+            .await
+            .ok()
+            .flatten()?;
+            return updated.turn_settings;
+        }
+        let mut registry = self.inner.registry.lock().await;
+        let session = registry
+            .sessions
+            .get_mut(&session_id)
+            .filter(|session| session.owner_user_id == user_id)?;
+        session.turn_settings = Some(settings.clone());
+        Some(settings)
+    }
+
     pub async fn publish_event(
         &self,
         session_id: SessionId,
@@ -841,6 +919,26 @@ impl AppState {
                             },
                         );
                     }
+                }
+            }
+            AppEvent::QuestionRequested(request) => {
+                tracing::info!(
+                    question_id = %request.question_id,
+                    %session_id,
+                    "question requested"
+                );
+                self.inner.registry.lock().await.questions.insert(
+                    request.question_id,
+                    RegisteredQuestion {
+                        session_id,
+                        resolved: false,
+                    },
+                );
+            }
+            AppEvent::QuestionAnswered(answered) => {
+                let mut registry = self.inner.registry.lock().await;
+                if let Some(question) = registry.questions.get_mut(&answered.question_id) {
+                    question.resolved = true;
                 }
             }
             _ => {}
@@ -920,6 +1018,31 @@ impl AppState {
 
         self.store_event(session_id, envelope.clone()).await;
         Some(envelope)
+    }
+
+    pub async fn question_session(&self, question_id: QuestionId) -> Option<SessionId> {
+        self.inner
+            .registry
+            .lock()
+            .await
+            .questions
+            .get(&question_id)
+            .filter(|question| !question.resolved)
+            .map(|question| question.session_id)
+    }
+
+    pub async fn finish_question_answer(
+        &self,
+        session_id: SessionId,
+        answer: AgentQuestionAnswer,
+    ) -> BrowserEventEnvelope {
+        let event = AppEvent::QuestionAnswered(agenter_core::QuestionAnsweredEvent {
+            session_id,
+            question_id: answer.question_id,
+            answer,
+            provider_payload: None,
+        });
+        self.publish_event(session_id, event).await
     }
 
     async fn store_event(
@@ -1017,6 +1140,7 @@ impl AppState {
                         status: session.status,
                         title: session.title,
                         external_session_id: session.external_session_id,
+                        turn_settings: session.turn_settings,
                     },
                     Err(error) => {
                         tracing::warn!(
@@ -1038,6 +1162,7 @@ impl AppState {
                     status: SessionStatus::Running,
                     title: discovered_session.title.clone(),
                     external_session_id: Some(discovered_session.external_session_id.clone()),
+                    turn_settings: None,
                 }
             };
 
@@ -1256,6 +1381,8 @@ fn app_event_name(event: &AppEvent) -> &'static str {
         AppEvent::FileChangeRejected(_) => "file_change_rejected",
         AppEvent::ApprovalRequested(_) => "approval_requested",
         AppEvent::ApprovalResolved(_) => "approval_resolved",
+        AppEvent::QuestionRequested(_) => "question_requested",
+        AppEvent::QuestionAnswered(_) => "question_answered",
         AppEvent::Error(_) => "error",
     }
 }

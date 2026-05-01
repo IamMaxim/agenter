@@ -1,6 +1,7 @@
 use agenter_core::{
-    AgentCapabilities, AgentProviderId, AppEvent, ApprovalDecision, ApprovalId, FileChangeKind,
-    SessionId, UserMessageEvent, WorkspaceRef,
+    AgentCapabilities, AgentOptions, AgentProviderId, AgentQuestionAnswer, AgentTurnSettings,
+    AppEvent, ApprovalDecision, ApprovalId, FileChangeKind, SessionId, UserMessageEvent,
+    WorkspaceRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -79,9 +80,11 @@ pub struct RunnerCommandEnvelope {
 pub enum RunnerCommand {
     CreateSession(CreateSessionCommand),
     ResumeSession(ResumeSessionCommand),
+    GetAgentOptions(GetAgentOptionsCommand),
     AgentSendInput(AgentInputCommand),
     InterruptSession { session_id: SessionId },
     AnswerApproval(ApprovalAnswerCommand),
+    AnswerQuestion(QuestionAnswerCommand),
     ShutdownSession(ShutdownSessionCommand),
 }
 
@@ -107,7 +110,15 @@ pub struct AgentInputCommand {
     pub session_id: SessionId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<AgentTurnSettings>,
     pub input: AgentInput,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GetAgentOptionsCommand {
+    pub session_id: SessionId,
+    pub provider_id: AgentProviderId,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -122,6 +133,12 @@ pub struct ApprovalAnswerCommand {
     pub session_id: SessionId,
     pub approval_id: ApprovalId,
     pub decision: ApprovalDecision,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct QuestionAnswerCommand {
+    pub session_id: SessionId,
+    pub answer: AgentQuestionAnswer,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -147,6 +164,9 @@ pub enum RunnerResponseOutcome {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunnerCommandResult {
     Accepted,
+    AgentOptions {
+        options: AgentOptions,
+    },
     SessionCreated {
         session_id: SessionId,
         external_session_id: String,
@@ -316,8 +336,9 @@ pub enum RunnerHealthStatus {
 #[cfg(test)]
 mod tests {
     use agenter_core::{
-        AgentCapabilities, AgentMessageDeltaEvent, AgentProviderId, AppEvent, ApprovalDecision,
-        ApprovalId, RunnerId, SessionId, UserMessageEvent, WorkspaceId, WorkspaceRef,
+        AgentCapabilities, AgentMessageDeltaEvent, AgentProviderId, AgentQuestionAnswer,
+        AgentReasoningEffort, AgentTurnSettings, AppEvent, ApprovalDecision, ApprovalId,
+        QuestionId, RunnerId, SessionId, UserMessageEvent, WorkspaceId, WorkspaceRef,
     };
 
     use super::*;
@@ -369,6 +390,7 @@ mod tests {
             command: RunnerCommand::AgentSendInput(AgentInputCommand {
                 session_id: SessionId::nil(),
                 external_session_id: Some("thread-1".to_owned()),
+                settings: None,
                 input: AgentInput::Text {
                     text: "Run tests".to_owned(),
                 },
@@ -490,6 +512,7 @@ mod tests {
         let command = RunnerCommand::AgentSendInput(AgentInputCommand {
             session_id: SessionId::nil(),
             external_session_id: None,
+            settings: None,
             input: AgentInput::UserMessage {
                 payload: UserMessageEvent {
                     session_id: SessionId::nil(),
@@ -505,5 +528,76 @@ mod tests {
         assert_eq!(json["type"], "agent_send_input");
         assert_eq!(json["input"]["type"], "user_message");
         assert_eq!(json["input"]["payload"]["content"], "hello");
+    }
+
+    #[test]
+    fn round_trips_agent_input_settings_without_breaking_absent_settings() {
+        let with_settings = RunnerCommand::AgentSendInput(AgentInputCommand {
+            session_id: SessionId::nil(),
+            external_session_id: Some("thread-1".to_owned()),
+            settings: Some(AgentTurnSettings {
+                model: Some("gpt-5.4".to_owned()),
+                reasoning_effort: Some(AgentReasoningEffort::High),
+                collaboration_mode: Some("plan".to_owned()),
+            }),
+            input: AgentInput::Text {
+                text: "Plan this".to_owned(),
+            },
+        });
+        let without_settings = serde_json::json!({
+            "type": "agent_send_input",
+            "session_id": SessionId::nil(),
+            "external_session_id": "thread-1",
+            "input": {"type": "text", "text": "hello"}
+        });
+
+        let json = serde_json::to_value(&with_settings).expect("serialize settings");
+        let decoded_old: RunnerCommand =
+            serde_json::from_value(without_settings).expect("deserialize old command");
+
+        assert_eq!(json["settings"]["model"], "gpt-5.4");
+        assert_eq!(json["settings"]["reasoning_effort"], "high");
+        assert_eq!(json["settings"]["collaboration_mode"], "plan");
+        match decoded_old {
+            RunnerCommand::AgentSendInput(command) => assert_eq!(command.settings, None),
+            other => panic!("unexpected command {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trips_provider_options_and_question_answer_commands() {
+        let options = RunnerServerMessage::Command(Box::new(RunnerCommandEnvelope {
+            request_id: RequestId::from("options-1"),
+            command: RunnerCommand::GetAgentOptions(GetAgentOptionsCommand {
+                session_id: SessionId::nil(),
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+            }),
+        }));
+        let answer = RunnerServerMessage::Command(Box::new(RunnerCommandEnvelope {
+            request_id: RequestId::from("question-1"),
+            command: RunnerCommand::AnswerQuestion(QuestionAnswerCommand {
+                session_id: SessionId::nil(),
+                answer: AgentQuestionAnswer {
+                    question_id: QuestionId::nil(),
+                    answers: std::collections::BTreeMap::from([(
+                        "targets".to_owned(),
+                        vec!["web".to_owned(), "runner".to_owned()],
+                    )]),
+                },
+            }),
+        }));
+
+        let options_json = serde_json::to_value(&options).expect("serialize options command");
+        let answer_json = serde_json::to_value(&answer).expect("serialize answer command");
+        let decoded_answer: RunnerServerMessage =
+            serde_json::from_value(answer_json.clone()).expect("decode answer command");
+
+        assert_eq!(options_json["command"]["type"], "get_agent_options");
+        assert_eq!(answer_json["command"]["type"], "answer_question");
+        assert_eq!(
+            answer_json["command"]["answer"]["answers"]["targets"][1],
+            "runner"
+        );
+        assert_eq!(decoded_answer, answer);
     }
 }

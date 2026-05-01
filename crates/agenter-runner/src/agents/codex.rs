@@ -6,9 +6,11 @@ use std::{
 };
 
 use agenter_core::{
-    AgentErrorEvent, AgentMessageDeltaEvent, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind,
+    AgentCollaborationMode, AgentErrorEvent, AgentMessageDeltaEvent, AgentModelOption,
+    AgentOptions, AgentQuestionAnswer, AgentQuestionChoice, AgentQuestionField,
+    AgentReasoningEffort, AgentTurnSettings, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind,
     ApprovalRequestEvent, CommandCompletedEvent, CommandEvent, FileChangeEvent, FileChangeKind,
-    MessageCompletedEvent, SessionId,
+    MessageCompletedEvent, QuestionId, QuestionRequestedEvent, SessionId,
 };
 use agenter_protocol::{
     DiscoveredCommandAction, DiscoveredFileChangeStatus, DiscoveredSessionHistoryItem,
@@ -32,11 +34,17 @@ pub struct CodexTurnRequest {
     pub workspace_path: PathBuf,
     pub external_session_id: Option<String>,
     pub prompt: String,
+    pub settings: Option<AgentTurnSettings>,
 }
 
 #[derive(Debug)]
 pub struct PendingCodexApproval {
     pub response: oneshot::Sender<ApprovalDecision>,
+}
+
+#[derive(Debug)]
+pub struct PendingCodexQuestion {
+    pub response: oneshot::Sender<AgentQuestionAnswer>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,6 +58,12 @@ pub enum CodexApprovalKind {
     Command,
     FileChange,
     Permissions,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexQuestionKind {
+    ToolUserInput,
+    McpElicitation,
 }
 
 #[derive(Debug)]
@@ -211,6 +225,21 @@ impl CodexAppServer {
         Ok(codex_history_from_thread_read_response(&response))
     }
 
+    pub async fn agent_options(&mut self) -> anyhow::Result<AgentOptions> {
+        self.initialize().await?;
+        let models_id = self
+            .send_request("model/list", json!({"includeHidden": false}))
+            .await?;
+        let models = self.read_response(models_id, "model/list").await?;
+        let modes_id = self
+            .send_request("collaborationMode/list", json!({}))
+            .await?;
+        let modes = self
+            .read_response(modes_id, "collaborationMode/list")
+            .await?;
+        Ok(codex_agent_options_from_responses(&models, &modes))
+    }
+
     pub fn set_active_thread(&mut self, thread_id: impl Into<String>) {
         self.thread_id = Some(thread_id.into());
         self.turn_id = None;
@@ -233,17 +262,7 @@ impl CodexAppServer {
             "starting codex turn"
         );
         let turn_start_id = self
-            .send_request(
-                "turn/start",
-                json!({
-                    "threadId": thread_id,
-                    "cwd": request.workspace_path,
-                    "approvalPolicy": "on-request",
-                    "approvalsReviewer": "user",
-                    "sandboxPolicy": {"type": "readOnly", "networkAccess": false},
-                    "input": [{"type": "text", "text": request.prompt}]
-                }),
-            )
+            .send_request("turn/start", codex_turn_start_params(thread_id, request))
             .await?;
         let response = self.read_response(turn_start_id, "turn/start").await?;
         if let Some(turn_id) = codex_turn_id(&response) {
@@ -296,6 +315,28 @@ impl CodexAppServer {
             &json!({
                 "id": native_request_id,
                 "result": approval_response_for_decision(approval_kind, decision)
+            }),
+        )
+        .await
+    }
+
+    pub async fn send_question_response(
+        &mut self,
+        native_request_id: Value,
+        kind: CodexQuestionKind,
+        answer: AgentQuestionAnswer,
+    ) -> anyhow::Result<()> {
+        tracing::info!(
+            native_request_id = ?native_request_id,
+            ?kind,
+            question_id = %answer.question_id,
+            "sending codex question response"
+        );
+        write_json(
+            &mut self.stdin,
+            &json!({
+                "id": native_request_id,
+                "result": question_response_for_answer(kind, answer)
             }),
         )
         .await
@@ -373,12 +414,52 @@ pub fn codex_thread_start_params(workspace_path: &PathBuf) -> Value {
     })
 }
 
+pub fn codex_turn_start_params(thread_id: &str, request: &CodexTurnRequest) -> Value {
+    let mut params = json!({
+        "threadId": thread_id,
+        "cwd": request.workspace_path,
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "sandboxPolicy": {"type": "readOnly", "networkAccess": false},
+        "input": [{"type": "text", "text": request.prompt}]
+    });
+    let Some(settings) = &request.settings else {
+        return params;
+    };
+    if let Some(model) = &settings.model {
+        params["model"] = json!(model);
+    }
+    if let Some(effort) = &settings.reasoning_effort {
+        params["effort"] = json!(codex_reasoning_effort(effort));
+    }
+    if let Some(mode) = &settings.collaboration_mode {
+        let mut mode_payload = json!({
+            "mode": mode,
+            "settings": {
+                "model": settings.model.as_deref().unwrap_or(""),
+                "reasoning_effort": settings
+                    .reasoning_effort
+                    .as_ref()
+                    .map(codex_reasoning_effort)
+            }
+        });
+        if settings.model.is_none() {
+            mode_payload["settings"]["model"] = Value::Null;
+        }
+        params["collaborationMode"] = mode_payload;
+    }
+    params
+}
+
 pub async fn run_codex_turn_on_server(
     server: &mut CodexAppServer,
     request: CodexTurnRequest,
     event_sender: mpsc::UnboundedSender<AppEvent>,
     pending_approvals: std::sync::Arc<
         tokio::sync::Mutex<HashMap<ApprovalId, PendingCodexApproval>>,
+    >,
+    pending_questions: std::sync::Arc<
+        tokio::sync::Mutex<HashMap<QuestionId, PendingCodexQuestion>>,
     >,
 ) -> anyhow::Result<()> {
     while server.thread_id.is_none() {
@@ -428,6 +509,31 @@ pub async fn run_codex_turn_on_server(
             }
             continue;
         }
+        if let Some((question_id, native_request_id, event)) =
+            normalize_codex_question_request(request.session_id, &message)
+        {
+            let Some(question_kind) = codex_question_kind(&message) else {
+                continue;
+            };
+            let (sender, receiver) = oneshot::channel();
+            pending_questions
+                .lock()
+                .await
+                .insert(question_id, PendingCodexQuestion { response: sender });
+            tracing::info!(
+                session_id = %request.session_id,
+                %question_id,
+                ?question_kind,
+                "codex question request pending"
+            );
+            event_sender.send(event).ok();
+            if let Ok(answer) = receiver.await {
+                server
+                    .send_question_response(native_request_id, question_kind, answer)
+                    .await?;
+            }
+            continue;
+        }
 
         for event in normalize_codex_message_for_scope(request.session_id, &message, &scope) {
             let completed = jsonrpc_method(&message) == Some("turn/completed");
@@ -440,6 +546,82 @@ pub async fn run_codex_turn_on_server(
     }
 
     Ok(())
+}
+
+pub fn codex_agent_options_from_responses(models: &Value, modes: &Value) -> AgentOptions {
+    AgentOptions {
+        models: codex_model_options(models),
+        collaboration_modes: codex_collaboration_modes(modes),
+    }
+}
+
+fn codex_model_options(message: &Value) -> Vec<AgentModelOption> {
+    message
+        .pointer("/result/data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|model| !bool_at(model, &["/hidden"]).unwrap_or(false))
+        .filter_map(|model| {
+            let id = string_at(model, &["/id", "/model"])?;
+            Some(AgentModelOption {
+                id: id.to_owned(),
+                display_name: string_at(model, &["/displayName", "/display_name", "/model"])
+                    .unwrap_or(id)
+                    .to_owned(),
+                description: string_at(model, &["/description"]).map(str::to_owned),
+                is_default: bool_at(model, &["/isDefault", "/is_default"]).unwrap_or(false),
+                default_reasoning_effort: string_at(
+                    model,
+                    &["/defaultReasoningEffort", "/default_reasoning_effort"],
+                )
+                .and_then(agent_reasoning_effort),
+                supported_reasoning_efforts: model
+                    .get("supportedReasoningEfforts")
+                    .or_else(|| model.get("supported_reasoning_efforts"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|effort| {
+                        effort
+                            .as_str()
+                            .or_else(|| string_at(effort, &["/effort", "/id", "/value"]))
+                            .and_then(agent_reasoning_effort)
+                    })
+                    .collect(),
+                input_modalities: model
+                    .get("inputModalities")
+                    .or_else(|| model.get("input_modalities"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+fn codex_collaboration_modes(message: &Value) -> Vec<AgentCollaborationMode> {
+    message
+        .pointer("/result/data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|mode| {
+            let id = string_at(mode, &["/mode", "/id", "/name"])?;
+            Some(AgentCollaborationMode {
+                id: id.to_owned(),
+                label: string_at(mode, &["/name", "/label"])
+                    .unwrap_or(id)
+                    .to_owned(),
+                model: string_at(mode, &["/model"]).map(str::to_owned),
+                reasoning_effort: string_at(mode, &["/reasoning_effort", "/reasoningEffort"])
+                    .and_then(agent_reasoning_effort),
+            })
+        })
+        .collect()
 }
 
 async fn write_json(stdin: &mut ChildStdin, message: &Value) -> anyhow::Result<()> {
@@ -545,6 +727,215 @@ pub fn normalize_codex_approval_request(
         provider_payload: Some(message.clone()),
     });
     Some((approval_id, native_request_id, approval_kind, event))
+}
+
+pub fn normalize_codex_question_request(
+    session_id: SessionId,
+    message: &Value,
+) -> Option<(QuestionId, Value, AppEvent)> {
+    let method = jsonrpc_method(message)?;
+    let native_request_id = message.get("id")?.clone();
+    let question_id = QuestionId::new();
+    let (title, description, fields) = match method {
+        "item/tool/requestUserInput" => (
+            "Codex needs input".to_owned(),
+            None,
+            tool_user_input_fields(message),
+        ),
+        "mcpServer/elicitation/request" => {
+            let params = message.get("params").unwrap_or(&Value::Null);
+            (
+                string_at(params, &["/serverName"])
+                    .unwrap_or("MCP input")
+                    .to_owned(),
+                string_at(params, &["/message"]).map(str::to_owned),
+                mcp_elicitation_fields(params),
+            )
+        }
+        _ => return None,
+    };
+    let event = AppEvent::QuestionRequested(QuestionRequestedEvent {
+        session_id,
+        question_id,
+        title,
+        description,
+        fields,
+        provider_payload: Some(message.clone()),
+    });
+    Some((question_id, native_request_id, event))
+}
+
+fn codex_question_kind(message: &Value) -> Option<CodexQuestionKind> {
+    match jsonrpc_method(message)? {
+        "item/tool/requestUserInput" => Some(CodexQuestionKind::ToolUserInput),
+        "mcpServer/elicitation/request" => Some(CodexQuestionKind::McpElicitation),
+        _ => None,
+    }
+}
+
+fn tool_user_input_fields(message: &Value) -> Vec<AgentQuestionField> {
+    message
+        .pointer("/params/questions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|question| {
+            let id = string_at(question, &["/id"])?;
+            let choices: Vec<_> = question
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|option| {
+                    let label = string_at(option, &["/label"])?;
+                    Some(AgentQuestionChoice {
+                        value: label.to_owned(),
+                        label: label.to_owned(),
+                        description: string_at(option, &["/description"]).map(str::to_owned),
+                    })
+                })
+                .collect();
+            Some(AgentQuestionField {
+                id: id.to_owned(),
+                label: string_at(question, &["/header"]).unwrap_or(id).to_owned(),
+                prompt: string_at(question, &["/question"]).map(str::to_owned),
+                kind: if choices.is_empty() {
+                    "text".to_owned()
+                } else {
+                    "single_select".to_owned()
+                },
+                required: true,
+                secret: bool_at(question, &["/isSecret"]).unwrap_or(false),
+                choices,
+                default_answers: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+fn mcp_elicitation_fields(params: &Value) -> Vec<AgentQuestionField> {
+    let required: std::collections::BTreeSet<_> = params
+        .pointer("/requestedSchema/required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    let Some(properties) = params
+        .pointer("/requestedSchema/properties")
+        .and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+    properties
+        .iter()
+        .map(|(id, schema)| {
+            let (kind, choices) = mcp_field_kind_and_choices(schema);
+            AgentQuestionField {
+                id: id.clone(),
+                label: string_at(schema, &["/title"]).unwrap_or(id).to_owned(),
+                prompt: string_at(schema, &["/description"]).map(str::to_owned),
+                kind,
+                required: required.contains(id),
+                secret: false,
+                choices,
+                default_answers: default_answers(schema),
+            }
+        })
+        .collect()
+}
+
+fn mcp_field_kind_and_choices(schema: &Value) -> (String, Vec<AgentQuestionChoice>) {
+    if schema.get("type").and_then(Value::as_str) == Some("array") {
+        return (
+            "multi_select".to_owned(),
+            enum_choices(
+                schema
+                    .pointer("/items/enum")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten(),
+            ),
+        );
+    }
+    if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
+        return (
+            "single_select".to_owned(),
+            one_of
+                .iter()
+                .filter_map(|option| {
+                    let value = string_at(option, &["/const"])?;
+                    Some(AgentQuestionChoice {
+                        value: value.to_owned(),
+                        label: string_at(option, &["/title"]).unwrap_or(value).to_owned(),
+                        description: None,
+                    })
+                })
+                .collect(),
+        );
+    }
+    if let Some(enum_values) = schema.get("enum").and_then(Value::as_array) {
+        return ("single_select".to_owned(), enum_choices(enum_values.iter()));
+    }
+    match schema.get("type").and_then(Value::as_str) {
+        Some("boolean") => ("boolean".to_owned(), Vec::new()),
+        Some("number" | "integer") => ("number".to_owned(), Vec::new()),
+        _ => ("text".to_owned(), Vec::new()),
+    }
+}
+
+fn enum_choices<'a>(values: impl Iterator<Item = &'a Value>) -> Vec<AgentQuestionChoice> {
+    values
+        .filter_map(Value::as_str)
+        .map(|value| AgentQuestionChoice {
+            value: value.to_owned(),
+            label: value.to_owned(),
+            description: None,
+        })
+        .collect()
+}
+
+fn default_answers(schema: &Value) -> Vec<String> {
+    match schema.get("default") {
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        Some(Value::String(value)) => vec![value.clone()],
+        Some(Value::Bool(value)) => vec![value.to_string()],
+        Some(Value::Number(value)) => vec![value.to_string()],
+        _ => Vec::new(),
+    }
+}
+
+pub fn question_response_for_answer(kind: CodexQuestionKind, answer: AgentQuestionAnswer) -> Value {
+    match kind {
+        CodexQuestionKind::ToolUserInput => {
+            let answers = answer
+                .answers
+                .into_iter()
+                .map(|(id, answers)| (id, json!({ "answers": answers })))
+                .collect::<serde_json::Map<_, _>>();
+            json!({ "answers": answers })
+        }
+        CodexQuestionKind::McpElicitation => {
+            let content = answer
+                .answers
+                .into_iter()
+                .map(|(id, answers)| {
+                    let value = if answers.len() == 1 {
+                        json!(answers[0])
+                    } else {
+                        json!(answers)
+                    };
+                    (id, value)
+                })
+                .collect::<serde_json::Map<_, _>>();
+            json!({ "action": "accept", "content": content, "_meta": null })
+        }
+    }
 }
 
 pub fn approval_response_for_decision(
@@ -1107,6 +1498,29 @@ fn bool_at(message: &Value, pointers: &[&str]) -> Option<bool> {
         .find_map(|pointer| message.pointer(pointer).and_then(Value::as_bool))
 }
 
+fn agent_reasoning_effort(value: &str) -> Option<AgentReasoningEffort> {
+    match value {
+        "none" => Some(AgentReasoningEffort::None),
+        "minimal" => Some(AgentReasoningEffort::Minimal),
+        "low" => Some(AgentReasoningEffort::Low),
+        "medium" => Some(AgentReasoningEffort::Medium),
+        "high" => Some(AgentReasoningEffort::High),
+        "xhigh" => Some(AgentReasoningEffort::Xhigh),
+        _ => None,
+    }
+}
+
+fn codex_reasoning_effort(effort: &AgentReasoningEffort) -> &'static str {
+    match effort {
+        AgentReasoningEffort::None => "none",
+        AgentReasoningEffort::Minimal => "minimal",
+        AgentReasoningEffort::Low => "low",
+        AgentReasoningEffort::Medium => "medium",
+        AgentReasoningEffort::High => "high",
+        AgentReasoningEffort::Xhigh => "xhigh",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1592,5 +2006,170 @@ mod tests {
             ),
             json!({"permissions": {"fileSystem": null, "network": null}, "scope": "turn"})
         );
+    }
+
+    #[test]
+    fn maps_codex_model_and_collaboration_mode_lists() {
+        let models = json!({
+            "id": 6,
+            "result": {
+                "data": [
+                    {
+                        "id": "gpt-5.4",
+                        "model": "gpt-5.4",
+                        "displayName": "GPT-5.4",
+                        "description": "Balanced",
+                        "hidden": false,
+                        "isDefault": true,
+                        "defaultReasoningEffort": "medium",
+                        "supportedReasoningEfforts": [
+                            {"effort": "low"},
+                            {"effort": "medium"},
+                            {"effort": "high"}
+                        ],
+                        "inputModalities": ["text", "image"]
+                    }
+                ]
+            }
+        });
+        let modes = json!({
+            "id": 7,
+            "result": {
+                "data": [
+                    {
+                        "name": "Planning",
+                        "mode": "plan",
+                        "model": "gpt-5.4",
+                        "reasoning_effort": "high"
+                    }
+                ]
+            }
+        });
+
+        let options = codex_agent_options_from_responses(&models, &modes);
+
+        assert_eq!(options.models[0].id, "gpt-5.4");
+        assert_eq!(options.models[0].display_name, "GPT-5.4");
+        assert_eq!(
+            options.models[0].default_reasoning_effort,
+            Some(agenter_core::AgentReasoningEffort::Medium)
+        );
+        assert_eq!(options.collaboration_modes[0].id, "plan");
+        assert_eq!(
+            options.collaboration_modes[0].reasoning_effort,
+            Some(agenter_core::AgentReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn turn_start_params_include_model_effort_and_plan_mode() {
+        let request = CodexTurnRequest {
+            session_id: SessionId::nil(),
+            workspace_path: PathBuf::from("/work/agenter"),
+            external_session_id: Some("thread-1".to_owned()),
+            prompt: "Plan this".to_owned(),
+            settings: Some(agenter_core::AgentTurnSettings {
+                model: Some("gpt-5.4".to_owned()),
+                reasoning_effort: Some(agenter_core::AgentReasoningEffort::High),
+                collaboration_mode: Some("plan".to_owned()),
+            }),
+        };
+
+        let params = codex_turn_start_params("thread-1", &request);
+
+        assert_eq!(params["model"], "gpt-5.4");
+        assert_eq!(params["effort"], "high");
+        assert_eq!(params["collaborationMode"]["mode"], "plan");
+        assert_eq!(params["collaborationMode"]["settings"]["model"], "gpt-5.4");
+        assert_eq!(
+            params["collaborationMode"]["settings"]["reasoning_effort"],
+            "high"
+        );
+    }
+
+    #[test]
+    fn normalizes_tool_user_input_request_with_multiple_answer_values() {
+        let message = json!({
+            "id": 99,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "questions": [
+                    {
+                        "id": "target",
+                        "header": "Target",
+                        "question": "Choose targets",
+                        "options": [
+                            {"label": "Web", "description": "Browser UI"},
+                            {"label": "Runner", "description": "Runner daemon"}
+                        ]
+                    }
+                ]
+            }
+        });
+
+        let Some((question_id, native_request_id, event)) =
+            normalize_codex_question_request(SessionId::nil(), &message)
+        else {
+            panic!("expected question request");
+        };
+
+        assert_eq!(native_request_id, json!(99));
+        if let AppEvent::QuestionRequested(payload) = event {
+            assert_eq!(payload.question_id, question_id);
+            assert_eq!(payload.fields[0].kind, "single_select");
+            assert_eq!(payload.fields[0].choices[1].value, "Runner");
+        } else {
+            panic!("unexpected event");
+        }
+    }
+
+    #[test]
+    fn normalizes_mcp_elicitation_multi_select_form() {
+        let message = json!({
+            "id": "mcp-1",
+            "method": "mcpServer/elicitation/request",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "serverName": "demo",
+                "mode": "form",
+                "message": "Pick targets",
+                "requestedSchema": {
+                    "type": "object",
+                    "required": ["targets"],
+                    "properties": {
+                        "targets": {
+                            "type": "array",
+                            "title": "Targets",
+                            "description": "Choose one or more",
+                            "items": {
+                                "type": "string",
+                                "enum": ["web", "runner"]
+                            },
+                            "default": ["web"]
+                        }
+                    }
+                }
+            }
+        });
+
+        let Some((_question_id, _native_request_id, event)) =
+            normalize_codex_question_request(SessionId::nil(), &message)
+        else {
+            panic!("expected question request");
+        };
+
+        if let AppEvent::QuestionRequested(payload) = event {
+            assert_eq!(payload.title, "demo");
+            assert_eq!(payload.description.as_deref(), Some("Pick targets"));
+            assert_eq!(payload.fields[0].kind, "multi_select");
+            assert_eq!(payload.fields[0].default_answers, vec!["web"]);
+            assert_eq!(payload.fields[0].choices[1].value, "runner");
+        } else {
+            panic!("unexpected event");
+        }
     }
 }

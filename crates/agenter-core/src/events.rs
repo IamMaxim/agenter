@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ApprovalRequestEvent, ApprovalResolvedEvent, SessionId, SessionInfo, SessionStatus, UserId,
+    ApprovalRequestEvent, ApprovalResolvedEvent, QuestionAnsweredEvent, QuestionRequestedEvent,
+    SessionId, SessionInfo, SessionStatus, UserId,
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -24,6 +25,8 @@ pub enum AppEvent {
     FileChangeRejected(FileChangeEvent),
     ApprovalRequested(ApprovalRequestEvent),
     ApprovalResolved(ApprovalResolvedEvent),
+    QuestionRequested(QuestionRequestedEvent),
+    QuestionAnswered(QuestionAnsweredEvent),
     Error(AgentErrorEvent),
 }
 
@@ -208,9 +211,12 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use crate::{
-        AgentCapabilities, AgentProviderId, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind,
-        ApprovalRequestEvent, ApprovalResolvedEvent, CommandEvent, RunnerId, SessionId,
-        SessionInfo, SessionStatus, UserId, UserMessageEvent, WorkspaceId,
+        AgentCapabilities, AgentCollaborationMode, AgentModelOption, AgentProviderId,
+        AgentQuestionAnswer, AgentQuestionChoice, AgentQuestionField, AgentReasoningEffort,
+        AgentTurnSettings, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind,
+        ApprovalRequestEvent, ApprovalResolvedEvent, CommandEvent, QuestionId,
+        QuestionRequestedEvent, RunnerId, SessionId, SessionInfo, SessionStatus, UserId,
+        UserMessageEvent, WorkspaceId,
     };
 
     #[test]
@@ -305,9 +311,104 @@ mod tests {
             command_execution: true,
             plan_updates: true,
             interrupt: true,
+            model_selection: true,
+            reasoning_effort: true,
+            collaboration_modes: true,
+            tool_user_input: true,
+            mcp_elicitation: true,
         };
         let capabilities_json = serde_json::to_value(capabilities).expect("serialize caps");
         assert_eq!(capabilities_json["session_history"], true);
+    }
+
+    #[test]
+    fn round_trips_agent_options_and_turn_settings() {
+        let model = AgentModelOption {
+            id: "gpt-5.4".to_owned(),
+            display_name: "GPT-5.4".to_owned(),
+            description: Some("Balanced coding model".to_owned()),
+            is_default: true,
+            default_reasoning_effort: Some(AgentReasoningEffort::Medium),
+            supported_reasoning_efforts: vec![
+                AgentReasoningEffort::Low,
+                AgentReasoningEffort::Medium,
+                AgentReasoningEffort::High,
+            ],
+            input_modalities: vec!["text".to_owned(), "image".to_owned()],
+        };
+        let mode = AgentCollaborationMode {
+            id: "plan".to_owned(),
+            label: "Plan".to_owned(),
+            model: Some("gpt-5.4".to_owned()),
+            reasoning_effort: Some(AgentReasoningEffort::High),
+        };
+        let settings = AgentTurnSettings {
+            model: Some(model.id.clone()),
+            reasoning_effort: Some(AgentReasoningEffort::High),
+            collaboration_mode: Some("plan".to_owned()),
+        };
+
+        let json = serde_json::json!({
+            "model": model,
+            "mode": mode,
+            "settings": settings
+        });
+
+        assert_eq!(json["model"]["id"], "gpt-5.4");
+        assert_eq!(json["model"]["default_reasoning_effort"], "medium");
+        assert_eq!(json["mode"]["id"], "plan");
+        assert_eq!(json["settings"]["reasoning_effort"], "high");
+        assert_eq!(json["settings"]["collaboration_mode"], "plan");
+    }
+
+    #[test]
+    fn round_trips_question_requested_event_with_multi_select() {
+        let question_id = QuestionId::nil();
+        let event = AppEvent::QuestionRequested(QuestionRequestedEvent {
+            session_id: SessionId::nil(),
+            question_id,
+            title: "Need a choice".to_owned(),
+            description: Some("Pick one or more targets".to_owned()),
+            fields: vec![AgentQuestionField {
+                id: "targets".to_owned(),
+                label: "Targets".to_owned(),
+                prompt: Some("Which targets should be updated?".to_owned()),
+                kind: "multi_select".to_owned(),
+                required: true,
+                secret: false,
+                choices: vec![
+                    AgentQuestionChoice {
+                        value: "web".to_owned(),
+                        label: "Web".to_owned(),
+                        description: Some("Browser UI".to_owned()),
+                    },
+                    AgentQuestionChoice {
+                        value: "runner".to_owned(),
+                        label: "Runner".to_owned(),
+                        description: None,
+                    },
+                ],
+                default_answers: vec!["web".to_owned()],
+            }],
+            provider_payload: None,
+        });
+
+        let answer = AgentQuestionAnswer {
+            question_id,
+            answers: std::collections::BTreeMap::from([(
+                "targets".to_owned(),
+                vec!["web".to_owned(), "runner".to_owned()],
+            )]),
+        };
+
+        let event_json = serde_json::to_value(&event).expect("serialize question");
+        let answer_json = serde_json::to_value(answer).expect("serialize answer");
+        let decoded: AppEvent = serde_json::from_value(event_json.clone()).expect("decode event");
+
+        assert_eq!(event_json["type"], "question_requested");
+        assert_eq!(event_json["payload"]["fields"][0]["kind"], "multi_select");
+        assert_eq!(answer_json["answers"]["targets"][1], "runner");
+        assert_eq!(decoded, event);
     }
 
     #[test]

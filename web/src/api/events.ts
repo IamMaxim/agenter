@@ -1,5 +1,6 @@
 import type { BrowserServerMessage } from './types';
 import { debugLog } from './debug';
+import { normalizeBrowserServerMessage } from '../lib/normalizers';
 
 export interface BrowserEventSocket {
   close: () => void;
@@ -9,7 +10,11 @@ export interface BrowserEventHandlers {
   onMessage: (message: BrowserServerMessage) => void;
   onOpen?: () => void;
   onClose?: () => void;
-  onError?: (error: Event) => void;
+  onError?: (error: Error | Event) => void;
+}
+
+export function parseBrowserServerMessage(data: string): BrowserServerMessage {
+  return normalizeBrowserServerMessage(JSON.parse(data));
 }
 
 export function connectSessionEvents(
@@ -34,9 +39,14 @@ export function connectSessionEvents(
   });
 
   socket.addEventListener('message', (event) => {
-    const message = JSON.parse(event.data as string) as BrowserServerMessage;
-    debugLog('ws:message', { sessionId, type: message.type });
-    handlers.onMessage(message);
+    try {
+      const message = parseBrowserServerMessage(event.data as string);
+      debugLog('ws:message', { sessionId, type: message.type });
+      handlers.onMessage(message);
+    } catch (error) {
+      debugLog('ws:parse-error', { sessionId });
+      handlers.onError?.(error instanceof Error ? error : new Error('Invalid browser event.'));
+    }
   });
   socket.addEventListener('close', (event) => {
     debugLog('ws:close', { sessionId, code: event.code, reason: event.reason });

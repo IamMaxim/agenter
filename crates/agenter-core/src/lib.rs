@@ -14,6 +14,12 @@ pub use events::{
     MessageCompletedEvent, PlanEntry, PlanEntryStatus, PlanEvent, SessionStatusChangedEvent,
     ToolEvent, UserMessageEvent,
 };
-pub use ids::{ApprovalId, ConnectorBindingId, RunnerId, SessionId, UserId, WorkspaceId};
-pub use session::{AgentCapabilities, AgentProviderId, SessionInfo, SessionStatus};
+pub use ids::{
+    ApprovalId, ConnectorBindingId, QuestionId, RunnerId, SessionId, UserId, WorkspaceId,
+};
+pub use session::{
+    AgentCapabilities, AgentCollaborationMode, AgentModelOption, AgentOptions, AgentProviderId,
+    AgentQuestionAnswer, AgentQuestionChoice, AgentQuestionField, AgentReasoningEffort,
+    AgentTurnSettings, QuestionAnsweredEvent, QuestionRequestedEvent, SessionInfo, SessionStatus,
+};
 pub use workspace::WorkspaceRef;

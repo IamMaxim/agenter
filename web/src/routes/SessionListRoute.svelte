@@ -3,6 +3,7 @@
   import { createSession, listRunners, listRunnerWorkspaces, listSessions } from '../api/sessions';
   import type { SessionInfo, WorkspaceRef } from '../api/types';
   import { routeHref } from '../lib/router';
+  import { pushToast } from '../lib/toasts';
 
   let sessions: SessionInfo[] = [];
   let firstWorkspace: WorkspaceRef | undefined;
@@ -23,6 +24,7 @@
       }
     } catch {
       error = 'Could not load sessions.';
+      pushToast({ severity: 'error', message: error });
     } finally {
       loading = false;
     }
@@ -47,6 +49,7 @@
       window.location.hash = routeHref({ name: 'chat', sessionId: session.session_id }).slice(1);
     } catch {
       error = 'Could not create session.';
+      pushToast({ severity: 'error', message: error });
     } finally {
       creating = false;
     }

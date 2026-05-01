@@ -1,4 +1,4 @@
-import type { AppEvent, BrowserEventEnvelope } from '../api/types';
+import type { AgentQuestionField, AppEvent, BrowserEventEnvelope } from '../api/types';
 
 export type ChatItem =
   | {
@@ -65,6 +65,15 @@ export type ChatItem =
       title: string;
       detail?: string;
       resolvedDecision?: string;
+    }
+  | {
+      id: string;
+      kind: 'question';
+      questionId: string;
+      title: string;
+      description?: string;
+      fields: AgentQuestionField[];
+      answered: boolean;
     }
   | {
       id: string;
@@ -224,6 +233,18 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
       });
     case 'approval_resolved':
       return updateApprovalResolved(items, payload);
+    case 'question_requested':
+      return upsert(items, {
+        id: `question:${stringField(payload, 'question_id') ?? fallbackId(event)}`,
+        kind: 'question',
+        questionId: stringField(payload, 'question_id') ?? fallbackId(event),
+        title: stringField(payload, 'title') ?? 'Input requested',
+        description: stringField(payload, 'description'),
+        fields: questionFields(payload),
+        answered: false
+      });
+    case 'question_answered':
+      return updateQuestionAnswered(items, payload);
     case 'error':
       return [
         ...items,
@@ -247,6 +268,13 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
         }
       ];
   }
+}
+
+function questionFields(payload: Record<string, unknown>): AgentQuestionField[] {
+  const fields = payload.fields;
+  return Array.isArray(fields)
+    ? fields.filter((field): field is AgentQuestionField => typeof field === 'object' && field !== null)
+    : [];
 }
 
 function updateCommandOutput(items: ChatItem[], payload: Record<string, unknown>): ChatItem[] {
@@ -340,6 +368,21 @@ function updateApprovalResolved(items: ChatItem[], payload: Record<string, unkno
       typeof decision === 'object' && decision !== null && 'decision' in decision
         ? String(decision.decision)
         : undefined
+  });
+}
+
+function updateQuestionAnswered(items: ChatItem[], payload: Record<string, unknown>): ChatItem[] {
+  const questionId = stringField(payload, 'question_id') ?? fallbackId({ type: 'question_answered', payload });
+  const id = `question:${questionId}`;
+  const existing = items.find((item) => item.id === id);
+  return upsert(items, {
+    id,
+    kind: 'question',
+    questionId,
+    title: existing?.kind === 'question' ? existing.title : 'Input answered',
+    description: existing?.kind === 'question' ? existing.description : undefined,
+    fields: existing?.kind === 'question' ? existing.fields : [],
+    answered: true
   });
 }
 

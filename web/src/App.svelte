@@ -3,7 +3,10 @@
   import { getCurrentUser, logout } from './api/auth';
   import { ApiError } from './api/http';
   import type { AuthenticatedUser } from './api/types';
-  import { parseRoute, routeHref, type AppRoute } from './lib/router';
+  import SessionTreeSidebar from './components/SessionTreeSidebar.svelte';
+  import ToastHost from './components/ToastHost.svelte';
+  import { parseRoute, type AppRoute } from './lib/router';
+  import { pushToast } from './lib/toasts';
   import ChatRoute from './routes/ChatRoute.svelte';
   import LoginRoute from './routes/LoginRoute.svelte';
   import SessionListRoute from './routes/SessionListRoute.svelte';
@@ -23,13 +26,25 @@
   }
 
   async function signOut() {
-    await logout();
-    user = null;
-    window.location.hash = '/login';
+    try {
+      await logout();
+      user = null;
+      window.location.hash = '/login';
+    } catch {
+      pushToast({ severity: 'error', message: 'Could not sign out. Check the control plane and try again.' });
+    }
   }
 
   onMount(() => {
     window.addEventListener('hashchange', syncRoute);
+    const showRuntimeError = () => {
+      pushToast({ severity: 'error', message: 'Unexpected frontend error. The app shell is still running.' });
+    };
+    const showUnhandledRejection = () => {
+      pushToast({ severity: 'error', message: 'Unexpected async error. The app shell is still running.' });
+    };
+    window.addEventListener('error', showRuntimeError);
+    window.addEventListener('unhandledrejection', showUnhandledRejection);
 
     getCurrentUser()
       .then((nextUser) => {
@@ -41,6 +56,7 @@
       .catch((err) => {
         if (!(err instanceof ApiError && err.status === 401)) {
           console.error(err);
+          pushToast({ severity: 'error', message: 'Could not load the current user.' });
         }
         if (route.name !== 'login') {
           window.location.hash = '/login';
@@ -50,7 +66,11 @@
         authLoaded = true;
       });
 
-    return () => window.removeEventListener('hashchange', syncRoute);
+    return () => {
+      window.removeEventListener('hashchange', syncRoute);
+      window.removeEventListener('error', showRuntimeError);
+      window.removeEventListener('unhandledrejection', showUnhandledRejection);
+    };
   });
 </script>
 
@@ -60,21 +80,7 @@
   <LoginRoute onLogin={afterLogin} />
 {:else}
   <div class="app-shell">
-    <aside class="sidebar">
-      <div class="brand">
-        <strong>Agenter</strong>
-        <span>{user.display_name ?? user.email}</span>
-      </div>
-      <nav>
-        <a class:active={route.name === 'sessions' || route.name === 'chat'} href={routeHref({ name: 'sessions' })}>
-          Sessions
-        </a>
-        <a class:active={route.name === 'workspaces'} href={routeHref({ name: 'workspaces' })}>
-          Workspaces
-        </a>
-      </nav>
-      <button class="secondary" type="button" on:click={signOut}>Sign out</button>
-    </aside>
+    <SessionTreeSidebar {user} {route} onSignOut={signOut} />
 
     <main class="content">
       {#if route.name === 'workspaces'}
@@ -87,3 +93,5 @@
     </main>
   </div>
 {/if}
+
+<ToastHost />

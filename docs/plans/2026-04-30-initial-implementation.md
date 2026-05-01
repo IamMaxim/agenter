@@ -421,6 +421,8 @@ Active execution notes:
 - Codex persistence now imports native `thread/read` history beyond messages: command executions, file changes, collaboration tool calls, and implementation plans are converted into the existing app event cache so restored sessions display inline activity rows and plan cards.
 - Codex command/tool UI follow-up enriches imported shell command events with process metadata and command actions, preserves command titles while output arrives, infers skill/file/search/list actions from Codex command action payloads, and renders `spawnAgent`/`wait`/`closeAgent` as first-party subagent rows in the browser.
 - Codex subagent UX follow-up promotes `spawnAgent`, `wait`, and `closeAgent` to dedicated browser rows with structured agent ids, model/reasoning badges, prompt text, per-agent statuses, result messages, and advanced provider-payload details.
+- Codex model/mode/questions follow-up adds provider-neutral turn settings, model/reasoning/mode option discovery, browser composer settings, Codex `turn/start` settings propagation, and question cards for `item/tool/requestUserInput` plus MCP elicitation forms including multi-select fields. Qwen remains compiled with unsupported/empty option handling for this pass.
+- Verification for the Codex model/mode/questions follow-up passed: `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`, `npm run check`, `npm run lint`, `npm run test`, and `npm run build`. Postgres integration tests remain ignored unless `DATABASE_URL` points at a disposable database, as before.
 
 ## Verification Policy
 

@@ -75,6 +75,65 @@ describe('chat event state', () => {
     });
   });
 
+  test('maps multi-select question requests and answered events', () => {
+    let state = createChatState();
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-question',
+      event: {
+        type: 'question_requested',
+        payload: {
+          session_id: 's1',
+          question_id: 'q1',
+          title: 'Need input',
+          description: 'Pick targets',
+          fields: [
+            {
+              id: 'targets',
+              label: 'Targets',
+              prompt: 'Which targets?',
+              kind: 'multi_select',
+              required: true,
+              secret: false,
+              choices: [
+                { value: 'web', label: 'Web' },
+                { value: 'runner', label: 'Runner' }
+              ],
+              default_answers: ['web']
+            }
+          ]
+        }
+      }
+    });
+
+    expect(state.items[0]).toMatchObject({
+      id: 'question:q1',
+      kind: 'question',
+      questionId: 'q1',
+      answered: false,
+      fields: [{ id: 'targets', kind: 'multi_select' }]
+    });
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-question-answered',
+      event: {
+        type: 'question_answered',
+        payload: {
+          session_id: 's1',
+          question_id: 'q1',
+          answer: { question_id: 'q1', answers: { targets: ['web', 'runner'] } }
+        }
+      }
+    });
+
+    expect(state.items[0]).toMatchObject({
+      id: 'question:q1',
+      kind: 'question',
+      answered: true
+    });
+  });
+
   test('keeps user and assistant messages as markdown-capable transcript items', () => {
     let state = createChatState();
 

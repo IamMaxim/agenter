@@ -4,10 +4,10 @@ This file is the project-local memory surface for future agent sessions. Keep it
 
 ## Current State
 
-- The repository is in documentation/harness initialization.
-- The only source product spec is `docs/chatgpt/001_initial.md`.
-- Application code has not been scaffolded.
-- The project is not currently relying on a committed git history.
+- The repository has moved beyond documentation-only setup into the initial Rust/Svelte implementation plan.
+- The active implementation plan is `docs/plans/2026-04-30-initial-implementation.md`.
+- The technical spec remains `docs/specs/2026-04-30-remote-agent-control-plane.md`, with the original source discussion in `docs/chatgpt/001_initial.md`.
+- The Rust workspace, browser UI, fake runner flow, Codex adapter, and Qwen adapter are present.
 
 ## Durable Assumptions
 
@@ -35,5 +35,6 @@ Do not store large transcripts here. Link to specs, plans, decisions, and runboo
 
 ## Recent Notes
 
+- 2026-05-01: Added Codex-first model/mode/question support: provider-neutral turn settings, model/reasoning/mode option discovery, composer settings in the browser, Codex `turn/start` settings propagation, and question cards for tool input plus MCP elicitation forms.
 - 2026-04-30: Added protocol spike runbooks for Codex app-server (`docs/runbooks/codex-app-server-spike.md`) and Qwen ACP (`docs/runbooks/qwen-acp-spike.md`) so provider JSON-RPC shapes can be captured before adapter APIs are finalized.
 - 2026-04-30: Created initial harness documentation and preserved the initial technical discussion in `docs/chatgpt/001_initial.md`.

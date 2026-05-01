@@ -46,12 +46,21 @@ pub fn app(state: AppState) -> Router {
             "/api/sessions/{session_id}/messages",
             post(send_session_message),
         )
+        .route(
+            "/api/sessions/{session_id}/agent-options",
+            get(session_agent_options),
+        )
+        .route(
+            "/api/sessions/{session_id}/settings",
+            get(get_session_settings).patch(update_session_settings),
+        )
         .route("/api/sessions/{session_id}/history", get(session_history))
         .route("/api/approvals", get(list_approvals))
         .route(
             "/api/approvals/{approval_id}/decision",
             post(decide_approval),
         )
+        .route("/api/questions/{question_id}/answer", post(answer_question))
         .route("/api/runner/ws", get(runner_ws::handler))
         .route("/api/browser/ws", get(browser_ws_authenticated))
         .layer(TraceLayer::new_for_http())
@@ -141,6 +150,12 @@ struct CreateSessionRequest {
 #[derive(Debug, Deserialize)]
 struct SendMessageRequest {
     content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateSessionSettingsRequest {
+    #[serde(flatten)]
+    settings: agenter_core::AgentTurnSettings,
 }
 
 #[derive(Debug, Deserialize)]
@@ -429,24 +444,26 @@ async fn list_runners(State(state): State<AppState>, headers: HeaderMap) -> Resp
     }
 
     let runners: Vec<_> = state
-        .list_runners()
+        .list_runners_with_connection_status()
         .await
         .into_iter()
-        .map(|runner| RunnerInfoResponse {
-            runner_id: runner.runner_id,
-            name: runner
+        .map(|entry| RunnerInfoResponse {
+            runner_id: entry.runner.runner_id,
+            name: entry
+                .runner
                 .workspaces
                 .first()
                 .and_then(|workspace| workspace.display_name.clone())
                 .or_else(|| {
-                    runner
+                    entry
+                        .runner
                         .capabilities
                         .agent_providers
                         .first()
                         .map(|provider| provider.provider_id.to_string())
                 })
-                .unwrap_or_else(|| runner.runner_id.to_string()),
-            status: "connected",
+                .unwrap_or_else(|| entry.runner.runner_id.to_string()),
+            status: if entry.connected { "online" } else { "offline" },
             last_seen_at: None,
         })
         .collect();
@@ -553,6 +570,7 @@ async fn create_session(
                 provider_id,
                 title: request.title,
                 external_session_id: None,
+                turn_settings: None,
             })
             .await;
         let info = agenter_core::SessionInfo {
@@ -650,6 +668,7 @@ async fn create_session(
             provider_id,
             title,
             external_session_id: Some(external_session_id),
+            turn_settings: None,
         })
         .await;
     tracing::info!(
@@ -701,6 +720,7 @@ async fn send_session_message(
         tracing::debug!(user_id = %user.user_id, %session_id, "send session message rejected empty content");
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let settings = state.session_turn_settings(user.user_id, session_id).await;
 
     let message = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
         agenter_protocol::runner::RunnerCommandEnvelope {
@@ -709,6 +729,7 @@ async fn send_session_message(
                 agenter_protocol::runner::AgentInputCommand {
                     session_id,
                     external_session_id: session.external_session_id,
+                    settings,
                     input: agenter_protocol::runner::AgentInput::UserMessage {
                         payload: agenter_core::UserMessageEvent {
                             session_id,
@@ -790,6 +811,101 @@ fn runner_wait_error_status(error: RunnerCommandWaitError) -> StatusCode {
         | RunnerCommandWaitError::StaleApproval => StatusCode::SERVICE_UNAVAILABLE,
         RunnerCommandWaitError::TimedOut => StatusCode::GATEWAY_TIMEOUT,
     }
+}
+
+async fn session_agent_options(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<agenter_core::SessionId>,
+) -> Response {
+    let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(session) = state.session(user.user_id, session_id).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let request_id = agenter_protocol::RequestId::from(Uuid::new_v4().to_string());
+    let command = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
+        agenter_protocol::runner::RunnerCommandEnvelope {
+            request_id: request_id.clone(),
+            command: agenter_protocol::runner::RunnerCommand::GetAgentOptions(
+                agenter_protocol::runner::GetAgentOptionsCommand {
+                    session_id,
+                    provider_id: session.provider_id,
+                },
+            ),
+        },
+    ));
+
+    match state
+        .send_runner_command_and_wait(
+            session.runner_id,
+            request_id,
+            command,
+            RUNNER_COMMAND_RESPONSE_TIMEOUT,
+        )
+        .await
+    {
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok {
+            result: agenter_protocol::runner::RunnerCommandResult::AgentOptions { options },
+        }) => Json(options).into_response(),
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Error { error }) => {
+            tracing::warn!(
+                %session_id,
+                code = %error.code,
+                message = %error.message,
+                "runner could not load agent options"
+            );
+            Json(agenter_core::AgentOptions::default()).into_response()
+        }
+        Ok(other) => {
+            tracing::warn!(%session_id, ?other, "unexpected runner options response");
+            Json(agenter_core::AgentOptions::default()).into_response()
+        }
+        Err(error) => {
+            tracing::warn!(%session_id, ?error, "agent options unavailable");
+            Json(agenter_core::AgentOptions::default()).into_response()
+        }
+    }
+}
+
+async fn get_session_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<agenter_core::SessionId>,
+) -> Response {
+    let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if !state.can_access_session(user.user_id, session_id).await {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Json(
+        state
+            .session_turn_settings(user.user_id, session_id)
+            .await
+            .unwrap_or_default(),
+    )
+    .into_response()
+}
+
+async fn update_session_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<agenter_core::SessionId>,
+    Json(request): Json<UpdateSessionSettingsRequest>,
+) -> Response {
+    let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(settings) = state
+        .update_session_turn_settings(user.user_id, session_id, request.settings)
+        .await
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Json(settings).into_response()
 }
 
 async fn session_history(
@@ -919,6 +1035,74 @@ async fn decide_approval(
 
     tracing::info!(user_id = %user.user_id, %approval_id, %session_id, "approval decision resolved");
     Json(envelope).into_response()
+}
+
+async fn answer_question(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(question_id): Path<agenter_core::QuestionId>,
+    Json(mut answer): Json<agenter_core::AgentQuestionAnswer>,
+) -> Response {
+    let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        tracing::debug!(%question_id, "question answer rejected missing or invalid session");
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    answer.question_id = question_id;
+    let Some(session_id) = state.question_session(question_id).await else {
+        tracing::warn!(%question_id, "question answer rejected missing question");
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(session) = state.session(user.user_id, session_id).await else {
+        tracing::warn!(user_id = %user.user_id, %question_id, %session_id, "question answer rejected session not found");
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let request_id = agenter_protocol::RequestId::from(Uuid::new_v4().to_string());
+    let command = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
+        agenter_protocol::runner::RunnerCommandEnvelope {
+            request_id: request_id.clone(),
+            command: agenter_protocol::runner::RunnerCommand::AnswerQuestion(
+                agenter_protocol::runner::QuestionAnswerCommand {
+                    session_id,
+                    answer: answer.clone(),
+                },
+            ),
+        },
+    ));
+
+    match state
+        .send_runner_command_and_wait(
+            session.runner_id,
+            request_id,
+            command,
+            RUNNER_COMMAND_RESPONSE_TIMEOUT,
+        )
+        .await
+    {
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok {
+            result: agenter_protocol::runner::RunnerCommandResult::Accepted,
+        }) => {
+            let envelope = state.finish_question_answer(session_id, answer).await;
+            Json(envelope).into_response()
+        }
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Error { error }) => {
+            tracing::warn!(
+                user_id = %user.user_id,
+                %question_id,
+                code = %error.code,
+                message = %error.message,
+                "question answer rejected by runner"
+            );
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+        Ok(other) => {
+            tracing::warn!(user_id = %user.user_id, %question_id, ?other, "question answer received unexpected runner response");
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+        Err(error) => {
+            tracing::warn!(user_id = %user.user_id, %question_id, ?error, "question answer failed because runner is unavailable");
+            runner_wait_error_status(error).into_response()
+        }
+    }
 }
 
 async fn browser_ws_authenticated(
@@ -1119,6 +1303,83 @@ mod tests {
             .await
             .expect("read create session body");
         serde_json::from_slice(&body).expect("session info json")
+    }
+
+    #[tokio::test]
+    async fn runner_list_reports_online_and_offline_status() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let browser_session_token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let mut online_hello = fake_hello();
+        let online_runner_id = RunnerId::new();
+        online_hello.runner_id = online_runner_id;
+        online_hello.workspaces[0].runner_id = online_runner_id;
+        online_hello.workspaces[0].display_name = Some("online-workspace".to_owned());
+        let mut offline_hello = fake_hello();
+        let offline_runner_id = RunnerId::new();
+        offline_hello.runner_id = offline_runner_id;
+        offline_hello.workspaces[0].runner_id = offline_runner_id;
+        offline_hello.workspaces[0].display_name = Some("offline-workspace".to_owned());
+
+        let online_runner = state
+            .register_runner(
+                online_hello.runner_id,
+                online_hello.capabilities,
+                online_hello.workspaces,
+            )
+            .await;
+        let offline_runner = state
+            .register_runner(
+                offline_hello.runner_id,
+                offline_hello.capabilities,
+                offline_hello.workspaces,
+            )
+            .await;
+        let (runner_sender, _runner_receiver) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .connect_runner(online_runner.runner_id, runner_sender)
+            .await;
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runners")
+                    .header(
+                        header::COOKIE,
+                        format!("{}={browser_session_token}", auth::SESSION_COOKIE_NAME),
+                    )
+                    .body(Body::empty())
+                    .expect("build runners request"),
+            )
+            .await
+            .expect("route runners request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read runners body");
+        let runners: serde_json::Value = serde_json::from_slice(&body).expect("runner json");
+        let statuses: std::collections::HashMap<_, _> = runners
+            .as_array()
+            .expect("runner list")
+            .iter()
+            .map(|runner| {
+                (
+                    runner["runner_id"].as_str().expect("runner id").to_owned(),
+                    runner["status"].as_str().expect("runner status").to_owned(),
+                )
+            })
+            .collect();
+
+        assert_eq!(statuses[&online_runner.runner_id.to_string()], "online");
+        assert_eq!(statuses[&offline_runner.runner_id.to_string()], "offline");
     }
 
     #[tokio::test]

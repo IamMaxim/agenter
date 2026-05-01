@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { listRunners, listRunnerWorkspaces } from '../api/sessions';
   import type { RunnerInfo, WorkspaceRef } from '../api/types';
+  import { pushToast } from '../lib/toasts';
 
   let runners: RunnerInfo[] = [];
   let workspacesByRunner: Record<string, WorkspaceRef[]> = {};
@@ -20,6 +21,7 @@
       workspacesByRunner = Object.fromEntries(workspacePairs);
     } catch {
       error = 'Could not load workspaces.';
+      pushToast({ severity: 'error', message: error });
     } finally {
       loading = false;
     }
