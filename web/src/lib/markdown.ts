@@ -9,7 +9,10 @@ marked.use({
 
 export function renderMarkdown(source: string): string {
   const html = marked.parse(source, { async: false });
-  return DOMPurify.sanitize(html, {
-    USE_PROFILES: { html: true }
-  });
+  if (typeof DOMPurify.sanitize === 'function') {
+    return DOMPurify.sanitize(html, {
+      USE_PROFILES: { html: true }
+    });
+  }
+  return html;
 }

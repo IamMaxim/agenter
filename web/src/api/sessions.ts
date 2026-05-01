@@ -29,6 +29,10 @@ export interface SendMessageRequest {
   content: string;
 }
 
+export interface RenameSessionRequest {
+  title: string | null;
+}
+
 export async function listRunners(): Promise<RunnerInfo[]> {
   return normalizeRunners(await requestJson<unknown>('/api/runners'));
 }
@@ -91,6 +95,22 @@ export async function createSession(request: CreateSessionRequest): Promise<Sess
   );
   if (!session) {
     throw new Error('Create session returned malformed data.');
+  }
+  return session;
+}
+
+export async function renameSession(
+  sessionId: string,
+  request: RenameSessionRequest
+): Promise<SessionInfo> {
+  const session = normalizeSessionInfo(
+    await requestJson<unknown>(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(request)
+    })
+  );
+  if (!session) {
+    throw new Error('Rename session returned malformed data.');
   }
   return session;
 }

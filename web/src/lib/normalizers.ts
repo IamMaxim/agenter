@@ -222,7 +222,9 @@ function normalizeSession(value: unknown): SessionInfo | undefined {
     status: isSessionStatus(record.status) ? record.status : 'degraded',
     external_session_id:
       typeof record.external_session_id === 'string' ? record.external_session_id : null,
-    title: typeof record.title === 'string' ? record.title : null
+    title: typeof record.title === 'string' ? record.title : null,
+    created_at: typeof record.created_at === 'string' ? record.created_at : null,
+    updated_at: typeof record.updated_at === 'string' ? record.updated_at : null
   };
 }
 

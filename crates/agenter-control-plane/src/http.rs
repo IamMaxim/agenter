@@ -41,7 +41,10 @@ pub fn app(state: AppState) -> Router {
             get(list_runner_workspaces),
         )
         .route("/api/sessions", get(list_sessions).post(create_session))
-        .route("/api/sessions/{session_id}", get(get_session))
+        .route(
+            "/api/sessions/{session_id}",
+            get(get_session).patch(update_session),
+        )
         .route(
             "/api/sessions/{session_id}/messages",
             post(send_session_message),
@@ -150,6 +153,11 @@ struct CreateSessionRequest {
 #[derive(Debug, Deserialize)]
 struct SendMessageRequest {
     content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateSessionRequest {
+    title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -531,8 +539,36 @@ async fn get_session(
         status: session.status,
         external_session_id: session.external_session_id,
         title: session.title,
+        created_at: Some(session.created_at),
+        updated_at: Some(session.updated_at),
     })
     .into_response()
+}
+
+async fn update_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<agenter_core::SessionId>,
+    Json(request): Json<UpdateSessionRequest>,
+) -> Response {
+    let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        tracing::debug!(%session_id, "update session rejected missing or invalid session");
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    let title = request.title.and_then(|title| {
+        let trimmed = title.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    });
+    let Some(session) = state
+        .update_session_title(user.user_id, session_id, title)
+        .await
+    else {
+        tracing::warn!(user_id = %user.user_id, %session_id, "session update not found or forbidden");
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    Json(session).into_response()
 }
 
 async fn create_session(
@@ -582,6 +618,8 @@ async fn create_session(
             status: session.status,
             external_session_id: session.external_session_id,
             title: session.title,
+            created_at: Some(session.created_at),
+            updated_at: Some(session.updated_at),
         };
         state
             .publish_event(
@@ -689,6 +727,8 @@ async fn create_session(
         status: session.status,
         external_session_id: session.external_session_id,
         title: session.title,
+        created_at: Some(session.created_at),
+        updated_at: Some(session.updated_at),
     };
     state
         .publish_event(

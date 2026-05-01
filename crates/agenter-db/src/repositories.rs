@@ -682,6 +682,29 @@ pub async fn update_session_turn_settings(
     row.as_ref().map(session_from_row).transpose()
 }
 
+pub async fn update_session_title(
+    pool: &PgPool,
+    owner_user_id: UserId,
+    session_id: SessionId,
+    title: Option<&str>,
+) -> Result<Option<AgentSession>> {
+    let row = sqlx::query(
+        "update agent_sessions
+         set title = $3,
+             updated_at = now()
+         where owner_user_id = $1 and session_id = $2
+         returning session_id, owner_user_id, runner_id, workspace_id, provider_id,
+             external_session_id, status, title, turn_settings, created_at, updated_at",
+    )
+    .bind(owner_user_id.as_uuid())
+    .bind(session_id.as_uuid())
+    .bind(title)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(session_from_row).transpose()
+}
+
 pub async fn session_turn_settings(
     pool: &PgPool,
     owner_user_id: UserId,

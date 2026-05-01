@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use chrono::{DateTime, Utc};
+
 use crate::QuestionId;
 
 use crate::{RunnerId, SessionId, UserId, WorkspaceId};
@@ -89,6 +91,10 @@ pub struct SessionInfo {
     pub external_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

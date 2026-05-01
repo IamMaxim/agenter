@@ -1,4 +1,5 @@
 <script lang="ts">
+  import AnsiBlock from './AnsiBlock.svelte';
   import MarkdownBlock from './MarkdownBlock.svelte';
   import type { ChatItem } from '../lib/chatEvents';
 
@@ -93,7 +94,7 @@
           Provider payload
         </button>
         {#if providerExpanded}
-          <pre>{providerPayload}</pre>
+          <AnsiBlock content={providerPayload} />
         {/if}
       {/if}
     </div>

@@ -37,7 +37,9 @@ const sessions: SessionInfo[] = [
     workspace_id: 'workspace-a',
     provider_id: 'qwen',
     status: 'waiting_for_input',
-    title: null
+    title: null,
+    created_at: '2026-04-30T10:00:00Z',
+    updated_at: '2026-04-30T10:05:00Z'
   },
   {
     session_id: 'session-a',
@@ -46,7 +48,9 @@ const sessions: SessionInfo[] = [
     workspace_id: 'workspace-a',
     provider_id: 'codex',
     status: 'running',
-    title: 'Sidebar tree redesign'
+    title: 'Sidebar tree redesign',
+    created_at: '2026-04-30T11:00:00Z',
+    updated_at: '2026-04-30T11:05:00Z'
   }
 ];
 
@@ -72,6 +76,44 @@ describe('sidebar session tree', () => {
     ]);
     expect(tree[1].status).toBe('offline');
     expect(tree[1].sessions).toEqual([]);
+  });
+
+  test('sorts sessions by most recently updated date with stable fallbacks', () => {
+    const tree = buildSessionTree({
+      runners: [runnerOnline],
+      workspacesByRunner: {
+        'runner-a': [workspaceA]
+      },
+      sessions: [
+        {
+          ...sessions[0],
+          session_id: 'older',
+          title: 'Older',
+          updated_at: '2026-04-30T09:00:00Z',
+          created_at: '2026-04-30T09:00:00Z'
+        },
+        {
+          ...sessions[0],
+          session_id: 'newer',
+          title: 'Newer',
+          updated_at: '2026-04-30T12:00:00Z',
+          created_at: '2026-04-30T08:00:00Z'
+        },
+        {
+          ...sessions[0],
+          session_id: 'created-only',
+          title: 'Created only',
+          updated_at: null,
+          created_at: '2026-04-30T11:00:00Z'
+        }
+      ]
+    });
+
+    expect(tree[0].sessions.map((session) => session.session_id)).toEqual([
+      'newer',
+      'created-only',
+      'older'
+    ]);
   });
 
   test('maps runner status to online or offline dot tones', () => {

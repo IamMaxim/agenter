@@ -42,6 +42,8 @@ export interface SessionInfo {
   status: SessionStatus;
   external_session_id?: string | null;
   title?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
 }
 
 export type AgentReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';

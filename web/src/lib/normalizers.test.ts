@@ -62,7 +62,9 @@ describe('frontend API normalizers', () => {
         provider_id: 'unknown',
         status: 'degraded',
         external_session_id: null,
-        title: null
+        title: null,
+        created_at: null,
+        updated_at: null
       }
     ]);
   });

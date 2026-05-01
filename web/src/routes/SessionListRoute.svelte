@@ -3,6 +3,7 @@
   import { createSession, listRunners, listRunnerWorkspaces, listSessions } from '../api/sessions';
   import type { SessionInfo, WorkspaceRef } from '../api/types';
   import { routeHref } from '../lib/router';
+  import { sortSessionsByDate } from '../lib/sidebarTree';
   import { pushToast } from '../lib/toasts';
 
   let sessions: SessionInfo[] = [];
@@ -13,7 +14,7 @@
 
   async function refresh() {
     try {
-      sessions = await listSessions();
+      sessions = sortSessionsByDate(await listSessions());
       const runners = await listRunners();
       for (const runner of runners) {
         const workspaces = await listRunnerWorkspaces(runner.runner_id);

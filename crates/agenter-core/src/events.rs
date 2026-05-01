@@ -292,6 +292,8 @@ mod tests {
             status: SessionStatus::Running,
             external_session_id: Some("thread-1".to_owned()),
             title: Some("Initial setup".to_owned()),
+            created_at: None,
+            updated_at: None,
         });
 
         let json = serde_json::to_value(&event).expect("serialize event");

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import InlineEventRow from '../components/InlineEventRow.svelte';
   import MarkdownBlock from '../components/MarkdownBlock.svelte';
   import PlanCard from '../components/PlanCard.svelte';
@@ -12,6 +12,7 @@
     getSessionSettings,
     getSession,
     getSessionHistory,
+    renameSession,
     sendSessionMessage,
     updateSessionSettings
   } from '../api/sessions';
@@ -42,6 +43,9 @@
   let socket: BrowserEventSocket | undefined;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let closedByRoute = false;
+  let mounted = false;
+  let activeSessionId = '';
+  let connectionGeneration = 0;
   let chatState: ChatState = createChatState();
   let session: SessionInfo | undefined;
   let connectionState = 'Connecting';
@@ -50,13 +54,23 @@
   let decisionError = '';
   let settingsError = '';
   let settingsOpen = false;
+  let editingTitle = false;
+  let titleDraft = '';
+  let renaming = false;
+  let messageTextarea: HTMLTextAreaElement | undefined;
   let agentOptions: AgentOptions = { models: [], collaboration_modes: [] };
   let turnSettings: AgentTurnSettings = {};
   let questionDrafts: Record<string, Record<string, string[]>> = {};
 
   $: items = chatState.items;
+  $: if (mounted && sessionId !== activeSessionId) {
+    activeSessionId = sessionId;
+    void reloadAndConnect();
+  }
 
   onMount(() => {
+    mounted = true;
+    activeSessionId = sessionId;
     void reloadAndConnect();
   });
 
@@ -69,12 +83,30 @@
   });
 
   async function reloadAndConnect() {
+    const generation = ++connectionGeneration;
     socket?.close();
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
+    }
+    chatState = createChatState();
+    session = undefined;
+    sendError = '';
+    decisionError = '';
+    settingsError = '';
+    editingTitle = false;
     connectionState = 'Loading history';
     try {
       session = await getSession(sessionId);
-      void loadAgentSettings();
+      if (generation !== connectionGeneration) {
+        return;
+      }
+      titleDraft = session.title ?? '';
+      void loadAgentSettings(generation);
       const history = await getSessionHistory(sessionId);
+      if (generation !== connectionGeneration) {
+        return;
+      }
       let nextState = createChatState();
       for (const envelope of history) {
         try {
@@ -96,9 +128,15 @@
     connectionState = 'Connecting';
     socket = connectSessionEvents(sessionId, {
       onOpen: () => {
+        if (generation !== connectionGeneration) {
+          return;
+        }
         connectionState = 'Subscribed';
       },
       onMessage: (message: BrowserServerMessage) => {
+        if (generation !== connectionGeneration) {
+          return;
+        }
         if (message.type === 'app_event') {
           try {
             chatState = applyChatEnvelope(chatState, message);
@@ -112,12 +150,15 @@
         }
       },
       onClose: () => {
-        if (!closedByRoute) {
+        if (!closedByRoute && generation === connectionGeneration) {
           connectionState = 'Reconnecting';
           reconnectTimer = setTimeout(() => void reloadAndConnect(), 900);
         }
       },
       onError: () => {
+        if (generation !== connectionGeneration) {
+          return;
+        }
         connectionState = 'Connection error';
         pushToast({ severity: 'error', message: 'Browser event stream encountered an error.' });
       }
@@ -134,10 +175,66 @@
     try {
       await sendSessionMessage(sessionId, { content });
       draft = '';
+      await tick();
+      resizeMessageTextarea();
     } catch {
       sendError = 'Could not send message. Check that the runner is connected.';
       pushToast({ severity: 'error', message: sendError });
     }
+  }
+
+  async function saveTitle() {
+    if (!session || renaming) {
+      return;
+    }
+    renaming = true;
+    try {
+      session = await renameSession(session.session_id, {
+        title: titleDraft.trim() || null
+      });
+      titleDraft = session.title ?? '';
+      editingTitle = false;
+      window.dispatchEvent(new CustomEvent('agenter:sessions-changed'));
+    } catch {
+      pushToast({ severity: 'error', message: 'Could not rename session.' });
+    } finally {
+      renaming = false;
+    }
+  }
+
+  function cancelTitleEdit() {
+    titleDraft = session?.title ?? '';
+    editingTitle = false;
+  }
+
+  function handleTitleKeydown(event: KeyboardEvent) {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      void saveTitle();
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      cancelTitleEdit();
+    }
+  }
+
+  function handleMessageKeydown(event: KeyboardEvent) {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      void submit();
+    }
+  }
+
+  function resizeMessageTextarea() {
+    if (!messageTextarea) {
+      return;
+    }
+    messageTextarea.style.height = 'auto';
+    const lineHeight = Number.parseFloat(getComputedStyle(messageTextarea).lineHeight) || 20;
+    const maxHeight = lineHeight * 20 + 24;
+    const nextHeight = Math.min(messageTextarea.scrollHeight, maxHeight);
+    messageTextarea.style.height = `${nextHeight}px`;
+    messageTextarea.style.overflowY = messageTextarea.scrollHeight > maxHeight ? 'auto' : 'hidden';
   }
 
   async function resolveApproval(item: ChatItem, decision: 'accept' | 'decline') {
@@ -155,16 +252,22 @@
     }
   }
 
-  async function loadAgentSettings() {
+  async function loadAgentSettings(generation = connectionGeneration) {
     settingsError = '';
     try {
       const [options, settings] = await Promise.all([
         getSessionAgentOptions(sessionId),
         getSessionSettings(sessionId)
       ]);
+      if (generation !== connectionGeneration) {
+        return;
+      }
       agentOptions = normalizeAgentOptions(options);
       turnSettings = normalizeTurnSettings(settings);
     } catch {
+      if (generation !== connectionGeneration) {
+        return;
+      }
       settingsError = 'Agent options are unavailable.';
       agentOptions = { models: [], collaboration_modes: [] };
       pushToast({ severity: 'warning', message: 'Agent options are unavailable. Using defaults.' });
@@ -262,7 +365,26 @@
 
 <section class="chat-layout">
   <header class="chat-header">
-    <span class="chat-title">{session?.title ?? 'New session'}</span>
+    {#if editingTitle}
+      <div class="title-editor">
+        <input
+          aria-label="Session title"
+          bind:value={titleDraft}
+          disabled={renaming}
+          on:keydown={handleTitleKeydown}
+        />
+        <button class="secondary compact" disabled={renaming} type="button" on:click={saveTitle}>
+          Save
+        </button>
+        <button class="secondary compact" disabled={renaming} type="button" on:click={cancelTitleEdit}>
+          Cancel
+        </button>
+      </div>
+    {:else}
+      <button class="chat-title-button" type="button" on:click={() => (editingTitle = true)}>
+        <span class="chat-title">{session?.title ?? 'New session'}</span>
+      </button>
+    {/if}
     <div>
       <!-- <a class="back-link" href={routeHref({ name: 'sessions' })}>Sessions</a> -->
       <!-- <p>{sessionId}</p> -->
@@ -435,7 +557,15 @@
       {/if}
     </div>
     <label class="sr-only" for="message">Message</label>
-    <textarea id="message" bind:value={draft} rows="1" placeholder="Message the agent"></textarea>
+    <textarea
+      id="message"
+      bind:this={messageTextarea}
+      bind:value={draft}
+      rows="1"
+      placeholder="Message the agent"
+      on:input={resizeMessageTextarea}
+      on:keydown={handleMessageKeydown}
+    ></textarea>
     <button type="submit">Send</button>
   </form>
   {#if sendError || decisionError}

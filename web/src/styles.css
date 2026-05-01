@@ -103,8 +103,7 @@ textarea {
 }
 
 textarea {
-  /* min-height: 4rem; */
-  resize: vertical;
+  resize: none;
 }
 
 input:focus,
@@ -275,6 +274,23 @@ nav a:hover {
   margin-left: auto;
   color: #8f98a7;
   font-size: 0.78rem;
+}
+
+.tree-new-session {
+  flex: 0 0 auto;
+  width: 1.35rem;
+  min-height: 1.35rem;
+  border: 0;
+  border-radius: 4px;
+  padding: 0;
+  color: #aeb6c3;
+  background: transparent;
+  line-height: 1;
+}
+
+.tree-new-session:hover:not(:disabled) {
+  color: #f1f3f7;
+  background: #242a35;
 }
 
 .tree-session-list {
@@ -472,6 +488,21 @@ nav a:hover {
   max-width: 100%;
 }
 
+.chat-title-button {
+  min-width: 0;
+  min-height: 1.6rem;
+  border: 0;
+  border-radius: 4px;
+  padding: 0.12rem 0.25rem;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+}
+
+.chat-title-button:hover {
+  background: #1b202b;
+}
+
 .chat-header .chat-title {
   color: #f1f3f7;
   font-weight: 400;
@@ -486,6 +517,19 @@ nav a:hover {
   /* font-size: 1.25rem; */
   /* line-height: 1.15; */
   /* color: #8f98a7; */
+}
+
+.title-editor {
+  display: grid;
+  grid-template-columns: minmax(10rem, 1fr) auto auto;
+  align-items: center;
+  min-width: 0;
+  gap: 0.4rem;
+}
+
+.title-editor input {
+  min-height: 2rem;
+  padding: 0.35rem 0.5rem;
 }
 
 /* .chat-header p {
@@ -579,8 +623,11 @@ nav a:hover {
 .markdown-content pre {
   border: 1px solid #2a2f3a;
   border-radius: 7px;
+  max-width: 100%;
+  overflow-x: auto;
   padding: 0.75rem;
   background: #0b0d12;
+  white-space: pre;
 }
 
 .markdown-content code {
@@ -593,6 +640,8 @@ nav a:hover {
 .markdown-content pre code {
   padding: 0;
   background: transparent;
+  overflow-wrap: normal;
+  white-space: pre;
 }
 
 .inline-event {
@@ -689,12 +738,64 @@ nav a:hover {
   padding-left: 0.8rem;
 }
 
-.inline-event-detail pre {
+.inline-event-detail pre,
+.ansi-block {
   border: 1px solid #2a2f3a;
   border-radius: 7px;
+  max-width: 100%;
+  overflow-x: auto;
   padding: 0.7rem;
   color: #cbd5e1;
   background: #0b0d12;
+  white-space: pre;
+}
+
+.ansi-block code {
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  overflow-wrap: normal;
+  white-space: pre;
+}
+
+.ansi-fg-black,
+.ansi-fg-bright-black {
+  color: #697281;
+}
+
+.ansi-fg-red,
+.ansi-fg-bright-red {
+  color: #fca5a5;
+}
+
+.ansi-fg-green,
+.ansi-fg-bright-green {
+  color: #86efac;
+}
+
+.ansi-fg-yellow,
+.ansi-fg-bright-yellow {
+  color: #fde68a;
+}
+
+.ansi-fg-blue,
+.ansi-fg-bright-blue {
+  color: #93c5fd;
+}
+
+.ansi-fg-magenta,
+.ansi-fg-bright-magenta {
+  color: #f0abfc;
+}
+
+.ansi-fg-cyan,
+.ansi-fg-bright-cyan {
+  color: #67e8f9;
+}
+
+.ansi-fg-white,
+.ansi-fg-bright-white {
+  color: #f8fafc;
 }
 
 .command-meta,
@@ -878,9 +979,12 @@ nav a:hover {
 .subagent-detail pre {
   border: 1px solid #2a2f3a;
   border-radius: 7px;
+  max-width: 100%;
+  overflow-x: auto;
   padding: 0.7rem;
   color: #cbd5e1;
   background: #0b0d12;
+  white-space: pre;
 }
 
 .event-card,
@@ -964,7 +1068,7 @@ nav a:hover {
   margin: 0 0.5rem 0.5rem 0.5rem;
   background: #0f1115;
   border: 1px solid #262a32;
-  border-radius: 999px;
+  border-radius: 24px;
   padding: 0.25rem;
 }
 
@@ -973,10 +1077,12 @@ nav a:hover {
 }
 
 .composer #message {
+  max-height: calc(1.4em * 20 + 24px);
   border: none;
   outline: none;
   box-shadow: none;
   background: transparent;
+  overflow-y: hidden;
 }
 
 .composer-settings {
@@ -1053,6 +1159,10 @@ nav a:hover {
 
   .chat-header h1 {
     font-size: 1.55rem;
+  }
+
+  .title-editor {
+    grid-template-columns: 1fr;
   }
 
   .user-message,

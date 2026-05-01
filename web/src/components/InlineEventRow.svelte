@@ -1,4 +1,5 @@
 <script lang="ts">
+  import AnsiBlock from './AnsiBlock.svelte';
   import type { ChatItem } from '../lib/chatEvents';
 
   export let item: Extract<ChatItem, { kind: 'inlineEvent' }>;
@@ -74,10 +75,10 @@
         </div>
       {/if}
       {#if item.detail}
-        <pre>{item.detail}</pre>
+        <AnsiBlock content={item.detail} />
       {/if}
       {#if 'output' in item && item.output}
-        <pre>{item.output}</pre>
+        <AnsiBlock content={item.output} />
       {/if}
     </div>
   {/if}

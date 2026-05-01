@@ -230,6 +230,7 @@ Active execution notes:
 - Final approval-race fix adds a last-mile WebSocket writer guard so a browser approval answer queued before a runner-originated resolution is dropped before it can reach the runner socket.
 - Regression coverage now includes a full in-process browser plus fake-runner pipeline test for login, runner registration, browser subscription, message send, runner responses, streamed events, approval decisions, runner approval commands, and history replay. Runner websocket handling now treats valid command responses and heartbeats as first-class frames instead of logging them as undecodable text.
 - Browser chat redesign follow-up makes the Svelte UI a dark Codex-like workbench: user and assistant messages render sanitized markdown, simple assistant messages stay inline, command/tool/file events render as expandable inline rows, and only user messages, `plan_updated` implementation plans, approvals, and future widgets receive boxed card treatment.
+- Frontend session polish follow-up sorts sessions by recent update time where timestamps are available, exposes session rename through `PATCH /api/sessions/{session_id}`, refreshes chat state when the sidebar switches sessions, adds workspace-level new-session buttons to the tree, makes the composer Enter-to-send with Shift+Enter newlines and auto-resize up to 20 lines, and renders markdown code blocks plus ANSI-colored command output in horizontally scrollable non-wrapping blocks.
 
 ## Milestone 3: Real Agent Adapters
 

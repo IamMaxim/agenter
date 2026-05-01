@@ -41,17 +41,24 @@ export function buildSessionTree({
           runner,
           workspace,
           status: runnerStatusTone(runner.status),
-          sessions: sortSessions(sessionsByWorkspace.get(workspace.workspace_id) ?? [])
+          sessions: sortSessionsByDate(sessionsByWorkspace.get(workspace.workspace_id) ?? [])
         };
       })
     )
     .sort((left, right) => left.label.localeCompare(right.label));
 }
 
-function sortSessions(sessions: SessionInfo[]): SessionInfo[] {
-  return [...sessions].sort((left, right) => {
-    const leftTitle = left.title?.trim();
-    const rightTitle = right.title?.trim();
+export function sortSessionsByDate(sessions: SessionInfo[]): SessionInfo[] {
+  return sessions.map((session, index) => ({ session, index })).sort((left, right) => {
+    const dateOrder = sessionTime(right.session) - sessionTime(left.session);
+    if (dateOrder !== 0) {
+      return dateOrder;
+    }
+    if (sessionTime(left.session) !== 0 || sessionTime(right.session) !== 0) {
+      return left.index - right.index;
+    }
+    const leftTitle = left.session.title?.trim();
+    const rightTitle = right.session.title?.trim();
     if (leftTitle && rightTitle) {
       return leftTitle.localeCompare(rightTitle);
     }
@@ -61,6 +68,15 @@ function sortSessions(sessions: SessionInfo[]): SessionInfo[] {
     if (rightTitle) {
       return 1;
     }
-    return left.session_id.localeCompare(right.session_id);
-  });
+    return left.session.session_id.localeCompare(right.session.session_id);
+  }).map(({ session }) => session);
+}
+
+function sessionTime(session: SessionInfo): number {
+  const value = session.updated_at ?? session.created_at;
+  if (!value) {
+    return 0;
+  }
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : 0;
 }

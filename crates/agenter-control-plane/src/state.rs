@@ -13,6 +13,7 @@ use agenter_protocol::{
     },
     RequestId,
 };
+use chrono::{DateTime, Utc};
 use tokio::{
     sync::{broadcast, mpsc, oneshot, Mutex},
     time::timeout,
@@ -107,6 +108,8 @@ pub struct RegisteredSession {
     pub title: Option<String>,
     pub external_session_id: Option<String>,
     pub turn_settings: Option<AgentTurnSettings>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug)]
@@ -583,6 +586,7 @@ impl AppState {
     }
 
     pub async fn register_session(&self, registration: SessionRegistration) -> RegisteredSession {
+        let now = Utc::now();
         let mut session = RegisteredSession {
             session_id: registration.session_id,
             owner_user_id: registration.owner_user_id,
@@ -593,6 +597,8 @@ impl AppState {
             title: registration.title,
             external_session_id: registration.external_session_id,
             turn_settings: registration.turn_settings,
+            created_at: now,
+            updated_at: now,
         };
         if let Some(pool) = &self.inner.db_pool {
             match agenter_db::create_session_with_id(
@@ -616,6 +622,8 @@ impl AppState {
                     session.title = persisted.title;
                     session.external_session_id = persisted.external_session_id;
                     session.turn_settings = persisted.turn_settings;
+                    session.created_at = persisted.created_at;
+                    session.updated_at = persisted.updated_at;
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -700,6 +708,8 @@ impl AppState {
                             status: session.session.status.clone(),
                             external_session_id: session.session.external_session_id.clone(),
                             title: session.session.title.clone(),
+                            created_at: Some(session.session.created_at),
+                            updated_at: Some(session.session.updated_at),
                         })
                         .collect()
                 })
@@ -708,7 +718,8 @@ impl AppState {
                     Vec::new()
                 });
         }
-        self.inner
+        let mut sessions: Vec<_> = self
+            .inner
             .registry
             .lock()
             .await
@@ -716,7 +727,44 @@ impl AppState {
             .values()
             .filter(|session| session.owner_user_id == user_id)
             .map(session_info)
-            .collect()
+            .collect();
+        sort_session_infos(&mut sessions);
+        sessions
+    }
+
+    pub async fn update_session_title(
+        &self,
+        user_id: UserId,
+        session_id: SessionId,
+        title: Option<String>,
+    ) -> Option<SessionInfo> {
+        if let Some(pool) = &self.inner.db_pool {
+            return agenter_db::update_session_title(pool, user_id, session_id, title.as_deref())
+                .await
+                .ok()
+                .flatten()
+                .map(|session| SessionInfo {
+                    session_id: session.session_id,
+                    owner_user_id: session.owner_user_id,
+                    runner_id: session.runner_id,
+                    workspace_id: session.workspace_id,
+                    provider_id: session.provider_id,
+                    status: session.status,
+                    external_session_id: session.external_session_id,
+                    title: session.title,
+                    created_at: Some(session.created_at),
+                    updated_at: Some(session.updated_at),
+                });
+        }
+
+        let mut registry = self.inner.registry.lock().await;
+        let session = registry.sessions.get_mut(&session_id)?;
+        if session.owner_user_id != user_id {
+            return None;
+        }
+        session.title = title;
+        session.updated_at = Utc::now();
+        Some(session_info(session))
     }
 
     pub async fn session(
@@ -744,6 +792,8 @@ impl AppState {
                     title: session.session.title,
                     external_session_id: session.session.external_session_id,
                     turn_settings: session.session.turn_settings,
+                    created_at: session.session.created_at,
+                    updated_at: session.session.updated_at,
                 });
         }
         self.inner
@@ -1141,6 +1191,8 @@ impl AppState {
                         title: session.title,
                         external_session_id: session.external_session_id,
                         turn_settings: session.turn_settings,
+                        created_at: session.created_at,
+                        updated_at: session.updated_at,
                     },
                     Err(error) => {
                         tracing::warn!(
@@ -1153,6 +1205,7 @@ impl AppState {
                     }
                 }
             } else {
+                let now = Utc::now();
                 RegisteredSession {
                     session_id: SessionId::new(),
                     owner_user_id,
@@ -1163,6 +1216,8 @@ impl AppState {
                     title: discovered_session.title.clone(),
                     external_session_id: Some(discovered_session.external_session_id.clone()),
                     turn_settings: None,
+                    created_at: now,
+                    updated_at: now,
                 }
             };
 
@@ -1407,7 +1462,23 @@ fn session_info(session: &RegisteredSession) -> SessionInfo {
         status: session.status.clone(),
         external_session_id: session.external_session_id.clone(),
         title: session.title.clone(),
+        created_at: Some(session.created_at),
+        updated_at: Some(session.updated_at),
     }
+}
+
+fn sort_session_infos(sessions: &mut [SessionInfo]) {
+    sessions.sort_by(|left, right| {
+        right
+            .updated_at
+            .or(right.created_at)
+            .cmp(&left.updated_at.or(left.created_at))
+            .then_with(|| {
+                left.session_id
+                    .to_string()
+                    .cmp(&right.session_id.to_string())
+            })
+    });
 }
 
 #[cfg(test)]

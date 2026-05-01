@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { listRunners, listRunnerWorkspaces, listSessions } from '../api/sessions';
+  import { createSession, listRunners, listRunnerWorkspaces, listSessions } from '../api/sessions';
   import type { AuthenticatedUser, RunnerInfo, SessionInfo, WorkspaceRef } from '../api/types';
   import { routeHref, type AppRoute } from '../lib/router';
   import { buildSessionTree, type SessionTreeGroup } from '../lib/sidebarTree';
@@ -16,6 +16,7 @@
   let groups: SessionTreeGroup[] = [];
   let loading = true;
   let error = '';
+  let creatingGroupId = '';
   let lastRouteKey = '';
   let mounted = false;
 
@@ -31,6 +32,9 @@
     mounted = true;
     lastRouteKey = routeKey;
     void refreshSidebar();
+    const refresh = () => void refreshSidebar();
+    window.addEventListener('agenter:sessions-changed', refresh);
+    return () => window.removeEventListener('agenter:sessions-changed', refresh);
   });
 
   async function refreshSidebar() {
@@ -55,6 +59,27 @@
 
   function sessionTitle(session: SessionInfo) {
     return session.title?.trim() || 'Untitled session';
+  }
+
+  async function newSession(group: SessionTreeGroup) {
+    if (creatingGroupId) {
+      return;
+    }
+    creatingGroupId = group.id;
+    try {
+      const session = await createSession({
+        workspace_id: group.workspace.workspace_id,
+        provider_id: 'codex',
+        title: `Chat in ${group.workspace.display_name ?? group.workspace.path}`
+      });
+      window.location.hash = routeHref({ name: 'chat', sessionId: session.session_id }).slice(1);
+      window.dispatchEvent(new CustomEvent('agenter:sessions-changed'));
+      await refreshSidebar();
+    } catch {
+      pushToast({ severity: 'error', message: 'Could not create session for this workspace.' });
+    } finally {
+      creatingGroupId = '';
+    }
   }
 </script>
 
@@ -86,6 +111,16 @@
             <span class:online={group.status === 'online'} class="runner-dot" aria-hidden="true"></span>
             <span class="tree-group-label" title={group.label}>{group.label}</span>
             <span class="tree-count">{group.sessions.length}</span>
+            <button
+              aria-label={`New session in ${group.label}`}
+              class="tree-new-session"
+              disabled={creatingGroupId === group.id || group.status !== 'online'}
+              title="New session"
+              type="button"
+              on:click={() => newSession(group)}
+            >
+              +
+            </button>
           </div>
 
           <div class="tree-session-list">
