@@ -3,6 +3,10 @@ use agenter_protocol::runner::{
     AgentEvent, RunnerClientMessage, RunnerCommand, RunnerEvent, RunnerHeartbeat,
     RunnerResponseEnvelope, RunnerServerMessage, PROTOCOL_VERSION,
 };
+use agenter_protocol::{
+    chunk_message, reassemble_message, RunnerTransportChunkFrame, RunnerTransportChunkReassembler,
+    RunnerTransportOutboundFrame,
+};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -14,6 +18,9 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 
 use crate::state::AppState;
+
+const DEFAULT_RUNNER_WS_CHUNK_BYTES: usize = 1024 * 1024;
+const DEFAULT_RUNNER_WS_MAX_MESSAGE_BYTES: usize = 512 * 1024 * 1024;
 
 #[cfg(test)]
 pub fn smoke_session_id() -> SessionId {
@@ -31,6 +38,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         tracing::warn!("runner websocket closed before hello");
         return;
     };
+
+    let mut runner_message_reassembler =
+        RunnerTransportChunkReassembler::new(runner_ws_max_message_bytes());
 
     let Ok(Message::Text(text)) = first else {
         tracing::warn!("runner websocket first frame was not text");
@@ -85,8 +95,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             message = receiver.next() => {
                 match message {
                     Some(Ok(Message::Text(text))) => {
-                        match classify_runner_client_text(&text) {
-                            Ok(RunnerClientFrame::Event(envelope)) => {
+                        match classify_runner_client_text(&mut runner_message_reassembler, &text) {
+                            Ok(Some(RunnerClientFrame::Event(envelope))) => {
                                 match envelope.event {
                                     RunnerEvent::AgentEvent(AgentEvent { session_id, event }) => {
                                     if app_event_session_id(&event) != Some(session_id) {
@@ -99,14 +109,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     state.publish_event(session_id, event).await;
                                     }
                                     RunnerEvent::SessionsDiscovered(discovered) => {
-                                        state
-                                            .import_discovered_sessions(runner.runner_id, discovered)
+                                        let request_id = envelope.request_id.clone();
+                                        let import_mode = if request_id.is_some() {
+                                            crate::state::SessionImportMode::Forced
+                                        } else {
+                                            crate::state::SessionImportMode::Automatic
+                                        };
+                                        let summary = state
+                                            .import_discovered_sessions(runner.runner_id, discovered, import_mode)
                                             .await;
+                                        if let Some(request_id) = request_id {
+                                            state.record_refresh_summary(request_id, summary).await;
+                                        }
                                     }
                                     RunnerEvent::HealthChanged(_) | RunnerEvent::Error(_) => {}
                                 }
                             }
-                                Ok(RunnerClientFrame::Response(response)) => {
+                                Ok(Some(RunnerClientFrame::Response(response))) => {
                                     tracing::debug!(
                                         runner_id = %runner.runner_id,
                                         request_id = %response.request_id,
@@ -120,18 +139,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         )
                                         .await;
                                 }
-                            Ok(RunnerClientFrame::Heartbeat(heartbeat)) => {
+                            Ok(Some(RunnerClientFrame::Heartbeat(heartbeat))) => {
                                 tracing::debug!(
                                     runner_id = %runner.runner_id,
                                     sequence = heartbeat.sequence,
                                     "runner heartbeat received"
                                 );
                             }
-                            Ok(RunnerClientFrame::Hello) => {
+                            Ok(Some(RunnerClientFrame::Hello)) => {
                                 tracing::warn!(runner_id = %runner.runner_id, "runner hello received after handshake");
                             }
-                            Err(_) => {
-                                tracing::warn!(runner_id = %runner.runner_id, "runner websocket ignored undecodable text frame");
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::warn!(runner_id = %runner.runner_id, %error, "runner websocket ignored undecodable text frame");
                             }
                         }
                     }
@@ -193,8 +213,44 @@ async fn send_server_message(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     message: RunnerServerMessage,
 ) -> Result<(), axum::Error> {
-    let json = serde_json::to_string(&message).expect("runner server message serializes");
-    sender.send(Message::Text(json.into())).await
+    let frames =
+        chunk_message(&message, runner_ws_chunk_bytes()).expect("runner server message serializes");
+    if frames.len() > 1 {
+        let chunk_start = runner_transport_chunk_start(&frames);
+        tracing::warn!(
+            direction = "control_plane_to_runner",
+            message_type = runner_server_message_type(&message),
+            transfer_id = chunk_start.as_ref().map(|start| start.transfer_id.as_str()),
+            total_bytes = chunk_start.as_ref().map(|start| start.total_bytes),
+            frame_count = frames.len(),
+            total_chunks = chunk_start.as_ref().map(|start| start.total_chunks),
+            "sending chunked runner websocket message"
+        );
+    }
+    for frame in frames {
+        let RunnerTransportOutboundFrame::Text(text) = frame;
+        sender.send(Message::Text(text.into())).await?;
+    }
+    Ok(())
+}
+
+fn runner_server_message_type(message: &RunnerServerMessage) -> &'static str {
+    match message {
+        RunnerServerMessage::Command(_) => "runner_command",
+        RunnerServerMessage::HeartbeatAck(_) => "runner_heartbeat_ack",
+    }
+}
+
+fn runner_transport_chunk_start(
+    frames: &[RunnerTransportOutboundFrame],
+) -> Option<agenter_protocol::runner_transport::RunnerChunkStart> {
+    let RunnerTransportOutboundFrame::Text(text) = frames.first()?;
+    let Ok(RunnerTransportChunkFrame::Start(start)) =
+        serde_json::from_str::<RunnerTransportChunkFrame>(text)
+    else {
+        return None;
+    };
+    Some(start)
 }
 
 #[derive(Debug)]
@@ -205,13 +261,43 @@ enum RunnerClientFrame {
     Event(agenter_protocol::runner::RunnerEventEnvelope),
 }
 
-fn classify_runner_client_text(text: &str) -> Result<RunnerClientFrame, serde_json::Error> {
-    match serde_json::from_str::<RunnerClientMessage>(text)? {
-        RunnerClientMessage::Hello(_) => Ok(RunnerClientFrame::Hello),
-        RunnerClientMessage::Heartbeat(heartbeat) => Ok(RunnerClientFrame::Heartbeat(heartbeat)),
-        RunnerClientMessage::Response(response) => Ok(RunnerClientFrame::Response(response)),
-        RunnerClientMessage::Event(event) => Ok(RunnerClientFrame::Event(event)),
+fn classify_runner_client_text(
+    reassembler: &mut RunnerTransportChunkReassembler,
+    text: &str,
+) -> Result<Option<RunnerClientFrame>, agenter_protocol::runner_transport::RunnerTransportError> {
+    let Some(message) = reassemble_message::<RunnerClientMessage>(reassembler, text)? else {
+        return Ok(None);
+    };
+    match message {
+        RunnerClientMessage::Hello(_) => Ok(Some(RunnerClientFrame::Hello)),
+        RunnerClientMessage::Heartbeat(heartbeat) => {
+            Ok(Some(RunnerClientFrame::Heartbeat(heartbeat)))
+        }
+        RunnerClientMessage::Response(response) => Ok(Some(RunnerClientFrame::Response(response))),
+        RunnerClientMessage::Event(event) => Ok(Some(RunnerClientFrame::Event(event))),
     }
+}
+
+fn runner_ws_chunk_bytes() -> usize {
+    env_usize(
+        "AGENTER_RUNNER_WS_CHUNK_BYTES",
+        DEFAULT_RUNNER_WS_CHUNK_BYTES,
+    )
+}
+
+fn runner_ws_max_message_bytes() -> usize {
+    env_usize(
+        "AGENTER_RUNNER_WS_MAX_MESSAGE_BYTES",
+        DEFAULT_RUNNER_WS_MAX_MESSAGE_BYTES,
+    )
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 fn app_event_session_id(event: &AppEvent) -> Option<SessionId> {
@@ -235,6 +321,7 @@ fn app_event_session_id(event: &AppEvent) -> Option<SessionId> {
         AppEvent::ApprovalResolved(event) => Some(event.session_id),
         AppEvent::QuestionRequested(event) => Some(event.session_id),
         AppEvent::QuestionAnswered(event) => Some(event.session_id),
+        AppEvent::ProviderEvent(event) => Some(event.session_id),
         AppEvent::Error(event) => event.session_id,
     }
 }
@@ -261,8 +348,11 @@ mod tests {
         .expect("serialize runner response");
 
         assert!(matches!(
-            classify_runner_client_text(&text),
-            Ok(RunnerClientFrame::Response(_))
+            classify_runner_client_text(
+                &mut RunnerTransportChunkReassembler::new(runner_ws_max_message_bytes()),
+                &text
+            ),
+            Ok(Some(RunnerClientFrame::Response(_)))
         ));
     }
 }

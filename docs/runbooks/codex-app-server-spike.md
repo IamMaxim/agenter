@@ -59,7 +59,9 @@ AGENTER_DEV_RUNNER_TOKEN=dev-runner-token \
   cargo run -p agenter-runner
 ```
 
-The adapter advertises a single configured workspace and the `codex` provider, lazily starts one persistent `codex app-server --listen stdio://` process for that runner workspace, starts a native thread when the browser creates an Agenter session, starts turns with read-only sandbox policy, normalizes known message, command, file, tool, error, and approval request events, and routes approval answers back to the JSON-RPC server request id. Live Codex 0.125 agent text currently arrives as `item/agentMessage/delta` and `item/completed` with `params.item.type == "agentMessage"`; echoed `userMessage` and `reasoning` item events are intentionally ignored by the adapter. The control plane stores the native Codex thread id as `external_session_id` in its session registry and sends that id on later browser messages.
+The adapter advertises a single configured workspace and the `codex` provider, lazily starts one persistent `codex app-server --listen stdio://` process for that runner workspace, starts a native thread when the browser creates an Agenter session, starts turns with read-only sandbox policy, normalizes known message, command, file, tool, plan, compaction, status, error, question, and approval request events, and routes approval/question answers back to the JSON-RPC server request id. Live Codex 0.125 agent text currently arrives as `item/agentMessage/delta` and `item/completed` with `params.item.type == "agentMessage"`; echoed `userMessage` and `reasoning` item lifecycle events are intentionally ignored by the adapter, while reasoning deltas and other lower-priority provider notifications are surfaced as generic provider events instead of being silently dropped. The control plane stores the native Codex thread id as `external_session_id` in its session registry and sends that id on later browser messages. For an existing or provider-refreshed session, the runner must call `thread/resume` for that id before `turn/start`; merely setting local adapter state is not enough because a fresh app-server process may not have loaded the persisted Codex thread.
+
+Runner WebSocket transport must keep individual frames smaller than the control plane's frame limit while preserving full payload data. Large runner messages are split into chunk frames and reassembled before the normal runner JSON protocol is decoded, so raw Codex provider payloads and `thread/read` history should remain complete unless the configurable reassembled-message limit is exceeded.
 
 Codex 0.125 validates `thread/start.params.sessionStartSource` as a provider-owned enum. Use `"startup"` for normal Agenter-created sessions. Do not send arbitrary client labels such as `"agenter"`; live Codex rejects those with `unknown variant ..., expected startup or clear`.
 
@@ -260,13 +262,13 @@ Capture complete JSON lines for these methods and response IDs:
 - Client request: `thread/resume`
 - Client request: `thread/read` if used to inspect history
 - Client request: `turn/start`
-- Server notifications: `thread/started`, `thread/status/changed`, `turn/started`, `item/started`, `agentMessage/delta`, `turn/completed`, `item/completed`
-- Server requests: `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`
+- Server notifications: `thread/started`, `thread/status/changed`, `thread/compacted`, `turn/started`, `turn/completed`, `turn/plan/updated`, `item/started`, `item/completed`, `item/agentMessage/delta`, `item/plan/delta`, `item/commandExecution/outputDelta`, `item/fileChange/outputDelta`, `item/fileChange/patchUpdated`, warning/model/reasoning/MCP notifications, and any previously unknown method observed during a turn
+- Server requests: `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, and any unsupported request that carries an `id`
 - Approval responses sent by the client for every server request ID
 
 ## Schema-Derived Shape Notes
 
-These names were seen from the locally generated app-server schema on 2026-04-30. Treat live transcripts as the final authority for adapter work.
+These names were seen from the locally generated app-server schema on 2026-04-30 and refreshed on 2026-05-01 with `codex app-server generate-ts --experimental` and `codex app-server generate-json-schema --experimental`. Treat live transcripts as the final authority for adapter work.
 
 ```json
 {"id":1,"method":"initialize","params":{"clientInfo":{"name":"agenter-codex-spike","version":"0.1.0"},"capabilities":{"experimentalApi":true}}}
@@ -280,6 +282,22 @@ These names were seen from the locally generated app-server schema on 2026-04-30
 ```
 
 Approval decisions observed in the generated schema include `accept`, `acceptForSession`, `decline`, and `cancel` for command and file-change approval requests. Command approvals also include provider-specific policy amendment decisions.
+
+Protocol coverage policy:
+
+- First-class normalized events: agent message deltas/completion, turn completion, implementation plan updates, command start/output/completion, file-change items, approval requests, user-input questions, and MCP elicitation questions.
+- Visible provider fallback events: compaction (`thread/compacted` and `contextCompaction` items), thread/turn status, warnings, model reroutes/verifications, reasoning deltas, MCP progress, hooks, auto-approval reviews, token usage, fuzzy search, realtime notifications, and other supported-but-not-yet-promoted server notifications.
+- Unsupported server requests with JSON-RPC `id` are surfaced as provider events and answered with JSON-RPC method-not-found errors so a turn does not hang invisibly.
+
+Browser slash command mapping:
+
+- `/compact` sends `thread/compact/start` with the active `threadId`.
+- `/review` sends `review/start`; default target is uncommitted changes, with base branch, commit, custom, and detached variants represented in Agenter slash-command arguments.
+- `/steer` sends `turn/steer` and requires an active `turnId`.
+- `/fork` sends `thread/fork`; the control plane registers the returned native thread id as a new Agenter session when present.
+- `/archive` and `/unarchive` send the matching thread archive requests.
+- `/rollback` sends `thread/rollback` and requires explicit browser confirmation because it rewrites provider history.
+- `/shell` sends `thread/shellCommand` and requires explicit browser confirmation because Codex describes this method as unsandboxed full-access shell execution.
 
 ## Observed Rust Spike Output
 

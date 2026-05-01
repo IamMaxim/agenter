@@ -7,10 +7,13 @@ use std::{
 
 use agenter_core::{
     AgentCollaborationMode, AgentErrorEvent, AgentMessageDeltaEvent, AgentModelOption,
-    AgentOptions, AgentQuestionAnswer, AgentQuestionChoice, AgentQuestionField,
+    AgentOptions, AgentProviderId, AgentQuestionAnswer, AgentQuestionChoice, AgentQuestionField,
     AgentReasoningEffort, AgentTurnSettings, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind,
-    ApprovalRequestEvent, CommandCompletedEvent, CommandEvent, FileChangeEvent, FileChangeKind,
-    MessageCompletedEvent, QuestionId, QuestionRequestedEvent, SessionId,
+    ApprovalRequestEvent, CommandCompletedEvent, CommandEvent, CommandOutputEvent,
+    CommandOutputStream, FileChangeEvent, FileChangeKind, MessageCompletedEvent, PlanEntry,
+    PlanEntryStatus, PlanEvent, ProviderEvent, QuestionId, QuestionRequestedEvent, SessionId,
+    SlashCommandArgument, SlashCommandArgumentKind, SlashCommandDangerLevel,
+    SlashCommandDefinition, SlashCommandRequest, SlashCommandResult, SlashCommandTarget,
 };
 use agenter_protocol::{
     DiscoveredCommandAction, DiscoveredFileChangeStatus, DiscoveredSessionHistoryItem,
@@ -28,7 +31,7 @@ use tokio::{
 const STARTUP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const RECENT_STDERR_LINES: usize = 20;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CodexTurnRequest {
     pub session_id: SessionId,
     pub workspace_path: PathBuf,
@@ -240,6 +243,37 @@ impl CodexAppServer {
         Ok(codex_agent_options_from_responses(&models, &modes))
     }
 
+    pub async fn execute_provider_command(
+        &mut self,
+        request: &SlashCommandRequest,
+        workspace_path: &PathBuf,
+    ) -> anyhow::Result<SlashCommandResult> {
+        self.initialize().await?;
+        let Some(thread_id) = self.thread_id.clone() else {
+            return Err(anyhow!(
+                "codex thread id was not observed before provider command"
+            ));
+        };
+        let (method, params) = codex_provider_command_request(
+            &thread_id,
+            request,
+            self.turn_id.as_deref(),
+            workspace_path,
+        )?;
+        tracing::info!(provider_thread_id = %thread_id, method, command_id = %request.command_id, "executing codex provider command");
+        let request_id = self.send_request(method, params).await?;
+        let response = self.read_response(request_id, method).await?;
+        if let Some(thread_id) = codex_thread_id(&response) {
+            self.thread_id = Some(thread_id.to_owned());
+        }
+        Ok(SlashCommandResult {
+            accepted: true,
+            message: codex_provider_command_message(&request.command_id).to_owned(),
+            session: None,
+            provider_payload: Some(response),
+        })
+    }
+
     pub fn set_active_thread(&mut self, thread_id: impl Into<String>) {
         self.thread_id = Some(thread_id.into());
         self.turn_id = None;
@@ -338,6 +372,23 @@ impl CodexAppServer {
                 "id": native_request_id,
                 "result": question_response_for_answer(kind, answer)
             }),
+        )
+        .await
+    }
+
+    pub async fn send_unsupported_request_response(
+        &mut self,
+        native_request_id: Value,
+        method: &str,
+    ) -> anyhow::Result<()> {
+        tracing::warn!(
+            native_request_id = ?native_request_id,
+            method,
+            "rejecting unsupported codex server request"
+        );
+        write_json(
+            &mut self.stdin,
+            &unsupported_request_response(native_request_id, method),
         )
         .await
     }
@@ -451,6 +502,240 @@ pub fn codex_turn_start_params(thread_id: &str, request: &CodexTurnRequest) -> V
     params
 }
 
+pub fn codex_provider_slash_commands() -> Vec<SlashCommandDefinition> {
+    vec![
+        codex_slash_command(
+            "codex.compact",
+            "compact",
+            "Start native Codex context compaction.",
+        ),
+        codex_slash_command(
+            "codex.review",
+            "review",
+            "Start a native Codex code review.",
+        )
+        .with_argument(
+            "target",
+            SlashCommandArgumentKind::Rest,
+            false,
+            "Review target flags",
+        ),
+        codex_slash_command("codex.steer", "steer", "Steer the active Codex turn.").with_argument(
+            "input",
+            SlashCommandArgumentKind::Rest,
+            true,
+            "Text to steer with",
+        ),
+        codex_slash_command("codex.fork", "fork", "Fork the current Codex thread."),
+        codex_slash_command(
+            "codex.archive",
+            "archive",
+            "Archive the current Codex thread.",
+        ),
+        codex_slash_command(
+            "codex.unarchive",
+            "unarchive",
+            "Unarchive the current Codex thread.",
+        ),
+        codex_slash_command(
+            "codex.rollback",
+            "rollback",
+            "Drop recent turns from Codex history. Does not revert files.",
+        )
+        .danger(SlashCommandDangerLevel::Dangerous)
+        .with_argument(
+            "numTurns",
+            SlashCommandArgumentKind::Number,
+            true,
+            "Number of turns",
+        ),
+        codex_slash_command(
+            "codex.shell",
+            "shell",
+            "Run an unsandboxed provider-native shell command.",
+        )
+        .danger(SlashCommandDangerLevel::Dangerous)
+        .with_alias("sh")
+        .with_argument(
+            "command",
+            SlashCommandArgumentKind::Rest,
+            true,
+            "Shell command",
+        ),
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect()
+}
+
+fn codex_provider_command_request(
+    thread_id: &str,
+    request: &SlashCommandRequest,
+    turn_id: Option<&str>,
+    workspace_path: &PathBuf,
+) -> anyhow::Result<(&'static str, Value)> {
+    match request.command_id.as_str() {
+        "codex.compact" => Ok(("thread/compact/start", json!({"threadId": thread_id}))),
+        "codex.review" => Ok((
+            "review/start",
+            json!({
+                "threadId": thread_id,
+                "target": codex_review_target(&request.arguments),
+                "delivery": codex_review_delivery(&request.arguments)
+            }),
+        )),
+        "codex.steer" => {
+            let Some(turn_id) = turn_id else {
+                return Err(anyhow!("codex /steer requires an active turn"));
+            };
+            let input = string_argument(&request.arguments, "input")?;
+            Ok((
+                "turn/steer",
+                json!({
+                    "threadId": thread_id,
+                    "expectedTurnId": turn_id,
+                    "input": [{"type": "text", "text": input}]
+                }),
+            ))
+        }
+        "codex.fork" => Ok((
+            "thread/fork",
+            json!({
+                "threadId": thread_id,
+                "cwd": workspace_path,
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "excludeTurns": false,
+                "persistExtendedHistory": true
+            }),
+        )),
+        "codex.archive" => Ok(("thread/archive", json!({"threadId": thread_id}))),
+        "codex.unarchive" => Ok(("thread/unarchive", json!({"threadId": thread_id}))),
+        "codex.rollback" => Ok((
+            "thread/rollback",
+            json!({
+                "threadId": thread_id,
+                "numTurns": number_argument(&request.arguments, "numTurns")?
+            }),
+        )),
+        "codex.shell" => Ok((
+            "thread/shellCommand",
+            json!({
+                "threadId": thread_id,
+                "command": string_argument(&request.arguments, "command")?
+            }),
+        )),
+        other => Err(anyhow!("unsupported codex provider command `{other}`")),
+    }
+}
+
+fn codex_provider_command_message(command_id: &str) -> &'static str {
+    match command_id {
+        "codex.compact" => "Codex compaction started.",
+        "codex.review" => "Codex review started.",
+        "codex.steer" => "Codex turn steering submitted.",
+        "codex.fork" => "Codex thread forked.",
+        "codex.archive" => "Codex thread archived.",
+        "codex.unarchive" => "Codex thread unarchived.",
+        "codex.rollback" => "Codex rollback completed.",
+        "codex.shell" => "Codex shell command submitted.",
+        _ => "Codex provider command executed.",
+    }
+}
+
+fn codex_review_target(arguments: &Value) -> Value {
+    if let Some(branch) = string_at(arguments, &["/base", "/branch"]) {
+        return json!({"type": "baseBranch", "branch": branch});
+    }
+    if let Some(sha) = string_at(arguments, &["/commit", "/sha"]) {
+        return json!({"type": "commit", "sha": sha});
+    }
+    if let Some(instructions) = string_at(arguments, &["/custom", "/instructions", "/target"]) {
+        if !instructions.trim().is_empty() {
+            return json!({"type": "custom", "instructions": instructions});
+        }
+    }
+    json!({"type": "uncommittedChanges"})
+}
+
+fn codex_review_delivery(arguments: &Value) -> Value {
+    if bool_at(arguments, &["/detached"]).unwrap_or(false) {
+        json!("detached")
+    } else {
+        json!("inline")
+    }
+}
+
+fn string_argument(arguments: &Value, name: &str) -> anyhow::Result<String> {
+    arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("missing required argument `{name}`"))
+}
+
+fn number_argument(arguments: &Value, name: &str) -> anyhow::Result<u64> {
+    arguments
+        .get(name)
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| anyhow!("missing required positive integer argument `{name}`"))
+}
+
+struct CodexSlashCommandBuilder(SlashCommandDefinition);
+
+impl CodexSlashCommandBuilder {
+    fn with_argument(
+        mut self,
+        name: &str,
+        kind: SlashCommandArgumentKind,
+        required: bool,
+        description: &str,
+    ) -> Self {
+        self.0.arguments.push(SlashCommandArgument {
+            name: name.to_owned(),
+            kind,
+            required,
+            description: Some(description.to_owned()),
+            choices: Vec::new(),
+        });
+        self
+    }
+
+    fn with_alias(mut self, alias: &str) -> Self {
+        self.0.aliases.push(alias.to_owned());
+        self
+    }
+
+    fn danger(mut self, danger_level: SlashCommandDangerLevel) -> Self {
+        self.0.danger_level = danger_level;
+        self
+    }
+}
+
+impl From<CodexSlashCommandBuilder> for SlashCommandDefinition {
+    fn from(builder: CodexSlashCommandBuilder) -> Self {
+        builder.0
+    }
+}
+
+fn codex_slash_command(id: &str, name: &str, description: &str) -> CodexSlashCommandBuilder {
+    CodexSlashCommandBuilder(SlashCommandDefinition {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        aliases: Vec::new(),
+        description: description.to_owned(),
+        category: "provider".to_owned(),
+        provider_id: Some(AgentProviderId::from(AgentProviderId::CODEX)),
+        target: SlashCommandTarget::Provider,
+        danger_level: SlashCommandDangerLevel::Safe,
+        arguments: Vec::new(),
+        examples: Vec::new(),
+    })
+}
+
 pub async fn run_codex_turn_on_server(
     server: &mut CodexAppServer,
     request: CodexTurnRequest,
@@ -532,6 +817,15 @@ pub async fn run_codex_turn_on_server(
                     .send_question_response(native_request_id, question_kind, answer)
                     .await?;
             }
+            continue;
+        }
+        if let Some((native_request_id, method)) = unsupported_codex_server_request(&message) {
+            for event in normalize_codex_message_for_scope(request.session_id, &message, &scope) {
+                event_sender.send(event).ok();
+            }
+            server
+                .send_unsupported_request_response(native_request_id, method)
+                .await?;
             continue;
         }
 
@@ -658,6 +952,41 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
         "agentMessage/completed" | "agentMessage/complete" => {
             message_completed(session_id, message).into_iter().collect()
         }
+        "turn/started" => vec![provider_event(
+            session_id,
+            message,
+            "turn",
+            "Turn started",
+            Some("running"),
+        )],
+        "thread/status/changed" => vec![provider_event(
+            session_id,
+            message,
+            "thread",
+            "Thread status changed",
+            string_at(message, &["/params/status"]).or(Some("updated")),
+        )],
+        "thread/compacted" => vec![provider_event(
+            session_id,
+            message,
+            "compaction",
+            "Context compacted",
+            Some("completed"),
+        )],
+        "turn/plan/updated" => turn_plan_updated(session_id, message).into_iter().collect(),
+        "item/plan/delta" => plan_delta(session_id, message).into_iter().collect(),
+        "item/commandExecution/outputDelta" | "command/exec/outputDelta" => {
+            command_output_delta(session_id, message)
+                .into_iter()
+                .collect()
+        }
+        "item/fileChange/outputDelta" | "item/fileChange/patchUpdated" => vec![provider_event(
+            session_id,
+            message,
+            "file",
+            provider_event_title(method),
+            Some("updated"),
+        )],
         "item/started" => item_started(session_id, message).into_iter().collect(),
         "item/completed" => item_completed(session_id, message).into_iter().collect(),
         "turn/completed" => vec![AppEvent::AgentMessageCompleted(MessageCompletedEvent {
@@ -676,7 +1005,13 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
                 .to_owned(),
             provider_payload: Some(message.clone()),
         })],
-        _ => Vec::new(),
+        _ => vec![provider_event(
+            session_id,
+            message,
+            provider_event_category(method),
+            provider_event_title(method),
+            None,
+        )],
     }
 }
 
@@ -771,6 +1106,22 @@ fn codex_question_kind(message: &Value) -> Option<CodexQuestionKind> {
         "mcpServer/elicitation/request" => Some(CodexQuestionKind::McpElicitation),
         _ => None,
     }
+}
+
+fn unsupported_codex_server_request(message: &Value) -> Option<(Value, &str)> {
+    let native_request_id = message.get("id")?.clone();
+    let method = jsonrpc_method(message)?;
+    Some((native_request_id, method))
+}
+
+fn unsupported_request_response(native_request_id: Value, method: &str) -> Value {
+    json!({
+        "id": native_request_id,
+        "error": {
+            "code": -32601,
+            "message": format!("unsupported Codex server request method: {method}")
+        }
+    })
 }
 
 fn tool_user_input_fields(message: &Value) -> Vec<AgentQuestionField> {
@@ -1001,6 +1352,102 @@ fn message_completed(session_id: SessionId, message: &Value) -> Option<AppEvent>
     }))
 }
 
+fn turn_plan_updated(session_id: SessionId, message: &Value) -> Option<AppEvent> {
+    let entries = message
+        .pointer("/params/plan")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let label = string_at(entry, &["/step", "/label", "/content", "/text"])?;
+            Some(PlanEntry {
+                label: label.to_owned(),
+                status: match string_at(entry, &["/status"]) {
+                    Some("completed") => PlanEntryStatus::Completed,
+                    Some("inProgress" | "in_progress") => PlanEntryStatus::InProgress,
+                    _ => PlanEntryStatus::Pending,
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() && string_at(message, &["/params/explanation"]).is_none() {
+        return None;
+    }
+    Some(AppEvent::PlanUpdated(PlanEvent {
+        session_id,
+        plan_id: string_at(message, &["/params/turnId", "/params/id"]).map(str::to_owned),
+        title: Some("Implementation plan".to_owned()),
+        content: string_at(message, &["/params/explanation"]).map(str::to_owned),
+        entries,
+        provider_payload: Some(message.clone()),
+    }))
+}
+
+fn plan_delta(session_id: SessionId, message: &Value) -> Option<AppEvent> {
+    let content = string_at(
+        message,
+        &["/params/delta", "/params/text", "/params/content"],
+    )?;
+    Some(AppEvent::PlanUpdated(PlanEvent {
+        session_id,
+        plan_id: string_at(
+            message,
+            &["/params/itemId", "/params/item/id", "/params/id"],
+        )
+        .map(str::to_owned),
+        title: Some("Implementation plan".to_owned()),
+        content: Some(content.to_owned()),
+        entries: Vec::new(),
+        provider_payload: Some(message.clone()),
+    }))
+}
+
+fn command_output_delta(session_id: SessionId, message: &Value) -> Option<AppEvent> {
+    let delta = string_at(
+        message,
+        &["/params/delta", "/params/text", "/params/output"],
+    )?;
+    Some(AppEvent::CommandOutputDelta(CommandOutputEvent {
+        session_id,
+        command_id: item_id(message),
+        stream: match string_at(message, &["/params/stream"]) {
+            Some("stderr") => CommandOutputStream::Stderr,
+            _ => CommandOutputStream::Stdout,
+        },
+        delta: delta.to_owned(),
+        provider_payload: Some(message.clone()),
+    }))
+}
+
+fn provider_event(
+    session_id: SessionId,
+    message: &Value,
+    category: impl Into<String>,
+    title: impl Into<String>,
+    status: Option<&str>,
+) -> AppEvent {
+    AppEvent::ProviderEvent(ProviderEvent {
+        session_id,
+        provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+        event_id: string_at(
+            message,
+            &[
+                "/params/item/id",
+                "/params/itemId",
+                "/params/id",
+                "/params/turnId",
+                "/params/threadId",
+            ],
+        )
+        .map(str::to_owned),
+        category: category.into(),
+        title: title.into(),
+        detail: provider_event_detail(message),
+        status: status.map(str::to_owned),
+        provider_payload: Some(message.clone()),
+    })
+}
+
 fn item_started(session_id: SessionId, message: &Value) -> Option<AppEvent> {
     if should_ignore_item_event(message) {
         return None;
@@ -1037,6 +1484,15 @@ fn item_started(session_id: SessionId, message: &Value) -> Option<AppEvent> {
 fn item_completed(session_id: SessionId, message: &Value) -> Option<AppEvent> {
     if item_type(message) == Some("agentMessage") {
         return message_completed(session_id, message);
+    }
+    if item_type(message) == Some("contextCompaction") {
+        return Some(provider_event(
+            session_id,
+            message,
+            "compaction",
+            "Context compacted",
+            Some("completed"),
+        ));
     }
     if should_ignore_item_event(message) {
         return None;
@@ -1318,6 +1774,16 @@ fn collect_codex_history_item(value: &Value, items: &mut Vec<DiscoveredSessionHi
                 });
             }
         }
+        Some("contextCompaction") => {
+            items.push(DiscoveredSessionHistoryItem::ProviderEvent {
+                event_id: string_at(value, &["/id"]).map(str::to_owned),
+                category: "compaction".to_owned(),
+                title: "Context compacted".to_owned(),
+                detail: None,
+                status: Some("completed".to_owned()),
+                provider_payload: Some(value.clone()),
+            });
+        }
         _ => {}
     }
 }
@@ -1410,6 +1876,11 @@ fn codex_jsonrpc_error_summary(method: &str, message: &Value) -> Option<String> 
     Some(format!("codex {method} failed: {code} {message}"))
 }
 
+pub fn is_codex_thread_not_found_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    let message = error.to_string();
+    message.contains("codex turn/start failed") && message.contains("thread not found")
+}
+
 fn missing_thread_id_error(method: &str, message: &Value, stderr: &[String]) -> String {
     let mut error = format!("codex {method} response did not include a thread id");
     let stderr_label = recent_stderr_label(stderr);
@@ -1478,6 +1949,70 @@ fn item_type(message: &Value) -> Option<&str> {
 
 fn should_ignore_item_event(message: &Value) -> bool {
     matches!(item_type(message), Some("userMessage" | "reasoning"))
+}
+
+fn provider_event_category(method: &str) -> &'static str {
+    match method {
+        "error" | "warning" | "guardianWarning" | "deprecationNotice" | "configWarning" => {
+            "warning"
+        }
+        method if method.starts_with("thread/realtime/") => "realtime",
+        method if method.starts_with("thread/") => "thread",
+        method if method.starts_with("turn/") => "turn",
+        method if method.starts_with("item/reasoning/") => "reasoning",
+        method if method.starts_with("item/mcpToolCall/") || method.starts_with("mcpServer/") => {
+            "mcp"
+        }
+        method if method.starts_with("model/") => "model",
+        method if method.starts_with("hook/") => "hook",
+        method if method.starts_with("account/") => "account",
+        method if method.starts_with("fuzzyFileSearch/") => "search",
+        method if method.starts_with("windows") => "environment",
+        _ => "provider",
+    }
+}
+
+fn provider_event_title(method: &str) -> String {
+    match method {
+        "model/rerouted" => "Model rerouted".to_owned(),
+        "model/verification" => "Model verification".to_owned(),
+        "warning" => "Warning".to_owned(),
+        "guardianWarning" => "Guardian warning".to_owned(),
+        "deprecationNotice" => "Deprecation notice".to_owned(),
+        "configWarning" => "Configuration warning".to_owned(),
+        "item/fileChange/outputDelta" => "File change output".to_owned(),
+        "item/fileChange/patchUpdated" => "File patch updated".to_owned(),
+        _ => method
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => {
+                        let mut word = first.to_uppercase().collect::<String>();
+                        word.push_str(chars.as_str());
+                        word
+                    }
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn provider_event_detail(message: &Value) -> Option<String> {
+    string_at(
+        message,
+        &[
+            "/params/message",
+            "/params/detail",
+            "/params/statusMessage",
+            "/params/error/message",
+            "/params/reason",
+        ],
+    )
+    .map(str::to_owned)
 }
 
 fn string_at<'a>(message: &'a Value, pointers: &[&str]) -> Option<&'a str> {
@@ -1590,6 +2125,161 @@ mod tests {
         };
         assert_eq!(completed.message_id, "msg-live-1");
         assert_eq!(completed.content.as_deref(), Some("Done."));
+    }
+
+    #[test]
+    fn normalizes_codex_thread_compacted_as_provider_event() {
+        let message = json!({
+            "method": "thread/compacted",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1"
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        assert_eq!(events.len(), 1);
+        let AppEvent::ProviderEvent(event) = &events[0] else {
+            panic!("expected provider event");
+        };
+        assert_eq!(event.provider_id.as_str(), AgentProviderId::CODEX);
+        assert_eq!(event.category, "compaction");
+        assert_eq!(event.title, "Context compacted");
+        assert_eq!(event.status.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn normalizes_codex_context_compaction_item_as_provider_event() {
+        let message = json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "compact-1",
+                    "type": "contextCompaction"
+                }
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        assert_eq!(events.len(), 1);
+        let AppEvent::ProviderEvent(event) = &events[0] else {
+            panic!("expected provider event");
+        };
+        assert_eq!(event.event_id.as_deref(), Some("compact-1"));
+        assert_eq!(event.category, "compaction");
+        assert_eq!(event.title, "Context compacted");
+    }
+
+    #[test]
+    fn normalizes_unknown_codex_notification_as_provider_event() {
+        let message = json!({
+            "method": "model/rerouted",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "from": "gpt-5.4",
+                "to": "gpt-5.4-mini"
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        assert_eq!(events.len(), 1);
+        let AppEvent::ProviderEvent(event) = &events[0] else {
+            panic!("expected provider event");
+        };
+        assert_eq!(event.category, "model");
+        assert_eq!(event.title, "Model rerouted");
+        assert_eq!(event.provider_payload.as_ref(), Some(&message));
+    }
+
+    #[test]
+    fn builds_error_response_for_unsupported_codex_server_request() {
+        let message = json!({
+            "id": "tool-call-1",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "tool-1"
+            }
+        });
+
+        let Some((native_request_id, method)) = unsupported_codex_server_request(&message) else {
+            panic!("expected unsupported server request");
+        };
+
+        assert_eq!(native_request_id, json!("tool-call-1"));
+        assert_eq!(method, "item/tool/call");
+        assert_eq!(
+            unsupported_request_response(native_request_id, method),
+            json!({
+                "id": "tool-call-1",
+                "error": {
+                    "code": -32601,
+                    "message": "unsupported Codex server request method: item/tool/call"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn normalizes_codex_plan_update_notification() {
+        let message = json!({
+            "method": "turn/plan/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "explanation": "Implement in phases",
+                "plan": [
+                    {"step": "Add tests", "status": "completed"},
+                    {"step": "Implement mapping", "status": "inProgress"},
+                    {"step": "Verify", "status": "pending"}
+                ]
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        assert_eq!(events.len(), 1);
+        let AppEvent::PlanUpdated(plan) = &events[0] else {
+            panic!("expected plan update");
+        };
+        assert_eq!(plan.plan_id.as_deref(), Some("turn-1"));
+        assert_eq!(plan.content.as_deref(), Some("Implement in phases"));
+        assert_eq!(plan.entries[1].label, "Implement mapping");
+        assert_eq!(
+            plan.entries[1].status,
+            agenter_core::PlanEntryStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn normalizes_codex_command_output_delta() {
+        let message = json!({
+            "method": "item/commandExecution/outputDelta",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "cmd-1",
+                "stream": "stderr",
+                "delta": "warning\n"
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        assert_eq!(events.len(), 1);
+        let AppEvent::CommandOutputDelta(output) = &events[0] else {
+            panic!("expected command output");
+        };
+        assert_eq!(output.command_id, "cmd-1");
+        assert_eq!(output.stream, agenter_core::CommandOutputStream::Stderr);
+        assert_eq!(output.delta, "warning\n");
     }
 
     #[test]
@@ -1791,6 +2481,10 @@ mod tests {
                                     "type": "plan",
                                     "id": "plan-1",
                                     "text": "# Plan\n\n1. Test"
+                                },
+                                {
+                                    "type": "contextCompaction",
+                                    "id": "compact-1"
                                 }
                             ]
                         }
@@ -1936,6 +2630,17 @@ mod tests {
                         "text": "# Plan\n\n1. Test"
                     })),
                 },
+                DiscoveredSessionHistoryItem::ProviderEvent {
+                    event_id: Some("compact-1".to_owned()),
+                    category: "compaction".to_owned(),
+                    title: "Context compacted".to_owned(),
+                    detail: None,
+                    status: Some("completed".to_owned()),
+                    provider_payload: Some(json!({
+                        "type": "contextCompaction",
+                        "id": "compact-1"
+                    })),
+                },
             ]
         );
     }
@@ -1962,6 +2667,112 @@ mod tests {
             codex_jsonrpc_error_summary("thread/start", &message),
             Some("codex thread/start failed: -32602 invalid thread/start params".to_owned())
         );
+    }
+
+    #[test]
+    fn detects_codex_turn_start_thread_not_found_errors() {
+        let error = anyhow!("codex turn/start failed: -32600 thread not found: thread-1");
+
+        assert!(is_codex_thread_not_found_error(error.as_ref()));
+        assert!(!is_codex_thread_not_found_error(
+            anyhow!("codex turn/start failed: -32600 model not found").as_ref()
+        ));
+        assert!(!is_codex_thread_not_found_error(
+            anyhow!("codex thread/resume failed: -32600 thread not found: thread-1").as_ref()
+        ));
+    }
+
+    #[test]
+    fn codex_provider_slash_command_manifest_marks_dangerous_commands() {
+        let commands = codex_provider_slash_commands();
+
+        let shell = commands
+            .iter()
+            .find(|command| command.id == "codex.shell")
+            .expect("shell command");
+        assert_eq!(shell.name, "shell");
+        assert_eq!(shell.aliases, vec!["sh"]);
+        assert_eq!(shell.danger_level, SlashCommandDangerLevel::Dangerous);
+        assert_eq!(shell.arguments[0].kind, SlashCommandArgumentKind::Rest);
+
+        let compact = commands
+            .iter()
+            .find(|command| command.id == "codex.compact")
+            .expect("compact command");
+        assert_eq!(compact.danger_level, SlashCommandDangerLevel::Safe);
+    }
+
+    #[test]
+    fn maps_codex_provider_slash_commands_to_jsonrpc_requests() {
+        let workspace = PathBuf::from("/work/agenter");
+        let compact = SlashCommandRequest {
+            command_id: "codex.compact".to_owned(),
+            arguments: json!({}),
+            raw_input: "/compact".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &compact, Some("turn-1"), &workspace)
+                .expect("compact maps");
+        assert_eq!(method, "thread/compact/start");
+        assert_eq!(params, json!({"threadId": "thread-1"}));
+
+        let steer = SlashCommandRequest {
+            command_id: "codex.steer".to_owned(),
+            arguments: json!({"input": "please focus"}),
+            raw_input: "/steer please focus".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &steer, Some("turn-1"), &workspace)
+                .expect("steer maps");
+        assert_eq!(method, "turn/steer");
+        assert_eq!(params["expectedTurnId"], "turn-1");
+        assert_eq!(params["input"][0]["text"], "please focus");
+
+        let shell = SlashCommandRequest {
+            command_id: "codex.shell".to_owned(),
+            arguments: json!({"command": "pwd | cat"}),
+            raw_input: "/shell pwd | cat".to_owned(),
+            confirmed: true,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &shell, Some("turn-1"), &workspace)
+                .expect("shell maps");
+        assert_eq!(method, "thread/shellCommand");
+        assert_eq!(params["command"], "pwd | cat");
+    }
+
+    #[test]
+    fn maps_codex_review_and_rollback_arguments() {
+        let workspace = PathBuf::from("/work/agenter");
+        let review = SlashCommandRequest {
+            command_id: "codex.review".to_owned(),
+            arguments: json!({"base": "main", "detached": true}),
+            raw_input: "/review --base main --detached".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &review, None, &workspace)
+                .expect("review maps");
+        assert_eq!(method, "review/start");
+        assert_eq!(
+            params["target"],
+            json!({"type": "baseBranch", "branch": "main"})
+        );
+        assert_eq!(params["delivery"], "detached");
+
+        let rollback = SlashCommandRequest {
+            command_id: "codex.rollback".to_owned(),
+            arguments: json!({"numTurns": 2}),
+            raw_input: "/rollback 2".to_owned(),
+            confirmed: true,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &rollback, None, &workspace)
+                .expect("rollback maps");
+        assert_eq!(method, "thread/rollback");
+        assert_eq!(params["numTurns"], 2);
     }
 
     #[test]

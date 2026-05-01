@@ -15,14 +15,18 @@ use agenter_core::{
     WorkspaceId, WorkspaceRef,
 };
 use agenter_protocol::runner::{
-    AgentInput, AgentProviderAdvertisement, DiscoveredSession, DiscoveredSessions,
-    RunnerCapabilities, RunnerClientMessage, RunnerCommand, RunnerCommandResult, RunnerError,
-    RunnerEvent, RunnerEventEnvelope, RunnerHello, RunnerResponseEnvelope, RunnerResponseOutcome,
-    PROTOCOL_VERSION,
+    AgentInput, AgentProviderAdvertisement, DiscoveredSession, DiscoveredSessionHistoryStatus,
+    DiscoveredSessions, RunnerCapabilities, RunnerClientMessage, RunnerCommand,
+    RunnerCommandResult, RunnerError, RunnerEvent, RunnerEventEnvelope, RunnerHello,
+    RunnerResponseEnvelope, RunnerResponseOutcome, RunnerServerMessage, PROTOCOL_VERSION,
+};
+use agenter_protocol::{
+    chunk_message, reassemble_message, RunnerTransportChunkFrame, RunnerTransportChunkReassembler,
+    RunnerTransportOutboundFrame,
 };
 use agents::codex::{
-    run_codex_turn_on_server, CodexAppServer, CodexTurnRequest, PendingCodexApproval,
-    PendingCodexQuestion,
+    codex_provider_slash_commands, is_codex_thread_not_found_error, run_codex_turn_on_server,
+    CodexAppServer, CodexTurnRequest, PendingCodexApproval, PendingCodexQuestion,
 };
 use agents::qwen_acp::{run_qwen_turn, PendingQwenApproval, QwenTurnRequest};
 use futures_util::{SinkExt, StreamExt};
@@ -32,11 +36,26 @@ use uuid::Uuid;
 
 const DEFAULT_CONTROL_PLANE_WS: &str = "ws://127.0.0.1:7777/api/runner/ws";
 const DEFAULT_DEV_RUNNER_TOKEN: &str = "dev-runner-token";
+const DEFAULT_RUNNER_WS_CHUNK_BYTES: usize = 1024 * 1024;
+const DEFAULT_RUNNER_WS_MAX_MESSAGE_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Clone)]
 struct CodexRunnerRuntime {
     workspace_path: PathBuf,
     server: Arc<Mutex<Option<CodexAppServer>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CodexTurnThreadAction {
+    StartNew,
+    ResumeExisting(String),
+}
+
+fn codex_turn_thread_action(external_session_id: Option<&str>) -> CodexTurnThreadAction {
+    match external_session_id {
+        Some(thread_id) => CodexTurnThreadAction::ResumeExisting(thread_id.to_owned()),
+        None => CodexTurnThreadAction::StartNew,
+    }
 }
 
 impl CodexRunnerRuntime {
@@ -68,23 +87,29 @@ impl CodexRunnerRuntime {
         let threads = server.list_threads(&self.workspace_path).await?;
         let mut discovered = Vec::with_capacity(threads.len());
         for thread in threads {
-            let history = match server
+            let (history_status, history) = match server
                 .read_thread_history(&thread.external_session_id)
                 .await
             {
-                Ok(history) => history,
+                Ok(history) => (DiscoveredSessionHistoryStatus::Loaded, history),
                 Err(error) => {
                     tracing::warn!(
                         external_session_id = %thread.external_session_id,
                         %error,
                         "failed to read codex thread history during discovery"
                     );
-                    Vec::new()
+                    (
+                        DiscoveredSessionHistoryStatus::Failed {
+                            message: error.to_string(),
+                        },
+                        Vec::new(),
+                    )
                 }
             };
             discovered.push(DiscoveredSession {
                 external_session_id: thread.external_session_id,
                 title: thread.title,
+                history_status,
                 history,
             });
         }
@@ -97,6 +122,23 @@ impl CodexRunnerRuntime {
         server.agent_options().await
     }
 
+    async fn execute_provider_command(
+        &self,
+        external_session_id: Option<String>,
+        command: agenter_core::SlashCommandRequest,
+    ) -> anyhow::Result<agenter_core::SlashCommandResult> {
+        let mut guard = self.server.lock().await;
+        let server = ensure_codex_server(&mut guard, self.workspace_path.clone()).await?;
+        if let Some(thread_id) = external_session_id {
+            server
+                .resume_thread(&thread_id, &self.workspace_path)
+                .await?;
+        }
+        server
+            .execute_provider_command(&command, &self.workspace_path)
+            .await
+    }
+
     async fn run_turn(
         &self,
         request: CodexTurnRequest,
@@ -106,20 +148,49 @@ impl CodexRunnerRuntime {
     ) -> anyhow::Result<()> {
         let mut guard = self.server.lock().await;
         let server = ensure_codex_server(&mut guard, self.workspace_path.clone()).await?;
-        if let Some(thread_id) = &request.external_session_id {
-            server.set_active_thread(thread_id.clone());
-        } else {
-            let thread_id = server.start_thread(&self.workspace_path).await?;
-            server.set_active_thread(thread_id);
-        }
-        run_codex_turn_on_server(
+        let existing_thread_id =
+            match codex_turn_thread_action(request.external_session_id.as_deref()) {
+                CodexTurnThreadAction::ResumeExisting(thread_id) => {
+                    server
+                        .resume_thread(&thread_id, &self.workspace_path)
+                        .await?;
+                    Some(thread_id)
+                }
+                CodexTurnThreadAction::StartNew => {
+                    let thread_id = server.start_thread(&self.workspace_path).await?;
+                    server.set_active_thread(thread_id);
+                    None
+                }
+            };
+        let result = run_codex_turn_on_server(
             server,
-            request,
-            event_sender,
-            pending_approvals,
-            pending_questions,
+            request.clone(),
+            event_sender.clone(),
+            pending_approvals.clone(),
+            pending_questions.clone(),
         )
-        .await
+        .await;
+        if let (Err(error), Some(thread_id)) = (&result, existing_thread_id.as_deref()) {
+            if is_codex_thread_not_found_error(error.as_ref()) {
+                tracing::warn!(
+                    session_id = %request.session_id,
+                    provider_thread_id = %thread_id,
+                    "codex turn/start reported missing thread after resume; retrying resume once"
+                );
+                server
+                    .resume_thread(thread_id, &self.workspace_path)
+                    .await?;
+                return run_codex_turn_on_server(
+                    server,
+                    request,
+                    event_sender,
+                    pending_approvals,
+                    pending_questions,
+                )
+                .await;
+            }
+        }
+        result
     }
 }
 
@@ -182,6 +253,8 @@ async fn run_codex_runner() -> anyhow::Result<()> {
     tracing::info!(url = %url, workspace = %workspace_path.display(), "connecting codex runner to control plane");
     let (socket, _) = connect_async(&url).await?;
     let (mut sender, mut receiver) = socket.split();
+    let mut server_message_reassembler =
+        RunnerTransportChunkReassembler::new(runner_ws_max_message_bytes());
     let hello = codex_hello(token, workspace_path.clone());
     let advertised_workspace = hello.workspaces.first().cloned();
     tracing::info!(runner_id = %hello.runner_id, "sending codex runner hello");
@@ -251,10 +324,9 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                 let Message::Text(text) = message? else {
                     continue;
                 };
-                let Ok(agenter_protocol::RunnerServerMessage::Command(envelope)) =
-                    serde_json::from_str::<agenter_protocol::RunnerServerMessage>(&text)
+                let Some(RunnerServerMessage::Command(envelope)) =
+                    next_runner_server_message(&mut server_message_reassembler, &text)?
                 else {
-                    tracing::warn!("codex runner ignored undecodable control-plane message");
                     continue;
                 };
 
@@ -303,6 +375,39 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                         )
                         .await?;
                     }
+                    RunnerCommand::RefreshSessions(command) => {
+                        tracing::info!(request_id = %envelope.request_id, workspace = %command.workspace.path, provider_id = %command.provider_id, "codex runner received refresh sessions");
+                        let outcome = match codex_runtime.discover_sessions().await {
+                            Ok(sessions) => {
+                                send_runner_message(
+                                    &mut sender,
+                                    RunnerClientMessage::Event(RunnerEventEnvelope {
+                                        request_id: Some(envelope.request_id.clone()),
+                                        event: RunnerEvent::SessionsDiscovered(DiscoveredSessions {
+                                            workspace: command.workspace,
+                                            provider_id: command.provider_id,
+                                            sessions,
+                                        }),
+                                    }),
+                                )
+                                .await?;
+                                RunnerResponseOutcome::Ok {
+                                    result: RunnerCommandResult::Accepted,
+                                }
+                            }
+                            Err(error) => RunnerResponseOutcome::Error {
+                                error: runner_error("codex_refresh_sessions_failed", error),
+                            },
+                        };
+                        send_runner_message(
+                            &mut sender,
+                            RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                request_id: envelope.request_id,
+                                outcome,
+                            }),
+                        )
+                        .await?;
+                    }
                     RunnerCommand::GetAgentOptions(command) => {
                         tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, "codex runner received agent options request");
                         let outcome = match codex_runtime.agent_options().await {
@@ -318,6 +423,21 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                             RunnerClientMessage::Response(RunnerResponseEnvelope {
                                 request_id: envelope.request_id,
                                 outcome,
+                            }),
+                        )
+                        .await?;
+                    }
+                    RunnerCommand::ListProviderCommands(command) => {
+                        tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, provider_id = %command.provider_id, "codex runner received provider command manifest request");
+                        send_runner_message(
+                            &mut sender,
+                            RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                request_id: envelope.request_id,
+                                outcome: RunnerResponseOutcome::Ok {
+                                    result: RunnerCommandResult::ProviderCommands {
+                                        commands: codex_provider_slash_commands(),
+                                    },
+                                },
                             }),
                         )
                         .await?;
@@ -358,6 +478,28 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                                 })).ok();
                             }
                         });
+                    }
+                    RunnerCommand::ExecuteProviderCommand(command) => {
+                        tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, command_id = %command.command.command_id, "codex runner received provider command");
+                        let outcome = match codex_runtime
+                            .execute_provider_command(command.external_session_id, command.command)
+                            .await
+                        {
+                            Ok(result) => RunnerResponseOutcome::Ok {
+                                result: RunnerCommandResult::ProviderCommandExecuted { result },
+                            },
+                            Err(error) => RunnerResponseOutcome::Error {
+                                error: runner_error("codex_provider_command_failed", error),
+                            },
+                        };
+                        send_runner_message(
+                            &mut sender,
+                            RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                request_id: envelope.request_id,
+                                outcome,
+                            }),
+                        )
+                        .await?;
                     }
                     RunnerCommand::AnswerApproval(command) => {
                         tracing::info!(session_id = %command.session_id, approval_id = %command.approval_id, "codex runner received approval answer");
@@ -445,6 +587,8 @@ async fn run_qwen_runner() -> anyhow::Result<()> {
     tracing::info!(url = %url, workspace = %workspace_path.display(), "connecting qwen runner to control plane");
     let (socket, _) = connect_async(&url).await?;
     let (mut sender, mut receiver) = socket.split();
+    let mut server_message_reassembler =
+        RunnerTransportChunkReassembler::new(runner_ws_max_message_bytes());
     let hello = qwen_hello(token, workspace_path.clone());
     tracing::info!(runner_id = %hello.runner_id, "sending qwen runner hello");
     send_runner_message(&mut sender, RunnerClientMessage::Hello(hello)).await?;
@@ -482,10 +626,9 @@ async fn run_qwen_runner() -> anyhow::Result<()> {
                 let Message::Text(text) = message? else {
                     continue;
                 };
-                let Ok(agenter_protocol::RunnerServerMessage::Command(envelope)) =
-                    serde_json::from_str::<agenter_protocol::RunnerServerMessage>(&text)
+                let Some(RunnerServerMessage::Command(envelope)) =
+                    next_runner_server_message(&mut server_message_reassembler, &text)?
                 else {
-                    tracing::warn!("qwen runner ignored undecodable control-plane message");
                     continue;
                 };
 
@@ -549,8 +692,40 @@ async fn run_qwen_runner() -> anyhow::Result<()> {
                         )
                         .await?;
                     }
+                    RunnerCommand::ListProviderCommands(command) => {
+                        tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, provider_id = %command.provider_id, "qwen runner received provider command manifest request");
+                        send_runner_message(
+                            &mut sender,
+                            RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                request_id: envelope.request_id,
+                                outcome: RunnerResponseOutcome::Ok {
+                                    result: RunnerCommandResult::ProviderCommands {
+                                        commands: Vec::new(),
+                                    },
+                                },
+                            }),
+                        )
+                        .await?;
+                    }
+                    RunnerCommand::ExecuteProviderCommand(command) => {
+                        tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, command_id = %command.command.command_id, "qwen runner received unsupported provider command");
+                        send_runner_message(
+                            &mut sender,
+                            RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                request_id: envelope.request_id,
+                                outcome: RunnerResponseOutcome::Error {
+                                    error: agenter_protocol::runner::RunnerError {
+                                        code: "qwen_provider_command_unsupported".to_owned(),
+                                        message: "Qwen ACP provider slash commands are not implemented yet.".to_owned(),
+                                    },
+                                },
+                            }),
+                        )
+                        .await?;
+                    }
                     RunnerCommand::CreateSession(_)
                     | RunnerCommand::ResumeSession(_)
+                    | RunnerCommand::RefreshSessions(_)
                     | RunnerCommand::GetAgentOptions(_)
                     | RunnerCommand::AnswerQuestion(_)
                     | RunnerCommand::InterruptSession { .. }
@@ -583,6 +758,8 @@ async fn run_fake_runner() -> anyhow::Result<()> {
     tracing::info!(url = %url, "connecting fake runner to control plane");
     let (socket, _) = connect_async(&url).await?;
     let (mut sender, mut receiver) = socket.split();
+    let mut server_message_reassembler =
+        RunnerTransportChunkReassembler::new(runner_ws_max_message_bytes());
 
     let hello = fake_hello(token);
     tracing::info!(runner_id = %hello.runner_id, "sending fake runner hello");
@@ -592,36 +769,85 @@ async fn run_fake_runner() -> anyhow::Result<()> {
         let Message::Text(text) = message? else {
             continue;
         };
-        let Ok(agenter_protocol::RunnerServerMessage::Command(envelope)) =
-            serde_json::from_str::<agenter_protocol::RunnerServerMessage>(&text)
+        let Some(RunnerServerMessage::Command(envelope)) =
+            next_runner_server_message(&mut server_message_reassembler, &text)?
         else {
-            tracing::warn!("fake runner ignored undecodable control-plane message");
             continue;
         };
 
-        if let RunnerCommand::AgentSendInput(command) = envelope.command {
-            tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, "fake runner received agent input");
-            send_runner_message(
-                &mut sender,
-                RunnerClientMessage::Response(RunnerResponseEnvelope {
-                    request_id: envelope.request_id.clone(),
-                    outcome: RunnerResponseOutcome::Ok {
-                        result: RunnerCommandResult::Accepted,
-                    },
-                }),
-            )
-            .await?;
-
-            for event in deterministic_fake_events(command.session_id, &command.input) {
-                tracing::debug!(session_id = %command.session_id, "fake runner emitting event");
+        match envelope.command {
+            RunnerCommand::AgentSendInput(command) => {
+                tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, "fake runner received agent input");
                 send_runner_message(
                     &mut sender,
-                    RunnerClientMessage::Event(RunnerEventEnvelope {
-                        request_id: Some(envelope.request_id.clone()),
-                        event: RunnerEvent::AgentEvent(agenter_protocol::AgentEvent {
-                            session_id: command.session_id,
-                            event,
+                    RunnerClientMessage::Response(RunnerResponseEnvelope {
+                        request_id: envelope.request_id.clone(),
+                        outcome: RunnerResponseOutcome::Ok {
+                            result: RunnerCommandResult::Accepted,
+                        },
+                    }),
+                )
+                .await?;
+
+                for event in deterministic_fake_events(command.session_id, &command.input) {
+                    tracing::debug!(session_id = %command.session_id, "fake runner emitting event");
+                    send_runner_message(
+                        &mut sender,
+                        RunnerClientMessage::Event(RunnerEventEnvelope {
+                            request_id: Some(envelope.request_id.clone()),
+                            event: RunnerEvent::AgentEvent(agenter_protocol::AgentEvent {
+                                session_id: command.session_id,
+                                event,
+                            }),
                         }),
+                    )
+                    .await?;
+                }
+            }
+            RunnerCommand::ListProviderCommands(_) => {
+                send_runner_message(
+                    &mut sender,
+                    RunnerClientMessage::Response(RunnerResponseEnvelope {
+                        request_id: envelope.request_id,
+                        outcome: RunnerResponseOutcome::Ok {
+                            result: RunnerCommandResult::ProviderCommands {
+                                commands: codex_provider_slash_commands(),
+                            },
+                        },
+                    }),
+                )
+                .await?;
+            }
+            RunnerCommand::ExecuteProviderCommand(command) => {
+                send_runner_message(
+                    &mut sender,
+                    RunnerClientMessage::Response(RunnerResponseEnvelope {
+                        request_id: envelope.request_id,
+                        outcome: RunnerResponseOutcome::Ok {
+                            result: RunnerCommandResult::ProviderCommandExecuted {
+                                result: agenter_core::SlashCommandResult {
+                                    accepted: true,
+                                    message: format!(
+                                        "Fake provider command {} accepted.",
+                                        command.command.command_id
+                                    ),
+                                    session: None,
+                                    provider_payload: None,
+                                },
+                            },
+                        },
+                    }),
+                )
+                .await?;
+            }
+            _ => {
+                send_runner_message(
+                    &mut sender,
+                    RunnerClientMessage::Response(RunnerResponseEnvelope {
+                        request_id: envelope.request_id,
+                        outcome: RunnerResponseOutcome::Ok {
+                            result: RunnerCommandResult::Accepted,
+                        },
                     }),
                 )
                 .await?;
@@ -641,10 +867,91 @@ async fn send_runner_message(
     >,
     message: RunnerClientMessage,
 ) -> anyhow::Result<()> {
-    sender
-        .send(Message::Text(serde_json::to_string(&message)?.into()))
-        .await?;
+    let chunk_bytes = runner_ws_chunk_bytes();
+    let frames = chunk_message(&message, chunk_bytes)?;
+    if frames.len() > 1 {
+        let json = serde_json::to_string(&message)?;
+        let chunk_start = runner_transport_chunk_start(&frames);
+        tracing::warn!(
+            direction = "runner_to_control_plane",
+            message_type = runner_client_message_type(&message),
+            transfer_id = chunk_start.as_ref().map(|start| start.transfer_id.as_str()),
+            total_bytes = chunk_start.as_ref().map(|start| start.total_bytes),
+            message_bytes = json.len(),
+            chunk_bytes,
+            frame_count = frames.len(),
+            total_chunks = chunk_start.as_ref().map(|start| start.total_chunks),
+            "sending chunked runner websocket message"
+        );
+    } else {
+        let RunnerTransportOutboundFrame::Text(json) = &frames[0];
+        tracing::debug!(
+            message_bytes = json.len(),
+            "sending runner websocket message"
+        );
+    }
+
+    for frame in frames {
+        let RunnerTransportOutboundFrame::Text(text) = frame;
+        sender.send(Message::Text(text.into())).await?;
+    }
     Ok(())
+}
+
+fn runner_client_message_type(message: &RunnerClientMessage) -> &'static str {
+    match message {
+        RunnerClientMessage::Hello(_) => "runner_hello",
+        RunnerClientMessage::Heartbeat(_) => "runner_heartbeat",
+        RunnerClientMessage::Response(_) => "runner_response",
+        RunnerClientMessage::Event(_) => "runner_event",
+    }
+}
+
+fn runner_transport_chunk_start(
+    frames: &[RunnerTransportOutboundFrame],
+) -> Option<agenter_protocol::runner_transport::RunnerChunkStart> {
+    let RunnerTransportOutboundFrame::Text(text) = frames.first()?;
+    let Ok(RunnerTransportChunkFrame::Start(start)) =
+        serde_json::from_str::<RunnerTransportChunkFrame>(text)
+    else {
+        return None;
+    };
+    Some(start)
+}
+
+fn next_runner_server_message(
+    reassembler: &mut RunnerTransportChunkReassembler,
+    text: &str,
+) -> anyhow::Result<Option<RunnerServerMessage>> {
+    match reassemble_message(reassembler, text) {
+        Ok(message) => Ok(message),
+        Err(error) => {
+            tracing::warn!(%error, "runner ignored undecodable control-plane message");
+            Ok(None)
+        }
+    }
+}
+
+fn runner_ws_chunk_bytes() -> usize {
+    env_usize(
+        "AGENTER_RUNNER_WS_CHUNK_BYTES",
+        DEFAULT_RUNNER_WS_CHUNK_BYTES,
+    )
+}
+
+fn runner_ws_max_message_bytes() -> usize {
+    env_usize(
+        "AGENTER_RUNNER_WS_MAX_MESSAGE_BYTES",
+        DEFAULT_RUNNER_WS_MAX_MESSAGE_BYTES,
+    )
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 fn runner_error(code: &str, error: anyhow::Error) -> RunnerError {
@@ -821,6 +1128,7 @@ fn app_event_session_id(event: &AppEvent) -> Option<SessionId> {
         AppEvent::ApprovalResolved(event) => Some(event.session_id),
         AppEvent::QuestionRequested(event) => Some(event.session_id),
         AppEvent::QuestionAnswered(event) => Some(event.session_id),
+        AppEvent::ProviderEvent(event) => Some(event.session_id),
         AppEvent::Error(event) => event.session_id,
     }
 }
@@ -945,5 +1253,17 @@ mod tests {
         assert!(matches!(events[1], AppEvent::CommandStarted(_)));
         assert!(matches!(events[9], AppEvent::AgentMessageDelta(_)));
         assert!(matches!(events[10], AppEvent::AgentMessageCompleted(_)));
+    }
+
+    #[test]
+    fn codex_turn_uses_resume_for_existing_provider_thread() {
+        assert_eq!(
+            codex_turn_thread_action(Some("thread-1")),
+            CodexTurnThreadAction::ResumeExisting("thread-1".to_owned())
+        );
+        assert_eq!(
+            codex_turn_thread_action(None),
+            CodexTurnThreadAction::StartNew
+        );
     }
 }

@@ -121,6 +121,8 @@ Runner logs are written to:
 tmp/agenter-logs/agenter-runner.log
 ```
 
+If the control plane logs a runner WebSocket receive error like `Space limit exceeded: Message too long`, confirm both services are using the current runner WebSocket transport. Large runner messages are split into chunk frames and reassembled before normal JSON decoding, preserving full provider payloads and discovered-history data. `AGENTER_RUNNER_WS_CHUNK_BYTES` controls the raw chunk target, and `AGENTER_RUNNER_WS_MAX_MESSAGE_BYTES` controls the maximum reassembled message size.
+
 Tail both Rust service logs:
 
 ```sh

@@ -76,6 +76,45 @@ export interface AgentTurnSettings {
   collaboration_mode?: string | null;
 }
 
+export type SlashCommandTarget = 'local' | 'runner' | 'provider';
+export type SlashCommandDangerLevel = 'safe' | 'confirm' | 'dangerous';
+export type SlashCommandArgumentKind = 'string' | 'number' | 'enum' | 'rest';
+
+export interface SlashCommandArgument {
+  name: string;
+  kind: SlashCommandArgumentKind;
+  required: boolean;
+  description?: string | null;
+  choices: string[];
+}
+
+export interface SlashCommandDefinition {
+  id: string;
+  name: string;
+  aliases: string[];
+  description: string;
+  category: string;
+  provider_id?: AgentProviderId | null;
+  target: SlashCommandTarget;
+  danger_level: SlashCommandDangerLevel;
+  arguments: SlashCommandArgument[];
+  examples: string[];
+}
+
+export interface SlashCommandRequest {
+  command_id: string;
+  arguments: Record<string, unknown>;
+  raw_input: string;
+  confirmed: boolean;
+}
+
+export interface SlashCommandResult {
+  accepted: boolean;
+  message: string;
+  session?: SessionInfo | null;
+  provider_payload?: Record<string, unknown> | null;
+}
+
 export interface AgentQuestionChoice {
   value: string;
   label: string;
@@ -118,6 +157,7 @@ export type AppEventType =
   | 'approval_resolved'
   | 'question_requested'
   | 'question_answered'
+  | 'provider_event'
   | 'error';
 
 export interface AppEvent {

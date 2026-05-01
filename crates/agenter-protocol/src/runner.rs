@@ -1,7 +1,7 @@
 use agenter_core::{
     AgentCapabilities, AgentOptions, AgentProviderId, AgentQuestionAnswer, AgentTurnSettings,
-    AppEvent, ApprovalDecision, ApprovalId, FileChangeKind, SessionId, UserMessageEvent,
-    WorkspaceRef,
+    AppEvent, ApprovalDecision, ApprovalId, FileChangeKind, SessionId, SlashCommandDefinition,
+    SlashCommandRequest, SlashCommandResult, UserMessageEvent, WorkspaceRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -80,8 +80,11 @@ pub struct RunnerCommandEnvelope {
 pub enum RunnerCommand {
     CreateSession(CreateSessionCommand),
     ResumeSession(ResumeSessionCommand),
+    RefreshSessions(RefreshSessionsCommand),
+    ListProviderCommands(ListProviderCommandsCommand),
     GetAgentOptions(GetAgentOptionsCommand),
     AgentSendInput(AgentInputCommand),
+    ExecuteProviderCommand(ProviderCommandExecutionCommand),
     InterruptSession { session_id: SessionId },
     AnswerApproval(ApprovalAnswerCommand),
     AnswerQuestion(QuestionAnswerCommand),
@@ -105,6 +108,18 @@ pub struct ResumeSessionCommand {
     pub external_session_id: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RefreshSessionsCommand {
+    pub workspace: WorkspaceRef,
+    pub provider_id: AgentProviderId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ListProviderCommandsCommand {
+    pub session_id: SessionId,
+    pub provider_id: AgentProviderId,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AgentInputCommand {
     pub session_id: SessionId,
@@ -119,6 +134,15 @@ pub struct AgentInputCommand {
 pub struct GetAgentOptionsCommand {
     pub session_id: SessionId,
     pub provider_id: AgentProviderId,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ProviderCommandExecutionCommand {
+    pub session_id: SessionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_session_id: Option<String>,
+    pub provider_id: AgentProviderId,
+    pub command: SlashCommandRequest,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -166,6 +190,12 @@ pub enum RunnerCommandResult {
     Accepted,
     AgentOptions {
         options: AgentOptions,
+    },
+    ProviderCommands {
+        commands: Vec<SlashCommandDefinition>,
+    },
+    ProviderCommandExecuted {
+        result: SlashCommandResult,
     },
     SessionCreated {
         session_id: SessionId,
@@ -217,8 +247,20 @@ pub struct DiscoveredSession {
     pub external_session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default)]
+    pub history_status: DiscoveredSessionHistoryStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<DiscoveredSessionHistoryItem>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DiscoveredSessionHistoryStatus {
+    #[default]
+    Loaded,
+    Failed {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -282,6 +324,18 @@ pub enum DiscoveredSessionHistoryItem {
         status: DiscoveredFileChangeStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
         diff: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_payload: Option<Value>,
+    },
+    ProviderEvent {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        event_id: Option<String>,
+        category: String,
+        title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         provider_payload: Option<Value>,
     },
@@ -433,6 +487,87 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_refresh_sessions_command() {
+        let workspace = WorkspaceRef {
+            workspace_id: WorkspaceId::nil(),
+            runner_id: RunnerId::nil(),
+            path: "/work/agenter".to_owned(),
+            display_name: Some("agenter".to_owned()),
+        };
+        let message = RunnerServerMessage::Command(Box::new(RunnerCommandEnvelope {
+            request_id: RequestId::from("refresh-1"),
+            command: RunnerCommand::RefreshSessions(RefreshSessionsCommand {
+                workspace: workspace.clone(),
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+            }),
+        }));
+
+        let json = serde_json::to_value(&message).expect("serialize refresh command");
+        let decoded: RunnerServerMessage =
+            serde_json::from_value(json.clone()).expect("deserialize refresh command");
+
+        assert_eq!(json["type"], "runner_command");
+        assert_eq!(json["command"]["type"], "refresh_sessions");
+        assert_eq!(json["command"]["provider_id"], AgentProviderId::CODEX);
+        assert_eq!(json["command"]["workspace"]["path"], workspace.path);
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn round_trips_provider_command_manifest_and_execution() {
+        let manifest = RunnerServerMessage::Command(Box::new(RunnerCommandEnvelope {
+            request_id: RequestId::from("provider-commands-1"),
+            command: RunnerCommand::ListProviderCommands(ListProviderCommandsCommand {
+                session_id: SessionId::nil(),
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+            }),
+        }));
+        let manifest_json = serde_json::to_value(&manifest).expect("serialize manifest request");
+        let decoded_manifest: RunnerServerMessage =
+            serde_json::from_value(manifest_json.clone()).expect("deserialize manifest request");
+        assert_eq!(manifest_json["command"]["type"], "list_provider_commands");
+        assert_eq!(decoded_manifest, manifest);
+
+        let execution = RunnerServerMessage::Command(Box::new(RunnerCommandEnvelope {
+            request_id: RequestId::from("provider-exec-1"),
+            command: RunnerCommand::ExecuteProviderCommand(ProviderCommandExecutionCommand {
+                session_id: SessionId::nil(),
+                external_session_id: Some("thread-1".to_owned()),
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                command: agenter_core::SlashCommandRequest {
+                    command_id: "codex.compact".to_owned(),
+                    arguments: serde_json::json!({}),
+                    raw_input: "/compact".to_owned(),
+                    confirmed: false,
+                },
+            }),
+        }));
+        let execution_json = serde_json::to_value(&execution).expect("serialize execution request");
+        let decoded_execution: RunnerServerMessage =
+            serde_json::from_value(execution_json.clone()).expect("deserialize execution request");
+        assert_eq!(
+            execution_json["command"]["type"],
+            "execute_provider_command"
+        );
+        assert_eq!(decoded_execution, execution);
+
+        let result = RunnerResponseOutcome::Ok {
+            result: RunnerCommandResult::ProviderCommandExecuted {
+                result: agenter_core::SlashCommandResult {
+                    accepted: true,
+                    message: "Compaction started.".to_owned(),
+                    session: None,
+                    provider_payload: None,
+                },
+            },
+        };
+        let result_json = serde_json::to_value(&result).expect("serialize result");
+        let decoded_result: RunnerResponseOutcome =
+            serde_json::from_value(result_json).expect("deserialize result");
+        assert_eq!(decoded_result, result);
+    }
+
+    #[test]
     fn round_trips_agent_event() {
         let message = RunnerClientMessage::Event(RunnerEventEnvelope {
             request_id: Some(RequestId::from("event-1")),
@@ -474,6 +609,7 @@ mod tests {
                 sessions: vec![DiscoveredSession {
                     external_session_id: "codex-thread-1".to_owned(),
                     title: Some("Existing Codex Thread".to_owned()),
+                    history_status: DiscoveredSessionHistoryStatus::Loaded,
                     history: vec![
                         DiscoveredSessionHistoryItem::UserMessage {
                             message_id: Some("user-1".to_owned()),
@@ -503,6 +639,45 @@ mod tests {
         assert_eq!(
             json["event"]["sessions"][0]["history"][0]["type"],
             "user_message"
+        );
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn round_trips_discovered_session_history_failure() {
+        let workspace = WorkspaceRef {
+            workspace_id: WorkspaceId::nil(),
+            runner_id: RunnerId::nil(),
+            path: "/work/agenter".to_owned(),
+            display_name: None,
+        };
+        let message = RunnerClientMessage::Event(RunnerEventEnvelope {
+            request_id: Some(RequestId::from("refresh-1")),
+            event: RunnerEvent::SessionsDiscovered(DiscoveredSessions {
+                workspace,
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                sessions: vec![DiscoveredSession {
+                    external_session_id: "codex-thread-failed".to_owned(),
+                    title: None,
+                    history_status: DiscoveredSessionHistoryStatus::Failed {
+                        message: "thread/read failed".to_owned(),
+                    },
+                    history: Vec::new(),
+                }],
+            }),
+        });
+
+        let json = serde_json::to_value(&message).expect("serialize discovered sessions");
+        let decoded: RunnerClientMessage =
+            serde_json::from_value(json.clone()).expect("deserialize discovered sessions");
+
+        assert_eq!(
+            json["event"]["sessions"][0]["history_status"]["status"],
+            "failed"
+        );
+        assert_eq!(
+            json["event"]["sessions"][0]["history_status"]["message"],
+            "thread/read failed"
         );
         assert_eq!(decoded, message);
     }

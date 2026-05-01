@@ -12,7 +12,8 @@ describe('requestJson', () => {
       'fetch',
       vi.fn().mockResolvedValue({
         ok: false,
-        status: 503
+        status: 503,
+        text: () => Promise.resolve('')
       })
     );
 
@@ -20,6 +21,31 @@ describe('requestJson', () => {
       name: 'ApiError',
       status: 503,
       message: 'GET /api/sessions failed with 503'
+    } satisfies Partial<ApiError>);
+  });
+
+  test('throws ApiError with server-provided JSON error detail', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 502,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              code: 'codex_provider_command_failed',
+              message: 'thread not found'
+            })
+          )
+      })
+    );
+
+    await expect(requestJson('/api/sessions/s1/slash-commands', { method: 'POST' })).rejects.toMatchObject({
+      name: 'ApiError',
+      status: 502,
+      code: 'codex_provider_command_failed',
+      detail: 'thread not found',
+      message: 'thread not found'
     } satisfies Partial<ApiError>);
   });
 

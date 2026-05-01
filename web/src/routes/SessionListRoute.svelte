@@ -1,6 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { createSession, listRunners, listRunnerWorkspaces, listSessions } from '../api/sessions';
+  import {
+    createSession,
+    listRunners,
+    listRunnerWorkspaces,
+    listSessions,
+    refreshWorkspaceProviderSessions
+  } from '../api/sessions';
   import type { SessionInfo, WorkspaceRef } from '../api/types';
   import { routeHref } from '../lib/router';
   import { sortSessionsByDate } from '../lib/sidebarTree';
@@ -11,6 +17,7 @@
   let loading = true;
   let error = '';
   let creating = false;
+  let refreshingProvider = false;
 
   async function refresh() {
     try {
@@ -55,6 +62,27 @@
       creating = false;
     }
   }
+
+  async function refreshProviderSessions() {
+    if (!firstWorkspace || refreshingProvider) {
+      return;
+    }
+    refreshingProvider = true;
+    error = '';
+    try {
+      const summary = await refreshWorkspaceProviderSessions(firstWorkspace.workspace_id, 'codex');
+      sessions = sortSessionsByDate(await listSessions());
+      pushToast({
+        severity: summary.skipped_failed_count > 0 ? 'warning' : 'info',
+        message: `Provider refresh: ${summary.refreshed_cache_count}/${summary.discovered_count} session caches refreshed.`
+      });
+    } catch {
+      error = 'Could not refresh provider sessions.';
+      pushToast({ severity: 'error', message: error });
+    } finally {
+      refreshingProvider = false;
+    }
+  }
 </script>
 
 <section class="page-section">
@@ -63,9 +91,14 @@
       <h1>Sessions</h1>
       <p>Persistent agent conversations across browser and future connector projections.</p>
     </div>
-    <button type="button" disabled={!firstWorkspace || creating} on:click={newSession}>
-      {creating ? 'Creating...' : 'New session'}
-    </button>
+    <div class="header-actions">
+      <button type="button" disabled={!firstWorkspace || refreshingProvider} on:click={refreshProviderSessions}>
+        {refreshingProvider ? 'Refreshing...' : 'Refresh provider'}
+      </button>
+      <button type="button" disabled={!firstWorkspace || creating} on:click={newSession}>
+        {creating ? 'Creating...' : 'New session'}
+      </button>
+    </div>
   </div>
 
   {#if loading}

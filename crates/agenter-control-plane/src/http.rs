@@ -40,6 +40,10 @@ pub fn app(state: AppState) -> Router {
             "/api/runners/{runner_id}/workspaces",
             get(list_runner_workspaces),
         )
+        .route(
+            "/api/workspaces/{workspace_id}/providers/{provider_id}/sessions/refresh",
+            post(refresh_workspace_provider_sessions),
+        )
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route(
             "/api/sessions/{session_id}",
@@ -48,6 +52,10 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/api/sessions/{session_id}/messages",
             post(send_session_message),
+        )
+        .route(
+            "/api/sessions/{session_id}/slash-commands",
+            get(list_slash_commands).post(execute_slash_command),
         )
         .route(
             "/api/sessions/{session_id}/agent-options",
@@ -740,6 +748,71 @@ async fn create_session(
     (StatusCode::CREATED, Json(info)).into_response()
 }
 
+async fn refresh_workspace_provider_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((workspace_id, provider_id)): Path<(agenter_core::WorkspaceId, String)>,
+) -> Response {
+    let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        tracing::debug!(%workspace_id, provider_id, "session refresh rejected missing or invalid session");
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let provider_id = agenter_core::AgentProviderId::from(provider_id);
+    let Some((runner_id, workspace)) = state
+        .resolve_runner_workspace(workspace_id, &provider_id)
+        .await
+    else {
+        tracing::warn!(
+            user_id = %user.user_id,
+            %workspace_id,
+            provider_id = %provider_id,
+            "session refresh failed: no connected runner workspace/provider match"
+        );
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let request_id = agenter_protocol::RequestId::from(Uuid::new_v4().to_string());
+    let command = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
+        agenter_protocol::runner::RunnerCommandEnvelope {
+            request_id: request_id.clone(),
+            command: agenter_protocol::runner::RunnerCommand::RefreshSessions(
+                agenter_protocol::runner::RefreshSessionsCommand {
+                    workspace,
+                    provider_id,
+                },
+            ),
+        },
+    ));
+    match state
+        .send_runner_command_and_wait(
+            runner_id,
+            request_id.clone(),
+            command,
+            RUNNER_COMMAND_RESPONSE_TIMEOUT,
+        )
+        .await
+    {
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok { .. }) => {
+            let summary = state
+                .take_refresh_summary(&request_id)
+                .await
+                .unwrap_or_default();
+            Json(summary).into_response()
+        }
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Error { error }) => {
+            tracing::warn!(
+                user_id = %user.user_id,
+                %workspace_id,
+                code = %error.code,
+                message = %error.message,
+                "session refresh failed in runner"
+            );
+            (StatusCode::BAD_GATEWAY, Json(error)).into_response()
+        }
+        Err(error) => runner_wait_error_status(error).into_response(),
+    }
+}
+
 async fn send_session_message(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -761,6 +834,18 @@ async fn send_session_message(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let settings = state.session_turn_settings(user.user_id, session_id).await;
+    let user_message = agenter_core::UserMessageEvent {
+        session_id,
+        message_id: Some(Uuid::new_v4().to_string()),
+        author_user_id: Some(user.user_id),
+        content: content.to_owned(),
+    };
+    state
+        .publish_event(
+            session_id,
+            agenter_core::AppEvent::UserMessage(user_message.clone()),
+        )
+        .await;
 
     let message = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
         agenter_protocol::runner::RunnerCommandEnvelope {
@@ -771,12 +856,7 @@ async fn send_session_message(
                     external_session_id: session.external_session_id,
                     settings,
                     input: agenter_protocol::runner::AgentInput::UserMessage {
-                        payload: agenter_core::UserMessageEvent {
-                            session_id,
-                            message_id: Some(Uuid::new_v4().to_string()),
-                            author_user_id: Some(user.user_id),
-                            content: content.to_owned(),
-                        },
+                        payload: user_message,
                     },
                 },
             ),
@@ -792,7 +872,7 @@ async fn send_session_message(
     match state
         .send_runner_command_and_wait(
             session.runner_id,
-            request_id,
+            request_id.clone(),
             message,
             RUNNER_COMMAND_RESPONSE_TIMEOUT,
         )
@@ -819,7 +899,16 @@ async fn send_session_message(
                 message = %error.message,
                 "session message rejected by runner"
             );
-            StatusCode::BAD_GATEWAY.into_response()
+            publish_runner_error_event(
+                &state,
+                session_id,
+                "send_session_message",
+                Some(&request_id),
+                &error.code,
+                &error.message,
+            )
+            .await;
+            (StatusCode::BAD_GATEWAY, Json(error)).into_response()
         }
         Ok(other) => {
             tracing::warn!(
@@ -829,7 +918,24 @@ async fn send_session_message(
                 ?other,
                 "session message received unexpected runner response"
             );
-            StatusCode::BAD_GATEWAY.into_response()
+            let detail = format!("unexpected runner response: {other:?}");
+            publish_runner_error_event(
+                &state,
+                session_id,
+                "send_session_message",
+                Some(&request_id),
+                "unexpected_runner_response",
+                &detail,
+            )
+            .await;
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(agenter_protocol::runner::RunnerError {
+                    code: "unexpected_runner_response".to_owned(),
+                    message: detail,
+                }),
+            )
+                .into_response()
         }
         Err(error) => {
             tracing::warn!(
@@ -839,7 +945,26 @@ async fn send_session_message(
                 ?error,
                 "session message failed because runner is unavailable"
             );
-            runner_wait_error_status(error).into_response()
+            let status = runner_wait_error_status(error);
+            let code = runner_wait_error_code(error);
+            let message = runner_wait_error_message(error);
+            publish_runner_error_event(
+                &state,
+                session_id,
+                "send_session_message",
+                Some(&request_id),
+                code,
+                message,
+            )
+            .await;
+            (
+                status,
+                Json(agenter_protocol::runner::RunnerError {
+                    code: code.to_owned(),
+                    message: message.to_owned(),
+                }),
+            )
+                .into_response()
         }
     }
 }
@@ -851,6 +976,1270 @@ fn runner_wait_error_status(error: RunnerCommandWaitError) -> StatusCode {
         | RunnerCommandWaitError::StaleApproval => StatusCode::SERVICE_UNAVAILABLE,
         RunnerCommandWaitError::TimedOut => StatusCode::GATEWAY_TIMEOUT,
     }
+}
+
+fn runner_wait_error_code(error: RunnerCommandWaitError) -> &'static str {
+    match error {
+        RunnerCommandWaitError::NotConnected => "runner_not_connected",
+        RunnerCommandWaitError::Closed => "runner_command_channel_closed",
+        RunnerCommandWaitError::StaleApproval => "stale_approval",
+        RunnerCommandWaitError::TimedOut => "runner_command_timeout",
+    }
+}
+
+fn runner_wait_error_message(error: RunnerCommandWaitError) -> &'static str {
+    match error {
+        RunnerCommandWaitError::NotConnected => "Runner is not connected.",
+        RunnerCommandWaitError::Closed => "Runner command channel closed.",
+        RunnerCommandWaitError::StaleApproval => "Approval is no longer pending.",
+        RunnerCommandWaitError::TimedOut => "Runner command timed out.",
+    }
+}
+
+async fn publish_runner_error_event(
+    state: &AppState,
+    session_id: agenter_core::SessionId,
+    operation: &str,
+    request_id: Option<&agenter_protocol::RequestId>,
+    code: &str,
+    message: &str,
+) {
+    state
+        .publish_event(
+            session_id,
+            agenter_core::AppEvent::Error(agenter_core::AgentErrorEvent {
+                session_id: Some(session_id),
+                code: Some(code.to_owned()),
+                message: message.to_owned(),
+                provider_payload: Some(serde_json::json!({
+                    "operation": operation,
+                    "request_id": request_id.map(|id| id.to_string()),
+                    "detail": message,
+                })),
+            }),
+        )
+        .await;
+}
+
+async fn list_slash_commands(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<agenter_core::SessionId>,
+) -> Response {
+    let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        tracing::debug!(%session_id, "slash command list rejected missing or invalid session");
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(session) = state.session(user.user_id, session_id).await else {
+        tracing::warn!(user_id = %user.user_id, %session_id, "slash command list rejected session not found");
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let mut commands = local_slash_commands(&session.provider_id);
+    let request_id = agenter_protocol::RequestId::from(Uuid::new_v4().to_string());
+    let message = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
+        agenter_protocol::runner::RunnerCommandEnvelope {
+            request_id: request_id.clone(),
+            command: agenter_protocol::runner::RunnerCommand::ListProviderCommands(
+                agenter_protocol::runner::ListProviderCommandsCommand {
+                    session_id,
+                    provider_id: session.provider_id.clone(),
+                },
+            ),
+        },
+    ));
+    match state
+        .send_runner_command_and_wait(
+            session.runner_id,
+            request_id,
+            message,
+            RUNNER_COMMAND_RESPONSE_TIMEOUT,
+        )
+        .await
+    {
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok {
+            result:
+                agenter_protocol::runner::RunnerCommandResult::ProviderCommands {
+                    commands: provider_commands,
+                },
+        }) => commands.extend(provider_commands),
+        Ok(other) => {
+            tracing::warn!(%session_id, ?other, "runner returned unexpected slash command manifest response");
+        }
+        Err(error) => {
+            tracing::debug!(%session_id, ?error, "provider slash command manifest unavailable");
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    commands.retain(|command| seen.insert(command.id.clone()));
+
+    Json(commands).into_response()
+}
+
+async fn execute_slash_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<agenter_core::SessionId>,
+    Json(request): Json<agenter_core::SlashCommandRequest>,
+) -> Response {
+    let Some(user) = authenticated_user_from_headers(&state, &headers).await else {
+        tracing::debug!(%session_id, "slash command rejected missing or invalid session");
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(session) = state.session(user.user_id, session_id).await else {
+        tracing::warn!(user_id = %user.user_id, %session_id, "slash command rejected session not found");
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(definition) = local_slash_commands(&session.provider_id)
+        .into_iter()
+        .find(|command| command.id == request.command_id)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(agenter_core::SlashCommandResult {
+                accepted: false,
+                message: format!("Unknown slash command `{}`.", request.raw_input),
+                session: None,
+                provider_payload: None,
+            }),
+        )
+            .into_response();
+    };
+    if matches!(
+        definition.danger_level,
+        agenter_core::SlashCommandDangerLevel::Confirm
+            | agenter_core::SlashCommandDangerLevel::Dangerous
+    ) && !request.confirmed
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(agenter_core::SlashCommandResult {
+                accepted: false,
+                message: format!("Command /{} requires confirmation.", definition.name),
+                session: None,
+                provider_payload: None,
+            }),
+        )
+            .into_response();
+    }
+    publish_slash_user_echo(&state, user.user_id, session.session_id, &request).await;
+
+    if request.command_id.starts_with("local.") {
+        return execute_local_slash_command(state, user.user_id, session, request, definition)
+            .await;
+    }
+    if request.command_id == "runner.interrupt" {
+        return execute_runner_interrupt_slash_command(state, session, request, definition).await;
+    }
+    if !request
+        .command_id
+        .starts_with(&format!("{}.", session.provider_id.as_str()))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(agenter_core::SlashCommandResult {
+                accepted: false,
+                message: format!("Unknown slash command `{}`.", request.raw_input),
+                session: None,
+                provider_payload: None,
+            }),
+        )
+            .into_response();
+    }
+
+    execute_provider_slash_command(state, user.user_id, session, request, definition).await
+}
+
+async fn execute_local_slash_command(
+    state: AppState,
+    user_id: agenter_core::UserId,
+    session: crate::state::RegisteredSession,
+    request: agenter_core::SlashCommandRequest,
+    definition: agenter_core::SlashCommandDefinition,
+) -> Response {
+    let session_id = session.session_id;
+    match request.command_id.as_str() {
+        "local.title" => {
+            let title = request
+                .arguments
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(str::to_owned);
+            let Some(session) = state
+                .update_session_title(user_id, session.session_id, title)
+                .await
+            else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            let result = agenter_core::SlashCommandResult {
+                accepted: true,
+                message: "Session title updated.".to_owned(),
+                session: Some(session),
+                provider_payload: None,
+            };
+            slash_result_response(
+                &state,
+                session_id,
+                &request,
+                &definition,
+                StatusCode::OK,
+                result,
+            )
+            .await
+        }
+        "local.model" | "local.mode" | "local.reasoning" => {
+            let mut settings = state
+                .session_turn_settings(user_id, session.session_id)
+                .await
+                .unwrap_or_default();
+            match request.command_id.as_str() {
+                "local.model" => {
+                    settings.model = request
+                        .arguments
+                        .get("model")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned);
+                }
+                "local.mode" => {
+                    settings.collaboration_mode = request
+                        .arguments
+                        .get("mode")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned);
+                }
+                "local.reasoning" => {
+                    settings.reasoning_effort = request
+                        .arguments
+                        .get("effort")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(agent_reasoning_effort_from_str);
+                }
+                _ => {}
+            }
+            let Some(settings) = state
+                .update_session_turn_settings(user_id, session.session_id, settings)
+                .await
+            else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            let result = agenter_core::SlashCommandResult {
+                accepted: true,
+                message: "Session settings updated.".to_owned(),
+                session: None,
+                provider_payload: Some(serde_json::to_value(settings).unwrap_or_default()),
+            };
+            slash_result_response(
+                &state,
+                session.session_id,
+                &request,
+                &definition,
+                StatusCode::OK,
+                result,
+            )
+            .await
+        }
+        "local.help" => {
+            let result = agenter_core::SlashCommandResult {
+                accepted: true,
+                message: "Type / to browse commands. Provider commands are marked with their provider and dangerous commands require confirmation.".to_owned(),
+                session: None,
+                provider_payload: None,
+            };
+            slash_result_response(
+                &state,
+                session.session_id,
+                &request,
+                &definition,
+                StatusCode::OK,
+                result,
+            )
+            .await
+        }
+        "local.new" => {
+            let title = request
+                .arguments
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(str::to_owned);
+            create_session_from_slash(state, user_id, session, request, definition, title).await
+        }
+        "local.refresh" => {
+            refresh_workspace_provider_sessions_for_user(
+                state,
+                user_id,
+                session.workspace.workspace_id,
+                session.provider_id,
+                Some((session.session_id, request, definition)),
+            )
+            .await
+        }
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(agenter_core::SlashCommandResult {
+                accepted: false,
+                message: format!("Unknown slash command `{}`.", request.raw_input),
+                session: None,
+                provider_payload: None,
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn create_session_from_slash(
+    state: AppState,
+    user_id: agenter_core::UserId,
+    source: crate::state::RegisteredSession,
+    request: agenter_core::SlashCommandRequest,
+    definition: agenter_core::SlashCommandDefinition,
+    title: Option<String>,
+) -> Response {
+    let source_session_id = source.session_id;
+    let session_id = agenter_core::SessionId::new();
+    let external_session_id = if source.provider_id.as_str() == agenter_core::AgentProviderId::CODEX
+    {
+        let request_id = agenter_protocol::RequestId::from(Uuid::new_v4().to_string());
+        let command = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
+            agenter_protocol::runner::RunnerCommandEnvelope {
+                request_id: request_id.clone(),
+                command: agenter_protocol::runner::RunnerCommand::CreateSession(
+                    agenter_protocol::runner::CreateSessionCommand {
+                        session_id,
+                        workspace: source.workspace.clone(),
+                        provider_id: source.provider_id.clone(),
+                        initial_input: None,
+                    },
+                ),
+            },
+        ));
+        match state
+            .send_runner_command_and_wait(
+                source.runner_id,
+                request_id,
+                command,
+                RUNNER_COMMAND_RESPONSE_TIMEOUT,
+            )
+            .await
+        {
+            Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok {
+                result:
+                    agenter_protocol::runner::RunnerCommandResult::SessionCreated {
+                        session_id: returned_session_id,
+                        external_session_id,
+                    },
+            }) if returned_session_id == session_id => Some(external_session_id),
+            Ok(agenter_protocol::runner::RunnerResponseOutcome::Error { error }) => {
+                let result = agenter_core::SlashCommandResult {
+                    accepted: false,
+                    message: error.message.clone(),
+                    session: None,
+                    provider_payload: Some(serde_json::json!({ "code": error.code })),
+                };
+                return slash_result_response(
+                    &state,
+                    source_session_id,
+                    &request,
+                    &definition,
+                    StatusCode::BAD_GATEWAY,
+                    result,
+                )
+                .await;
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    ?other,
+                    "unexpected runner create-session response for slash /new"
+                );
+                let result = agenter_core::SlashCommandResult {
+                    accepted: false,
+                    message: format!("Unexpected runner response: {other:?}"),
+                    session: None,
+                    provider_payload: None,
+                };
+                return slash_result_response(
+                    &state,
+                    source_session_id,
+                    &request,
+                    &definition,
+                    StatusCode::BAD_GATEWAY,
+                    result,
+                )
+                .await;
+            }
+            Err(error) => {
+                let result = agenter_core::SlashCommandResult {
+                    accepted: false,
+                    message: runner_wait_error_message(error).to_owned(),
+                    session: None,
+                    provider_payload: Some(serde_json::json!({
+                        "code": runner_wait_error_code(error),
+                    })),
+                };
+                return slash_result_response(
+                    &state,
+                    source_session_id,
+                    &request,
+                    &definition,
+                    runner_wait_error_status(error),
+                    result,
+                )
+                .await;
+            }
+        }
+    } else {
+        None
+    };
+
+    let session = state
+        .register_session(SessionRegistration {
+            session_id,
+            owner_user_id: user_id,
+            runner_id: source.runner_id,
+            workspace: source.workspace,
+            provider_id: source.provider_id,
+            title,
+            external_session_id,
+            turn_settings: source.turn_settings,
+        })
+        .await;
+    let info = agenter_core::SessionInfo {
+        session_id: session.session_id,
+        owner_user_id: session.owner_user_id,
+        runner_id: session.runner_id,
+        workspace_id: session.workspace.workspace_id,
+        provider_id: session.provider_id,
+        status: session.status,
+        external_session_id: session.external_session_id,
+        title: session.title,
+        created_at: Some(session.created_at),
+        updated_at: Some(session.updated_at),
+    };
+    state
+        .publish_event(
+            info.session_id,
+            agenter_core::AppEvent::SessionStarted(info.clone()),
+        )
+        .await;
+    let result = agenter_core::SlashCommandResult {
+        accepted: true,
+        message: "New session created.".to_owned(),
+        session: Some(info),
+        provider_payload: None,
+    };
+    slash_result_response(
+        &state,
+        source_session_id,
+        &request,
+        &definition,
+        StatusCode::OK,
+        result,
+    )
+    .await
+}
+
+async fn execute_runner_interrupt_slash_command(
+    state: AppState,
+    session: crate::state::RegisteredSession,
+    request: agenter_core::SlashCommandRequest,
+    definition: agenter_core::SlashCommandDefinition,
+) -> Response {
+    let request_id = agenter_protocol::RequestId::from(Uuid::new_v4().to_string());
+    let message = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
+        agenter_protocol::runner::RunnerCommandEnvelope {
+            request_id: request_id.clone(),
+            command: agenter_protocol::runner::RunnerCommand::InterruptSession {
+                session_id: session.session_id,
+            },
+        },
+    ));
+    match state
+        .send_runner_command_and_wait(
+            session.runner_id,
+            request_id,
+            message,
+            RUNNER_COMMAND_RESPONSE_TIMEOUT,
+        )
+        .await
+    {
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok {
+            result: agenter_protocol::runner::RunnerCommandResult::Accepted,
+        }) => {
+            let result = agenter_core::SlashCommandResult {
+                accepted: true,
+                message: "Interrupt requested.".to_owned(),
+                session: None,
+                provider_payload: None,
+            };
+            slash_result_response(
+                &state,
+                session.session_id,
+                &request,
+                &definition,
+                StatusCode::OK,
+                result,
+            )
+            .await
+        }
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Error { error }) => {
+            let result = agenter_core::SlashCommandResult {
+                accepted: false,
+                message: error.message.clone(),
+                session: None,
+                provider_payload: Some(serde_json::json!({ "code": error.code })),
+            };
+            slash_result_response(
+                &state,
+                session.session_id,
+                &request,
+                &definition,
+                StatusCode::BAD_GATEWAY,
+                result,
+            )
+            .await
+        }
+        Ok(other) => {
+            tracing::warn!(session_id = %session.session_id, ?other, "runner returned unexpected interrupt slash response");
+            let result = agenter_core::SlashCommandResult {
+                accepted: false,
+                message: format!("Unexpected runner response: {other:?}"),
+                session: None,
+                provider_payload: None,
+            };
+            slash_result_response(
+                &state,
+                session.session_id,
+                &request,
+                &definition,
+                StatusCode::BAD_GATEWAY,
+                result,
+            )
+            .await
+        }
+        Err(error) => {
+            let result = agenter_core::SlashCommandResult {
+                accepted: false,
+                message: runner_wait_error_message(error).to_owned(),
+                session: None,
+                provider_payload: Some(serde_json::json!({
+                    "code": runner_wait_error_code(error),
+                })),
+            };
+            slash_result_response(
+                &state,
+                session.session_id,
+                &request,
+                &definition,
+                runner_wait_error_status(error),
+                result,
+            )
+            .await
+        }
+    }
+}
+
+async fn execute_provider_slash_command(
+    state: AppState,
+    user_id: agenter_core::UserId,
+    session: crate::state::RegisteredSession,
+    request: agenter_core::SlashCommandRequest,
+    definition: agenter_core::SlashCommandDefinition,
+) -> Response {
+    let provider_definition = provider_slash_commands(&session.provider_id)
+        .into_iter()
+        .find(|command| command.id == request.command_id);
+    if provider_definition.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(agenter_core::SlashCommandResult {
+                accepted: false,
+                message: format!("Unknown slash command `{}`.", request.raw_input),
+                session: None,
+                provider_payload: None,
+            }),
+        )
+            .into_response();
+    }
+
+    let request_id = agenter_protocol::RequestId::from(Uuid::new_v4().to_string());
+    let command_id = request.command_id.clone();
+    let command_request = request.clone();
+    let message = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
+        agenter_protocol::runner::RunnerCommandEnvelope {
+            request_id: request_id.clone(),
+            command: agenter_protocol::runner::RunnerCommand::ExecuteProviderCommand(
+                agenter_protocol::runner::ProviderCommandExecutionCommand {
+                    session_id: session.session_id,
+                    external_session_id: session.external_session_id.clone(),
+                    provider_id: session.provider_id.clone(),
+                    command: command_request,
+                },
+            ),
+        },
+    ));
+    match state
+        .send_runner_command_and_wait(
+            session.runner_id,
+            request_id,
+            message,
+            RUNNER_COMMAND_RESPONSE_TIMEOUT,
+        )
+        .await
+    {
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok {
+            result:
+                agenter_protocol::runner::RunnerCommandResult::ProviderCommandExecuted { mut result },
+        }) => {
+            if command_id == "codex.fork" {
+                if let Some(forked) = register_forked_session_from_provider_result(
+                    &state,
+                    user_id,
+                    &session,
+                    result.provider_payload.as_ref(),
+                )
+                .await
+                {
+                    result.session = Some(forked);
+                }
+            }
+            if let Some(status) = provider_slash_session_status(&command_id) {
+                if let Some(updated) = state
+                    .update_session_status(user_id, session.session_id, status.clone())
+                    .await
+                {
+                    state
+                        .publish_event(
+                            session.session_id,
+                            agenter_core::AppEvent::SessionStatusChanged(
+                                agenter_core::SessionStatusChangedEvent {
+                                    session_id: session.session_id,
+                                    status,
+                                    reason: Some(format!(
+                                        "Updated by /{}.",
+                                        command_id
+                                            .strip_prefix("codex.")
+                                            .unwrap_or(command_id.as_str())
+                                    )),
+                                },
+                            ),
+                        )
+                        .await;
+                    result.session = Some(updated);
+                }
+            }
+            slash_result_response(
+                &state,
+                session.session_id,
+                &request,
+                &definition,
+                StatusCode::OK,
+                result,
+            )
+            .await
+        }
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Error { error }) => {
+            let result = agenter_core::SlashCommandResult {
+                accepted: false,
+                message: error.message.clone(),
+                session: None,
+                provider_payload: Some(serde_json::json!({ "code": error.code })),
+            };
+            slash_result_response(
+                &state,
+                session.session_id,
+                &request,
+                &definition,
+                StatusCode::BAD_GATEWAY,
+                result,
+            )
+            .await
+        }
+        Ok(other) => {
+            tracing::warn!(?other, "runner returned unexpected provider slash response");
+            let result = agenter_core::SlashCommandResult {
+                accepted: false,
+                message: format!("Unexpected runner response: {other:?}"),
+                session: None,
+                provider_payload: None,
+            };
+            slash_result_response(
+                &state,
+                session.session_id,
+                &request,
+                &definition,
+                StatusCode::BAD_GATEWAY,
+                result,
+            )
+            .await
+        }
+        Err(error) => {
+            let result = agenter_core::SlashCommandResult {
+                accepted: false,
+                message: runner_wait_error_message(error).to_owned(),
+                session: None,
+                provider_payload: Some(serde_json::json!({
+                    "code": runner_wait_error_code(error),
+                })),
+            };
+            slash_result_response(
+                &state,
+                session.session_id,
+                &request,
+                &definition,
+                runner_wait_error_status(error),
+                result,
+            )
+            .await
+        }
+    }
+}
+
+async fn publish_slash_user_echo(
+    state: &AppState,
+    user_id: agenter_core::UserId,
+    session_id: agenter_core::SessionId,
+    request: &agenter_core::SlashCommandRequest,
+) {
+    state
+        .publish_event(
+            session_id,
+            agenter_core::AppEvent::UserMessage(agenter_core::UserMessageEvent {
+                session_id,
+                message_id: Some(Uuid::new_v4().to_string()),
+                author_user_id: Some(user_id),
+                content: request.raw_input.clone(),
+            }),
+        )
+        .await;
+}
+
+async fn slash_result_response(
+    state: &AppState,
+    session_id: agenter_core::SessionId,
+    request: &agenter_core::SlashCommandRequest,
+    definition: &agenter_core::SlashCommandDefinition,
+    status: StatusCode,
+    result: agenter_core::SlashCommandResult,
+) -> Response {
+    publish_slash_result_event(state, session_id, request, definition, &result).await;
+    (status, Json(result)).into_response()
+}
+
+async fn publish_slash_result_event(
+    state: &AppState,
+    session_id: agenter_core::SessionId,
+    request: &agenter_core::SlashCommandRequest,
+    definition: &agenter_core::SlashCommandDefinition,
+    result: &agenter_core::SlashCommandResult,
+) {
+    state
+        .publish_event(
+            session_id,
+            agenter_core::AppEvent::ProviderEvent(agenter_core::ProviderEvent {
+                session_id,
+                provider_id: definition
+                    .provider_id
+                    .clone()
+                    .unwrap_or_else(|| agenter_core::AgentProviderId::from("local")),
+                event_id: Some(format!(
+                    "slash-{}-{}",
+                    request.command_id.replace('.', "-"),
+                    Uuid::new_v4()
+                )),
+                category: "slash_command".to_owned(),
+                title: format!("/{}", definition.name),
+                detail: Some(result.message.clone()),
+                status: Some(
+                    if result.accepted {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    }
+                    .to_owned(),
+                ),
+                provider_payload: Some(serde_json::json!({
+                    "command_id": request.command_id,
+                    "raw_input": request.raw_input,
+                    "target": definition.target,
+                    "danger_level": definition.danger_level,
+                    "arguments": request.arguments,
+                    "accepted": result.accepted,
+                    "message": result.message,
+                    "provider_payload": result.provider_payload,
+                })),
+            }),
+        )
+        .await;
+}
+
+fn provider_slash_session_status(command_id: &str) -> Option<agenter_core::SessionStatus> {
+    match command_id {
+        "codex.archive" => Some(agenter_core::SessionStatus::Archived),
+        "codex.unarchive" => Some(agenter_core::SessionStatus::Running),
+        _ => None,
+    }
+}
+
+async fn register_forked_session_from_provider_result(
+    state: &AppState,
+    user_id: agenter_core::UserId,
+    source: &crate::state::RegisteredSession,
+    provider_payload: Option<&serde_json::Value>,
+) -> Option<agenter_core::SessionInfo> {
+    let external_session_id = provider_payload
+        .and_then(|payload| {
+            string_pointer(
+                payload,
+                &[
+                    "/result/thread/id",
+                    "/result/threadId",
+                    "/thread/id",
+                    "/threadId",
+                ],
+            )
+        })?
+        .to_owned();
+    let session = state
+        .register_session(SessionRegistration {
+            session_id: agenter_core::SessionId::new(),
+            owner_user_id: user_id,
+            runner_id: source.runner_id,
+            workspace: source.workspace.clone(),
+            provider_id: source.provider_id.clone(),
+            title: Some(format!(
+                "Fork of {}",
+                source.title.as_deref().unwrap_or("session")
+            )),
+            external_session_id: Some(external_session_id),
+            turn_settings: source.turn_settings.clone(),
+        })
+        .await;
+    let info = agenter_core::SessionInfo {
+        session_id: session.session_id,
+        owner_user_id: session.owner_user_id,
+        runner_id: session.runner_id,
+        workspace_id: session.workspace.workspace_id,
+        provider_id: session.provider_id,
+        status: session.status,
+        external_session_id: session.external_session_id,
+        title: session.title,
+        created_at: Some(session.created_at),
+        updated_at: Some(session.updated_at),
+    };
+    state
+        .publish_event(
+            info.session_id,
+            agenter_core::AppEvent::SessionStarted(info.clone()),
+        )
+        .await;
+    Some(info)
+}
+
+async fn refresh_workspace_provider_sessions_for_user(
+    state: AppState,
+    user_id: agenter_core::UserId,
+    workspace_id: agenter_core::WorkspaceId,
+    provider_id: agenter_core::AgentProviderId,
+    slash_context: Option<(
+        agenter_core::SessionId,
+        agenter_core::SlashCommandRequest,
+        agenter_core::SlashCommandDefinition,
+    )>,
+) -> Response {
+    let Some((runner_id, workspace)) = state
+        .resolve_runner_workspace(workspace_id, &provider_id)
+        .await
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let request_id = agenter_protocol::RequestId::from(Uuid::new_v4().to_string());
+    let command = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
+        agenter_protocol::runner::RunnerCommandEnvelope {
+            request_id: request_id.clone(),
+            command: agenter_protocol::runner::RunnerCommand::RefreshSessions(
+                agenter_protocol::runner::RefreshSessionsCommand {
+                    workspace,
+                    provider_id: provider_id.clone(),
+                },
+            ),
+        },
+    ));
+    match state
+        .send_runner_command_and_wait(
+            runner_id,
+            request_id.clone(),
+            command,
+            RUNNER_COMMAND_RESPONSE_TIMEOUT,
+        )
+        .await
+    {
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok { .. }) => {
+            let summary = state
+                .take_refresh_summary(&request_id)
+                .await
+                .unwrap_or_default();
+            let result = agenter_core::SlashCommandResult {
+                accepted: true,
+                message: format!(
+                    "Refresh complete: {} discovered, {} cache refreshed, {} skipped.",
+                    summary.discovered_count,
+                    summary.refreshed_cache_count,
+                    summary.skipped_failed_count
+                ),
+                session: None,
+                provider_payload: Some(serde_json::to_value(summary).unwrap_or_default()),
+            };
+            if let Some((session_id, request, definition)) = slash_context {
+                slash_result_response(
+                    &state,
+                    session_id,
+                    &request,
+                    &definition,
+                    StatusCode::OK,
+                    result,
+                )
+                .await
+            } else {
+                Json(result).into_response()
+            }
+        }
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Error { error }) => {
+            tracing::warn!(%user_id, %workspace_id, code = %error.code, message = %error.message, "slash refresh failed in runner");
+            let result = agenter_core::SlashCommandResult {
+                accepted: false,
+                message: error.message.clone(),
+                session: None,
+                provider_payload: Some(serde_json::json!({ "code": error.code })),
+            };
+            if let Some((session_id, request, definition)) = slash_context {
+                slash_result_response(
+                    &state,
+                    session_id,
+                    &request,
+                    &definition,
+                    StatusCode::BAD_GATEWAY,
+                    result,
+                )
+                .await
+            } else {
+                (StatusCode::BAD_GATEWAY, Json(error)).into_response()
+            }
+        }
+        Err(error) => {
+            let result = agenter_core::SlashCommandResult {
+                accepted: false,
+                message: runner_wait_error_message(error).to_owned(),
+                session: None,
+                provider_payload: Some(serde_json::json!({
+                    "code": runner_wait_error_code(error),
+                })),
+            };
+            if let Some((session_id, request, definition)) = slash_context {
+                slash_result_response(
+                    &state,
+                    session_id,
+                    &request,
+                    &definition,
+                    runner_wait_error_status(error),
+                    result,
+                )
+                .await
+            } else {
+                runner_wait_error_status(error).into_response()
+            }
+        }
+    }
+}
+
+fn local_slash_commands(
+    provider_id: &agenter_core::AgentProviderId,
+) -> Vec<agenter_core::SlashCommandDefinition> {
+    let mut commands: Vec<agenter_core::SlashCommandDefinition> = vec![
+        slash_command(
+            "local.help",
+            "help",
+            "Show available slash commands.",
+            "local",
+            agenter_core::SlashCommandTarget::Local,
+        ),
+        slash_command(
+            "local.model",
+            "model",
+            "Set the session model.",
+            "settings",
+            agenter_core::SlashCommandTarget::Local,
+        )
+        .with_argument(
+            "model",
+            agenter_core::SlashCommandArgumentKind::String,
+            true,
+            "Model id",
+        ),
+        slash_command(
+            "local.mode",
+            "mode",
+            "Set collaboration mode.",
+            "settings",
+            agenter_core::SlashCommandTarget::Local,
+        )
+        .with_argument(
+            "mode",
+            agenter_core::SlashCommandArgumentKind::String,
+            true,
+            "Mode id",
+        ),
+        slash_command(
+            "local.reasoning",
+            "reasoning",
+            "Set reasoning effort.",
+            "settings",
+            agenter_core::SlashCommandTarget::Local,
+        )
+        .with_argument(
+            "effort",
+            agenter_core::SlashCommandArgumentKind::Enum,
+            true,
+            "Reasoning effort",
+        )
+        .with_choices(["none", "minimal", "low", "medium", "high", "xhigh"]),
+        slash_command(
+            "local.title",
+            "title",
+            "Rename this session.",
+            "session",
+            agenter_core::SlashCommandTarget::Local,
+        )
+        .with_argument(
+            "title",
+            agenter_core::SlashCommandArgumentKind::Rest,
+            true,
+            "New title",
+        ),
+        slash_command(
+            "local.refresh",
+            "refresh",
+            "Refresh provider sessions from persistence.",
+            "session",
+            agenter_core::SlashCommandTarget::Local,
+        ),
+        slash_command(
+            "local.new",
+            "new",
+            "Create a new session in this workspace.",
+            "session",
+            agenter_core::SlashCommandTarget::Local,
+        )
+        .with_argument(
+            "title",
+            agenter_core::SlashCommandArgumentKind::Rest,
+            false,
+            "Optional title",
+        ),
+        slash_command(
+            "runner.interrupt",
+            "interrupt",
+            "Interrupt the current provider turn.",
+            "runner",
+            agenter_core::SlashCommandTarget::Runner,
+        ),
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    commands.extend(provider_slash_commands(provider_id));
+    commands
+}
+
+fn provider_slash_commands(
+    provider_id: &agenter_core::AgentProviderId,
+) -> Vec<agenter_core::SlashCommandDefinition> {
+    if provider_id.as_str() != agenter_core::AgentProviderId::CODEX {
+        return Vec::new();
+    }
+    vec![
+        slash_command(
+            "codex.compact",
+            "compact",
+            "Start native Codex context compaction.",
+            "provider",
+            agenter_core::SlashCommandTarget::Provider,
+        )
+        .into(),
+        slash_command(
+            "codex.review",
+            "review",
+            "Start a native Codex code review.",
+            "provider",
+            agenter_core::SlashCommandTarget::Provider,
+        )
+        .with_argument(
+            "target",
+            agenter_core::SlashCommandArgumentKind::Rest,
+            false,
+            "Review target flags",
+        )
+        .into(),
+        slash_command(
+            "codex.steer",
+            "steer",
+            "Steer the active Codex turn.",
+            "provider",
+            agenter_core::SlashCommandTarget::Provider,
+        )
+        .with_argument(
+            "input",
+            agenter_core::SlashCommandArgumentKind::Rest,
+            true,
+            "Text to steer with",
+        )
+        .into(),
+        slash_command(
+            "codex.fork",
+            "fork",
+            "Fork the current Codex thread.",
+            "provider",
+            agenter_core::SlashCommandTarget::Provider,
+        )
+        .into(),
+        slash_command(
+            "codex.archive",
+            "archive",
+            "Archive the current Codex thread.",
+            "provider",
+            agenter_core::SlashCommandTarget::Provider,
+        )
+        .into(),
+        slash_command(
+            "codex.unarchive",
+            "unarchive",
+            "Unarchive the current Codex thread.",
+            "provider",
+            agenter_core::SlashCommandTarget::Provider,
+        )
+        .into(),
+        slash_command(
+            "codex.rollback",
+            "rollback",
+            "Drop recent turns from Codex history. Does not revert files.",
+            "provider",
+            agenter_core::SlashCommandTarget::Provider,
+        )
+        .danger(agenter_core::SlashCommandDangerLevel::Dangerous)
+        .with_argument(
+            "numTurns",
+            agenter_core::SlashCommandArgumentKind::Number,
+            true,
+            "Number of turns",
+        )
+        .into(),
+        slash_command(
+            "codex.shell",
+            "shell",
+            "Run an unsandboxed provider-native shell command.",
+            "provider",
+            agenter_core::SlashCommandTarget::Provider,
+        )
+        .danger(agenter_core::SlashCommandDangerLevel::Dangerous)
+        .with_alias("sh")
+        .with_argument(
+            "command",
+            agenter_core::SlashCommandArgumentKind::Rest,
+            true,
+            "Shell command",
+        )
+        .into(),
+    ]
+}
+
+struct SlashCommandBuilder(agenter_core::SlashCommandDefinition);
+
+impl SlashCommandBuilder {
+    fn with_argument(
+        mut self,
+        name: &str,
+        kind: agenter_core::SlashCommandArgumentKind,
+        required: bool,
+        description: &str,
+    ) -> Self {
+        self.0.arguments.push(agenter_core::SlashCommandArgument {
+            name: name.to_owned(),
+            kind,
+            required,
+            description: Some(description.to_owned()),
+            choices: Vec::new(),
+        });
+        self
+    }
+
+    fn with_choices<const N: usize>(mut self, choices: [&str; N]) -> Self {
+        if let Some(argument) = self.0.arguments.last_mut() {
+            argument.choices = choices.into_iter().map(str::to_owned).collect();
+        }
+        self
+    }
+
+    fn with_alias(mut self, alias: &str) -> Self {
+        self.0.aliases.push(alias.to_owned());
+        self
+    }
+
+    fn danger(mut self, danger_level: agenter_core::SlashCommandDangerLevel) -> Self {
+        self.0.danger_level = danger_level;
+        self
+    }
+}
+
+impl From<SlashCommandBuilder> for agenter_core::SlashCommandDefinition {
+    fn from(builder: SlashCommandBuilder) -> Self {
+        builder.0
+    }
+}
+
+fn slash_command(
+    id: &str,
+    name: &str,
+    description: &str,
+    category: &str,
+    target: agenter_core::SlashCommandTarget,
+) -> SlashCommandBuilder {
+    SlashCommandBuilder(agenter_core::SlashCommandDefinition {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        aliases: Vec::new(),
+        description: description.to_owned(),
+        category: category.to_owned(),
+        provider_id: id.split_once('.').and_then(|(prefix, _)| {
+            (!matches!(prefix, "local" | "runner"))
+                .then(|| agenter_core::AgentProviderId::from(prefix))
+        }),
+        target,
+        danger_level: agenter_core::SlashCommandDangerLevel::Safe,
+        arguments: Vec::new(),
+        examples: Vec::new(),
+    })
+}
+
+fn agent_reasoning_effort_from_str(value: &str) -> Option<agenter_core::AgentReasoningEffort> {
+    match value {
+        "none" => Some(agenter_core::AgentReasoningEffort::None),
+        "minimal" => Some(agenter_core::AgentReasoningEffort::Minimal),
+        "low" => Some(agenter_core::AgentReasoningEffort::Low),
+        "medium" => Some(agenter_core::AgentReasoningEffort::Medium),
+        "high" => Some(agenter_core::AgentReasoningEffort::High),
+        "xhigh" => Some(agenter_core::AgentReasoningEffort::Xhigh),
+        _ => None,
+    }
+}
+
+fn string_pointer<'a>(value: &'a serde_json::Value, pointers: &[&str]) -> Option<&'a str> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(serde_json::Value::as_str))
 }
 
 async fn session_agent_options(
@@ -1171,18 +2560,19 @@ async fn authenticated_user_from_headers(
 mod tests {
     use agenter_core::{
         AgentCapabilities, AgentMessageDeltaEvent, AgentProviderId, AppEvent, ApprovalDecision,
-        ApprovalId, ApprovalKind, ApprovalRequestEvent, RunnerId, SessionId, SessionInfo,
-        WorkspaceId,
+        ApprovalId, ApprovalKind, ApprovalRequestEvent, FileChangeKind, RunnerId, SessionId,
+        SessionInfo, WorkspaceId,
     };
     use agenter_protocol::{
         browser::{
             BrowserClientMessage, BrowserEventEnvelope, BrowserServerMessage, SubscribeSession,
         },
+        chunk_message,
         runner::{
             AgentEvent, AgentProviderAdvertisement, RunnerCapabilities, RunnerClientMessage,
             RunnerEvent, RunnerEventEnvelope, RunnerHello, RunnerServerMessage, PROTOCOL_VERSION,
         },
-        RequestId,
+        RequestId, RunnerTransportOutboundFrame,
     };
     use axum::{
         body::{to_bytes, Body},
@@ -1343,6 +2733,35 @@ mod tests {
             .await
             .expect("read create session body");
         serde_json::from_slice(&body).expect("session info json")
+    }
+
+    #[test]
+    fn slash_command_registry_is_provider_heavy_but_marks_dangerous_commands() {
+        let commands = local_slash_commands(&AgentProviderId::from(AgentProviderId::CODEX));
+
+        assert!(commands.iter().any(|command| command.id == "local.help"));
+        assert!(commands
+            .iter()
+            .any(|command| command.id == "runner.interrupt"));
+        assert!(commands.iter().any(|command| command.id == "codex.compact"));
+        assert!(commands.iter().any(|command| command.id == "codex.review"));
+        let shell = commands
+            .iter()
+            .find(|command| command.id == "codex.shell")
+            .expect("shell command");
+        assert_eq!(
+            shell.danger_level,
+            agenter_core::SlashCommandDangerLevel::Dangerous
+        );
+        assert_eq!(shell.target, agenter_core::SlashCommandTarget::Provider);
+
+        let qwen_commands = local_slash_commands(&AgentProviderId::from(AgentProviderId::QWEN));
+        assert!(qwen_commands
+            .iter()
+            .any(|command| command.id == "local.help"));
+        assert!(!qwen_commands
+            .iter()
+            .any(|command| command.id.starts_with("codex.")));
     }
 
     #[tokio::test]
@@ -1542,6 +2961,144 @@ mod tests {
         let info: agenter_core::SessionInfo =
             serde_json::from_slice(&body).expect("session info json");
         assert_eq!(info.external_session_id.as_deref(), Some("codex-thread-1"));
+    }
+
+    #[tokio::test]
+    async fn refresh_workspace_sessions_sends_runner_command_and_rewrites_history() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let browser_session_token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let app_service = app(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("read listener address");
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.expect("serve app");
+        });
+
+        let (runner_socket, _) = connect_async(format!("ws://{addr}/api/runner/ws"))
+            .await
+            .expect("connect runner");
+        let (mut runner_sender, mut runner_receiver) = runner_socket.split();
+        let hello = fake_hello();
+        let workspace = hello.workspaces[0].clone();
+        runner_sender
+            .send(Message::Text(
+                serde_json::to_string(&RunnerClientMessage::Hello(hello))
+                    .expect("serialize hello")
+                    .into(),
+            ))
+            .await
+            .expect("send runner hello");
+        expect_no_runner_command(&mut runner_receiver).await;
+
+        let cookie = format!("{}={browser_session_token}", auth::SESSION_COOKIE_NAME);
+        let session = create_session_through_runner(
+            app_service.clone(),
+            &cookie,
+            workspace.workspace_id,
+            &mut runner_sender,
+            &mut runner_receiver,
+        )
+        .await;
+
+        let refresh_response = tokio::spawn({
+            let app_service = app_service.clone();
+            let cookie = cookie.clone();
+            let uri = format!(
+                "/api/workspaces/{}/providers/{}/sessions/refresh",
+                workspace.workspace_id,
+                AgentProviderId::CODEX
+            );
+            async move {
+                app_service
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header(header::COOKIE, &cookie)
+                            .body(Body::empty())
+                            .expect("build refresh request"),
+                    )
+                    .await
+                    .expect("route refresh request")
+            }
+        });
+
+        let refresh_command = next_runner_command(&mut runner_receiver).await;
+        let agenter_protocol::runner::RunnerCommand::RefreshSessions(command) =
+            &refresh_command.command
+        else {
+            panic!("expected refresh sessions command");
+        };
+        assert_eq!(command.workspace.workspace_id, workspace.workspace_id);
+        assert_eq!(command.provider_id.as_str(), AgentProviderId::CODEX);
+        runner_sender
+            .send(Message::Text(
+                serde_json::to_string(&RunnerClientMessage::Event(RunnerEventEnvelope {
+                    request_id: Some(refresh_command.request_id.clone()),
+                    event: RunnerEvent::SessionsDiscovered(agenter_protocol::runner::DiscoveredSessions {
+                        workspace: workspace.clone(),
+                        provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                        sessions: vec![agenter_protocol::runner::DiscoveredSession {
+                            external_session_id: "codex-thread-1".to_owned(),
+                            title: Some("Refreshed".to_owned()),
+                            history_status: agenter_protocol::runner::DiscoveredSessionHistoryStatus::Loaded,
+                            history: vec![agenter_protocol::runner::DiscoveredSessionHistoryItem::AgentMessage {
+                                message_id: "agent-new".to_owned(),
+                                content: "new history".to_owned(),
+                            }],
+                        }],
+                    }),
+                }))
+                .expect("serialize discovered event")
+                .into(),
+            ))
+            .await
+            .expect("send discovered event");
+        send_runner_response(&mut runner_sender, refresh_command.request_id).await;
+
+        let response = refresh_response.await.expect("refresh response task");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read refresh body");
+        let summary: serde_json::Value = serde_json::from_slice(&body).expect("refresh json");
+        assert_eq!(summary["discovered_count"], 1);
+        assert_eq!(summary["refreshed_cache_count"], 1);
+        assert_eq!(summary["skipped_failed_count"], 0);
+
+        let history_response = app_service
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/sessions/{}/history", session.session_id))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .expect("build history request"),
+            )
+            .await
+            .expect("route history request");
+        assert_eq!(history_response.status(), StatusCode::OK);
+        let history_body = to_bytes(history_response.into_body(), usize::MAX)
+            .await
+            .expect("read history body");
+        let history: Vec<BrowserEventEnvelope> =
+            serde_json::from_slice(&history_body).expect("history json");
+        assert_eq!(history.len(), 1);
+        assert!(matches!(
+            history[0].event,
+            AppEvent::AgentMessageCompleted(_)
+        ));
     }
 
     async fn send_runner_app_event(
@@ -1965,19 +3522,15 @@ mod tests {
         let send_response = send_response.await.expect("send response task");
         assert_eq!(send_response.status(), StatusCode::ACCEPTED);
 
+        let browser_user_echo = next_browser_event(&mut browser_receiver).await;
+        let AppEvent::UserMessage(user_echo) = browser_user_echo.event else {
+            panic!("expected browser-submitted user echo");
+        };
+        assert_eq!(user_echo.session_id, session.session_id);
+        assert_eq!(user_echo.content, "full pipeline message");
+        assert!(user_echo.message_id.is_some());
+
         let approval_id = ApprovalId::new();
-        send_runner_app_event(
-            &mut runner_sender,
-            Some(message_command.request_id.clone()),
-            session.session_id,
-            AppEvent::UserMessage(agenter_core::UserMessageEvent {
-                session_id: session.session_id,
-                message_id: Some("user-full-1".to_owned()),
-                author_user_id: None,
-                content: "full pipeline message".to_owned(),
-            }),
-        )
-        .await;
         send_runner_app_event(
             &mut runner_sender,
             Some(message_command.request_id.clone()),
@@ -2006,7 +3559,7 @@ mod tests {
         )
         .await;
 
-        let mut saw_user = false;
+        let mut saw_user = true;
         let mut saw_approval = false;
         let mut saw_delta = false;
         for _ in 0..6 {
@@ -2607,6 +4160,105 @@ mod tests {
             panic!("expected browser error");
         };
         assert_eq!(error.code, "forbidden");
+    }
+
+    #[tokio::test]
+    async fn runner_websocket_accepts_chunked_large_discovered_history_without_truncation() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.com".to_owned(),
+            "agenter-dev-password".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let user_id = state.bootstrap_user_id().expect("bootstrap user");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("read listener address");
+        tokio::spawn({
+            let state = state.clone();
+            async move {
+                axum::serve(listener, app(state)).await.expect("serve app");
+            }
+        });
+
+        let (runner_socket, _) = connect_async(format!("ws://{addr}/api/runner/ws"))
+            .await
+            .expect("connect runner");
+        let (mut runner_sender, mut runner_receiver) = runner_socket.split();
+        let hello = fake_hello();
+        let workspace = hello.workspaces[0].clone();
+        runner_sender
+            .send(Message::Text(
+                serde_json::to_string(&RunnerClientMessage::Hello(hello))
+                    .expect("serialize hello")
+                    .into(),
+            ))
+            .await
+            .expect("send runner hello");
+        expect_no_runner_command(&mut runner_receiver).await;
+
+        let huge_diff = "x".repeat(17 * 1024 * 1024);
+        let huge_payload = "y".repeat(17 * 1024 * 1024);
+        let message = RunnerClientMessage::Event(RunnerEventEnvelope {
+            request_id: None,
+            event: RunnerEvent::SessionsDiscovered(agenter_protocol::runner::DiscoveredSessions {
+                workspace,
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                sessions: vec![agenter_protocol::runner::DiscoveredSession {
+                    external_session_id: "codex-large-thread".to_owned(),
+                    title: Some("Large Thread".to_owned()),
+                    history_status:
+                        agenter_protocol::runner::DiscoveredSessionHistoryStatus::Loaded,
+                    history: vec![
+                        agenter_protocol::runner::DiscoveredSessionHistoryItem::FileChange {
+                            change_id: "change-large".to_owned(),
+                            path: "large.patch".to_owned(),
+                            change_kind: FileChangeKind::Modify,
+                            status: agenter_protocol::runner::DiscoveredFileChangeStatus::Proposed,
+                            diff: Some(huge_diff.clone()),
+                            provider_payload: Some(serde_json::json!({
+                                "raw": huge_payload.clone()
+                            })),
+                        },
+                    ],
+                }],
+            }),
+        });
+
+        let frames = chunk_message(&message, 1024 * 1024).expect("chunk large runner message");
+        assert!(frames.len() > 3);
+        for frame in frames {
+            let RunnerTransportOutboundFrame::Text(text) = frame;
+            assert!(text.len() < 2 * 1024 * 1024);
+            runner_sender
+                .send(Message::Text(text.into()))
+                .await
+                .expect("send chunk frame");
+        }
+
+        let mut imported_session = None;
+        for _ in 0..50 {
+            let sessions = state.list_sessions(user_id).await;
+            imported_session = sessions.into_iter().find(|session| {
+                session.external_session_id.as_deref() == Some("codex-large-thread")
+            });
+            if imported_session.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let imported_session = imported_session.expect("large discovered session imported");
+        let history = state
+            .session_history(user_id, imported_session.session_id)
+            .await
+            .expect("read imported history");
+        let event_json = serde_json::to_string(&history).expect("serialize imported history");
+
+        assert!(event_json.contains(&huge_diff));
+        assert!(event_json.contains(&huge_payload));
+        assert!(!event_json.contains("agenter_truncated"));
     }
 
     fn fake_hello() -> RunnerHello {

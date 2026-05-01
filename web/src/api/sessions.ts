@@ -16,6 +16,9 @@ import type {
   BrowserEventEnvelope,
   RunnerInfo,
   SessionInfo,
+  SlashCommandDefinition,
+  SlashCommandRequest,
+  SlashCommandResult,
   WorkspaceRef
 } from './types';
 
@@ -33,6 +36,12 @@ export interface RenameSessionRequest {
   title: string | null;
 }
 
+export interface WorkspaceSessionRefreshSummary {
+  discovered_count: number;
+  refreshed_cache_count: number;
+  skipped_failed_count: number;
+}
+
 export async function listRunners(): Promise<RunnerInfo[]> {
   return normalizeRunners(await requestJson<unknown>('/api/runners'));
 }
@@ -45,6 +54,25 @@ export async function listRunnerWorkspaces(runnerId: string): Promise<WorkspaceR
 
 export async function listSessions(): Promise<SessionInfo[]> {
   return normalizeSessions(await requestJson<unknown>('/api/sessions'));
+}
+
+export async function refreshWorkspaceProviderSessions(
+  workspaceId: string,
+  providerId: string
+): Promise<WorkspaceSessionRefreshSummary> {
+  const value = await requestJson<unknown>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/providers/${encodeURIComponent(providerId)}/sessions/refresh`,
+    { method: 'POST' }
+  );
+  if (typeof value !== 'object' || value === null) {
+    throw new Error('Refresh sessions returned malformed data.');
+  }
+  const record = value as Record<string, unknown>;
+  return {
+    discovered_count: numberField(record, 'discovered_count'),
+    refreshed_cache_count: numberField(record, 'refreshed_cache_count'),
+    skipped_failed_count: numberField(record, 'skipped_failed_count')
+  };
 }
 
 export async function getSession(sessionId: string): Promise<SessionInfo> {
@@ -125,6 +153,43 @@ export async function sendSessionMessage(
   });
 }
 
+export async function listSlashCommands(sessionId: string): Promise<SlashCommandDefinition[]> {
+  const value = await requestJson<unknown>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/slash-commands`
+  );
+  return Array.isArray(value)
+    ? value
+        .map(normalizeSlashCommandDefinition)
+        .filter((command): command is SlashCommandDefinition => command !== undefined)
+    : [];
+}
+
+export async function executeSlashCommand(
+  sessionId: string,
+  request: SlashCommandRequest
+): Promise<SlashCommandResult> {
+  const value = await requestJson<unknown>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/slash-commands`,
+    {
+      method: 'POST',
+      body: JSON.stringify(request)
+    }
+  );
+  if (typeof value !== 'object' || value === null) {
+    throw new Error('Slash command returned malformed data.');
+  }
+  const record = value as Record<string, unknown>;
+  return {
+    accepted: record.accepted === true,
+    message: typeof record.message === 'string' ? record.message : '',
+    session: normalizeSessionInfo(record.session),
+    provider_payload:
+      typeof record.provider_payload === 'object' && record.provider_payload !== null
+        ? (record.provider_payload as Record<string, unknown>)
+        : null
+  };
+}
+
 export async function decideApproval(
   approvalId: string,
   decision: ApprovalDecision
@@ -147,4 +212,66 @@ export async function answerQuestion(
       body: JSON.stringify(answer)
     })
   );
+}
+
+function numberField(record: Record<string, unknown>, field: string): number {
+  const value = record[field];
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function normalizeSlashCommandDefinition(value: unknown): SlashCommandDefinition | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.id !== 'string' ||
+    typeof record.name !== 'string' ||
+    typeof record.description !== 'string' ||
+    typeof record.category !== 'string' ||
+    typeof record.target !== 'string' ||
+    typeof record.danger_level !== 'string'
+  ) {
+    return undefined;
+  }
+  return {
+    id: record.id,
+    name: record.name,
+    aliases: stringArray(record.aliases),
+    description: record.description,
+    category: record.category,
+    provider_id: typeof record.provider_id === 'string' ? record.provider_id : null,
+    target: record.target as SlashCommandDefinition['target'],
+    danger_level: record.danger_level as SlashCommandDefinition['danger_level'],
+    arguments: Array.isArray(record.arguments)
+      ? record.arguments
+          .map(normalizeSlashCommandArgument)
+          .filter(
+            (argument): argument is SlashCommandDefinition['arguments'][number] =>
+              argument !== undefined
+          )
+      : [],
+    examples: stringArray(record.examples)
+  };
+}
+
+function normalizeSlashCommandArgument(value: unknown): SlashCommandDefinition['arguments'][number] | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.name !== 'string' || typeof record.kind !== 'string') {
+    return undefined;
+  }
+  return {
+    name: record.name,
+    kind: record.kind as SlashCommandDefinition['arguments'][number]['kind'],
+    required: record.required === true,
+    description: typeof record.description === 'string' ? record.description : null,
+    choices: stringArray(record.choices)
+  };
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 }

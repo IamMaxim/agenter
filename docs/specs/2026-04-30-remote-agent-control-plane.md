@@ -125,9 +125,13 @@ The runner normalizes provider events into app events. Initial event variants:
 - `FileChangeRejected`;
 - `ApprovalRequested`;
 - `ApprovalResolved`;
+- `QuestionRequested`;
+- `QuestionAnswered`;
+- `ProviderEvent`;
 - `Error`.
 
 Provider-specific raw payload fragments may be preserved inside event metadata for debugging, but connector renderers must consume the normalized event shape.
+`ProviderEvent` is the fallback for provider notifications that are useful to show or diagnose but do not yet deserve a first-class normalized event. Provider adapters should prefer first-class variants for stable user-facing behavior, and should use provider events to avoid silently dropping newly observed or lower-priority native protocol activity.
 
 ## Trait Boundaries
 
@@ -183,11 +187,15 @@ Use `codex app-server` via stdio JSON-RPC by default. The runner should initiali
 
 Do not expose Codex app-server networking publicly. Do not expose shell-command style helper APIs through messengers in v1 unless they are explicit user-initiated operations with clear authorization.
 
+Browser slash commands are modeled as Agenter command metadata rather than Codex-only UI code. The control plane owns command listing, parsing contracts, confirmation requirements, and routing. Provider adapters own provider-native command manifests and execution. Codex exposes provider-heavy browser commands for thread compaction, review, steering, fork, archive/unarchive, rollback, and native shell command execution. Dangerous commands such as rollback and native shell execution require explicit browser confirmation before the control plane dispatches them to the runner.
+
 ### Qwen
 
 Use `qwen --acp`. The runner should initialize ACP, inspect capabilities, create or resume sessions when supported, send prompts, collect `session/update` notifications, route permission requests, and normalize chunks, tool calls, plan updates, and errors.
 
 History and resume behavior must be feature-detected.
+
+Qwen/ACP slash command support uses the same generic command registry, but its provider-native manifest can remain empty until ACP-specific commands are validated. The browser and control-plane APIs must not assume Codex command IDs or Codex JSON-RPC method names for future ACP commands.
 
 ## Approval Handling
 
@@ -232,6 +240,7 @@ Initial browser/client endpoints:
 - `POST /api/sessions/{id}/interrupt`;
 - `POST /api/sessions/{id}/archive`;
 - `GET /api/sessions/{id}/history`;
+- `POST /api/workspaces/{id}/providers/{provider_id}/sessions/refresh`;
 - `GET /api/approvals`;
 - `POST /api/approvals/{id}/decision`;
 - `GET /api/ws`.

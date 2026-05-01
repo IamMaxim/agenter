@@ -4,6 +4,7 @@
   import MarkdownBlock from '../components/MarkdownBlock.svelte';
   import PlanCard from '../components/PlanCard.svelte';
   import SubagentEventRow from '../components/SubagentEventRow.svelte';
+  import { ApiError } from '../api/http';
   import { connectSessionEvents, type BrowserEventSocket } from '../api/events';
   import {
     answerQuestion,
@@ -12,7 +13,9 @@
     getSessionSettings,
     getSession,
     getSessionHistory,
+    listSlashCommands,
     renameSession,
+    executeSlashCommand,
     sendSessionMessage,
     updateSessionSettings
   } from '../api/sessions';
@@ -23,7 +26,9 @@
     AgentReasoningEffort,
     AgentTurnSettings,
     BrowserServerMessage,
-    SessionInfo
+    SessionInfo,
+    SlashCommandDefinition,
+    SlashCommandRequest
   } from '../api/types';
   import {
     effortsForSelectedModel as effortsForModel,
@@ -37,6 +42,14 @@
     type ChatItem,
     type ChatState
   } from '../lib/chatEvents';
+  import {
+    filterSlashCommands,
+    isSlashDraft,
+    needsSlashConfirmation,
+    parseSlashCommand,
+    slashRequest,
+    slashResultMessage
+  } from '../lib/slashCommands';
 
   export let sessionId: string;
 
@@ -61,8 +74,19 @@
   let agentOptions: AgentOptions = { models: [], collaboration_modes: [] };
   let turnSettings: AgentTurnSettings = {};
   let questionDrafts: Record<string, Record<string, string[]>> = {};
+  let slashCommands: SlashCommandDefinition[] = [];
+  let slashSelectionIndex = 0;
+  let pendingDangerCommand:
+    | { command: SlashCommandDefinition; request: SlashCommandRequest }
+    | undefined;
 
   $: items = chatState.items;
+  $: slashSuggestions = filterSlashCommands(draft, slashCommands);
+  $: parsedSlash = parseSlashCommand(draft, slashCommands);
+  $: slashMenuOpen = isSlashDraft(draft) && slashSuggestions.length > 0;
+  $: if (slashSelectionIndex >= slashSuggestions.length) {
+    slashSelectionIndex = 0;
+  }
   $: if (mounted && sessionId !== activeSessionId) {
     activeSessionId = sessionId;
     void reloadAndConnect();
@@ -103,6 +127,7 @@
       }
       titleDraft = session.title ?? '';
       void loadAgentSettings(generation);
+      void loadSlashCommands(generation);
       const history = await getSessionHistory(sessionId);
       if (generation !== connectionGeneration) {
         return;
@@ -171,16 +196,93 @@
       return;
     }
 
+    if (isSlashDraft(draft)) {
+      await submitSlashCommand();
+      return;
+    }
+
     sendError = '';
     try {
       await sendSessionMessage(sessionId, { content });
       draft = '';
       await tick();
       resizeMessageTextarea();
-    } catch {
-      sendError = 'Could not send message. Check that the runner is connected.';
+    } catch (error) {
+      sendError = apiErrorMessage(error, 'Could not send message. Check that the runner is connected.');
       pushToast({ severity: 'error', message: sendError });
     }
+  }
+
+  async function loadSlashCommands(generation = connectionGeneration) {
+    try {
+      const commands = await listSlashCommands(sessionId);
+      if (generation !== connectionGeneration) {
+        return;
+      }
+      slashCommands = commands;
+      slashSelectionIndex = 0;
+    } catch {
+      if (generation !== connectionGeneration) {
+        return;
+      }
+      slashCommands = [];
+      pushToast({ severity: 'warning', message: 'Slash commands are unavailable.' });
+    }
+  }
+
+  async function submitSlashCommand(confirmed = false) {
+    const parsed = parseSlashCommand(draft, slashCommands);
+    if (!parsed.command) {
+      sendError = parsed.error ?? 'Unknown slash command.';
+      pushToast({ severity: 'error', message: sendError });
+      return;
+    }
+    if (parsed.missingRequired.length > 0) {
+      sendError = `Missing argument: ${parsed.missingRequired.join(', ')}.`;
+      pushToast({ severity: 'warning', message: sendError });
+      return;
+    }
+    const request = slashRequest(draft, parsed.command, confirmed);
+    if (
+      needsSlashConfirmation(parsed.command) &&
+      !confirmed &&
+      pendingDangerCommand?.request.raw_input !== request.raw_input
+    ) {
+      pendingDangerCommand = { command: parsed.command, request };
+      sendError = '';
+      return;
+    }
+    await runSlashCommand({ ...request, confirmed: confirmed || needsSlashConfirmation(parsed.command) });
+  }
+
+  async function runSlashCommand(request: SlashCommandRequest) {
+    sendError = '';
+    try {
+      const result = await executeSlashCommand(sessionId, request);
+      if (result.session) {
+        session = result.session;
+        titleDraft = session.title ?? '';
+        window.dispatchEvent(new CustomEvent('agenter:sessions-changed'));
+      }
+      draft = '';
+      pendingDangerCommand = undefined;
+      pushToast({
+        severity: result.accepted ? 'info' : 'warning',
+        message: slashResultMessage(result)
+      });
+      await tick();
+      resizeMessageTextarea();
+    } catch (error) {
+      sendError = apiErrorMessage(error, 'Could not execute slash command.');
+      pushToast({ severity: 'error', message: sendError });
+    }
+  }
+
+  function apiErrorMessage(error: unknown, fallback: string): string {
+    if (error instanceof ApiError) {
+      return error.detail ?? error.message;
+    }
+    return fallback;
   }
 
   async function saveTitle() {
@@ -219,10 +321,66 @@
   }
 
   function handleMessageKeydown(event: KeyboardEvent) {
+    if (slashMenuOpen) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        slashSelectionIndex = (slashSelectionIndex + 1) % slashSuggestions.length;
+        return;
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        slashSelectionIndex =
+          (slashSelectionIndex - 1 + slashSuggestions.length) % slashSuggestions.length;
+        return;
+      }
+      if (event.key === 'Tab') {
+        event.preventDefault();
+        selectSlashCommand(slashSuggestions[slashSelectionIndex]);
+        return;
+      }
+      if (
+        event.key === 'Enter' &&
+        !event.shiftKey &&
+        !event.isComposing &&
+        parsedSlash.command?.id !== slashSuggestions[slashSelectionIndex]?.id
+      ) {
+        event.preventDefault();
+        selectSlashCommand(slashSuggestions[slashSelectionIndex]);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        slashSelectionIndex = 0;
+        return;
+      }
+    }
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       void submit();
     }
+  }
+
+  function selectSlashCommand(command: SlashCommandDefinition) {
+    draft = `/${command.name}${command.arguments.length > 0 ? ' ' : ''}`;
+    slashSelectionIndex = 0;
+    pendingDangerCommand = undefined;
+    void tick().then(() => {
+      messageTextarea?.focus();
+      resizeMessageTextarea();
+    });
+  }
+
+  function argumentHint(command: SlashCommandDefinition): string {
+    return command.arguments
+      .map((argument) => `${argument.required ? '<' : '['}${argument.name}${argument.required ? '>' : ']'}`)
+      .join(' ');
+  }
+
+  function confirmPendingDangerCommand() {
+    if (!pendingDangerCommand) {
+      return;
+    }
+    void runSlashCommand({ ...pendingDangerCommand.request, confirmed: true });
   }
 
   function resizeMessageTextarea() {
@@ -502,7 +660,10 @@
             <span>Error</span>
             <strong>{item.title}</strong>
             {#if item.detail}
-              <code>{item.detail}</code>
+              <details>
+                <summary>Details</summary>
+                <pre>{item.detail}</pre>
+              </details>
             {/if}
           </article>
         {/if}
@@ -511,6 +672,46 @@
   </div>
 
   <form class="composer" on:submit|preventDefault={submit}>
+    {#if slashMenuOpen}
+      <div class="slash-menu">
+        {#each slashSuggestions as command, index (command.id)}
+          <button
+            class:selected={index === slashSelectionIndex}
+            type="button"
+            on:click={() => selectSlashCommand(command)}
+          >
+            <span class="slash-command-name">/{command.name}</span>
+            {#if command.provider_id}
+              <code>{command.provider_id}</code>
+            {/if}
+            {#if command.danger_level !== 'safe'}
+              <strong>{command.danger_level}</strong>
+            {/if}
+            <span>{command.description}</span>
+            {#if argumentHint(command)}
+              <small>{argumentHint(command)}</small>
+            {/if}
+          </button>
+        {/each}
+      </div>
+    {/if}
+    {#if pendingDangerCommand}
+      <div class="slash-confirm">
+        <span>
+          Confirm /{pendingDangerCommand.command.name}: {pendingDangerCommand.command.description}
+        </span>
+        <button
+          class="danger compact"
+          type="button"
+          on:click={confirmPendingDangerCommand}
+        >
+          Run
+        </button>
+        <button class="secondary compact" type="button" on:click={() => (pendingDangerCommand = undefined)}>
+          Cancel
+        </button>
+      </div>
+    {/if}
     <div class="composer-settings">
       <button class="secondary compact" type="button" on:click={() => (settingsOpen = !settingsOpen)}>
         Settings

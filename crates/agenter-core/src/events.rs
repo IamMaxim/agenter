@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ApprovalRequestEvent, ApprovalResolvedEvent, QuestionAnsweredEvent, QuestionRequestedEvent,
-    SessionId, SessionInfo, SessionStatus, UserId,
+    AgentProviderId, ApprovalRequestEvent, ApprovalResolvedEvent, QuestionAnsweredEvent,
+    QuestionRequestedEvent, SessionId, SessionInfo, SessionStatus, UserId,
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -27,6 +27,7 @@ pub enum AppEvent {
     ApprovalResolved(ApprovalResolvedEvent),
     QuestionRequested(QuestionRequestedEvent),
     QuestionAnswered(QuestionAnsweredEvent),
+    ProviderEvent(ProviderEvent),
     Error(AgentErrorEvent),
 }
 
@@ -194,6 +195,22 @@ pub enum FileChangeKind {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ProviderEvent {
+    pub session_id: SessionId,
+    pub provider_id: AgentProviderId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    pub category: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_payload: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AgentErrorEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<SessionId>,
@@ -255,6 +272,32 @@ mod tests {
         assert_eq!(json["payload"]["command_id"], "cmd-1");
         assert_eq!(json["payload"]["cwd"], "/work/agenter");
         assert!(json["payload"].get("provider_payload").is_none());
+    }
+
+    #[test]
+    fn round_trips_provider_event_with_raw_payload() {
+        let event = AppEvent::ProviderEvent(crate::ProviderEvent {
+            session_id: SessionId::nil(),
+            provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+            event_id: Some("compact-1".to_owned()),
+            category: "compaction".to_owned(),
+            title: "Context compacted".to_owned(),
+            detail: Some("Codex compacted the active thread context".to_owned()),
+            status: Some("completed".to_owned()),
+            provider_payload: Some(serde_json::json!({
+                "method": "thread/compacted",
+                "params": {"threadId": "thread-1", "turnId": "turn-1"}
+            })),
+        });
+
+        let json = serde_json::to_value(&event).expect("serialize event");
+        let decoded: AppEvent = serde_json::from_value(json.clone()).expect("deserialize event");
+
+        assert_eq!(json["type"], "provider_event");
+        assert_eq!(json["payload"]["provider_id"], AgentProviderId::CODEX);
+        assert_eq!(json["payload"]["category"], "compaction");
+        assert_eq!(json["payload"]["status"], "completed");
+        assert_eq!(decoded, event);
     }
 
     #[test]

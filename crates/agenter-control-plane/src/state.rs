@@ -8,8 +8,9 @@ use agenter_core::{
 use agenter_protocol::{
     browser::BrowserEventEnvelope,
     runner::{
-        DiscoveredFileChangeStatus, DiscoveredSessionHistoryItem, DiscoveredSessions,
-        DiscoveredToolStatus, RunnerCapabilities, RunnerResponseOutcome, RunnerServerMessage,
+        DiscoveredFileChangeStatus, DiscoveredSessionHistoryItem, DiscoveredSessionHistoryStatus,
+        DiscoveredSessions, DiscoveredToolStatus, RunnerCapabilities, RunnerResponseOutcome,
+        RunnerServerMessage,
     },
     RequestId,
 };
@@ -42,6 +43,7 @@ struct AppStateInner {
     runner_connections: Mutex<HashMap<RunnerId, RunnerConnection>>,
     pending_runner_responses:
         Mutex<HashMap<(RunnerId, RequestId), oneshot::Sender<RunnerResponseOutcome>>>,
+    refresh_summaries: Mutex<HashMap<RequestId, WorkspaceSessionRefreshSummary>>,
 }
 
 #[derive(Debug, Default)]
@@ -157,6 +159,19 @@ pub enum RunnerCommandWaitError {
     TimedOut,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionImportMode {
+    Automatic,
+    Forced,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct WorkspaceSessionRefreshSummary {
+    pub discovered_count: usize,
+    pub refreshed_cache_count: usize,
+    pub skipped_failed_count: usize,
+}
+
 impl AppState {
     #[must_use]
     pub fn new(runner_token: String, cookie_security: CookieSecurity) -> Self {
@@ -171,6 +186,7 @@ impl AppState {
                 sessions: Mutex::new(HashMap::new()),
                 runner_connections: Mutex::new(HashMap::new()),
                 pending_runner_responses: Mutex::new(HashMap::new()),
+                refresh_summaries: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -201,6 +217,7 @@ impl AppState {
                 sessions: Mutex::new(HashMap::new()),
                 runner_connections: Mutex::new(HashMap::new()),
                 pending_runner_responses: Mutex::new(HashMap::new()),
+                refresh_summaries: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -243,6 +260,7 @@ impl AppState {
                 sessions: Mutex::new(HashMap::new()),
                 runner_connections: Mutex::new(HashMap::new()),
                 pending_runner_responses: Mutex::new(HashMap::new()),
+                refresh_summaries: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -767,6 +785,41 @@ impl AppState {
         Some(session_info(session))
     }
 
+    pub async fn update_session_status(
+        &self,
+        user_id: UserId,
+        session_id: SessionId,
+        status: SessionStatus,
+    ) -> Option<SessionInfo> {
+        if let Some(pool) = &self.inner.db_pool {
+            return agenter_db::update_session_status(pool, user_id, session_id, status)
+                .await
+                .ok()
+                .flatten()
+                .map(|session| SessionInfo {
+                    session_id: session.session_id,
+                    owner_user_id: session.owner_user_id,
+                    runner_id: session.runner_id,
+                    workspace_id: session.workspace_id,
+                    provider_id: session.provider_id,
+                    status: session.status,
+                    external_session_id: session.external_session_id,
+                    title: session.title,
+                    created_at: Some(session.created_at),
+                    updated_at: Some(session.updated_at),
+                });
+        }
+
+        let mut registry = self.inner.registry.lock().await;
+        let session = registry.sessions.get_mut(&session_id)?;
+        if session.owner_user_id != user_id {
+            return None;
+        }
+        session.status = status;
+        session.updated_at = Utc::now();
+        Some(session_info(session))
+    }
+
     pub async fn session(
         &self,
         user_id: UserId,
@@ -1137,7 +1190,12 @@ impl AppState {
         &self,
         runner_id: RunnerId,
         discovered: DiscoveredSessions,
-    ) {
+        mode: SessionImportMode,
+    ) -> WorkspaceSessionRefreshSummary {
+        let mut summary = WorkspaceSessionRefreshSummary {
+            discovered_count: discovered.sessions.len(),
+            ..WorkspaceSessionRefreshSummary::default()
+        };
         let Some(owner_user_id) = self
             .inner
             .bootstrap_admin
@@ -1145,7 +1203,8 @@ impl AppState {
             .map(|admin| admin.user.user_id)
         else {
             tracing::warn!(%runner_id, "cannot import discovered sessions without bootstrap admin user");
-            return;
+            summary.skipped_failed_count = summary.discovered_count;
+            return summary;
         };
 
         if let Some(pool) = &self.inner.db_pool {
@@ -1164,7 +1223,8 @@ impl AppState {
                     %error,
                     "failed to persist discovered session workspace"
                 );
-                return;
+                summary.skipped_failed_count = summary.discovered_count;
+                return summary;
             }
         }
 
@@ -1205,19 +1265,35 @@ impl AppState {
                     }
                 }
             } else {
-                let now = Utc::now();
-                RegisteredSession {
-                    session_id: SessionId::new(),
-                    owner_user_id,
-                    runner_id,
-                    workspace: discovered.workspace.clone(),
-                    provider_id: discovered.provider_id.clone(),
-                    status: SessionStatus::Running,
-                    title: discovered_session.title.clone(),
-                    external_session_id: Some(discovered_session.external_session_id.clone()),
-                    turn_settings: None,
-                    created_at: now,
-                    updated_at: now,
+                let mut registry = self.inner.registry.lock().await;
+                if let Some(existing) = registry
+                    .sessions
+                    .values_mut()
+                    .find(|session| {
+                        session.runner_id == runner_id
+                            && session.workspace.workspace_id == discovered.workspace.workspace_id
+                            && session.provider_id == discovered.provider_id
+                            && session.external_session_id.as_deref()
+                                == Some(discovered_session.external_session_id.as_str())
+                    })
+                    .cloned()
+                {
+                    existing
+                } else {
+                    let now = Utc::now();
+                    RegisteredSession {
+                        session_id: SessionId::new(),
+                        owner_user_id,
+                        runner_id,
+                        workspace: discovered.workspace.clone(),
+                        provider_id: discovered.provider_id.clone(),
+                        status: SessionStatus::Running,
+                        title: discovered_session.title.clone(),
+                        external_session_id: Some(discovered_session.external_session_id.clone()),
+                        turn_settings: None,
+                        created_at: now,
+                        updated_at: now,
+                    }
                 }
             };
 
@@ -1233,7 +1309,15 @@ impl AppState {
                 owner_user_id,
                 &discovered_session.history,
             );
-            if !discovered_events.is_empty() {
+            let history_loaded = matches!(
+                discovered_session.history_status,
+                DiscoveredSessionHistoryStatus::Loaded
+            );
+            if !history_loaded {
+                summary.skipped_failed_count += 1;
+                continue;
+            }
+            if !discovered_events.is_empty() || matches!(mode, SessionImportMode::Forced) {
                 if let Some(pool) = &self.inner.db_pool {
                     if let Err(error) =
                         agenter_db::clear_event_cache(pool, session.session_id).await
@@ -1249,6 +1333,7 @@ impl AppState {
                         .cache
                         .clear();
                 }
+                summary.refreshed_cache_count += 1;
                 for event in discovered_events {
                     self.store_event(
                         session.session_id,
@@ -1261,6 +1346,26 @@ impl AppState {
                 }
             }
         }
+        summary
+    }
+
+    pub async fn record_refresh_summary(
+        &self,
+        request_id: RequestId,
+        summary: WorkspaceSessionRefreshSummary,
+    ) {
+        self.inner
+            .refresh_summaries
+            .lock()
+            .await
+            .insert(request_id, summary);
+    }
+
+    pub async fn take_refresh_summary(
+        &self,
+        request_id: &RequestId,
+    ) -> Option<WorkspaceSessionRefreshSummary> {
+        self.inner.refresh_summaries.lock().await.remove(request_id)
     }
 }
 
@@ -1413,6 +1518,23 @@ fn discovered_history_events(
                     }
                 }
             }
+            DiscoveredSessionHistoryItem::ProviderEvent {
+                event_id,
+                category,
+                title,
+                detail,
+                status,
+                provider_payload,
+            } => vec![AppEvent::ProviderEvent(agenter_core::ProviderEvent {
+                session_id,
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                event_id: event_id.clone(),
+                category: category.clone(),
+                title: title.clone(),
+                detail: detail.clone(),
+                status: status.clone(),
+                provider_payload: provider_payload.clone(),
+            })],
         })
         .collect()
 }
@@ -1438,6 +1560,7 @@ fn app_event_name(event: &AppEvent) -> &'static str {
         AppEvent::ApprovalResolved(_) => "approval_resolved",
         AppEvent::QuestionRequested(_) => "question_requested",
         AppEvent::QuestionAnswered(_) => "question_answered",
+        AppEvent::ProviderEvent(_) => "provider_event",
         AppEvent::Error(_) => "error",
     }
 }
@@ -1545,6 +1668,174 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn forced_import_rewrites_loaded_history_cache() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let owner_user_id = state
+            .inner
+            .bootstrap_admin
+            .as_ref()
+            .expect("bootstrap admin")
+            .user
+            .user_id;
+        let runner_id = RunnerId::new();
+        let workspace = WorkspaceRef {
+            workspace_id: WorkspaceId::new(),
+            runner_id,
+            path: "/work/agenter".to_owned(),
+            display_name: Some("agenter".to_owned()),
+        };
+        let session = state
+            .register_session(SessionRegistration {
+                session_id: SessionId::new(),
+                owner_user_id,
+                runner_id,
+                workspace: workspace.clone(),
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                title: Some("Old".to_owned()),
+                external_session_id: Some("codex-thread-1".to_owned()),
+                turn_settings: None,
+            })
+            .await;
+        state
+            .publish_event(
+                session.session_id,
+                AppEvent::UserMessage(UserMessageEvent {
+                    session_id: session.session_id,
+                    message_id: Some("old".to_owned()),
+                    author_user_id: Some(owner_user_id),
+                    content: "old cache".to_owned(),
+                }),
+            )
+            .await;
+
+        let summary = state
+            .import_discovered_sessions(
+                runner_id,
+                DiscoveredSessions {
+                    workspace,
+                    provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                    sessions: vec![agenter_protocol::DiscoveredSession {
+                        external_session_id: "codex-thread-1".to_owned(),
+                        title: Some("New".to_owned()),
+                        history_status: DiscoveredSessionHistoryStatus::Loaded,
+                        history: vec![DiscoveredSessionHistoryItem::AgentMessage {
+                            message_id: "agent-new".to_owned(),
+                            content: "new cache".to_owned(),
+                        }],
+                    }],
+                },
+                SessionImportMode::Forced,
+            )
+            .await;
+
+        let history = state
+            .session_history(owner_user_id, session.session_id)
+            .await
+            .expect("history");
+        assert_eq!(
+            summary,
+            WorkspaceSessionRefreshSummary {
+                discovered_count: 1,
+                refreshed_cache_count: 1,
+                skipped_failed_count: 0,
+            }
+        );
+        assert_eq!(history.len(), 1);
+        assert!(matches!(
+            history[0].event,
+            AppEvent::AgentMessageCompleted(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn forced_import_keeps_cache_when_history_read_failed() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let owner_user_id = state
+            .inner
+            .bootstrap_admin
+            .as_ref()
+            .expect("bootstrap admin")
+            .user
+            .user_id;
+        let runner_id = RunnerId::new();
+        let workspace = WorkspaceRef {
+            workspace_id: WorkspaceId::new(),
+            runner_id,
+            path: "/work/agenter".to_owned(),
+            display_name: Some("agenter".to_owned()),
+        };
+        let session = state
+            .register_session(SessionRegistration {
+                session_id: SessionId::new(),
+                owner_user_id,
+                runner_id,
+                workspace: workspace.clone(),
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                title: Some("Old".to_owned()),
+                external_session_id: Some("codex-thread-1".to_owned()),
+                turn_settings: None,
+            })
+            .await;
+        state
+            .publish_event(
+                session.session_id,
+                AppEvent::UserMessage(UserMessageEvent {
+                    session_id: session.session_id,
+                    message_id: Some("old".to_owned()),
+                    author_user_id: Some(owner_user_id),
+                    content: "old cache".to_owned(),
+                }),
+            )
+            .await;
+
+        let summary = state
+            .import_discovered_sessions(
+                runner_id,
+                DiscoveredSessions {
+                    workspace,
+                    provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                    sessions: vec![agenter_protocol::DiscoveredSession {
+                        external_session_id: "codex-thread-1".to_owned(),
+                        title: Some("New".to_owned()),
+                        history_status: DiscoveredSessionHistoryStatus::Failed {
+                            message: "thread/read failed".to_owned(),
+                        },
+                        history: Vec::new(),
+                    }],
+                },
+                SessionImportMode::Forced,
+            )
+            .await;
+
+        let history = state
+            .session_history(owner_user_id, session.session_id)
+            .await
+            .expect("history");
+        assert_eq!(
+            summary,
+            WorkspaceSessionRefreshSummary {
+                discovered_count: 1,
+                refreshed_cache_count: 0,
+                skipped_failed_count: 1,
+            }
+        );
+        assert_eq!(history.len(), 1);
+        assert!(matches!(history[0].event, AppEvent::UserMessage(_)));
+    }
+
     #[test]
     fn discovered_history_items_are_rewritten_to_app_session_events() {
         let session_id = SessionId::nil();
@@ -1604,6 +1895,14 @@ mod tests {
                     content: "1. Test".to_owned(),
                     provider_payload: None,
                 },
+                DiscoveredSessionHistoryItem::ProviderEvent {
+                    event_id: Some("compact-1".to_owned()),
+                    category: "compaction".to_owned(),
+                    title: "Context compacted".to_owned(),
+                    detail: None,
+                    status: Some("completed".to_owned()),
+                    provider_payload: None,
+                },
             ],
         );
 
@@ -1615,6 +1914,7 @@ mod tests {
         assert!(matches!(events[5], AppEvent::ToolCompleted(_)));
         assert!(matches!(events[6], AppEvent::FileChangeApplied(_)));
         assert!(matches!(events[7], AppEvent::PlanUpdated(_)));
+        assert!(matches!(events[8], AppEvent::ProviderEvent(_)));
     }
 
     #[test]

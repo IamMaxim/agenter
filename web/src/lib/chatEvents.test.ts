@@ -506,4 +506,119 @@ describe('chat event state', () => {
       states: []
     });
   });
+
+  test('renders provider events as compact inline rows', () => {
+    let state = createChatState();
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-provider-compact',
+      event: {
+        type: 'provider_event',
+        payload: {
+          session_id: 's1',
+          provider_id: 'codex',
+          event_id: 'compact-1',
+          category: 'compaction',
+          title: 'Context compacted',
+          detail: 'Codex compacted the active thread context',
+          status: 'completed'
+        }
+      }
+    });
+
+    expect(state.items).toEqual([
+      {
+        id: 'event:provider:compact-1',
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        title: 'Context compacted',
+        detail: 'Codex compacted the active thread context',
+        status: 'completed'
+      }
+    ]);
+  });
+
+  test('renders slash command echo and execution result without merging them', () => {
+    let state = createChatState();
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-slash-user',
+      event: {
+        type: 'user_message',
+        payload: {
+          session_id: 's1',
+          message_id: 'slash-user-1',
+          content: '/compact'
+        }
+      }
+    });
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-slash-result',
+      event: {
+        type: 'provider_event',
+        payload: {
+          session_id: 's1',
+          provider_id: 'codex',
+          event_id: 'slash-codex-compact',
+          category: 'slash_command',
+          title: '/compact',
+          detail: 'Codex compaction started.',
+          status: 'accepted',
+          provider_payload: {
+            command_id: 'codex.compact',
+            target: 'provider',
+            danger_level: 'safe'
+          }
+        }
+      }
+    });
+
+    expect(state.items).toMatchObject([
+      {
+        kind: 'user',
+        content: '/compact'
+      },
+      {
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        title: '/compact',
+        detail: 'Codex compaction started.',
+        status: 'accepted'
+      }
+    ]);
+  });
+
+  test('renders error code and provider payload details', () => {
+    let state = createChatState();
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-error',
+      event: {
+        type: 'error',
+        payload: {
+          session_id: 's1',
+          code: 'codex_turn_failed',
+          message: 'codex turn/start failed',
+          provider_payload: {
+            operation: 'send_session_message',
+            request_id: 'req-1',
+            detail: 'thread not found'
+          }
+        }
+      }
+    });
+
+    expect(state.items[0]).toMatchObject({
+      kind: 'error',
+      title: 'codex turn/start failed',
+      detail: expect.stringContaining('codex_turn_failed')
+    });
+    expect(state.items[0]).toMatchObject({
+      detail: expect.stringContaining('thread not found')
+    });
+  });
 });

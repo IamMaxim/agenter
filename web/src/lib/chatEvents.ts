@@ -245,6 +245,15 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
       });
     case 'question_answered':
       return updateQuestionAnswered(items, payload);
+    case 'provider_event':
+      return upsert(items, {
+        id: `event:provider:${stringField(payload, 'event_id') ?? eventId ?? fallbackId(event)}`,
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        title: stringField(payload, 'title') ?? providerEventTitle(payload),
+        detail: stringField(payload, 'detail') ?? providerEventDetail(payload),
+        status: stringField(payload, 'status') ?? 'received'
+      });
     case 'error':
       return [
         ...items,
@@ -252,7 +261,7 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
           id: `error:${items.length}`,
           kind: 'error',
           title: stringField(payload, 'message') ?? 'Agent error',
-          detail: stringField(payload, 'code')
+          detail: errorDetail(payload)
         }
       ];
     default:
@@ -268,6 +277,22 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
         }
       ];
   }
+}
+
+function errorDetail(payload: Record<string, unknown>): string | undefined {
+  const parts = [
+    stringField(payload, 'code') ? `code: ${stringField(payload, 'code')}` : undefined,
+    providerPayloadDetail(payload)
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join('\n\n') : undefined;
+}
+
+function providerPayloadDetail(payload: Record<string, unknown>): string | undefined {
+  const provider = payload.provider_payload;
+  if (typeof provider === 'object' && provider !== null) {
+    return previewJson(provider);
+  }
+  return undefined;
 }
 
 function questionFields(payload: Record<string, unknown>): AgentQuestionField[] {
@@ -511,6 +536,31 @@ function providerPayload(payload: Record<string, unknown>): Record<string, unkno
     return input as Record<string, unknown>;
   }
   return payload;
+}
+
+function providerEventTitle(payload: Record<string, unknown>): string {
+  const category = stringField(payload, 'category');
+  if (category === 'compaction') {
+    return 'Context compacted';
+  }
+  if (category === 'warning') {
+    return 'Provider warning';
+  }
+  if (category === 'reasoning') {
+    return 'Reasoning update';
+  }
+  if (category === 'model') {
+    return 'Model update';
+  }
+  return 'Provider event';
+}
+
+function providerEventDetail(payload: Record<string, unknown>): string | undefined {
+  const provider = payload.provider_payload;
+  if (typeof provider === 'object' && provider !== null) {
+    return previewJson(provider);
+  }
+  return stringField(payload, 'category');
 }
 
 function receiverThreadIds(payload: Record<string, unknown>): string | undefined {
