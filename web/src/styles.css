@@ -25,14 +25,14 @@ textarea {
 }
 
 button {
-  min-height: 2rem;
   border: 1px solid #e7e9ee;
-  border-radius: 8px;
-  padding: 0.45rem 0.85rem;
+  border-radius: 4px;
+  padding: 4px 12px;
   color: #101217;
   background: #e7e9ee;
   cursor: pointer;
   font-weight: 700;
+  font-size: 11.5px;
 }
 
 button:hover:not(:disabled) {
@@ -1556,7 +1556,7 @@ body {
 
 button {
   border-color: var(--accent);
-  border-radius: 6px;
+  border-radius: 4px;
   color: var(--bg);
   background: var(--accent);
   font-weight: 600;
@@ -2005,6 +2005,32 @@ code {
   gap: 3px;
 }
 
+.chat-back-button {
+  display: none;
+  grid-column: 1 / -1;
+  align-items: center;
+  gap: 4px;
+  width: fit-content;
+  min-height: 26px;
+  border: 0;
+  border-radius: 6px;
+  padding: 3px 8px;
+  color: var(--fg-muted);
+  background: transparent;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px;
+}
+
+.chat-back-button:hover:not(:disabled) {
+  color: var(--fg);
+  background: var(--raised-hi);
+}
+
+.chat-back-button svg {
+  color: var(--fg-muted);
+  transform: rotate(180deg);
+}
+
 .chat-title-button:hover {
   background: var(--raised);
 }
@@ -2299,20 +2325,40 @@ code {
     grid-template-columns: 1fr;
   }
 
-  .sidebar {
+  .app-shell:not(.mobile-chat) .sidebar {
     position: static;
-    height: auto;
-    max-height: 45vh;
+    display: grid;
+    height: 100vh;
+    max-height: none;
     border-right: 0;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 0;
   }
 
-  .session-tree {
-    max-height: 26vh;
+  .app-shell:not(.mobile-chat) .session-tree {
+    max-height: none;
   }
 
-  .content {
+  .app-shell:not(.mobile-chat) nav {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .app-shell:not(.mobile-chat) .content {
+    display: none;
+  }
+
+  .app-shell.mobile-chat .sidebar {
+    display: none;
+  }
+
+  .app-shell.mobile-chat .content {
     padding: 0;
+    display: block;
+  }
+
+  .app-shell.mobile-chat .chat-layout {
+    height: 100vh;
+    min-height: 100vh;
   }
 
   .chat-header {
@@ -2843,6 +2889,18 @@ code {
   .event-card.log-card {
     max-width: 100%;
     padding: 12px;
+  }
+
+  .app-shell.mobile-chat .chat-back-button {
+    display: inline-flex;
+  }
+
+  .app-shell.mobile-chat .chat-heading {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
   }
 
   .composer-bottom-bar {

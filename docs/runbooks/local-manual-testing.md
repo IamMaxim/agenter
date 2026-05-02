@@ -158,6 +158,19 @@ To add browser console diagnostics for API and WebSocket lifecycle:
 just web-debug
 ```
 
+### Mobile + PWA Checks
+
+In a mobile viewport (or device emulation), confirm:
+
+- Opening `#/` shows the session list only;
+- opening a session hides the list and shows the full chat view;
+- the chat top bar has a **Sessions** back button that returns to the list.
+
+To verify installability:
+
+- open DevTools → Application → Manifest and ensure the manifest and icons load;
+- confirm a service worker registers (Application → Service Workers).
+
 This sets `VITE_AGENTER_DEBUG=1`. The default `just web` stays quiet.
 
 ## Optional Loki and Grafana

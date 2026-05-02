@@ -77,7 +77,7 @@
 {:else if !user || route.name === 'login'}
   <LoginRoute onLogin={afterLogin} />
 {:else}
-  <div class="app-shell">
+  <div class="app-shell" class:mobile-chat={route.name === 'chat'}>
     <SessionTreeSidebar {user} {route} onSignOut={signOut} />
 
     <main class="content">

@@ -63,3 +63,19 @@ Align the browser workbench with the checked-in mockups: sidebar/navigation from
 - Sidebar now refreshes in-place after reload completion and shows success/partial-failure/error toast feedback.
 - Added minimal fixed-position menu styling in `web/src/styles.css` (`.runner-context-menu` and `.runner-context-menu-item`) and menu close behavior for outside-click, `Escape`, and route-triggered refreshes.
 - Verification plan remains: `cd web && npm run check && npm run lint && npm run test && npm run build` plus manual browser menu-flow validation.
+
+## 2026-05-03 Mobile Detail Split + PWA
+
+- Added route-aware master-detail behavior for mobile widths: the sidebar and chat list are displayed on `/` (home), while `/sessions/{id}` displays only chat in full-height mode.
+- Introduced `class:mobile-chat` on the app shell in `web/src/App.svelte` and mobile media rules in `web/src/styles.css` to hide the sidebar only for chat routes under the mobile breakpoint.
+- Added a mobile-only chat back button in `web/src/routes/ChatRoute.svelte` that navigates to `#/`.
+- Added PWA baseline support (`web/public/manifest.webmanifest`, `web/public/sw.js`, `web/public/icons/icon.svg`, `web/index.html`, `web/src/main.ts`):
+  - manifest metadata + app icons;
+  - service-worker install/activate/fetch behavior for static cache + offline fallback;
+  - service-worker registration in app bootstrap.
+- Verification:
+  - `cd web && npm run check`
+  - `npm run lint`
+  - `npm run test`
+  - `npm run build`
+  - Manual: open a real mobile viewport, go to list first, open a session, return via back button, and confirm list returns; verify manifest presence in DevTools.

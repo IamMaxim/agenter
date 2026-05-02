@@ -92,6 +92,10 @@
   let eventStream: HTMLDivElement | undefined;
   const EVENT_STREAM_BOTTOM_EPSILON_PX = 8;
 
+  function exitSession() {
+    window.location.hash = '#/';
+  }
+
   // Verbatim copy of Codex TUI's PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX
   // (`tmp/codex/codex-rs/tui/src/chatwidget/plan_implementation.rs`). Mirrors
   // the exact wording so the model interprets a fresh-thread implementation
@@ -884,6 +888,10 @@
 <section class="chat-layout">
   <header class="chat-header">
     <div class="chat-heading">
+      <button class="chat-back-button" type="button" on:click={exitSession} aria-label="Back to sessions list">
+        <AgenterIcon name="chevron" size={12} />
+        <span>Sessions</span>
+      </button>
       {#if editingTitle}
         <div class="title-editor">
           <input
