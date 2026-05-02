@@ -1296,6 +1296,7 @@ mod tests {
                 title: "Approve full pipeline command".to_owned(),
                 details: Some("printf ok".to_owned()),
                 expires_at: None,
+                presentation: None,
                 provider_payload: None,
             }),
         )
@@ -1441,6 +1442,7 @@ mod tests {
                     title: "Run tests".to_owned(),
                     details: Some("cargo test".to_owned()),
                     expires_at: None,
+                    presentation: None,
                     provider_payload: None,
                 }),
             )
@@ -1614,6 +1616,7 @@ mod tests {
                     title: "Run tests".to_owned(),
                     details: Some("cargo test".to_owned()),
                     expires_at: None,
+                    presentation: None,
                     provider_payload: None,
                 }),
             )

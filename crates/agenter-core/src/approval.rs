@@ -32,6 +32,9 @@ pub struct ApprovalRequestEvent {
     pub details: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    /// Provider-neutral UI hints (Codex-correlated today). Browsers render rich approval cards from this shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_payload: Option<serde_json::Value>,
 }

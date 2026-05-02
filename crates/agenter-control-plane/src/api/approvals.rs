@@ -1,13 +1,20 @@
 use crate::state::{ApprovalResolutionStart, RunnerSendError};
+use agenter_core::SessionId;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use chrono::Utc;
+use serde::Deserialize;
 use uuid::Uuid;
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ListApprovalsQuery {
+    pub session_id: SessionId,
+}
 
 pub(super) fn router() -> Router<crate::state::AppState> {
     Router::new()
@@ -18,16 +25,28 @@ pub(super) fn router() -> Router<crate::state::AppState> {
 pub(super) async fn list_approvals(
     state: State<crate::state::AppState>,
     headers: HeaderMap,
+    Query(query): Query<ListApprovalsQuery>,
 ) -> Response {
     let state = state.0;
-    if super::authenticated_user_from_headers(&state, &headers)
-        .await
-        .is_none()
-    {
+    let Some(user) = super::authenticated_user_from_headers(&state, &headers).await else {
         return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if !state
+        .can_access_session(user.user_id, query.session_id)
+        .await
+    {
+        tracing::debug!(
+            user_id = %user.user_id,
+            session_id = %query.session_id,
+            "list approvals rejected session access"
+        );
+        return StatusCode::FORBIDDEN.into_response();
     }
 
-    Json(Vec::<agenter_protocol::browser::BrowserEventEnvelope>::new()).into_response()
+    let envelopes = state
+        .pending_approval_request_envelopes(query.session_id)
+        .await;
+    Json(envelopes).into_response()
 }
 
 pub(super) async fn decide_approval(

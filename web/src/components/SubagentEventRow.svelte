@@ -1,4 +1,5 @@
 <script lang="ts">
+  import AgenterIcon from './AgenterIcon.svelte';
   import AnsiBlock from './AnsiBlock.svelte';
   import MarkdownBlock from './MarkdownBlock.svelte';
   import type { ChatItem } from '../lib/chatEvents';
@@ -36,10 +37,11 @@
     type="button"
     on:click={toggle}
   >
+    <span class="inline-event-chevron" aria-hidden="true"><AgenterIcon name="chevron" size={14} /></span>
+    <span class="tool-icon" data-kind="subagent" aria-hidden="true"><AgenterIcon name="subagent" /></span>
     <span class="subagent-kind">subagent</span>
     <span class="subagent-title">{item.title}</span>
     <span class="subagent-agent">{agentLabel}</span>
-    <span class="inline-event-chevron" aria-hidden="true">›</span>
     <span class="spacer"></span>
     <span class:failed={item.status === 'failed'} class="inline-event-status">{item.status}</span>
   </button>

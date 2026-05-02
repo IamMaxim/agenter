@@ -35,6 +35,7 @@ Do not store large transcripts here. Link to specs, plans, decisions, and runboo
 
 ## Recent Notes
 
+- 2026-05-02: Implemented the browser workbench redesign plan in `docs/plans/2026-05-02-workbench-redesign.md`: sidebar from `tmp/mockup-1/Agenter Prototype.html`, chat/tool rows from `tmp/mockup-1/Tool Calls Mockup.html`, with no backend/protocol changes.
 - 2026-05-01: Added Codex-first model/mode/question support: provider-neutral turn settings, model/reasoning/mode option discovery, composer settings in the browser, Codex `turn/start` settings propagation, and question cards for tool input plus MCP elicitation forms.
 - 2026-04-30: Added protocol spike runbooks for Codex app-server (`docs/runbooks/codex-app-server-spike.md`) and Qwen ACP (`docs/runbooks/qwen-acp-spike.md`) so provider JSON-RPC shapes can be captured before adapter APIs are finalized.
 - 2026-04-30: Created initial harness documentation and preserved the initial technical discussion in `docs/chatgpt/001_initial.md`.

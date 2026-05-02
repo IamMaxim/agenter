@@ -1,5 +1,10 @@
 import { describe, expect, test } from 'vitest';
-import { applyChatEnvelope, createChatState } from './chatEvents';
+import {
+  applyChatEnvelope,
+  approvalUiChoices,
+  createChatState,
+  fileChangeApprovalFiles
+} from './chatEvents';
 import type { BrowserEventEnvelope } from '../api/types';
 
 describe('chat event state', () => {
@@ -73,6 +78,80 @@ describe('chat event state', () => {
       approvalId: 'a1',
       resolvedDecision: 'accept'
     });
+  });
+
+  test('stores approval_requested presentation payloads', () => {
+    let state = createChatState();
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-approval-pre',
+      event: {
+        type: 'approval_requested',
+        payload: {
+          session_id: 's1',
+          approval_id: 'pa1',
+          kind: 'file_change',
+          title: 'Patches',
+          details: 'Reason: tweak\n\nFiles:\n• a.ts',
+          presentation: {
+            variant: 'codex_file_change',
+            paths: ['a.ts'],
+            files: [{ path: 'a.ts', change_kind: 'update', unified_diff: '@@ stub' }]
+          }
+        }
+      }
+    });
+
+    const row = state.items[0];
+    expect(row.kind).toBe('approval');
+    if (row.kind !== 'approval') {
+      throw new Error('expected approval');
+    }
+    expect(row.presentation?.variant).toBe('codex_file_change');
+    expect(fileChangeApprovalFiles(row.presentation)).toEqual([
+      { path: 'a.ts', changeKind: 'update', diff: '@@ stub' }
+    ]);
+    expect(approvalUiChoices(row)).toEqual([
+      'accept',
+      'accept_for_session',
+      'decline',
+      'cancel'
+    ]);
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-approval-pre-resolved',
+      event: {
+        type: 'approval_resolved',
+        payload: {
+          session_id: 's1',
+          approval_id: 'pa1',
+          decision: { decision: 'accept' },
+          resolved_at: '2026-05-02T12:00:00Z'
+        }
+      }
+    });
+    const resolved = state.items[0];
+    expect(resolved.kind).toBe('approval');
+    if (resolved.kind === 'approval') {
+      expect(resolved.presentation?.variant).toBe('codex_file_change');
+      expect(resolved.resolvedDecision).toBe('accept');
+    }
+  });
+
+  test('maps codex_command available_decisions strings to approval API choices', () => {
+    const item = {
+      id: 'approval:cmd',
+      kind: 'approval' as const,
+      approvalId: 'cmd-a',
+      title: 'shell',
+      presentation: {
+        variant: 'codex_command',
+        command: 'ls',
+        available_decisions: ['accept', 'acceptForSession']
+      }
+    };
+    expect(approvalUiChoices(item)).toEqual(['accept', 'accept_for_session']);
   });
 
   test('maps multi-select question requests and answered events', () => {

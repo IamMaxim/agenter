@@ -1,4 +1,9 @@
-import type { AgentQuestionField, AppEvent, BrowserEventEnvelope } from '../api/types';
+import type {
+  AgentQuestionField,
+  AppEvent,
+  ApprovalDecisionName,
+  BrowserEventEnvelope
+} from '../api/types';
 
 export type ChatItem =
   | {
@@ -64,6 +69,8 @@ export type ChatItem =
       approvalId: string;
       title: string;
       detail?: string;
+      /** Serialized shapes from runners (Codex-correlated today). See runner `presentation` on `approval_requested`. */
+      presentation?: Record<string, unknown>;
       resolvedDecision?: string;
     }
   | {
@@ -308,7 +315,8 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
         kind: 'approval',
         approvalId: stringField(payload, 'approval_id') ?? fallbackId(event),
         title: stringField(payload, 'title') ?? 'Approval requested',
-        detail: stringField(payload, 'details')
+        detail: stringField(payload, 'details'),
+        presentation: approvalPresentation(payload)
       });
     case 'approval_resolved':
       return updateApprovalResolved(items, payload);
@@ -468,6 +476,7 @@ function updateApprovalResolved(items: ChatItem[], payload: Record<string, unkno
     approvalId,
     title: existing?.kind === 'approval' ? existing.title : 'Approval resolved',
     detail: existing?.kind === 'approval' ? existing.detail : undefined,
+    presentation: existing?.kind === 'approval' ? existing.presentation : undefined,
     resolvedDecision:
       typeof decision === 'object' && decision !== null && 'decision' in decision
         ? String(decision.decision)
@@ -554,6 +563,109 @@ function humanizeStatus(status: string): string {
     .filter(Boolean)
     .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
     .join(' ');
+}
+
+function approvalPresentation(payload: Record<string, unknown>): Record<string, unknown> | undefined {
+  const raw = payload.presentation;
+  if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+const DEFAULT_APPROVAL_ACTIONS: ApprovalDecisionName[] = [
+  'accept',
+  'accept_for_session',
+  'decline',
+  'cancel'
+];
+
+function mapCodexDecisionLabel(raw: string): ApprovalDecisionName | undefined {
+  const norm = raw.replace(/_/g, '').toLowerCase();
+  switch (norm) {
+    case 'accept':
+      return 'accept';
+    case 'acceptforsession':
+      return 'accept_for_session';
+    case 'decline':
+      return 'decline';
+    case 'cancel':
+      return 'cancel';
+    default:
+      return undefined;
+  }
+}
+
+function dedupeStable<T extends string>(items: T[]): T[] {
+  const seen = new Set<T>();
+  const out: T[] = [];
+  for (const x of items) {
+    if (seen.has(x)) {
+      continue;
+    }
+    seen.add(x);
+    out.push(x);
+  }
+  return out;
+}
+
+/** Maps Codex `available_decisions` (when present) to API `ApprovalDecision` names; otherwise all four Codex-supported outcomes. */
+export function approvalUiChoices(item: Extract<ChatItem, { kind: 'approval' }>): ApprovalDecisionName[] {
+  const p = item.presentation;
+  const variant = p && typeof p.variant === 'string' ? p.variant : '';
+  if (variant === 'codex_command' && p && Array.isArray(p.available_decisions)) {
+    const mapped = p.available_decisions
+      .filter((entry): entry is string => typeof entry === 'string')
+      .map(mapCodexDecisionLabel)
+      .filter((x): x is ApprovalDecisionName => Boolean(x));
+    if (mapped.length > 0) {
+      return dedupeStable(mapped);
+    }
+  }
+  return [...DEFAULT_APPROVAL_ACTIONS];
+}
+
+export function approvalUiButtonLabel(decision: ApprovalDecisionName): string {
+  switch (decision) {
+    case 'accept':
+      return 'Accept';
+    case 'accept_for_session':
+      return 'Accept for session';
+    case 'decline':
+      return 'Decline';
+    case 'cancel':
+      return 'Cancel';
+    default:
+      return decision;
+  }
+}
+
+export function fileChangeApprovalFiles(presentation: Record<string, unknown> | undefined): {
+  path: string;
+  changeKind?: string;
+  diff?: string;
+}[] {
+  if (!presentation || presentation.variant !== 'codex_file_change') {
+    return [];
+  }
+  const raw = presentation.files;
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw
+    .filter((entry): entry is Record<string, unknown> => typeof entry === 'object' && entry !== null)
+    .map((f) => {
+      const unified = f.unified_diff;
+      let diffText: string | undefined;
+      if (typeof unified === 'string') {
+        diffText = unified;
+      }
+      return {
+        path: typeof f.path === 'string' ? f.path : '(unknown)',
+        changeKind: typeof f.change_kind === 'string' ? f.change_kind : undefined,
+        diff: diffText
+      };
+    });
 }
 
 function stringField(payload: Record<string, unknown>, field: string): string | undefined {

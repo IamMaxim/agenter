@@ -1259,6 +1259,7 @@ fn deterministic_fake_events(session_id: SessionId, input: &AgentInput) -> Vec<A
             title: "Approve fake command".to_owned(),
             details: Some("This is an in-memory approval stub.".to_owned()),
             expires_at: None,
+            presentation: None,
             provider_payload: None,
         }),
         AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {

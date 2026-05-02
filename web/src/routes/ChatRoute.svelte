@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
+  import AgenterIcon from '../components/AgenterIcon.svelte';
   import InlineEventRow from '../components/InlineEventRow.svelte';
   import MarkdownBlock from '../components/MarkdownBlock.svelte';
   import PlanCard from '../components/PlanCard.svelte';
@@ -28,6 +29,7 @@
     AgentReasoningEffort,
     AgentTurnSettings,
     BrowserServerMessage,
+    ApprovalDecisionName,
     SessionInfo,
     SessionUsageWindow,
     SlashCommandDefinition,
@@ -41,7 +43,10 @@
   import { pushToast } from '../lib/toasts';
   import {
     applyChatEnvelope,
+    approvalUiButtonLabel,
+    approvalUiChoices,
     createChatState,
+    fileChangeApprovalFiles,
     type ChatItem,
     type ChatState
   } from '../lib/chatEvents';
@@ -82,7 +87,10 @@
   let pendingDangerCommand:
     | { command: SlashCommandDefinition; request: SlashCommandRequest }
     | undefined;
+  let openComposerMenu: 'mode' | 'model' | 'reasoning' | null = null;
   let dismissedPlanIds: Set<string> = new Set();
+  let eventStream: HTMLDivElement | undefined;
+  const EVENT_STREAM_BOTTOM_EPSILON_PX = 8;
 
   // Verbatim copy of Codex TUI's PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX
   // (`tmp/codex/codex-rs/tui/src/chatwidget/plan_implementation.rs`). Mirrors
@@ -117,6 +125,8 @@
   $: window5hTitle = resetTitle(usage?.window_5h);
   $: weekLabel = `w ${percentLabel(usage?.week?.remaining_percent)}`;
   $: weekTitle = resetTitle(usage?.week);
+  $: sessionStatusTone = session ? statusTone(session.status) : 'idle';
+  $: sessionStatusLabel = session ? sessionStatusLabelFor(session.status) : connectionState;
   $: if (slashSelectionIndex >= slashSuggestions.length) {
     slashSelectionIndex = 0;
   }
@@ -175,6 +185,8 @@
         }
       }
       chatState = nextState;
+      await tick();
+      scrollEventStreamToBottom();
     } catch {
       connectionState = 'History unavailable';
       pushToast({ severity: 'error', message: 'Could not load session history.' });
@@ -193,12 +205,18 @@
         connectionState = 'Subscribed';
       },
       onMessage: (message: BrowserServerMessage) => {
+        const shouldScrollToBottom = isEventStreamAtBottom();
         if (generation !== connectionGeneration) {
           return;
         }
         if (message.type === 'app_event') {
           try {
             chatState = applyChatEnvelope(chatState, message);
+            void tick().then(() => {
+              if (shouldScrollToBottom) {
+                scrollEventStreamToBottom();
+              }
+            });
             if (
               message.event.type === 'provider_event' &&
               ['token_usage', 'rate_limits'].includes(String(message.event.payload.category ?? ''))
@@ -254,6 +272,23 @@
     } finally {
       submitting = false;
     }
+  }
+
+  function isEventStreamAtBottom(): boolean {
+    if (!eventStream) {
+      return true;
+    }
+    return (
+      eventStream.scrollTop + eventStream.clientHeight >=
+      eventStream.scrollHeight - EVENT_STREAM_BOTTOM_EPSILON_PX
+    );
+  }
+
+  function scrollEventStreamToBottom() {
+    if (!eventStream) {
+      return;
+    }
+    eventStream.scrollTop = eventStream.scrollHeight;
   }
 
   async function loadSlashCommands(generation = connectionGeneration) {
@@ -441,7 +476,7 @@
     messageTextarea.style.overflowY = messageTextarea.scrollHeight > maxHeight ? 'auto' : 'hidden';
   }
 
-  async function resolveApproval(item: ChatItem, decision: 'accept' | 'decline') {
+  async function resolveApproval(item: ChatItem, decision: ApprovalDecisionName) {
     if (item.kind !== 'approval' || item.resolvedDecision) {
       return;
     }
@@ -510,6 +545,40 @@
       reasoning_effort:
         selected?.default_reasoning_effort ?? turnSettings.reasoning_effort ?? null
     });
+  }
+
+  function toggleComposerMenu(menu: 'mode' | 'model' | 'reasoning') {
+    openComposerMenu = openComposerMenu === menu ? null : menu;
+  }
+
+  function modeLabel(modeId: string) {
+    return (agentOptions.collaboration_modes.find((mode) => mode.id === modeId)?.label ?? modeId) || 'default';
+  }
+
+  function modelLabel(modelId: string) {
+    return (agentOptions.models.find((model) => model.id === modelId)?.display_name ?? modelId) || 'model';
+  }
+
+  function reasoningLabel(reasoning: string) {
+    return reasoning || 'thinking';
+  }
+
+  function chooseMode(value: string) {
+    openComposerMenu = null;
+    setCollaborationMode(value);
+    void tick().then(() => messageTextarea?.focus());
+  }
+
+  function chooseModel(value: string) {
+    openComposerMenu = null;
+    setModel(value);
+    void tick().then(() => messageTextarea?.focus());
+  }
+
+  function chooseReasoning(value: string) {
+    openComposerMenu = null;
+    setReasoningEffort(value);
+    void tick().then(() => messageTextarea?.focus());
   }
 
   function setReasoningEffort(reasoning_effort: string) {
@@ -656,6 +725,42 @@
     return `Resets in ${relativeReset(reset)}; ${localResetTime(reset)}`;
   }
 
+  function statusTone(status: string | undefined): string {
+    if (status === 'running' || status === 'starting') {
+      return 'running';
+    }
+    if (status === 'waiting_for_approval' || status === 'waiting_for_input') {
+      return 'waiting';
+    }
+    if (status === 'failed' || status === 'degraded' || status === 'interrupted') {
+      return 'error';
+    }
+    if (status === 'completed') {
+      return 'done';
+    }
+    return 'idle';
+  }
+
+  function sessionStatusLabelFor(status: string | undefined): string {
+    switch (status) {
+      case 'running':
+        return 'running';
+      case 'waiting_for_approval':
+        return 'needs approval';
+      case 'waiting_for_input':
+        return 'waiting';
+      case 'failed':
+      case 'degraded':
+        return 'error';
+      case 'completed':
+        return 'done';
+      case 'starting':
+        return 'starting';
+      default:
+        return status ? status.replaceAll('_', ' ') : 'idle';
+    }
+  }
+
   function relativeReset(reset: Date): string {
     const minutes = Math.max(0, Math.round((reset.getTime() - Date.now()) / 60_000));
     if (minutes < 60) {
@@ -682,6 +787,18 @@
       minute: '2-digit',
       ...(sameYear ? {} : { year: 'numeric' })
     });
+  }
+
+  function presentationString(
+    presentation: Record<string, unknown> | undefined,
+    key: string
+  ): string | undefined {
+    const value = presentation?.[key];
+    return typeof value === 'string' && value ? value : undefined;
+  }
+
+  function resolvedApprovalLabel(decision: string) {
+    return decision.replaceAll('_', ' ');
   }
 
   function questionAnswers(item: ChatItem, field: AgentQuestionField): string[] {
@@ -733,34 +850,42 @@
 
 <section class="chat-layout">
   <header class="chat-header">
-    {#if editingTitle}
-      <div class="title-editor">
-        <input
-          aria-label="Session title"
-          bind:value={titleDraft}
-          disabled={renaming}
-          on:keydown={handleTitleKeydown}
-        />
-        <button class="secondary compact" disabled={renaming} type="button" on:click={saveTitle}>
-          Save
+    <div class="chat-heading">
+      {#if editingTitle}
+        <div class="title-editor">
+          <input
+            aria-label="Session title"
+            bind:value={titleDraft}
+            disabled={renaming}
+            on:keydown={handleTitleKeydown}
+          />
+          <button class="secondary compact" disabled={renaming} type="button" on:click={saveTitle}>
+            Save
+          </button>
+          <button class="secondary compact" disabled={renaming} type="button" on:click={cancelTitleEdit}>
+            Cancel
+          </button>
+        </div>
+      {:else}
+        <button class="chat-title-button" type="button" on:click={() => (editingTitle = true)}>
+          <span class="chat-title">{session?.title ?? 'New session'}</span>
         </button>
-        <button class="secondary compact" disabled={renaming} type="button" on:click={cancelTitleEdit}>
-          Cancel
-        </button>
+      {/if}
+      <div class="chat-subtitle">
+        <span>{session?.workspace_id ?? 'workspace'}</span>
+        <span>·</span>
+        <span>{session?.provider_id ?? 'provider'}</span>
+        <span>·</span>
+        <span>{connectionState}</span>
       </div>
-    {:else}
-      <button class="chat-title-button" type="button" on:click={() => (editingTitle = true)}>
-        <span class="chat-title">{session?.title ?? 'New session'}</span>
-      </button>
-    {/if}
-    <div>
-      <!-- <a class="back-link" href={routeHref({ name: 'sessions' })}>Sessions</a> -->
-      <!-- <p>{sessionId}</p> -->
     </div>
-    <span class="status-pill">{connectionState}</span>
+    <span class:done={sessionStatusTone === 'done'} class:error={sessionStatusTone === 'error'} class:idle={sessionStatusTone === 'idle'} class:running={sessionStatusTone === 'running'} class:waiting={sessionStatusTone === 'waiting'} class="status-pill">
+      <span class="status-dot" aria-hidden="true"></span>
+      {sessionStatusLabel}
+    </span>
   </header>
 
-  <div class="event-stream">
+  <div class="event-stream" bind:this={eventStream}>
     {#if items.length === 0}
       <div class="empty-state">
         <strong>No events yet</strong>
@@ -795,30 +920,67 @@
             onStayInPlan={() => handleStayInPlan(item.id)}
           />
         {:else if item.kind === 'approval'}
-          <article class="event-card approval-card">
-            <div class="card-heading">
-              <span>Approval</span>
-              {#if item.resolvedDecision}
-                <code>{item.resolvedDecision}</code>
-              {/if}
-            </div>
-            <strong>{item.title}</strong>
-            {#if item.detail}
-              <pre>{item.detail}</pre>
-            {/if}
-            {#if !item.resolvedDecision}
-              <div class="inline-actions">
-                <button type="button" on:click={() => resolveApproval(item, 'accept')}>Accept</button>
-                <button class="secondary compact" type="button" on:click={() => resolveApproval(item, 'decline')}>
-                  Decline
-                </button>
+          {#if item.resolvedDecision}
+            <article class="approval-resolved-row">
+              <span class="approval-resolved-icon" aria-hidden="true"><AgenterIcon name="checklist" size={12} /></span>
+              <span>Approval answered</span>
+              <code>{resolvedApprovalLabel(item.resolvedDecision)}</code>
+            </article>
+          {:else}
+            <article class="event-card approval-card log-card">
+              <div class="card-heading log-card-heading">
+                <span class="log-eyebrow">! approval requested</span>
               </div>
-            {/if}
-          </article>
+              <strong>{item.title}</strong>
+              {#if item.presentation?.variant === 'codex_command' && typeof item.presentation.command === 'string'}
+                <div class="approval-meta-grid">
+                  <span>command</span>
+                  <strong>{item.presentation.command}</strong>
+                  {#if presentationString(item.presentation, 'cwd')}
+                    <span>cwd</span>
+                    <strong>{presentationString(item.presentation, 'cwd')}</strong>
+                  {/if}
+                </div>
+                <pre class="approval-command">{item.presentation.command}</pre>
+              {/if}
+              {#each fileChangeApprovalFiles(item.presentation) as file}
+                <details class="approval-file-diff">
+                  <summary>
+                    <AgenterIcon name="file" size={12} />
+                    <span>{file.path}</span>
+                    {#if file.changeKind}<span class="muted"> ({file.changeKind})</span>{/if}
+                  </summary>
+                  {#if file.diff}<pre>{file.diff}</pre>{:else}<span class="muted">No diff text</span>{/if}
+                </details>
+              {/each}
+              {#if item.detail}
+                {#if fileChangeApprovalFiles(item.presentation).length === 0}
+                  <pre class="approval-detail-plain">{item.detail}</pre>
+                {:else}
+                  <details class="approval-extra-detail">
+                    <summary>Extra context</summary>
+                    <pre>{item.detail}</pre>
+                  </details>
+                {/if}
+              {/if}
+              <div class="inline-actions approval-actions">
+                {#each approvalUiChoices(item) as decisionBtn}
+                  <button
+                    class:secondary={decisionBtn === 'decline' || decisionBtn === 'cancel'}
+                    class="compact approval-decision"
+                    type="button"
+                    on:click={() => resolveApproval(item, decisionBtn)}
+                  >
+                    {approvalUiButtonLabel(decisionBtn)}
+                  </button>
+                {/each}
+              </div>
+            </article>
+          {/if}
         {:else if item.kind === 'question'}
-          <article class="event-card question-card">
-            <div class="card-heading">
-              <span>Question</span>
+          <article class="event-card question-card log-card">
+            <div class="card-heading log-card-heading">
+              <span class="log-eyebrow">? question</span>
               {#if item.answered}
                 <code>answered</code>
               {/if}
@@ -957,44 +1119,89 @@
       {/if}
     </button>
     <div class="composer-bottom-bar">
-      <select
-        aria-label="Collaboration mode"
-        class="composer-inline-select"
-        value={modeValue}
-        disabled={agentOptions.collaboration_modes.length === 0}
-        on:change={(event) => setCollaborationMode(event.currentTarget.value)}
-      >
-        {#if agentOptions.collaboration_modes.length === 0}
-          <option value="">default</option>
-        {:else}
-          {#each agentOptions.collaboration_modes as mode}
-            <option value={mode.id}>{mode.label}</option>
-          {/each}
+      <span class="composer-chip-wrap">
+        <button
+          aria-expanded={openComposerMenu === 'mode'}
+          aria-label="Collaboration mode"
+          class="composer-chip"
+          disabled={agentOptions.collaboration_modes.length === 0}
+          type="button"
+          on:click={() => toggleComposerMenu('mode')}
+        >
+          {modeLabel(modeValue)}
+          <AgenterIcon name="chevron" size={14} />
+        </button>
+        {#if openComposerMenu === 'mode'}
+          <span class="composer-chip-menu">
+            {#if agentOptions.collaboration_modes.length === 0}
+              <button type="button" disabled>default</button>
+            {:else}
+              {#each agentOptions.collaboration_modes as mode}
+                <button
+                  class:active={mode.id === modeValue}
+                  type="button"
+                  on:click={() => chooseMode(mode.id)}
+                >
+                  {mode.label}
+                </button>
+              {/each}
+            {/if}
+          </span>
         {/if}
-      </select>
+      </span>
       <span class="composer-dot" aria-hidden="true">·</span>
-      <select
-        aria-label="Model"
-        class="composer-inline-select model-select"
-        value={modelValue}
-        on:change={(event) => setModel(event.currentTarget.value)}
-      >
-        <option value="">model</option>
-        {#each agentOptions.models as model}
-          <option value={model.id}>{model.display_name}</option>
-        {/each}
-      </select>
-      <select
-        aria-label="Thinking level"
-        class="composer-inline-select"
-        value={reasoningValue}
-        on:change={(event) => setReasoningEffort(event.currentTarget.value)}
-      >
-        <option value="">thinking</option>
-        {#each effortsForSelectedModel() as effort}
-          <option value={effort}>{effort}</option>
-        {/each}
-      </select>
+      <span class="composer-chip-wrap model-chip-wrap">
+        <button
+          aria-expanded={openComposerMenu === 'model'}
+          aria-label="Model"
+          class="composer-chip"
+          type="button"
+          on:click={() => toggleComposerMenu('model')}
+        >
+          {modelLabel(modelValue)}
+          <AgenterIcon name="chevron" size={14} />
+        </button>
+        {#if openComposerMenu === 'model'}
+          <span class="composer-chip-menu">
+            <button class:active={modelValue === ''} type="button" on:click={() => chooseModel('')}>model</button>
+            {#each agentOptions.models as model}
+              <button
+                class:active={model.id === modelValue}
+                type="button"
+                on:click={() => chooseModel(model.id)}
+              >
+                {model.display_name}
+              </button>
+            {/each}
+          </span>
+        {/if}
+      </span>
+      <span class="composer-chip-wrap">
+        <button
+          aria-expanded={openComposerMenu === 'reasoning'}
+          aria-label="Thinking level"
+          class="composer-chip"
+          type="button"
+          on:click={() => toggleComposerMenu('reasoning')}
+        >
+          {reasoningLabel(reasoningValue)}
+          <AgenterIcon name="chevron" size={14} />
+        </button>
+        {#if openComposerMenu === 'reasoning'}
+          <span class="composer-chip-menu">
+            <button class:active={reasoningValue === ''} type="button" on:click={() => chooseReasoning('')}>thinking</button>
+            {#each effortsForSelectedModel() as effort}
+              <button
+                class:active={effort === reasoningValue}
+                type="button"
+                on:click={() => chooseReasoning(effort)}
+              >
+                {effort}
+              </button>
+            {/each}
+          </span>
+        {/if}
+      </span>
       <span class="composer-dot" aria-hidden="true">·</span>
       <span
         class:unknown={contextLabel === '--'}

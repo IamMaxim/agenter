@@ -5,6 +5,10 @@ use std::{
     time::Duration,
 };
 
+use crate::agents::codex_approval_context::{
+    presentation_for_command_execution_approval, sparse_file_change_fallback_details,
+    CodexApprovalItemCache,
+};
 use agenter_core::{
     AgentCollaborationMode, AgentErrorEvent, AgentMessageDeltaEvent, AgentModelOption,
     AgentOptions, AgentProviderId, AgentQuestionAnswer, AgentQuestionChoice, AgentQuestionField,
@@ -748,10 +752,12 @@ pub async fn run_codex_turn_on_server(
         tokio::sync::Mutex<HashMap<QuestionId, PendingCodexQuestion>>,
     >,
 ) -> anyhow::Result<()> {
+    let mut codex_approval_ctx = CodexApprovalItemCache::default();
     while server.thread_id.is_none() {
         let Some(message) = server.next_message().await? else {
             return Err(anyhow!("codex exited before returning a thread id"));
         };
+        codex_approval_ctx.observe_jsonrpc_message(&message);
         for event in normalize_codex_message(request.session_id, &message) {
             event_sender.send(event).ok();
         }
@@ -764,6 +770,7 @@ pub async fn run_codex_turn_on_server(
     };
     while let Some(message) = server.next_message().await? {
         scope.observe(&message);
+        codex_approval_ctx.observe_jsonrpc_message(&message);
         if !codex_message_belongs_to_scope(&message, &scope) {
             tracing::debug!(
                 provider_thread_id = message_thread_id(&message),
@@ -773,7 +780,11 @@ pub async fn run_codex_turn_on_server(
             continue;
         }
         if let Some((approval_id, native_request_id, approval_kind, event)) =
-            normalize_codex_approval_request(request.session_id, &message)
+            normalize_codex_approval_request(
+                request.session_id,
+                &message,
+                Some(&codex_approval_ctx),
+            )
         {
             let (sender, receiver) = oneshot::channel();
             pending_approvals
@@ -1047,6 +1058,7 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
 pub fn normalize_codex_approval_request(
     session_id: SessionId,
     message: &Value,
+    cache: Option<&CodexApprovalItemCache>,
 ) -> Option<(ApprovalId, Value, CodexApprovalKind, AppEvent)> {
     let method = jsonrpc_method(message)?;
     let (kind, approval_kind) = match method {
@@ -1069,18 +1081,9 @@ pub fn normalize_codex_approval_request(
         ApprovalKind::FileChange => "Approve Codex file change",
         ApprovalKind::ProviderSpecific | ApprovalKind::Tool => "Approve Codex permission",
     };
-    let details = string_at(
-        message,
-        &[
-            "/params/command",
-            "/params/item/command",
-            "/params/path",
-            "/params/item/path",
-            "/params/description",
-        ],
-    )
-    .map(str::to_owned)
-    .or_else(|| serde_json::to_string(message.get("params").unwrap_or(&Value::Null)).ok());
+
+    let params = message.get("params").unwrap_or(&Value::Null);
+    let (presentation, details) = synthesize_codex_approval_details(&kind, params, cache, message);
     let event = AppEvent::ApprovalRequested(ApprovalRequestEvent {
         session_id,
         approval_id,
@@ -1088,9 +1091,99 @@ pub fn normalize_codex_approval_request(
         title: title.to_owned(),
         details,
         expires_at: None,
+        presentation,
         provider_payload: Some(message.clone()),
     });
     Some((approval_id, native_request_id, approval_kind, event))
+}
+
+fn synthesize_codex_approval_details(
+    kind: &ApprovalKind,
+    params: &Value,
+    cache: Option<&CodexApprovalItemCache>,
+    raw_message: &Value,
+) -> (Option<Value>, Option<String>) {
+    match kind {
+        ApprovalKind::FileChange => {
+            let presentation = cache.and_then(|c| c.presentation_for_file_change_approval(params));
+
+            let body = presentation
+                .as_ref()
+                .and_then(|p| p.get("paths").and_then(Value::as_array))
+                .filter(|paths| !paths.is_empty())
+                .map(|paths| {
+                    let bullets = paths
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|path| format!("• {path}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("Files:\n{bullets}")
+                })
+                .or_else(|| codex_fallback_item_hint(params));
+
+            let details = join_sparse_prelude_then_body(params, body)
+                .or_else(|| Some("Codex proposes file edits.".to_owned()));
+            (presentation, details)
+        }
+        ApprovalKind::Command => {
+            let presentation = presentation_for_command_execution_approval(params);
+            let details = string_at(
+                raw_message,
+                &[
+                    "/params/command",
+                    "/params/item/command",
+                    "/params/description",
+                    "/params/reason",
+                ],
+            )
+            .map(str::to_owned)
+            .or_else(|| Some("Approve this shell command.".to_owned()));
+            (presentation, details)
+        }
+        ApprovalKind::ProviderSpecific | ApprovalKind::Tool => {
+            let extracted = [
+                "/params/description",
+                "/params/reason",
+                "/params/request/summary",
+            ]
+            .iter()
+            .find_map(|p| {
+                raw_message
+                    .pointer(p)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+
+            (None, extracted.or_else(|| codex_fallback_item_hint(params)))
+        }
+    }
+}
+
+fn codex_fallback_item_hint(params: &Value) -> Option<String> {
+    let item_id = string_at(
+        params,
+        &[
+            "/itemId",
+            "/item/id",
+            "/item_id",
+            "/approvalId",
+            "/approval_id",
+        ],
+    )?;
+    Some(format!(
+        "Codex is waiting on approval linked to `{item_id}`."
+    ))
+}
+
+fn join_sparse_prelude_then_body(params: &Value, tail: Option<String>) -> Option<String> {
+    let head = sparse_file_change_fallback_details(params);
+    match (head, tail) {
+        (Some(h), Some(t)) => Some(format!("{h}\n\n{t}")),
+        (Some(h), None) => Some(h),
+        (None, Some(t)) => Some(t),
+        (None, None) => None,
+    }
 }
 
 pub fn normalize_codex_question_request(
@@ -2814,7 +2907,7 @@ mod tests {
         });
 
         let (_approval_id, native_request_id, approval_kind, event) =
-            normalize_codex_approval_request(SessionId::nil(), &message)
+            normalize_codex_approval_request(SessionId::nil(), &message, None)
                 .expect("approval should normalize");
 
         assert_eq!(native_request_id, json!("approval-1"));
@@ -2824,6 +2917,60 @@ mod tests {
         };
         assert_eq!(request.kind, ApprovalKind::Command);
         assert_eq!(request.details.as_deref(), Some("cargo test"));
+        let pres = request.presentation.expect("command presentation");
+        assert_eq!(pres.get("variant"), Some(&json!("codex_command")));
+        assert_eq!(pres.get("command"), Some(&json!("cargo test")));
+    }
+
+    #[test]
+    fn enriches_file_change_approval_via_cache() {
+        let started = json!({
+            "method": "item/started",
+            "params": {
+                "threadId": "t1",
+                "turnId": "u1",
+                "item": {
+                    "id": "call_git",
+                    "type": "fileChange",
+                    "changes": [{"path": "README.md", "kind": {"type": "Update"}, "diff": "@@ hi"}]
+                }
+            }
+        });
+        let mut cache = CodexApprovalItemCache::default();
+        cache.observe_jsonrpc_message(&started);
+
+        let message = json!({
+            "id": 1,
+            "method": "item/fileChange/requestApproval",
+            "params": {
+                "threadId": "t1",
+                "turnId": "u1",
+                "itemId": "call_git",
+                "reason": "edit readme"
+            }
+        });
+
+        let (_id, rid, ak, ev) =
+            normalize_codex_approval_request(SessionId::nil(), &message, Some(&cache))
+                .expect("approval");
+        assert_eq!(rid, json!(1));
+        assert_eq!(ak, CodexApprovalKind::FileChange);
+
+        let AppEvent::ApprovalRequested(request) = ev else {
+            panic!("expected approval");
+        };
+        let pres = request.presentation.expect("presentation");
+        assert_eq!(pres["variant"], "codex_file_change");
+        assert_eq!(pres["paths"], json!(["README.md"]));
+        let details = request.details.expect("details");
+        assert!(
+            details.contains("README.md"),
+            "details missing path: {details}"
+        );
+        assert!(
+            details.contains("Reason"),
+            "missing reason prelude: {details}"
+        );
     }
 
     #[test]

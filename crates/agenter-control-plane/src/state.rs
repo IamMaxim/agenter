@@ -68,11 +68,51 @@ pub struct RegisteredQuestion {
     pub resolved: bool,
 }
 
+/// Tracks client-visible approval lifecycle. Pending/Resolving carry the original
+/// `approval_requested` envelope so reconnects still render cards after cache eviction.
 #[derive(Clone, Debug)]
 enum ApprovalStatus {
-    Pending,
-    Resolving,
+    Pending(Box<BrowserEventEnvelope>),
+    Resolving(Box<BrowserEventEnvelope>),
     Resolved(Box<BrowserEventEnvelope>),
+}
+
+fn envelope_references_approval_id(
+    envelope: &BrowserEventEnvelope,
+    approval_id: ApprovalId,
+) -> bool {
+    match &envelope.event {
+        AppEvent::ApprovalRequested(req) => req.approval_id == approval_id,
+        AppEvent::ApprovalResolved(res) => res.approval_id == approval_id,
+        _ => false,
+    }
+}
+
+fn merge_pending_approval_envelopes_for_session(
+    session_id: SessionId,
+    mut envelopes: Vec<BrowserEventEnvelope>,
+    registry: &Registry,
+) -> Vec<BrowserEventEnvelope> {
+    let mut injections = Vec::<BrowserEventEnvelope>::new();
+    for (&approval_id, approval) in &registry.approvals {
+        if approval.session_id != session_id {
+            continue;
+        }
+        match &approval.status {
+            ApprovalStatus::Pending(request) | ApprovalStatus::Resolving(request) => {
+                if envelopes
+                    .iter()
+                    .any(|e| envelope_references_approval_id(e, approval_id))
+                {
+                    continue;
+                }
+                injections.push((**request).clone());
+            }
+            ApprovalStatus::Resolved(_) => {}
+        }
+    }
+    envelopes.extend(injections);
+    envelopes
 }
 
 #[derive(Clone, Debug)]
@@ -849,12 +889,17 @@ impl AppState {
         Vec<BrowserEventEnvelope>,
         broadcast::Receiver<BrowserEventEnvelope>,
     ) {
-        let mut sessions = self.inner.sessions.lock().await;
-        let events = sessions
-            .entry(session_id)
-            .or_insert_with(SessionEvents::new);
-        let receiver = events.sender.subscribe();
-        (events.cache.clone(), receiver)
+        let (mut cached, receiver) = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let events = sessions
+                .entry(session_id)
+                .or_insert_with(SessionEvents::new);
+            let receiver = events.sender.subscribe();
+            (events.cache.clone(), receiver)
+        };
+        let registry = self.inner.registry.lock().await;
+        cached = merge_pending_approval_envelopes_for_session(session_id, cached, &registry);
+        (cached, receiver)
     }
 
     pub async fn session_history(
@@ -866,47 +911,68 @@ impl AppState {
             return None;
         }
 
-        if let Some(pool) = &self.inner.db_pool {
-            return Some(
-                agenter_db::list_event_cache(pool, session_id)
-                    .await
-                    .map(|events| {
-                        events
-                            .into_iter()
-                            .filter_map(|event| {
-                                serde_json::from_value::<AppEvent>(event.payload)
-                                    .map(|app_event| BrowserEventEnvelope {
-                                        event_id: Some(event.event_id.to_string().into()),
-                                        event: app_event,
-                                    })
-                                    .map_err(|error| {
-                                        tracing::warn!(
-                                            %session_id,
-                                            event_id = %event.event_id,
-                                            %error,
-                                            "failed to decode cached app event"
-                                        );
-                                    })
-                                    .ok()
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_else(|error| {
-                        tracing::warn!(%session_id, %error, "failed to load persisted session history");
-                        Vec::new()
-                    }),
-            );
-        }
-
-        Some(
+        let mut history = if let Some(pool) = &self.inner.db_pool {
+            agenter_db::list_event_cache(pool, session_id)
+                .await
+                .map(|events| {
+                    events
+                        .into_iter()
+                        .filter_map(|event| {
+                            serde_json::from_value::<AppEvent>(event.payload)
+                                .map(|app_event| BrowserEventEnvelope {
+                                    event_id: Some(event.event_id.to_string().into()),
+                                    event: app_event,
+                                })
+                                .map_err(|error| {
+                                    tracing::warn!(
+                                        %session_id,
+                                        event_id = %event.event_id,
+                                        %error,
+                                        "failed to decode cached app event"
+                                    );
+                                })
+                                .ok()
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%session_id, %error, "failed to load persisted session history");
+                    Vec::new()
+                })
+        } else {
             self.inner
                 .sessions
                 .lock()
                 .await
                 .get(&session_id)
                 .map(|events| events.cache.clone())
-                .unwrap_or_default(),
-        )
+                .unwrap_or_default()
+        };
+
+        let registry = self.inner.registry.lock().await;
+        history = merge_pending_approval_envelopes_for_session(session_id, history, &registry);
+        Some(history)
+    }
+
+    /// Pending or in-flight resolving approvals for a session (for API listing / tools).
+    pub async fn pending_approval_request_envelopes(
+        &self,
+        session_id: SessionId,
+    ) -> Vec<BrowserEventEnvelope> {
+        let registry = self.inner.registry.lock().await;
+        let mut out = Vec::new();
+        for approval in registry.approvals.values() {
+            if approval.session_id != session_id {
+                continue;
+            }
+            match &approval.status {
+                ApprovalStatus::Pending(env) | ApprovalStatus::Resolving(env) => {
+                    out.push((**env).clone());
+                }
+                ApprovalStatus::Resolved(_) => {}
+            }
+        }
+        out
     }
 
     pub async fn session_turn_settings(
@@ -978,7 +1044,7 @@ impl AppState {
                     request.approval_id,
                     RegisteredApproval {
                         session_id,
-                        status: ApprovalStatus::Pending,
+                        status: ApprovalStatus::Pending(Box::new(envelope.clone())),
                     },
                 );
             }
@@ -992,7 +1058,7 @@ impl AppState {
                 match registry.approvals.get_mut(&resolved.approval_id) {
                     Some(approval) => match &approval.status {
                         ApprovalStatus::Resolved(existing) => return *existing.clone(),
-                        ApprovalStatus::Pending | ApprovalStatus::Resolving => {
+                        ApprovalStatus::Pending(_) | ApprovalStatus::Resolving(_) => {
                             approval.status = ApprovalStatus::Resolved(Box::new(envelope.clone()));
                         }
                     },
@@ -1077,14 +1143,14 @@ impl AppState {
             return ApprovalResolutionStart::Missing;
         };
         match &approval.status {
-            ApprovalStatus::Pending => {
-                approval.status = ApprovalStatus::Resolving;
+            ApprovalStatus::Pending(request_env) => {
+                approval.status = ApprovalStatus::Resolving(request_env.clone());
                 tracing::debug!(%approval_id, session_id = %approval.session_id, "approval resolution started");
                 ApprovalResolutionStart::Started {
                     session_id: approval.session_id,
                 }
             }
-            ApprovalStatus::Resolving => ApprovalResolutionStart::InProgress,
+            ApprovalStatus::Resolving(_) => ApprovalResolutionStart::InProgress,
             ApprovalStatus::Resolved(envelope) => ApprovalResolutionStart::AlreadyResolved {
                 session_id: approval.session_id,
                 envelope: envelope.clone(),
@@ -1097,8 +1163,8 @@ impl AppState {
         let Some(approval) = registry.approvals.get_mut(&approval_id) else {
             return;
         };
-        if matches!(approval.status, ApprovalStatus::Resolving) {
-            approval.status = ApprovalStatus::Pending;
+        if let ApprovalStatus::Resolving(request_env) = &approval.status {
+            approval.status = ApprovalStatus::Pending(request_env.clone());
         }
     }
 
@@ -1109,7 +1175,7 @@ impl AppState {
             .await
             .approvals
             .get(&approval_id)
-            .is_some_and(|approval| matches!(approval.status, ApprovalStatus::Resolving))
+            .is_some_and(|approval| matches!(approval.status, ApprovalStatus::Resolving(_)))
     }
 
     pub async fn finish_approval_resolution(
@@ -1130,8 +1196,8 @@ impl AppState {
             }
             match &approval.status {
                 ApprovalStatus::Resolved(existing) => return Some(*existing.clone()),
-                ApprovalStatus::Pending => return None,
-                ApprovalStatus::Resolving => {
+                ApprovalStatus::Pending(_) => return None,
+                ApprovalStatus::Resolving(_) => {
                     approval.status = ApprovalStatus::Resolved(Box::new(envelope.clone()));
                 }
             }
@@ -1786,7 +1852,10 @@ fn sort_session_infos(sessions: &mut [SessionInfo]) {
 
 #[cfg(test)]
 mod tests {
-    use agenter_core::{AppEvent, RunnerId, SessionId, UserMessageEvent};
+    use agenter_core::{
+        AgentProviderId, AppEvent, ApprovalId, ApprovalKind, ApprovalRequestEvent, RunnerId,
+        SessionId, UserMessageEvent, WorkspaceId, WorkspaceRef,
+    };
     use agenter_protocol::runner::{RunnerHeartbeatAck, RunnerServerMessage};
 
     use super::*;
@@ -1921,6 +1990,96 @@ mod tests {
             usage.week.and_then(|window| window.remaining_percent),
             Some(80)
         );
+    }
+
+    #[tokio::test]
+    async fn session_history_reinjects_evicted_pending_approval() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("bootstrap");
+        let owner = state.inner.bootstrap_admin.as_ref().unwrap().user.user_id;
+        let runner_id = RunnerId::new();
+        let workspace = WorkspaceRef {
+            workspace_id: WorkspaceId::new(),
+            runner_id,
+            path: "/tmp/agenter-test".to_owned(),
+            display_name: None,
+        };
+        let session = state
+            .create_session(
+                SessionId::new(),
+                owner,
+                runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let sid = session.session_id;
+        let approval_id = ApprovalId::new();
+        state
+            .publish_event(
+                sid,
+                AppEvent::ApprovalRequested(ApprovalRequestEvent {
+                    session_id: sid,
+                    approval_id,
+                    kind: ApprovalKind::FileChange,
+                    title: "Approve change".to_owned(),
+                    details: Some("files".to_owned()),
+                    expires_at: None,
+                    presentation: None,
+                    provider_payload: None,
+                }),
+            )
+            .await;
+
+        for i in 0..super::SESSION_EVENT_CACHE_LIMIT {
+            state
+                .publish_event(
+                    sid,
+                    AppEvent::UserMessage(UserMessageEvent {
+                        session_id: sid,
+                        message_id: Some(format!("filler-{i}")),
+                        author_user_id: None,
+                        content: "x".to_owned(),
+                    }),
+                )
+                .await;
+        }
+
+        let cache_len = state
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(&sid)
+            .map(|e| e.cache.len())
+            .unwrap_or(0);
+        assert_eq!(cache_len, super::SESSION_EVENT_CACHE_LIMIT);
+        assert!(
+            !state.inner.sessions.lock().await[&sid]
+                .cache
+                .iter()
+                .any(|e| matches!(e.event, AppEvent::ApprovalRequested(_))),
+            "oldest approval_requested should be evicted from ring buffer"
+        );
+
+        let history = state.session_history(owner, sid).await.expect("history");
+        let found = history.iter().find_map(|env| match &env.event {
+            AppEvent::ApprovalRequested(req) if req.approval_id == approval_id => Some(()),
+            _ => None,
+        });
+        assert!(
+            found.is_some(),
+            "history should merge pending approval from registry"
+        );
+
+        let pending = state.pending_approval_request_envelopes(sid).await;
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(pending[0].event, AppEvent::ApprovalRequested(_)));
     }
 
     #[tokio::test]

@@ -455,6 +455,7 @@ pub fn normalize_qwen_permission_request(
         title: "Approve Qwen permission".to_owned(),
         details,
         expires_at: None,
+        presentation: None,
         provider_payload: Some(message.clone()),
     });
     Some((approval_id, native_request_id, event))

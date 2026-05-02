@@ -334,6 +334,7 @@ mod tests {
             title: "Run command".to_owned(),
             details: Some("cargo test".to_owned()),
             expires_at: None,
+            presentation: None,
             provider_payload: Some(serde_json::json!({ "native_id": "approval-1" })),
         });
 
@@ -346,6 +347,21 @@ mod tests {
             json["payload"]["provider_payload"]["native_id"],
             "approval-1"
         );
+
+        let with_pres = AppEvent::ApprovalRequested(ApprovalRequestEvent {
+            session_id: SessionId::nil(),
+            approval_id,
+            kind: ApprovalKind::FileChange,
+            title: "Patch".to_owned(),
+            details: Some("delta".to_owned()),
+            expires_at: None,
+            presentation: Some(
+                serde_json::json!({"variant": "codex_file_change", "paths": ["a.rs"]}),
+            ),
+            provider_payload: None,
+        });
+        let pj = serde_json::to_value(&with_pres).expect("serialize approval with presentation");
+        assert!(pj["payload"]["presentation"]["paths"][0].is_string());
     }
 
     #[test]
