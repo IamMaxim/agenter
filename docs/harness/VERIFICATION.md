@@ -44,6 +44,15 @@ npm run build
 
 `npm run check` runs `svelte-check`, `npm run lint` runs ESLint, `npm run test` runs Vitest, and `npm run build` runs the Vite production build.
 
+Composer usage bar manual checklist:
+
+- Open a session with `token_usage` and `rate_limits` provider events.
+- Confirm the composer bottom bar order is mode, dot, model, thinking level, dot, context, spacer, 5h, dot, week.
+- Hover context usage and confirm the token count title appears when token totals are known.
+- Hover 5h and weekly metrics and confirm reset countdown plus local reset datetime appear.
+- Simulate missing or partial usage and confirm unknown metrics render as `--` without implying `0%`.
+- Change mode, model, and reasoning from the composer bar and confirm the saved values remain reflected after reload.
+
 ## Integration Phase
 
 Protocol and connector work should include focused integration checks:

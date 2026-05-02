@@ -75,6 +75,26 @@ button.danger.compact {
   width: auto;
 }
 
+button.busy {
+  display: inline-grid;
+  place-items: center;
+  min-width: 4.2rem;
+}
+
+.button-spinner {
+  width: 1rem;
+  height: 1rem;
+  border: 2px solid rgb(16 18 23 / 0.24);
+  border-top-color: #101217;
+  border-radius: 999px;
+  animation: spin 0.75s linear infinite;
+}
+
+button.busy:disabled .button-spinner {
+  border-color: rgb(216 221 231 / 0.22);
+  border-top-color: #d8dde7;
+}
+
 a {
   color: inherit;
 }
@@ -609,6 +629,50 @@ nav a:hover {
   color: #e7e9ee;
 }
 
+.working-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto auto minmax(5rem, 12rem);
+  align-items: center;
+  justify-content: start;
+  gap: 0.55rem;
+  width: fit-content;
+  max-width: 100%;
+  min-height: 2rem;
+  margin: 0.5rem 0;
+  overflow: hidden;
+  color: #cbd5e1;
+  font-size: 0.88rem;
+}
+
+.working-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 999px;
+  background: #93e1b5;
+  box-shadow: 0 0 0 0 rgb(147 225 181 / 0.45);
+  animation: pulse-dot 1.35s ease-in-out infinite;
+}
+
+.working-shimmer {
+  position: relative;
+  display: block;
+  height: 0.55rem;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #242a35;
+}
+
+.working-shimmer::before {
+  position: absolute;
+  inset: 0;
+  width: 45%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, transparent, #93e1b5, transparent);
+  content: "";
+  animation: working-shimmer 1.15s ease-in-out infinite;
+}
+
 .markdown-content {
   min-width: 0;
   color: inherit;
@@ -815,6 +879,35 @@ nav a:hover {
 .ansi-fg-white,
 .ansi-fg-bright-white {
   color: #f8fafc;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgb(147 225 181 / 0.32);
+    opacity: 0.72;
+  }
+
+  50% {
+    box-shadow: 0 0 0 0.45rem rgb(147 225 181 / 0);
+    opacity: 1;
+  }
+}
+
+@keyframes working-shimmer {
+  from {
+    transform: translateX(-110%);
+  }
+
+  to {
+    transform: translateX(240%);
+  }
 }
 
 .command-meta,
@@ -1082,7 +1175,7 @@ nav a:hover {
 .composer {
   position: relative;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 0.5rem;
   margin: 0 0.5rem 0.5rem 0.5rem;
@@ -1187,33 +1280,73 @@ nav a:hover {
   overflow-y: hidden;
 }
 
-.composer-settings {
-  position: relative;
-}
-
-.settings-popover {
-  position: absolute;
-  bottom: calc(100% + 0.5rem);
-  left: 0;
-  z-index: 5;
-  display: grid;
-  width: min(28rem, calc(100vw - 2rem));
-  gap: 0.65rem;
-  padding: 0.8rem;
-  border: 1px solid #303642;
-  border-radius: 8px;
-  background: #151922;
-  box-shadow: 0 16px 40px rgb(0 0 0 / 0.32);
-}
-
-.settings-popover label {
-  display: grid;
-  gap: 0.35rem;
-}
-
-.settings-popover span {
+.composer-bottom-bar {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.2rem 0.45rem;
+  min-height: 1.6rem;
+  padding: 0 0.65rem 0.25rem;
   color: #8f98a7;
-  font-size: 0.78rem;
+  font-size: 0.76rem;
+  line-height: 1.2;
+}
+
+.composer-inline-select {
+  min-width: 0;
+  max-width: 10rem;
+  border: 0;
+  border-radius: 5px;
+  padding: 0.1rem 0.25rem;
+  color: #aeb6c3;
+  background: transparent;
+  font: inherit;
+}
+
+.composer-inline-select:hover,
+.composer-inline-select:focus {
+  color: #d8dde7;
+  background: #171b23;
+  outline: 1px solid #303642;
+}
+
+.model-select {
+  max-width: 13rem;
+}
+
+.composer-dot {
+  color: #505865;
+}
+
+.composer-metric {
+  cursor: default;
+  white-space: nowrap;
+}
+
+.composer-metric:not(.unknown) {
+  color: #b6becb;
+}
+
+.composer-metric[title]:not([title='']) {
+  text-decoration: underline;
+  text-decoration-color: #3a424f;
+  text-decoration-style: dotted;
+  text-underline-offset: 0.18rem;
+}
+
+.composer-metric.unknown {
+  color: #6f7784;
+}
+
+.composer-spacer {
+  flex: 1 1 auto;
+  min-width: 1rem;
+}
+
+.composer-settings-error {
+  flex-basis: 100%;
+  color: #fca5a5;
 }
 
 .sr-only {

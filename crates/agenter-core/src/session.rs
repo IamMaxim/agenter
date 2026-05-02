@@ -95,6 +95,51 @@ pub struct SessionInfo {
     pub created_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Box<SessionUsageSnapshot>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionUsageContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionUsageWindow {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_percent: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_text_hint: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionUsageSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<AgentReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<SessionUsageContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_5h: Option<SessionUsageWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub week: Option<SessionUsageWindow>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

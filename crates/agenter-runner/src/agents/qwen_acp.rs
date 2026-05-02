@@ -2,7 +2,8 @@ use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use agenter_core::{
     AgentErrorEvent, AgentMessageDeltaEvent, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind,
-    ApprovalRequestEvent, MessageCompletedEvent, SessionId,
+    ApprovalRequestEvent, MessageCompletedEvent, SessionId, SessionStatus,
+    SessionStatusChangedEvent,
 };
 use anyhow::{anyhow, Context};
 use serde_json::{json, Value};
@@ -257,6 +258,13 @@ pub async fn run_qwen_turn(
         if is_response_to(&message, &prompt_request_id) {
             let event = normalize_qwen_prompt_response(request.session_id, &message);
             event_sender.send(event).ok();
+            event_sender
+                .send(AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
+                    session_id: request.session_id,
+                    status: SessionStatus::Completed,
+                    reason: Some("Qwen prompt completed.".to_owned()),
+                }))
+                .ok();
             tracing::info!(session_id = %request.session_id, "qwen prompt completed");
             server.shutdown().await?;
             return Ok(());
@@ -270,6 +278,13 @@ pub async fn run_qwen_turn(
                 .lock()
                 .await
                 .insert(approval_id, PendingQwenApproval { response: sender });
+            event_sender
+                .send(AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
+                    session_id: request.session_id,
+                    status: SessionStatus::WaitingForApproval,
+                    reason: Some("Qwen is waiting for approval.".to_owned()),
+                }))
+                .ok();
             tracing::info!(
                 session_id = %request.session_id,
                 %approval_id,
@@ -284,6 +299,13 @@ pub async fn run_qwen_turn(
                         qwen_permission_response(&message, decision),
                     )
                     .await?;
+                event_sender
+                    .send(AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
+                        session_id: request.session_id,
+                        status: SessionStatus::Running,
+                        reason: Some("Approval answered.".to_owned()),
+                    }))
+                    .ok();
             }
             continue;
         }
@@ -292,6 +314,13 @@ pub async fn run_qwen_turn(
             let completed = matches!(event, AppEvent::AgentMessageCompleted(_));
             event_sender.send(event).ok();
             if completed {
+                event_sender
+                    .send(AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
+                        session_id: request.session_id,
+                        status: SessionStatus::Completed,
+                        reason: Some("Qwen turn completed.".to_owned()),
+                    }))
+                    .ok();
                 tracing::info!(session_id = %request.session_id, "qwen turn completed");
                 server.shutdown().await?;
                 return Ok(());

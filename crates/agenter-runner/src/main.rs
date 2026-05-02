@@ -1,7 +1,7 @@
 mod agents;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     path::{Path, PathBuf},
     sync::Arc,
@@ -11,8 +11,8 @@ use agenter_core::{
     AgentCapabilities, AgentErrorEvent, AgentMessageDeltaEvent, AgentProviderId, AppEvent,
     ApprovalId, ApprovalKind, ApprovalRequestEvent, CommandCompletedEvent, CommandEvent,
     CommandOutputEvent, CommandOutputStream, FileChangeEvent, FileChangeKind,
-    MessageCompletedEvent, QuestionId, RunnerId, SessionId, ToolEvent, UserMessageEvent,
-    WorkspaceId, WorkspaceRef,
+    MessageCompletedEvent, QuestionId, RunnerId, SessionId, SessionStatus,
+    SessionStatusChangedEvent, ToolEvent, UserMessageEvent, WorkspaceId, WorkspaceRef,
 };
 use agenter_protocol::runner::{
     AgentInput, AgentProviderAdvertisement, DiscoveredSession, DiscoveredSessionHistoryStatus,
@@ -25,8 +25,9 @@ use agenter_protocol::{
     RunnerTransportOutboundFrame,
 };
 use agents::codex::{
-    codex_provider_slash_commands, is_codex_thread_not_found_error, run_codex_turn_on_server,
-    CodexAppServer, CodexTurnRequest, PendingCodexApproval, PendingCodexQuestion,
+    codex_provider_slash_commands, is_codex_no_rollout_resume_error,
+    is_codex_thread_not_found_error, run_codex_turn_on_server, CodexAppServer, CodexTurnRequest,
+    PendingCodexApproval, PendingCodexQuestion,
 };
 use agents::qwen_acp::{run_qwen_turn, PendingQwenApproval, QwenTurnRequest};
 use futures_util::{SinkExt, StreamExt};
@@ -43,16 +44,24 @@ const DEFAULT_RUNNER_WS_MAX_MESSAGE_BYTES: usize = 512 * 1024 * 1024;
 struct CodexRunnerRuntime {
     workspace_path: PathBuf,
     server: Arc<Mutex<Option<CodexAppServer>>>,
+    live_thread_ids: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CodexTurnThreadAction {
     StartNew,
+    UseLive(String),
     ResumeExisting(String),
 }
 
-fn codex_turn_thread_action(external_session_id: Option<&str>) -> CodexTurnThreadAction {
+fn codex_turn_thread_action(
+    external_session_id: Option<&str>,
+    live_thread_ids: &HashSet<String>,
+) -> CodexTurnThreadAction {
     match external_session_id {
+        Some(thread_id) if live_thread_ids.contains(thread_id) => {
+            CodexTurnThreadAction::UseLive(thread_id.to_owned())
+        }
         Some(thread_id) => CodexTurnThreadAction::ResumeExisting(thread_id.to_owned()),
         None => CodexTurnThreadAction::StartNew,
     }
@@ -63,13 +72,16 @@ impl CodexRunnerRuntime {
         Self {
             workspace_path,
             server: Arc::new(Mutex::new(None)),
+            live_thread_ids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
     async fn create_session(&self) -> anyhow::Result<String> {
         let mut guard = self.server.lock().await;
         let server = ensure_codex_server(&mut guard, self.workspace_path.clone()).await?;
-        server.start_thread(&self.workspace_path).await
+        let thread_id = server.start_thread(&self.workspace_path).await?;
+        self.remember_live_thread(&thread_id).await;
+        Ok(thread_id)
     }
 
     async fn resume_session(&self, external_session_id: &str) -> anyhow::Result<String> {
@@ -78,7 +90,15 @@ impl CodexRunnerRuntime {
         server
             .resume_thread(external_session_id, &self.workspace_path)
             .await?;
+        self.remember_live_thread(external_session_id).await;
         Ok(external_session_id.to_owned())
+    }
+
+    async fn remember_live_thread(&self, thread_id: &str) {
+        self.live_thread_ids
+            .lock()
+            .await
+            .insert(thread_id.to_owned());
     }
 
     async fn discover_sessions(&self) -> anyhow::Result<Vec<DiscoveredSession>> {
@@ -146,22 +166,40 @@ impl CodexRunnerRuntime {
         pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingCodexApproval>>>,
         pending_questions: Arc<Mutex<HashMap<QuestionId, PendingCodexQuestion>>>,
     ) -> anyhow::Result<()> {
+        let thread_action = {
+            let live_thread_ids = self.live_thread_ids.lock().await;
+            codex_turn_thread_action(request.external_session_id.as_deref(), &live_thread_ids)
+        };
         let mut guard = self.server.lock().await;
         let server = ensure_codex_server(&mut guard, self.workspace_path.clone()).await?;
-        let existing_thread_id =
-            match codex_turn_thread_action(request.external_session_id.as_deref()) {
-                CodexTurnThreadAction::ResumeExisting(thread_id) => {
-                    server
-                        .resume_thread(&thread_id, &self.workspace_path)
-                        .await?;
-                    Some(thread_id)
+        let existing_thread_id = match thread_action {
+            CodexTurnThreadAction::UseLive(thread_id) => {
+                server.set_active_thread(thread_id.clone());
+                Some(thread_id)
+            }
+            CodexTurnThreadAction::ResumeExisting(thread_id) => {
+                match server.resume_thread(&thread_id, &self.workspace_path).await {
+                    Ok(()) => self.remember_live_thread(&thread_id).await,
+                    Err(error) if is_codex_no_rollout_resume_error(error.as_ref()) => {
+                        tracing::warn!(
+                            session_id = %request.session_id,
+                            provider_thread_id = %thread_id,
+                            "codex resume reported no rollout; treating thread as a pre-first-turn live thread"
+                        );
+                        server.set_active_thread(thread_id.clone());
+                        self.remember_live_thread(&thread_id).await;
+                    }
+                    Err(error) => return Err(error),
                 }
-                CodexTurnThreadAction::StartNew => {
-                    let thread_id = server.start_thread(&self.workspace_path).await?;
-                    server.set_active_thread(thread_id);
-                    None
-                }
-            };
+                Some(thread_id)
+            }
+            CodexTurnThreadAction::StartNew => {
+                let thread_id = server.start_thread(&self.workspace_path).await?;
+                server.set_active_thread(thread_id.clone());
+                self.remember_live_thread(&thread_id).await;
+                None
+            }
+        };
         let result = run_codex_turn_on_server(
             server,
             request.clone(),
@@ -470,6 +508,11 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                         tokio::spawn(async move {
                             if let Err(error) = runtime.run_turn(request, event_sender.clone(), pending, pending_question_answers).await {
                                 tracing::error!(%session_id, %error, "codex turn failed");
+                                event_sender.send(AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
+                                    session_id,
+                                    status: SessionStatus::Failed,
+                                    reason: Some(error.to_string()),
+                                })).ok();
                                 event_sender.send(AppEvent::Error(AgentErrorEvent {
                                     session_id: Some(session_id),
                                     code: Some("codex_adapter_error".to_owned()),
@@ -657,6 +700,11 @@ async fn run_qwen_runner() -> anyhow::Result<()> {
                         tokio::spawn(async move {
                             if let Err(error) = run_qwen_turn(request, event_sender.clone(), pending).await {
                                 tracing::error!(%session_id, %error, "qwen turn failed");
+                                event_sender.send(AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
+                                    session_id,
+                                    status: SessionStatus::Failed,
+                                    reason: Some(error.to_string()),
+                                })).ok();
                                 event_sender.send(AppEvent::Error(AgentErrorEvent {
                                     session_id: Some(session_id),
                                     code: Some("qwen_adapter_error".to_owned()),
@@ -1257,12 +1305,19 @@ mod tests {
 
     #[test]
     fn codex_turn_uses_resume_for_existing_provider_thread() {
+        let mut live_threads = std::collections::HashSet::new();
+        live_threads.insert("live-thread-1".to_owned());
+
         assert_eq!(
-            codex_turn_thread_action(Some("thread-1")),
+            codex_turn_thread_action(Some("live-thread-1"), &live_threads),
+            CodexTurnThreadAction::UseLive("live-thread-1".to_owned())
+        );
+        assert_eq!(
+            codex_turn_thread_action(Some("thread-1"), &live_threads),
             CodexTurnThreadAction::ResumeExisting("thread-1".to_owned())
         );
         assert_eq!(
-            codex_turn_thread_action(None),
+            codex_turn_thread_action(None, &live_threads),
             CodexTurnThreadAction::StartNew
         );
     }

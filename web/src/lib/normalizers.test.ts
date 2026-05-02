@@ -64,9 +64,61 @@ describe('frontend API normalizers', () => {
         external_session_id: null,
         title: null,
         created_at: null,
-        updated_at: null
+        updated_at: null,
+        usage: null
       }
     ]);
+  });
+
+  test('normalizes session usage snapshots with partial payloads', () => {
+    expect(
+      normalizeSessions([
+        {
+          session_id: 'session-1',
+          workspace_id: 'workspace-1',
+          usage: {
+            mode_label: 'plan',
+            model: 'gpt-5.4',
+            reasoning_effort: 'high',
+            context: {
+              used_percent: 19,
+              used_tokens: 42000,
+              total_tokens: 258000
+            },
+            window_5h: {
+              remaining_percent: 42,
+              resets_at: '2026-04-12T20:01:00Z'
+            },
+            week: {
+              remaining_percent: 'bad'
+            }
+          }
+        }
+      ])[0].usage
+    ).toEqual({
+      mode_label: 'plan',
+      model: 'gpt-5.4',
+      reasoning_effort: 'high',
+      context: {
+        used_percent: 19,
+        used_tokens: 42000,
+        total_tokens: 258000
+      },
+      window_5h: {
+        used_percent: null,
+        remaining_percent: 42,
+        resets_at: '2026-04-12T20:01:00Z',
+        window_label: null,
+        remaining_text_hint: null
+      },
+      week: {
+        used_percent: null,
+        remaining_percent: null,
+        resets_at: null,
+        window_label: null,
+        remaining_text_hint: null
+      }
+    });
   });
 
   test('normalizes turn settings and browser event envelopes defensively', () => {

@@ -11,6 +11,9 @@ import type {
   RunnerStatus,
   SessionInfo,
   SessionStatus,
+  SessionUsageContext,
+  SessionUsageSnapshot,
+  SessionUsageWindow,
   WorkspaceRef
 } from '../api/types';
 
@@ -63,6 +66,7 @@ const appEventTypes = new Set<AppEventType>([
   'approval_resolved',
   'question_requested',
   'question_answered',
+  'provider_event',
   'error'
 ]);
 
@@ -224,7 +228,50 @@ function normalizeSession(value: unknown): SessionInfo | undefined {
       typeof record.external_session_id === 'string' ? record.external_session_id : null,
     title: typeof record.title === 'string' ? record.title : null,
     created_at: typeof record.created_at === 'string' ? record.created_at : null,
-    updated_at: typeof record.updated_at === 'string' ? record.updated_at : null
+    updated_at: typeof record.updated_at === 'string' ? record.updated_at : null,
+    usage: normalizeSessionUsage(record.usage)
+  };
+}
+
+export function normalizeSessionUsage(value: unknown): SessionUsageSnapshot | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const record = objectRecord(value);
+  return {
+    mode_label: typeof record.mode_label === 'string' ? record.mode_label : null,
+    model: typeof record.model === 'string' ? record.model : null,
+    reasoning_effort: isReasoningEffort(record.reasoning_effort) ? record.reasoning_effort : null,
+    context: normalizeUsageContext(record.context),
+    window_5h: normalizeUsageWindow(record.window_5h),
+    week: normalizeUsageWindow(record.week)
+  };
+}
+
+function normalizeUsageContext(value: unknown): SessionUsageContext | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const record = objectRecord(value);
+  return {
+    used_percent: numberOrNull(record.used_percent),
+    used_tokens: numberOrNull(record.used_tokens),
+    total_tokens: numberOrNull(record.total_tokens)
+  };
+}
+
+function normalizeUsageWindow(value: unknown): SessionUsageWindow | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const record = objectRecord(value);
+  return {
+    used_percent: numberOrNull(record.used_percent),
+    remaining_percent: numberOrNull(record.remaining_percent),
+    resets_at: typeof record.resets_at === 'string' ? record.resets_at : null,
+    window_label: typeof record.window_label === 'string' ? record.window_label : null,
+    remaining_text_hint:
+      typeof record.remaining_text_hint === 'string' ? record.remaining_text_hint : null
   };
 }
 
@@ -240,6 +287,10 @@ function objectRecord(value: unknown): Record<string, unknown> {
 
 function arrayValue(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
 function isReasoningEffort(value: unknown): value is AgentReasoningEffort {

@@ -12,8 +12,9 @@ use agenter_core::{
     ApprovalRequestEvent, CommandCompletedEvent, CommandEvent, CommandOutputEvent,
     CommandOutputStream, FileChangeEvent, FileChangeKind, MessageCompletedEvent, PlanEntry,
     PlanEntryStatus, PlanEvent, ProviderEvent, QuestionId, QuestionRequestedEvent, SessionId,
-    SlashCommandArgument, SlashCommandArgumentKind, SlashCommandDangerLevel,
-    SlashCommandDefinition, SlashCommandRequest, SlashCommandResult, SlashCommandTarget,
+    SessionStatus, SessionStatusChangedEvent, SlashCommandArgument, SlashCommandArgumentKind,
+    SlashCommandDangerLevel, SlashCommandDefinition, SlashCommandRequest, SlashCommandResult,
+    SlashCommandTarget,
 };
 use agenter_protocol::{
     DiscoveredCommandAction, DiscoveredFileChangeStatus, DiscoveredSessionHistoryItem,
@@ -779,6 +780,13 @@ pub async fn run_codex_turn_on_server(
                 .lock()
                 .await
                 .insert(approval_id, PendingCodexApproval { response: sender });
+            event_sender
+                .send(session_status_event(
+                    request.session_id,
+                    SessionStatus::WaitingForApproval,
+                    Some("Codex is waiting for approval.".to_owned()),
+                ))
+                .ok();
             tracing::info!(
                 session_id = %request.session_id,
                 %approval_id,
@@ -791,6 +799,13 @@ pub async fn run_codex_turn_on_server(
                 server
                     .send_approval_response(native_request_id, approval_kind, decision)
                     .await?;
+                event_sender
+                    .send(session_status_event(
+                        request.session_id,
+                        SessionStatus::Running,
+                        Some("Approval answered.".to_owned()),
+                    ))
+                    .ok();
             }
             continue;
         }
@@ -805,6 +820,13 @@ pub async fn run_codex_turn_on_server(
                 .lock()
                 .await
                 .insert(question_id, PendingCodexQuestion { response: sender });
+            event_sender
+                .send(session_status_event(
+                    request.session_id,
+                    SessionStatus::WaitingForInput,
+                    Some("Codex is waiting for input.".to_owned()),
+                ))
+                .ok();
             tracing::info!(
                 session_id = %request.session_id,
                 %question_id,
@@ -816,6 +838,13 @@ pub async fn run_codex_turn_on_server(
                 server
                     .send_question_response(native_request_id, question_kind, answer)
                     .await?;
+                event_sender
+                    .send(session_status_event(
+                        request.session_id,
+                        SessionStatus::Running,
+                        Some("Input answered.".to_owned()),
+                    ))
+                    .ok();
             }
             continue;
         }
@@ -829,13 +858,13 @@ pub async fn run_codex_turn_on_server(
             continue;
         }
 
+        let completed = jsonrpc_method(&message) == Some("turn/completed");
         for event in normalize_codex_message_for_scope(request.session_id, &message, &scope) {
-            let completed = jsonrpc_method(&message) == Some("turn/completed");
             event_sender.send(event).ok();
-            if completed {
-                tracing::info!(session_id = %request.session_id, "codex turn completed");
-                return Ok(());
-            }
+        }
+        if completed {
+            tracing::info!(session_id = %request.session_id, "codex turn completed");
+            return Ok(());
         }
     }
 
@@ -942,6 +971,9 @@ fn normalize_codex_message_for_scope(
 }
 
 fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<AppEvent> {
+    if let Some(events) = normalize_codex_non_jsonrpc_message(session_id, message) {
+        return events;
+    }
     let Some(method) = jsonrpc_method(message) else {
         return Vec::new();
     };
@@ -952,20 +984,10 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
         "agentMessage/completed" | "agentMessage/complete" => {
             message_completed(session_id, message).into_iter().collect()
         }
-        "turn/started" => vec![provider_event(
-            session_id,
-            message,
-            "turn",
-            "Turn started",
-            Some("running"),
-        )],
-        "thread/status/changed" => vec![provider_event(
-            session_id,
-            message,
-            "thread",
-            "Thread status changed",
-            string_at(message, &["/params/status"]).or(Some("updated")),
-        )],
+        "turn/started" => turn_started(session_id, message),
+        "thread/status/changed" => thread_status_changed(session_id, message),
+        "thread/tokenUsage/updated" => vec![token_usage_updated(session_id, message)],
+        "account/rateLimits/updated" => vec![rate_limits_updated(session_id, message)],
         "thread/compacted" => vec![provider_event(
             session_id,
             message,
@@ -989,14 +1011,21 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
         )],
         "item/started" => item_started(session_id, message).into_iter().collect(),
         "item/completed" => item_completed(session_id, message).into_iter().collect(),
-        "turn/completed" => vec![AppEvent::AgentMessageCompleted(MessageCompletedEvent {
-            session_id,
-            message_id: string_at(message, &["/params/turnId", "/params/id"])
-                .unwrap_or("codex-turn")
-                .to_owned(),
-            content: None,
-            provider_payload: Some(message.clone()),
-        })],
+        "turn/completed" => vec![
+            AppEvent::AgentMessageCompleted(MessageCompletedEvent {
+                session_id,
+                message_id: string_at(message, &["/params/turnId", "/params/id"])
+                    .unwrap_or("codex-turn")
+                    .to_owned(),
+                content: None,
+                provider_payload: Some(message.clone()),
+            }),
+            session_status_event(
+                session_id,
+                SessionStatus::Completed,
+                Some("Codex turn completed.".to_owned()),
+            ),
+        ],
         "error" => vec![AppEvent::Error(AgentErrorEvent {
             session_id: Some(session_id),
             code: string_at(message, &["/params/code"]).map(str::to_owned),
@@ -1379,6 +1408,7 @@ fn turn_plan_updated(session_id: SessionId, message: &Value) -> Option<AppEvent>
         title: Some("Implementation plan".to_owned()),
         content: string_at(message, &["/params/explanation"]).map(str::to_owned),
         entries,
+        append: false,
         provider_payload: Some(message.clone()),
     }))
 }
@@ -1398,6 +1428,7 @@ fn plan_delta(session_id: SessionId, message: &Value) -> Option<AppEvent> {
         title: Some("Implementation plan".to_owned()),
         content: Some(content.to_owned()),
         entries: Vec::new(),
+        append: true,
         provider_payload: Some(message.clone()),
     }))
 }
@@ -1419,6 +1450,173 @@ fn command_output_delta(session_id: SessionId, message: &Value) -> Option<AppEve
     }))
 }
 
+fn normalize_codex_non_jsonrpc_message(
+    session_id: SessionId,
+    message: &Value,
+) -> Option<Vec<AppEvent>> {
+    if message.get("method").is_some() {
+        return None;
+    }
+    if message.get("command_id").is_some() && message.get("raw_input").is_some() {
+        return Some(vec![codex_slash_command_result(session_id, message)]);
+    }
+    if item_type(message) == Some("contextCompaction") {
+        return Some(vec![codex_context_compaction_event(session_id, message)]);
+    }
+    None
+}
+
+fn codex_slash_command_result(session_id: SessionId, message: &Value) -> AppEvent {
+    let accepted = bool_at(message, &["/accepted"]).unwrap_or(false);
+    AppEvent::ProviderEvent(ProviderEvent {
+        session_id,
+        provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+        event_id: string_at(message, &["/command_id"]).map(str::to_owned),
+        category: "slash_command".to_owned(),
+        title: string_at(message, &["/raw_input", "/command_id"])
+            .unwrap_or("Provider command")
+            .to_owned(),
+        detail: string_at(message, &["/message"]).map(str::to_owned),
+        status: Some(if accepted { "accepted" } else { "rejected" }.to_owned()),
+        provider_payload: Some(message.clone()),
+    })
+}
+
+fn codex_context_compaction_event(session_id: SessionId, message: &Value) -> AppEvent {
+    AppEvent::ProviderEvent(ProviderEvent {
+        session_id,
+        provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+        event_id: string_at(message, &["/id", "/itemId", "/item/id"]).map(str::to_owned),
+        category: "compaction".to_owned(),
+        title: "Context compacted".to_owned(),
+        detail: None,
+        status: Some("completed".to_owned()),
+        provider_payload: Some(message.clone()),
+    })
+}
+
+fn thread_status_changed(session_id: SessionId, message: &Value) -> Vec<AppEvent> {
+    let provider_status = string_at(message, &["/params/status/type"])
+        .or_else(|| string_at(message, &["/params/status"]))
+        .unwrap_or("updated");
+    let mut events = Vec::new();
+    match provider_status {
+        "active" => events.push(session_status_event(
+            session_id,
+            SessionStatus::Running,
+            Some("Codex thread is active.".to_owned()),
+        )),
+        "idle" => events.push(session_status_event(
+            session_id,
+            SessionStatus::Completed,
+            Some("Codex thread is idle.".to_owned()),
+        )),
+        _ => {}
+    }
+    events.push(AppEvent::ProviderEvent(ProviderEvent {
+        session_id,
+        provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+        event_id: string_at(message, &["/params/threadId"]).map(str::to_owned),
+        category: "thread".to_owned(),
+        title: "Thread status changed".to_owned(),
+        detail: Some(format!("status: {provider_status}")),
+        status: Some(provider_status.to_owned()),
+        provider_payload: Some(message.clone()),
+    }));
+    events
+}
+
+fn turn_started(session_id: SessionId, message: &Value) -> Vec<AppEvent> {
+    let status = string_at(message, &["/params/turn/status"]).unwrap_or("running");
+    let mut events = Vec::new();
+    if matches!(status, "inProgress" | "running") {
+        events.push(session_status_event(
+            session_id,
+            SessionStatus::Running,
+            Some("Codex turn started.".to_owned()),
+        ));
+    }
+    events.push(AppEvent::ProviderEvent(ProviderEvent {
+        session_id,
+        provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+        event_id: string_at(message, &["/params/turn/id", "/params/turnId"]).map(str::to_owned),
+        category: "turn".to_owned(),
+        title: "Turn started".to_owned(),
+        detail: None,
+        status: Some(status.to_owned()),
+        provider_payload: Some(message.clone()),
+    }));
+    events
+}
+
+fn token_usage_updated(session_id: SessionId, message: &Value) -> AppEvent {
+    let last = integer_at(message, &["/params/tokenUsage/last/totalTokens"]);
+    let total = integer_at(message, &["/params/tokenUsage/total/totalTokens"]);
+    let window = integer_at(message, &["/params/tokenUsage/modelContextWindow"]);
+    AppEvent::ProviderEvent(ProviderEvent {
+        session_id,
+        provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+        event_id: string_at(message, &["/params/turnId", "/params/threadId"]).map(str::to_owned),
+        category: "token_usage".to_owned(),
+        title: "Token usage updated".to_owned(),
+        detail: Some(
+            [
+                last.map(|value| format!("last {value}")),
+                total.map(|value| format!("total {value}")),
+                window.map(|value| format!("window {value}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · "),
+        )
+        .filter(|detail| !detail.is_empty()),
+        status: Some("updated".to_owned()),
+        provider_payload: Some(message.clone()),
+    })
+}
+
+fn rate_limits_updated(session_id: SessionId, message: &Value) -> AppEvent {
+    let plan = string_at(message, &["/params/rateLimits/planType"]);
+    let primary = integer_at(message, &["/params/rateLimits/primary/usedPercent"]);
+    let secondary = integer_at(message, &["/params/rateLimits/secondary/usedPercent"]);
+    let reached = string_at(message, &["/params/rateLimits/rateLimitReachedType"]);
+    AppEvent::ProviderEvent(ProviderEvent {
+        session_id,
+        provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+        event_id: string_at(message, &["/params/rateLimits/limitId"]).map(str::to_owned),
+        category: "rate_limits".to_owned(),
+        title: "Rate limits updated".to_owned(),
+        detail: Some(
+            [
+                plan.map(str::to_owned),
+                primary.map(|value| format!("primary {value}%")),
+                secondary.map(|value| format!("secondary {value}%")),
+                reached.map(|value| format!("reached {value}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · "),
+        )
+        .filter(|detail| !detail.is_empty()),
+        status: Some("updated".to_owned()),
+        provider_payload: Some(message.clone()),
+    })
+}
+
+fn session_status_event(
+    session_id: SessionId,
+    status: SessionStatus,
+    reason: Option<String>,
+) -> AppEvent {
+    AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
+        session_id,
+        status,
+        reason,
+    })
+}
+
 fn provider_event(
     session_id: SessionId,
     message: &Value,
@@ -1436,6 +1634,7 @@ fn provider_event(
                 "/params/itemId",
                 "/params/id",
                 "/params/turnId",
+                "/params/turn/id",
                 "/params/threadId",
             ],
         )
@@ -1881,6 +2080,11 @@ pub fn is_codex_thread_not_found_error(error: &(dyn std::error::Error + 'static)
     message.contains("codex turn/start failed") && message.contains("thread not found")
 }
 
+pub fn is_codex_no_rollout_resume_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    let message = error.to_string();
+    message.contains("codex thread/resume failed") && message.contains("no rollout found")
+}
+
 fn missing_thread_id_error(method: &str, message: &Value, stderr: &[String]) -> String {
     let mut error = format!("codex {method} response did not include a thread id");
     let stderr_label = recent_stderr_label(stderr);
@@ -1944,7 +2148,7 @@ fn item_id(message: &Value) -> String {
 }
 
 fn item_type(message: &Value) -> Option<&str> {
-    string_at(message, &["/params/item/type", "/params/type"])
+    string_at(message, &["/params/item/type", "/params/type", "/type"])
 }
 
 fn should_ignore_item_event(message: &Value) -> bool {
@@ -2150,6 +2354,26 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_raw_codex_context_compaction_item_as_provider_event() {
+        let message = json!({
+            "id": "item-237",
+            "type": "contextCompaction"
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        assert_eq!(events.len(), 1);
+        let AppEvent::ProviderEvent(event) = &events[0] else {
+            panic!("expected provider event");
+        };
+        assert_eq!(event.event_id.as_deref(), Some("item-237"));
+        assert_eq!(event.category, "compaction");
+        assert_eq!(event.title, "Context compacted");
+        assert_eq!(event.status.as_deref(), Some("completed"));
+        assert_eq!(event.provider_payload.as_ref(), Some(&message));
+    }
+
+    #[test]
     fn normalizes_codex_context_compaction_item_as_provider_event() {
         let message = json!({
             "method": "item/completed",
@@ -2172,6 +2396,228 @@ mod tests {
         assert_eq!(event.event_id.as_deref(), Some("compact-1"));
         assert_eq!(event.category, "compaction");
         assert_eq!(event.title, "Context compacted");
+    }
+
+    #[test]
+    fn normalizes_codex_slash_command_result_object_as_provider_event() {
+        let message = json!({
+            "accepted": true,
+            "arguments": {},
+            "command_id": "codex.compact",
+            "danger_level": "safe",
+            "message": "Codex compaction started.",
+            "provider_payload": {
+                "id": 12,
+                "result": {}
+            },
+            "raw_input": "/compact",
+            "target": "provider"
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        assert_eq!(events.len(), 1);
+        let AppEvent::ProviderEvent(event) = &events[0] else {
+            panic!("expected provider event");
+        };
+        assert_eq!(event.category, "slash_command");
+        assert_eq!(event.title, "/compact");
+        assert_eq!(event.detail.as_deref(), Some("Codex compaction started."));
+        assert_eq!(event.status.as_deref(), Some("accepted"));
+        assert_eq!(event.provider_payload.as_ref(), Some(&message));
+    }
+
+    #[test]
+    fn normalizes_active_thread_status_as_running_status_and_provider_event() {
+        let message = json!({
+            "method": "thread/status/changed",
+            "params": {
+                "status": {
+                    "activeFlags": [],
+                    "type": "active"
+                },
+                "threadId": "019dddf9-a2d8-7510-91b8-9e351bd666dc"
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        assert_eq!(events.len(), 2);
+        let AppEvent::SessionStatusChanged(status) = &events[0] else {
+            panic!("expected session status");
+        };
+        assert_eq!(status.status, agenter_core::SessionStatus::Running);
+        let AppEvent::ProviderEvent(event) = &events[1] else {
+            panic!("expected provider event");
+        };
+        assert_eq!(event.category, "thread");
+        assert_eq!(event.status.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn normalizes_idle_thread_status_as_completed_status_and_provider_event() {
+        let message = json!({
+            "method": "thread/status/changed",
+            "params": {
+                "status": {
+                    "type": "idle"
+                },
+                "threadId": "019dddf9-a2d8-7510-91b8-9e351bd666dc"
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        assert_eq!(events.len(), 2);
+        let AppEvent::SessionStatusChanged(status) = &events[0] else {
+            panic!("expected session status");
+        };
+        assert_eq!(status.status, agenter_core::SessionStatus::Completed);
+        let AppEvent::ProviderEvent(event) = &events[1] else {
+            panic!("expected provider event");
+        };
+        assert_eq!(event.category, "thread");
+        assert_eq!(event.status.as_deref(), Some("idle"));
+    }
+
+    #[test]
+    fn normalizes_turn_started_as_running_status_and_provider_event() {
+        let message = json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "019dddf9-a2d8-7510-91b8-9e351bd666dc",
+                "turn": {
+                    "completedAt": null,
+                    "durationMs": null,
+                    "error": null,
+                    "id": "019de387-4cb9-7e51-bbeb-35f5e1c7d0bd",
+                    "items": [],
+                    "startedAt": 1777638788,
+                    "status": "inProgress"
+                }
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        assert_eq!(events.len(), 2);
+        let AppEvent::SessionStatusChanged(status) = &events[0] else {
+            panic!("expected session status");
+        };
+        assert_eq!(status.status, agenter_core::SessionStatus::Running);
+        let AppEvent::ProviderEvent(event) = &events[1] else {
+            panic!("expected provider event");
+        };
+        assert_eq!(
+            event.event_id.as_deref(),
+            Some("019de387-4cb9-7e51-bbeb-35f5e1c7d0bd")
+        );
+        assert_eq!(event.category, "turn");
+        assert_eq!(event.status.as_deref(), Some("inProgress"));
+    }
+
+    #[test]
+    fn normalizes_token_usage_update_as_provider_event_with_summary() {
+        let message = json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "019dddf9-a2d8-7510-91b8-9e351bd666dc",
+                "tokenUsage": {
+                    "last": {
+                        "cachedInputTokens": 0,
+                        "inputTokens": 0,
+                        "outputTokens": 0,
+                        "reasoningOutputTokens": 0,
+                        "totalTokens": 10421
+                    },
+                    "modelContextWindow": 258400,
+                    "total": {
+                        "cachedInputTokens": 137309056,
+                        "inputTokens": 140097909,
+                        "outputTokens": 301095,
+                        "reasoningOutputTokens": 44763,
+                        "totalTokens": 140399004
+                    }
+                },
+                "turnId": "019de387-4cb9-7e51-bbeb-35f5e1c7d0bd"
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        assert_eq!(events.len(), 1);
+        let AppEvent::ProviderEvent(event) = &events[0] else {
+            panic!("expected provider event");
+        };
+        assert_eq!(event.category, "token_usage");
+        assert_eq!(event.title, "Token usage updated");
+        assert!(event
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("last 10421"));
+        assert!(event
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("total 140399004"));
+        assert!(event
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("window 258400"));
+        assert_eq!(event.provider_payload.as_ref(), Some(&message));
+    }
+
+    #[test]
+    fn normalizes_rate_limit_update_as_provider_event_with_summary() {
+        let message = json!({
+            "method": "account/rateLimits/updated",
+            "params": {
+                "rateLimits": {
+                    "credits": null,
+                    "limitId": "codex",
+                    "limitName": null,
+                    "planType": "prolite",
+                    "primary": {
+                        "resetsAt": 1777640533,
+                        "usedPercent": 57,
+                        "windowDurationMins": 300
+                    },
+                    "rateLimitReachedType": null,
+                    "secondary": {
+                        "resetsAt": 1777968663,
+                        "usedPercent": 26,
+                        "windowDurationMins": 10080
+                    }
+                }
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        assert_eq!(events.len(), 1);
+        let AppEvent::ProviderEvent(event) = &events[0] else {
+            panic!("expected provider event");
+        };
+        assert_eq!(event.category, "rate_limits");
+        assert_eq!(event.title, "Rate limits updated");
+        assert!(event
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("prolite"));
+        assert!(event
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("primary 57%"));
+        assert!(event
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("secondary 26%"));
+        assert_eq!(event.provider_payload.as_ref(), Some(&message));
     }
 
     #[test]
@@ -2679,6 +3125,25 @@ mod tests {
         ));
         assert!(!is_codex_thread_not_found_error(
             anyhow!("codex thread/resume failed: -32600 thread not found: thread-1").as_ref()
+        ));
+    }
+
+    #[test]
+    fn detects_codex_no_rollout_resume_errors() {
+        assert!(is_codex_no_rollout_resume_error(
+            anyhow!(
+                "codex thread/resume failed: -32600 no rollout found for thread id 019de8a3-e4d4-78e3-8382-458afaddbe13"
+            )
+            .as_ref()
+        ));
+        assert!(!is_codex_no_rollout_resume_error(
+            anyhow!("codex thread/resume failed: -32600 thread not found: thread-1").as_ref()
+        ));
+        assert!(!is_codex_no_rollout_resume_error(
+            anyhow!(
+                "codex turn/start failed: -32600 no rollout found for thread id 019de8a3-e4d4-78e3-8382-458afaddbe13"
+            )
+            .as_ref()
         ));
     }
 

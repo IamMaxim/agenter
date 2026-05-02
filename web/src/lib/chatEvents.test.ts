@@ -282,6 +282,172 @@ describe('chat event state', () => {
     ]);
   });
 
+  test('appends streamed plan deltas and lets full snapshots replace content', () => {
+    let state = createChatState();
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-plan-delta-1',
+      event: {
+        type: 'plan_updated',
+        payload: {
+          session_id: 's1',
+          plan_id: 'plan-1',
+          title: 'Implementation plan',
+          content: '1. Add '
+        }
+      }
+    });
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-plan-delta-2',
+      event: {
+        type: 'plan_updated',
+        payload: {
+          session_id: 's1',
+          plan_id: 'plan-1',
+          content: 'tests',
+          append: true
+        }
+      }
+    });
+
+    expect(state.items[0]).toMatchObject({
+      id: 'plan:plan-1',
+      kind: 'plan',
+      content: '1. Add tests'
+    });
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-plan-snapshot',
+      event: {
+        type: 'plan_updated',
+        payload: {
+          session_id: 's1',
+          plan_id: 'plan-1',
+          title: 'Implementation plan',
+          content: '1. Final snapshot'
+        }
+      }
+    });
+
+    expect(state.items[0]).toMatchObject({
+      id: 'plan:plan-1',
+      kind: 'plan',
+      content: '1. Final snapshot'
+    });
+  });
+
+  test('maps session status changes to visible rows and activity state', () => {
+    let state = createChatState();
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-running',
+      event: {
+        type: 'session_status_changed',
+        payload: {
+          session_id: 's1',
+          status: 'running',
+          reason: 'Turn started.'
+        }
+      }
+    });
+
+    expect(state.activity).toEqual({ status: 'running', active: true, label: 'Working' });
+    expect(state.items[0]).toMatchObject({
+      id: 'status:evt-running',
+      kind: 'inlineEvent',
+      eventKind: 'event',
+      title: 'Working',
+      detail: 'Turn started.',
+      status: 'running'
+    });
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-completed',
+      event: {
+        type: 'session_status_changed',
+        payload: {
+          session_id: 's1',
+          status: 'completed'
+        }
+      }
+    });
+
+    expect(state.activity).toEqual({ status: 'completed', active: false, label: 'Turn complete' });
+  });
+
+  test('renders usage rate limit slash and compaction provider events compactly', () => {
+    let state = createChatState();
+
+    for (const [event_id, payload] of [
+      [
+        'evt-token',
+        {
+          session_id: 's1',
+          provider_id: 'codex',
+          event_id: 'turn-1',
+          category: 'token_usage',
+          title: 'Token usage updated',
+          detail: 'last 10 · total 100 · window 1000',
+          status: 'updated'
+        }
+      ],
+      [
+        'evt-rate',
+        {
+          session_id: 's1',
+          provider_id: 'codex',
+          category: 'rate_limits',
+          title: 'Rate limits updated',
+          detail: 'prolite · primary 57%',
+          status: 'updated'
+        }
+      ],
+      [
+        'evt-slash',
+        {
+          session_id: 's1',
+          provider_id: 'codex',
+          category: 'slash_command',
+          title: '/compact',
+          detail: 'Codex compaction started.',
+          status: 'accepted'
+        }
+      ],
+      [
+        'evt-compact',
+        {
+          session_id: 's1',
+          provider_id: 'codex',
+          event_id: 'item-237',
+          category: 'compaction',
+          title: 'Context compacted',
+          status: 'completed'
+        }
+      ]
+    ] as const) {
+      state = applyChatEnvelope(state, {
+        type: 'app_event',
+        event_id,
+        event: {
+          type: 'provider_event',
+          payload
+        }
+      });
+    }
+
+    expect(state.items).toMatchObject([
+      { kind: 'inlineEvent', title: 'Token usage updated', status: 'updated' },
+      { kind: 'inlineEvent', title: 'Rate limits updated', status: 'updated' },
+      { kind: 'inlineEvent', title: '/compact', status: 'accepted' },
+      { kind: 'inlineEvent', title: 'Context compacted', status: 'completed' }
+    ]);
+  });
+
   test('preserves command title while streaming output and exposes command metadata', () => {
     let state = createChatState();
 

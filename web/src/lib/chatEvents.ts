@@ -95,15 +95,23 @@ export interface SubagentStateView {
   message?: string;
 }
 
+export interface ChatActivity {
+  status: string;
+  active: boolean;
+  label: string;
+}
+
 export interface ChatState {
   seenEventIds: Set<string>;
   items: ChatItem[];
+  activity?: ChatActivity;
 }
 
 export function createChatState(): ChatState {
   return {
     seenEventIds: new Set(),
-    items: []
+    items: [],
+    activity: undefined
   };
 }
 
@@ -119,7 +127,8 @@ export function applyChatEnvelope(state: ChatState, envelope: BrowserEventEnvelo
 
   return {
     seenEventIds,
-    items: applyAppEvent(state.items, envelope.event, envelope.event_id)
+    items: applyAppEvent(state.items, envelope.event, envelope.event_id),
+    activity: applyActivity(state.activity, envelope.event)
   };
 }
 
@@ -133,6 +142,15 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
         messageId: stringField(payload, 'message_id') ?? fallbackId(event),
         content: stringField(payload, 'content') ?? '',
         markdown: true
+      });
+    case 'session_status_changed':
+      return upsert(items, {
+        id: `status:${eventId ?? stringField(payload, 'status') ?? fallbackId(event)}`,
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        title: statusLabel(stringField(payload, 'status')),
+        detail: stringField(payload, 'reason'),
+        status: stringField(payload, 'status') ?? 'updated'
       });
     case 'agent_message_delta': {
       const messageId = stringField(payload, 'message_id') ?? fallbackId(event);
@@ -167,12 +185,12 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
       });
     }
     case 'plan_updated':
-      return upsert(items, {
+      return upsertPlan(items, {
         id: `plan:${stringField(payload, 'plan_id') ?? stringField(payload, 'message_id') ?? eventId ?? eventIdHint(event)}`,
         kind: 'plan',
         title: stringField(payload, 'title') ?? 'Implementation plan',
         content: stringField(payload, 'content') ?? stringField(payload, 'markdown') ?? previewJson(payload) ?? ''
-      });
+      }, Boolean(payload.append));
     case 'command_started':
       return upsert(items, {
         id: `event:command:${stringField(payload, 'command_id') ?? fallbackId(event)}`,
@@ -418,6 +436,63 @@ function upsert(items: ChatItem[], next: ChatItem): ChatItem[] {
   }
 
   return [...items.slice(0, index), next, ...items.slice(index + 1)];
+}
+
+function upsertPlan(items: ChatItem[], next: Extract<ChatItem, { kind: 'plan' }>, append: boolean): ChatItem[] {
+  if (!append) {
+    return upsert(items, next);
+  }
+  const existing = items.find((item) => item.id === next.id);
+  if (existing?.kind !== 'plan') {
+    return upsert(items, next);
+  }
+  return upsert(items, {
+    ...next,
+    title: next.title || existing.title,
+    content: `${existing.content}${next.content}`
+  });
+}
+
+function applyActivity(current: ChatActivity | undefined, event: AppEvent): ChatActivity | undefined {
+  if (event.type !== 'session_status_changed') {
+    return current;
+  }
+  const status = stringField(event.payload, 'status');
+  if (!status) {
+    return current;
+  }
+  return {
+    status,
+    active: status === 'running',
+    label: statusLabel(status)
+  };
+}
+
+function statusLabel(status: string | undefined): string {
+  switch (status) {
+    case 'running':
+      return 'Working';
+    case 'waiting_for_approval':
+      return 'Waiting for approval';
+    case 'waiting_for_input':
+      return 'Waiting for input';
+    case 'completed':
+      return 'Turn complete';
+    case 'failed':
+      return 'Failed';
+    case 'interrupted':
+      return 'Interrupted';
+    default:
+      return status ? humanizeStatus(status) : 'Status changed';
+  }
+}
+
+function humanizeStatus(status: string): string {
+  return status
+    .split('_')
+    .filter(Boolean)
+    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+    .join(' ');
 }
 
 function stringField(payload: Record<string, unknown>, field: string): string | undefined {

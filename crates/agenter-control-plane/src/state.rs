@@ -2,7 +2,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use agenter_core::{
     AgentProviderId, AgentQuestionAnswer, AgentTurnSettings, AppEvent, ApprovalId, CommandAction,
-    CommandOutputStream, QuestionId, RunnerId, SessionId, SessionInfo, SessionStatus, UserId,
+    CommandOutputStream, ProviderEvent, QuestionId, RunnerId, SessionId, SessionInfo,
+    SessionStatus, SessionUsageContext, SessionUsageSnapshot, SessionUsageWindow, UserId,
     WorkspaceId, WorkspaceRef,
 };
 use agenter_protocol::{
@@ -15,6 +16,7 @@ use agenter_protocol::{
     RequestId,
 };
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use tokio::{
     sync::{broadcast, mpsc, oneshot, Mutex},
     time::timeout,
@@ -110,6 +112,7 @@ pub struct RegisteredSession {
     pub title: Option<String>,
     pub external_session_id: Option<String>,
     pub turn_settings: Option<AgentTurnSettings>,
+    pub usage: Option<SessionUsageSnapshot>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -124,6 +127,14 @@ pub struct SessionRegistration {
     pub title: Option<String>,
     pub external_session_id: Option<String>,
     pub turn_settings: Option<AgentTurnSettings>,
+    pub usage: Option<SessionUsageSnapshot>,
+}
+
+impl RegisteredSession {
+    #[must_use]
+    pub fn info(&self) -> SessionInfo {
+        session_info(self)
+    }
 }
 
 #[derive(Debug)]
@@ -599,6 +610,7 @@ impl AppState {
             title,
             external_session_id: None,
             turn_settings: None,
+            usage: None,
         })
         .await
     }
@@ -615,6 +627,7 @@ impl AppState {
             title: registration.title,
             external_session_id: registration.external_session_id,
             turn_settings: registration.turn_settings,
+            usage: registration.usage,
             created_at: now,
             updated_at: now,
         };
@@ -630,6 +643,7 @@ impl AppState {
                     external_session_id: session.external_session_id.clone(),
                     title: session.title.clone(),
                     status: session.status.clone(),
+                    usage_snapshot: session.usage.clone(),
                     turn_settings: session.turn_settings.clone(),
                 },
             )
@@ -640,6 +654,7 @@ impl AppState {
                     session.title = persisted.title;
                     session.external_session_id = persisted.external_session_id;
                     session.turn_settings = persisted.turn_settings;
+                    session.usage = persisted.usage_snapshot;
                     session.created_at = persisted.created_at;
                     session.updated_at = persisted.updated_at;
                 }
@@ -717,18 +732,7 @@ impl AppState {
                 .map(|sessions| {
                     sessions
                         .iter()
-                        .map(|session| SessionInfo {
-                            session_id: session.session.session_id,
-                            owner_user_id: session.session.owner_user_id,
-                            runner_id: session.session.runner_id,
-                            workspace_id: session.session.workspace_id,
-                            provider_id: session.session.provider_id.clone(),
-                            status: session.session.status.clone(),
-                            external_session_id: session.session.external_session_id.clone(),
-                            title: session.session.title.clone(),
-                            created_at: Some(session.session.created_at),
-                            updated_at: Some(session.session.updated_at),
-                        })
+                        .map(|session| db_session_info(&session.session))
                         .collect()
                 })
                 .unwrap_or_else(|error| {
@@ -761,18 +765,7 @@ impl AppState {
                 .await
                 .ok()
                 .flatten()
-                .map(|session| SessionInfo {
-                    session_id: session.session_id,
-                    owner_user_id: session.owner_user_id,
-                    runner_id: session.runner_id,
-                    workspace_id: session.workspace_id,
-                    provider_id: session.provider_id,
-                    status: session.status,
-                    external_session_id: session.external_session_id,
-                    title: session.title,
-                    created_at: Some(session.created_at),
-                    updated_at: Some(session.updated_at),
-                });
+                .map(|session| db_session_info(&session));
         }
 
         let mut registry = self.inner.registry.lock().await;
@@ -796,18 +789,7 @@ impl AppState {
                 .await
                 .ok()
                 .flatten()
-                .map(|session| SessionInfo {
-                    session_id: session.session_id,
-                    owner_user_id: session.owner_user_id,
-                    runner_id: session.runner_id,
-                    workspace_id: session.workspace_id,
-                    provider_id: session.provider_id,
-                    status: session.status,
-                    external_session_id: session.external_session_id,
-                    title: session.title,
-                    created_at: Some(session.created_at),
-                    updated_at: Some(session.updated_at),
-                });
+                .map(|session| db_session_info(&session));
         }
 
         let mut registry = self.inner.registry.lock().await;
@@ -845,6 +827,7 @@ impl AppState {
                     title: session.session.title,
                     external_session_id: session.session.external_session_id,
                     turn_settings: session.session.turn_settings,
+                    usage: session.session.usage_snapshot,
                     created_at: session.session.created_at,
                     updated_at: session.session.updated_at,
                 });
@@ -1044,10 +1027,45 @@ impl AppState {
                     question.resolved = true;
                 }
             }
+            AppEvent::ProviderEvent(provider_event) => {
+                if let Some(usage) = self
+                    .apply_provider_usage_event(session_id, provider_event)
+                    .await
+                {
+                    if let Some(pool) = &self.inner.db_pool {
+                        if let Err(error) =
+                            agenter_db::update_session_usage_snapshot(pool, session_id, &usage)
+                                .await
+                        {
+                            tracing::warn!(
+                                %session_id,
+                                %error,
+                                "failed to persist session usage snapshot"
+                            );
+                        }
+                    }
+                }
+            }
             _ => {}
         }
 
         self.store_event(session_id, envelope).await
+    }
+
+    async fn apply_provider_usage_event(
+        &self,
+        session_id: SessionId,
+        event: &ProviderEvent,
+    ) -> Option<SessionUsageSnapshot> {
+        let usage_update = usage_snapshot_from_provider_event(event)?;
+        let mut registry = self.inner.registry.lock().await;
+        let session = registry.sessions.get_mut(&session_id)?;
+        let mut usage = session.usage.clone().unwrap_or_default();
+        merge_usage_snapshot(&mut usage, usage_update);
+        apply_turn_settings_to_usage(&mut usage, session.turn_settings.as_ref());
+        session.usage = Some(usage.clone());
+        session.updated_at = Utc::now();
+        Some(usage)
     }
 
     pub async fn begin_approval_resolution(
@@ -1251,6 +1269,7 @@ impl AppState {
                         title: session.title,
                         external_session_id: session.external_session_id,
                         turn_settings: session.turn_settings,
+                        usage: session.usage_snapshot,
                         created_at: session.created_at,
                         updated_at: session.updated_at,
                     },
@@ -1291,6 +1310,7 @@ impl AppState {
                         title: discovered_session.title.clone(),
                         external_session_id: Some(discovered_session.external_session_id.clone()),
                         turn_settings: None,
+                        usage: None,
                         created_at: now,
                         updated_at: now,
                     }
@@ -1408,6 +1428,7 @@ fn discovered_history_events(
                 title: title.clone(),
                 content: Some(content.clone()),
                 entries: Vec::new(),
+                append: false,
                 provider_payload: provider_payload.clone(),
             })],
             DiscoveredSessionHistoryItem::Tool {
@@ -1576,6 +1597,11 @@ impl SessionEvents {
 }
 
 fn session_info(session: &RegisteredSession) -> SessionInfo {
+    let mut usage = session.usage.clone();
+    if usage.is_some() || session.turn_settings.is_some() {
+        let usage_ref = usage.get_or_insert_with(SessionUsageSnapshot::default);
+        apply_turn_settings_to_usage(usage_ref, session.turn_settings.as_ref());
+    }
     SessionInfo {
         session_id: session.session_id,
         owner_user_id: session.owner_user_id,
@@ -1587,7 +1613,161 @@ fn session_info(session: &RegisteredSession) -> SessionInfo {
         title: session.title.clone(),
         created_at: Some(session.created_at),
         updated_at: Some(session.updated_at),
+        usage: usage.map(Box::new),
     }
+}
+
+fn db_session_info(session: &agenter_db::models::AgentSession) -> SessionInfo {
+    let mut usage = session.usage_snapshot.clone();
+    if usage.is_some() || session.turn_settings.is_some() {
+        let usage_ref = usage.get_or_insert_with(SessionUsageSnapshot::default);
+        apply_turn_settings_to_usage(usage_ref, session.turn_settings.as_ref());
+    }
+    SessionInfo {
+        session_id: session.session_id,
+        owner_user_id: session.owner_user_id,
+        runner_id: session.runner_id,
+        workspace_id: session.workspace_id,
+        provider_id: session.provider_id.clone(),
+        status: session.status.clone(),
+        external_session_id: session.external_session_id.clone(),
+        title: session.title.clone(),
+        created_at: Some(session.created_at),
+        updated_at: Some(session.updated_at),
+        usage: usage.map(Box::new),
+    }
+}
+
+fn apply_turn_settings_to_usage(
+    usage: &mut SessionUsageSnapshot,
+    settings: Option<&AgentTurnSettings>,
+) {
+    let Some(settings) = settings else {
+        return;
+    };
+    if let Some(mode) = &settings.collaboration_mode {
+        usage.mode_label = Some(mode.clone());
+    }
+    if let Some(model) = &settings.model {
+        usage.model = Some(model.clone());
+    }
+    if let Some(reasoning_effort) = &settings.reasoning_effort {
+        usage.reasoning_effort = Some(reasoning_effort.clone());
+    }
+}
+
+fn merge_usage_snapshot(target: &mut SessionUsageSnapshot, update: SessionUsageSnapshot) {
+    if update.mode_label.is_some() {
+        target.mode_label = update.mode_label;
+    }
+    if update.model.is_some() {
+        target.model = update.model;
+    }
+    if update.reasoning_effort.is_some() {
+        target.reasoning_effort = update.reasoning_effort;
+    }
+    if update.context.is_some() {
+        target.context = update.context;
+    }
+    if update.window_5h.is_some() {
+        target.window_5h = update.window_5h;
+    }
+    if update.week.is_some() {
+        target.week = update.week;
+    }
+}
+
+fn usage_snapshot_from_provider_event(event: &ProviderEvent) -> Option<SessionUsageSnapshot> {
+    match event.category.as_str() {
+        "token_usage" => usage_snapshot_from_token_usage(event.provider_payload.as_ref()),
+        "rate_limits" => usage_snapshot_from_rate_limits(event.provider_payload.as_ref()),
+        _ => None,
+    }
+}
+
+fn usage_snapshot_from_token_usage(payload: Option<&Value>) -> Option<SessionUsageSnapshot> {
+    let payload = payload?;
+    let used_tokens = integer_at(
+        payload,
+        &[
+            "/params/tokenUsage/last/totalTokens",
+            "/params/tokenUsage/current/totalTokens",
+            "/params/tokenUsage/total/totalTokens",
+        ],
+    );
+    let total_tokens = integer_at(
+        payload,
+        &[
+            "/params/tokenUsage/modelContextWindow",
+            "/params/modelContextWindow",
+        ],
+    );
+    let used_percent = match (used_tokens, total_tokens) {
+        (Some(used), Some(total)) if total > 0 => Some(((used * 100) / total).min(100)),
+        _ => None,
+    };
+    (used_tokens.is_some() || total_tokens.is_some() || used_percent.is_some()).then(|| {
+        SessionUsageSnapshot {
+            context: Some(SessionUsageContext {
+                used_percent,
+                used_tokens,
+                total_tokens,
+            }),
+            ..SessionUsageSnapshot::default()
+        }
+    })
+}
+
+fn usage_snapshot_from_rate_limits(payload: Option<&Value>) -> Option<SessionUsageSnapshot> {
+    let payload = payload?;
+    let window_5h = usage_window_at(payload, "/params/rateLimits/primary", Some("5h".to_owned()));
+    let week = usage_window_at(
+        payload,
+        "/params/rateLimits/secondary",
+        Some("weekly".to_owned()),
+    );
+    (window_5h.is_some() || week.is_some()).then(|| SessionUsageSnapshot {
+        window_5h,
+        week,
+        ..SessionUsageSnapshot::default()
+    })
+}
+
+fn usage_window_at(
+    payload: &Value,
+    pointer: &str,
+    window_label: Option<String>,
+) -> Option<SessionUsageWindow> {
+    let value = payload.pointer(pointer)?;
+    let used_percent =
+        integer_at(value, &["/usedPercent", "/used_percent"]).map(|value| value.min(100));
+    let remaining_percent = used_percent
+        .map(|value| 100_u64.saturating_sub(value))
+        .or_else(|| {
+            integer_at(value, &["/remainingPercent", "/remaining_percent"])
+                .map(|value| value.min(100))
+        });
+    let resets_at = integer_at(value, &["/resetsAt", "/resets_at"])
+        .and_then(|timestamp| DateTime::from_timestamp(timestamp as i64, 0));
+    (used_percent.is_some() || remaining_percent.is_some() || resets_at.is_some()).then_some({
+        SessionUsageWindow {
+            used_percent,
+            remaining_percent,
+            resets_at,
+            window_label,
+            remaining_text_hint: None,
+        }
+    })
+}
+
+fn integer_at(value: &Value, pointers: &[&str]) -> Option<u64> {
+    pointers.iter().find_map(|pointer| {
+        let value = value.pointer(pointer)?;
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+            .or_else(|| value.as_f64().map(|value| value.round() as u64))
+    })
 }
 
 fn sort_session_infos(sessions: &mut [SessionInfo]) {
@@ -1633,6 +1813,114 @@ mod tests {
         let received = subscription.recv().await.expect("event is broadcast");
         assert!(matches!(received.event, AppEvent::UserMessage(_)));
         assert!(received.event_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn provider_usage_events_update_session_snapshot() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let owner_user_id = state
+            .inner
+            .bootstrap_admin
+            .as_ref()
+            .expect("bootstrap admin")
+            .user
+            .user_id;
+        let runner_id = RunnerId::new();
+        let workspace = WorkspaceRef {
+            workspace_id: WorkspaceId::new(),
+            runner_id,
+            path: "/work/agenter".to_owned(),
+            display_name: Some("agenter".to_owned()),
+        };
+        let session = state
+            .register_session(SessionRegistration {
+                session_id: SessionId::new(),
+                owner_user_id,
+                runner_id,
+                workspace,
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                title: None,
+                external_session_id: None,
+                turn_settings: Some(AgentTurnSettings {
+                    model: Some("gpt-5.4".to_owned()),
+                    reasoning_effort: Some(agenter_core::AgentReasoningEffort::High),
+                    collaboration_mode: Some("plan".to_owned()),
+                }),
+                usage: None,
+            })
+            .await;
+
+        state
+            .publish_event(
+                session.session_id,
+                AppEvent::ProviderEvent(agenter_core::ProviderEvent {
+                    session_id: session.session_id,
+                    provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                    event_id: None,
+                    category: "token_usage".to_owned(),
+                    title: "Token usage updated".to_owned(),
+                    detail: None,
+                    status: Some("updated".to_owned()),
+                    provider_payload: Some(serde_json::json!({
+                        "params": {
+                            "tokenUsage": {
+                                "last": { "totalTokens": 42000 },
+                                "modelContextWindow": 258000
+                            }
+                        }
+                    })),
+                }),
+            )
+            .await;
+        state
+            .publish_event(
+                session.session_id,
+                AppEvent::ProviderEvent(agenter_core::ProviderEvent {
+                    session_id: session.session_id,
+                    provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                    event_id: None,
+                    category: "rate_limits".to_owned(),
+                    title: "Rate limits updated".to_owned(),
+                    detail: None,
+                    status: Some("updated".to_owned()),
+                    provider_payload: Some(serde_json::json!({
+                        "params": {
+                            "rateLimits": {
+                                "primary": { "usedPercent": 58, "resetsAt": 1777640533 },
+                                "secondary": { "usedPercent": 20, "resetsAt": 1777968663 }
+                            }
+                        }
+                    })),
+                }),
+            )
+            .await;
+
+        let info = state
+            .session(owner_user_id, session.session_id)
+            .await
+            .expect("session")
+            .info();
+        let usage = info.usage.expect("usage snapshot");
+        assert_eq!(usage.mode_label.as_deref(), Some("plan"));
+        assert_eq!(usage.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(
+            usage.context.and_then(|context| context.used_percent),
+            Some(16)
+        );
+        assert_eq!(
+            usage.window_5h.and_then(|window| window.remaining_percent),
+            Some(42)
+        );
+        assert_eq!(
+            usage.week.and_then(|window| window.remaining_percent),
+            Some(80)
+        );
     }
 
     #[tokio::test]
@@ -1701,6 +1989,7 @@ mod tests {
                 title: Some("Old".to_owned()),
                 external_session_id: Some("codex-thread-1".to_owned()),
                 turn_settings: None,
+                usage: None,
             })
             .await;
         state
@@ -1787,6 +2076,7 @@ mod tests {
                 title: Some("Old".to_owned()),
                 external_session_id: Some("codex-thread-1".to_owned()),
                 turn_settings: None,
+                usage: None,
             })
             .await;
         state

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use agenter_core::{
     AgentProviderId, AgentTurnSettings, ApprovalDecision, ApprovalId, ApprovalKind, RunnerId,
-    SessionId, SessionStatus, UserId, WorkspaceId,
+    SessionId, SessionStatus, SessionUsageSnapshot, UserId, WorkspaceId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,6 +45,7 @@ pub struct AgentSession {
     pub external_session_id: Option<String>,
     pub status: SessionStatus,
     pub title: Option<String>,
+    pub usage_snapshot: Option<SessionUsageSnapshot>,
     pub turn_settings: Option<AgentTurnSettings>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

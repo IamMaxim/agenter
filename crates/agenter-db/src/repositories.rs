@@ -1,6 +1,6 @@
 use agenter_core::{
     AgentProviderId, AgentTurnSettings, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind,
-    RunnerId, SessionId, SessionStatus, UserId, WorkspaceId,
+    RunnerId, SessionId, SessionStatus, SessionUsageSnapshot, UserId, WorkspaceId,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgPool, Result, Row};
@@ -470,7 +470,7 @@ pub async fn create_session(
          )
          values ($1, $2, $3, $4, $5, $6, $7)
          returning session_id, owner_user_id, runner_id, workspace_id, provider_id,
-             external_session_id, status, title, turn_settings, created_at, updated_at",
+             external_session_id, status, title, usage_snapshot, turn_settings, created_at, updated_at",
     )
     .bind(owner_user_id.as_uuid())
     .bind(runner_id.as_uuid())
@@ -495,6 +495,7 @@ pub struct CreateSessionRecord {
     pub external_session_id: Option<String>,
     pub title: Option<String>,
     pub status: SessionStatus,
+    pub usage_snapshot: Option<SessionUsageSnapshot>,
     pub turn_settings: Option<AgentTurnSettings>,
 }
 
@@ -512,11 +513,12 @@ pub async fn create_session_with_id(
             external_session_id,
             status,
             title,
+            usage_snapshot,
             turn_settings
          )
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          returning session_id, owner_user_id, runner_id, workspace_id, provider_id,
-             external_session_id, status, title, turn_settings, created_at, updated_at",
+             external_session_id, status, title, usage_snapshot, turn_settings, created_at, updated_at",
     )
     .bind(record.session_id.as_uuid())
     .bind(record.owner_user_id.as_uuid())
@@ -526,6 +528,11 @@ pub async fn create_session_with_id(
     .bind(record.external_session_id)
     .bind(session_status_to_db(&record.status))
     .bind(record.title)
+    .bind(
+        record
+            .usage_snapshot
+            .map(|usage| serde_json::to_value(usage).expect("serialize usage snapshot")),
+    )
     .bind(
         record
             .turn_settings
@@ -566,7 +573,7 @@ pub async fn upsert_session_by_external_id(
                        end,
                        updated_at = now()
          returning session_id, owner_user_id, runner_id, workspace_id, provider_id,
-             external_session_id, status, title, turn_settings, created_at, updated_at",
+             external_session_id, status, title, usage_snapshot, turn_settings, created_at, updated_at",
     )
     .bind(owner_user_id.as_uuid())
     .bind(runner_id.as_uuid())
@@ -595,6 +602,7 @@ pub async fn list_sessions_for_user(
             s.external_session_id,
             s.status,
             s.title,
+            s.usage_snapshot,
             s.turn_settings,
             s.created_at,
             s.updated_at,
@@ -633,6 +641,7 @@ pub async fn find_session_for_user(
             s.external_session_id,
             s.status,
             s.title,
+            s.usage_snapshot,
             s.turn_settings,
             s.created_at,
             s.updated_at,
@@ -671,7 +680,7 @@ pub async fn update_session_turn_settings(
              updated_at = now()
          where owner_user_id = $1 and session_id = $2
          returning session_id, owner_user_id, runner_id, workspace_id, provider_id,
-             external_session_id, status, title, turn_settings, created_at, updated_at",
+             external_session_id, status, title, usage_snapshot, turn_settings, created_at, updated_at",
     )
     .bind(owner_user_id.as_uuid())
     .bind(session_id.as_uuid())
@@ -694,7 +703,7 @@ pub async fn update_session_title(
              updated_at = now()
          where owner_user_id = $1 and session_id = $2
          returning session_id, owner_user_id, runner_id, workspace_id, provider_id,
-             external_session_id, status, title, turn_settings, created_at, updated_at",
+             external_session_id, status, title, usage_snapshot, turn_settings, created_at, updated_at",
     )
     .bind(owner_user_id.as_uuid())
     .bind(session_id.as_uuid())
@@ -717,11 +726,34 @@ pub async fn update_session_status(
              updated_at = now()
          where owner_user_id = $1 and session_id = $2
          returning session_id, owner_user_id, runner_id, workspace_id, provider_id,
-             external_session_id, status, title, turn_settings, created_at, updated_at",
+             external_session_id, status, title, usage_snapshot, turn_settings, created_at, updated_at",
     )
     .bind(owner_user_id.as_uuid())
     .bind(session_id.as_uuid())
     .bind(session_status_to_db(&status))
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(session_from_row).transpose()
+}
+
+pub async fn update_session_usage_snapshot(
+    pool: &PgPool,
+    session_id: SessionId,
+    usage_snapshot: &SessionUsageSnapshot,
+) -> Result<Option<AgentSession>> {
+    let usage_snapshot =
+        serde_json::to_value(usage_snapshot).expect("usage snapshot must serialize to JSON");
+    let row = sqlx::query(
+        "update agent_sessions
+         set usage_snapshot = $2,
+             updated_at = now()
+         where session_id = $1
+         returning session_id, owner_user_id, runner_id, workspace_id, provider_id,
+             external_session_id, status, title, usage_snapshot, turn_settings, created_at, updated_at",
+    )
+    .bind(session_id.as_uuid())
+    .bind(usage_snapshot)
     .fetch_optional(pool)
     .await?;
 
@@ -1039,6 +1071,7 @@ fn workspace_from_row(row: &PgRow) -> Result<Workspace> {
 fn session_from_row(row: &PgRow) -> Result<AgentSession> {
     let status: String = row.try_get("status")?;
     let provider_id: String = row.try_get("provider_id")?;
+    let usage_snapshot: Option<serde_json::Value> = row.try_get("usage_snapshot")?;
     let turn_settings: Option<serde_json::Value> = row.try_get("turn_settings")?;
     Ok(AgentSession {
         session_id: SessionId::from_uuid(row.try_get("session_id")?),
@@ -1049,6 +1082,7 @@ fn session_from_row(row: &PgRow) -> Result<AgentSession> {
         external_session_id: row.try_get("external_session_id")?,
         status: session_status_from_db(&status)?,
         title: row.try_get("title")?,
+        usage_snapshot: usage_snapshot.and_then(|usage| serde_json::from_value(usage).ok()),
         turn_settings: turn_settings.and_then(|settings| serde_json::from_value(settings).ok()),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -1069,6 +1103,7 @@ fn cached_event_from_row(row: &PgRow) -> Result<CachedEvent> {
 fn session_with_workspace_from_row(row: &PgRow) -> Result<AgentSessionWithWorkspace> {
     let status: String = row.try_get("status")?;
     let provider_id: String = row.try_get("provider_id")?;
+    let usage_snapshot: Option<serde_json::Value> = row.try_get("usage_snapshot")?;
     let turn_settings: Option<serde_json::Value> = row.try_get("turn_settings")?;
     Ok(AgentSessionWithWorkspace {
         session: AgentSession {
@@ -1080,6 +1115,7 @@ fn session_with_workspace_from_row(row: &PgRow) -> Result<AgentSessionWithWorksp
             external_session_id: row.try_get("external_session_id")?,
             status: session_status_from_db(&status)?,
             title: row.try_get("title")?,
+            usage_snapshot: usage_snapshot.and_then(|usage| serde_json::from_value(usage).ok()),
             turn_settings: turn_settings.and_then(|settings| serde_json::from_value(settings).ok()),
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,

@@ -44,9 +44,33 @@ export interface SessionInfo {
   title?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
+  usage?: SessionUsageSnapshot | null;
 }
 
 export type AgentReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+
+export interface SessionUsageContext {
+  used_percent?: number | null;
+  used_tokens?: number | null;
+  total_tokens?: number | null;
+}
+
+export interface SessionUsageWindow {
+  used_percent?: number | null;
+  remaining_percent?: number | null;
+  resets_at?: string | null;
+  window_label?: string | null;
+  remaining_text_hint?: string | null;
+}
+
+export interface SessionUsageSnapshot {
+  mode_label?: string | null;
+  model?: string | null;
+  reasoning_effort?: AgentReasoningEffort | null;
+  context?: SessionUsageContext | null;
+  window_5h?: SessionUsageWindow | null;
+  week?: SessionUsageWindow | null;
+}
 
 export interface AgentModelOption {
   id: string;

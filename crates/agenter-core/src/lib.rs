@@ -22,6 +22,7 @@ pub use session::{
     AgentCapabilities, AgentCollaborationMode, AgentModelOption, AgentOptions, AgentProviderId,
     AgentQuestionAnswer, AgentQuestionChoice, AgentQuestionField, AgentReasoningEffort,
     AgentTurnSettings, QuestionAnsweredEvent, QuestionRequestedEvent, SessionInfo, SessionStatus,
+    SessionUsageContext, SessionUsageSnapshot, SessionUsageWindow,
 };
 pub use slash_command::{
     SlashCommandArgument, SlashCommandArgumentKind, SlashCommandDangerLevel,

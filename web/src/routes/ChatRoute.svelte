@@ -27,6 +27,7 @@
     AgentTurnSettings,
     BrowserServerMessage,
     SessionInfo,
+    SessionUsageWindow,
     SlashCommandDefinition,
     SlashCommandRequest
   } from '../api/types';
@@ -66,7 +67,7 @@
   let sendError = '';
   let decisionError = '';
   let settingsError = '';
-  let settingsOpen = false;
+  let submitting = false;
   let editingTitle = false;
   let titleDraft = '';
   let renaming = false;
@@ -81,9 +82,22 @@
     | undefined;
 
   $: items = chatState.items;
+  $: turnActivity = chatState.activity;
+  $: turnActive = turnActivity?.active ?? false;
+  $: sendBusy = submitting || turnActive;
   $: slashSuggestions = filterSlashCommands(draft, slashCommands);
   $: parsedSlash = parseSlashCommand(draft, slashCommands);
   $: slashMenuOpen = isSlashDraft(draft) && slashSuggestions.length > 0;
+  $: usage = session?.usage ?? null;
+  $: modeValue = turnSettings.collaboration_mode ?? usage?.mode_label ?? '';
+  $: modelValue = turnSettings.model ?? usage?.model ?? '';
+  $: reasoningValue = turnSettings.reasoning_effort ?? usage?.reasoning_effort ?? '';
+  $: contextLabel = percentLabel(usage?.context?.used_percent);
+  $: contextTitle = tokenUsageTitle(usage?.context?.used_tokens, usage?.context?.total_tokens);
+  $: window5hLabel = `5h ${percentLabel(usage?.window_5h?.remaining_percent)}`;
+  $: window5hTitle = resetTitle(usage?.window_5h);
+  $: weekLabel = `w ${percentLabel(usage?.week?.remaining_percent)}`;
+  $: weekTitle = resetTitle(usage?.week);
   $: if (slashSelectionIndex >= slashSuggestions.length) {
     slashSelectionIndex = 0;
   }
@@ -165,6 +179,12 @@
         if (message.type === 'app_event') {
           try {
             chatState = applyChatEnvelope(chatState, message);
+            if (
+              message.event.type === 'provider_event' &&
+              ['token_usage', 'rate_limits'].includes(String(message.event.payload.category ?? ''))
+            ) {
+              void refreshSessionUsage(generation);
+            }
           } catch {
             pushToast({ severity: 'warning', message: 'Skipped a malformed live event.' });
           }
@@ -202,6 +222,7 @@
     }
 
     sendError = '';
+    submitting = true;
     try {
       await sendSessionMessage(sessionId, { content });
       draft = '';
@@ -210,6 +231,8 @@
     } catch (error) {
       sendError = apiErrorMessage(error, 'Could not send message. Check that the runner is connected.');
       pushToast({ severity: 'error', message: sendError });
+    } finally {
+      submitting = false;
     }
   }
 
@@ -257,6 +280,7 @@
 
   async function runSlashCommand(request: SlashCommandRequest) {
     sendError = '';
+    submitting = true;
     try {
       const result = await executeSlashCommand(sessionId, request);
       if (result.session) {
@@ -275,6 +299,8 @@
     } catch (error) {
       sendError = apiErrorMessage(error, 'Could not execute slash command.');
       pushToast({ severity: 'error', message: sendError });
+    } finally {
+      submitting = false;
     }
   }
 
@@ -432,6 +458,19 @@
     }
   }
 
+  async function refreshSessionUsage(generation = connectionGeneration) {
+    try {
+      const refreshed = await getSession(sessionId);
+      if (generation !== connectionGeneration) {
+        return;
+      }
+      session = refreshed;
+      titleDraft = session.title ?? '';
+    } catch {
+      // Usage metrics are informational; retain the last-known snapshot across transient refresh errors.
+    }
+  }
+
   async function saveSettings(next: AgentTurnSettings) {
     turnSettings = next;
     settingsError = '';
@@ -472,6 +511,66 @@
 
   function effortsForSelectedModel(): string[] {
     return effortsForModel(agentOptions, turnSettings);
+  }
+
+  function percentLabel(value: number | null | undefined): string {
+    return typeof value === 'number' && Number.isFinite(value) ? `${Math.round(value)}%` : '--';
+  }
+
+  function tokenUsageTitle(used: number | null | undefined, total: number | null | undefined): string | undefined {
+    if (used === null || used === undefined || total === null || total === undefined) {
+      return undefined;
+    }
+    return `${formatTokenCount(used)}/${formatTokenCount(total)}`;
+  }
+
+  function formatTokenCount(value: number): string {
+    if (value >= 1_000_000) {
+      return `${Math.round(value / 100_000) / 10}M`;
+    }
+    if (value >= 1_000) {
+      return `${Math.round(value / 1_000)}K`;
+    }
+    return `${Math.round(value)}`;
+  }
+
+  function resetTitle(window: SessionUsageWindow | null | undefined): string | undefined {
+    if (!window?.resets_at) {
+      return undefined;
+    }
+    const reset = new Date(window.resets_at);
+    if (Number.isNaN(reset.getTime())) {
+      return undefined;
+    }
+    return `Resets in ${relativeReset(reset)}; ${localResetTime(reset)}`;
+  }
+
+  function relativeReset(reset: Date): string {
+    const minutes = Math.max(0, Math.round((reset.getTime() - Date.now()) / 60_000));
+    if (minutes < 60) {
+      return `${minutes}min`;
+    }
+    const hours = Math.round(minutes / 60);
+    if (hours < 48) {
+      return `${hours}h`;
+    }
+    return `${Math.round(hours / 24)}d`;
+  }
+
+  function localResetTime(reset: Date): string {
+    const now = new Date();
+    const sameYear = reset.getFullYear() === now.getFullYear();
+    const sameDay = reset.toDateString() === now.toDateString();
+    if (sameDay) {
+      return reset.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+    return reset.toLocaleString([], {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      ...(sameYear ? {} : { year: 'numeric' })
+    });
   }
 
   function questionAnswers(item: ChatItem, field: AgentQuestionField): string[] {
@@ -669,6 +768,13 @@
         {/if}
       {/each}
     {/if}
+    {#if turnActive}
+      <div class="working-row" aria-live="polite">
+        <span class="working-dot"></span>
+        <span>{turnActivity?.label ?? 'Working'}</span>
+        <span class="working-shimmer"></span>
+      </div>
+    {/if}
   </div>
 
   <form class="composer" on:submit|preventDefault={submit}>
@@ -712,51 +818,6 @@
         </button>
       </div>
     {/if}
-    <div class="composer-settings">
-      <button class="secondary compact" type="button" on:click={() => (settingsOpen = !settingsOpen)}>
-        Settings
-      </button>
-      {#if settingsOpen}
-        <div class="settings-popover">
-          <label>
-            <span>Model</span>
-            <select value={turnSettings.model ?? ''} on:change={(event) => setModel(event.currentTarget.value)}>
-              <option value="">Default</option>
-              {#each agentOptions.models as model}
-                <option value={model.id}>{model.display_name}</option>
-              {/each}
-            </select>
-          </label>
-          <label>
-            <span>Mode</span>
-            <select
-              value={turnSettings.collaboration_mode ?? ''}
-              on:change={(event) => setCollaborationMode(event.currentTarget.value)}
-            >
-              <option value="">Default</option>
-              {#each agentOptions.collaboration_modes as mode}
-                <option value={mode.id}>{mode.label}</option>
-              {/each}
-            </select>
-          </label>
-          <label>
-            <span>Reasoning</span>
-            <select
-              value={turnSettings.reasoning_effort ?? ''}
-              on:change={(event) => setReasoningEffort(event.currentTarget.value)}
-            >
-              <option value="">Default</option>
-              {#each effortsForSelectedModel() as effort}
-                <option value={effort}>{effort}</option>
-              {/each}
-            </select>
-          </label>
-          {#if settingsError}
-            <small class="error">{settingsError}</small>
-          {/if}
-        </div>
-      {/if}
-    </div>
     <label class="sr-only" for="message">Message</label>
     <textarea
       id="message"
@@ -767,7 +828,76 @@
       on:input={resizeMessageTextarea}
       on:keydown={handleMessageKeydown}
     ></textarea>
-    <button type="submit">Send</button>
+    <button class:busy={sendBusy} type="submit" disabled={submitting} aria-label={sendBusy ? 'Working' : 'Send'}>
+      {#if sendBusy}
+        <span class="button-spinner" aria-hidden="true"></span>
+      {:else}
+        Send
+      {/if}
+    </button>
+    <div class="composer-bottom-bar">
+      <select
+        aria-label="Collaboration mode"
+        class="composer-inline-select"
+        value={modeValue}
+        on:change={(event) => setCollaborationMode(event.currentTarget.value)}
+      >
+        <option value="">default</option>
+        {#each agentOptions.collaboration_modes as mode}
+          <option value={mode.id}>{mode.label}</option>
+        {/each}
+      </select>
+      <span class="composer-dot" aria-hidden="true">·</span>
+      <select
+        aria-label="Model"
+        class="composer-inline-select model-select"
+        value={modelValue}
+        on:change={(event) => setModel(event.currentTarget.value)}
+      >
+        <option value="">model</option>
+        {#each agentOptions.models as model}
+          <option value={model.id}>{model.display_name}</option>
+        {/each}
+      </select>
+      <select
+        aria-label="Thinking level"
+        class="composer-inline-select"
+        value={reasoningValue}
+        on:change={(event) => setReasoningEffort(event.currentTarget.value)}
+      >
+        <option value="">thinking</option>
+        {#each effortsForSelectedModel() as effort}
+          <option value={effort}>{effort}</option>
+        {/each}
+      </select>
+      <span class="composer-dot" aria-hidden="true">·</span>
+      <span
+        class:unknown={contextLabel === '--'}
+        class="composer-metric"
+        title={contextTitle}
+      >
+        {contextLabel}
+      </span>
+      <span class="composer-spacer"></span>
+      <span
+        class:unknown={window5hLabel.endsWith('--')}
+        class="composer-metric"
+        title={window5hTitle}
+      >
+        {window5hLabel}
+      </span>
+      <span class="composer-dot" aria-hidden="true">·</span>
+      <span
+        class:unknown={weekLabel.endsWith('--')}
+        class="composer-metric"
+        title={weekTitle}
+      >
+        {weekLabel}
+      </span>
+      {#if settingsError}
+        <small class="composer-settings-error">{settingsError}</small>
+      {/if}
+    </div>
   </form>
   {#if sendError || decisionError}
     <p class="error" role="alert">{sendError || decisionError}</p>

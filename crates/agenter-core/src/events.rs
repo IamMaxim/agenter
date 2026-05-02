@@ -79,8 +79,14 @@ pub struct PlanEvent {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<PlanEntry>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub append: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_payload: Option<serde_json::Value>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -301,6 +307,24 @@ mod tests {
     }
 
     #[test]
+    fn serializes_plan_delta_marker_only_when_append_is_true() {
+        let event = AppEvent::PlanUpdated(crate::PlanEvent {
+            session_id: SessionId::nil(),
+            plan_id: Some("plan-1".to_owned()),
+            title: Some("Implementation plan".to_owned()),
+            content: Some("next words".to_owned()),
+            entries: Vec::new(),
+            append: true,
+            provider_payload: None,
+        });
+
+        let json = serde_json::to_value(event).expect("serialize event");
+
+        assert_eq!(json["type"], "plan_updated");
+        assert_eq!(json["payload"]["append"], true);
+    }
+
+    #[test]
     fn serializes_approval_requested_event_with_uuid_ids() {
         let approval_id = ApprovalId::nil();
         let event = AppEvent::ApprovalRequested(ApprovalRequestEvent {
@@ -337,6 +361,7 @@ mod tests {
             title: Some("Initial setup".to_owned()),
             created_at: None,
             updated_at: None,
+            usage: None,
         });
 
         let json = serde_json::to_value(&event).expect("serialize event");
