@@ -598,6 +598,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_acp_session_waits_for_runner_and_stores_external_id() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let browser_session_token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let app_service = app(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("read listener address");
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.expect("serve app");
+        });
+
+        let (runner_socket, _) = connect_async(format!("ws://{addr}/api/runner/ws"))
+            .await
+            .expect("connect runner");
+        let (mut runner_sender, mut runner_receiver) = runner_socket.split();
+        let mut hello = fake_hello();
+        hello.capabilities.agent_providers[0].provider_id =
+            AgentProviderId::from(AgentProviderId::QWEN);
+        hello.capabilities.agent_providers[0]
+            .capabilities
+            .session_resume = true;
+        let workspace_id = hello.workspaces[0].workspace_id;
+        runner_sender
+            .send(Message::Text(
+                serde_json::to_string(&RunnerClientMessage::Hello(hello))
+                    .expect("serialize hello")
+                    .into(),
+            ))
+            .await
+            .expect("send runner hello");
+        expect_no_runner_command(&mut runner_receiver).await;
+
+        let cookie = format!("{}={browser_session_token}", SESSION_COOKIE_NAME);
+        let create_response = tokio::spawn(async move {
+            app_service
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/sessions")
+                        .header(header::COOKIE, &cookie)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "workspace_id": workspace_id,
+                                "provider_id": AgentProviderId::from(AgentProviderId::QWEN),
+                                "title": "qwen real session"
+                            })
+                            .to_string(),
+                        ))
+                        .expect("build create session request"),
+                )
+                .await
+                .expect("route create session request")
+        });
+
+        let create_command = next_runner_command(&mut runner_receiver).await;
+        let agenter_protocol::runner::RunnerCommand::CreateSession(command) =
+            &create_command.command
+        else {
+            panic!("expected create session command");
+        };
+        assert_eq!(command.provider_id.as_str(), AgentProviderId::QWEN);
+        let session_id = command.session_id;
+        send_runner_response_result(
+            &mut runner_sender,
+            create_command.request_id,
+            agenter_protocol::runner::RunnerCommandResult::SessionCreated {
+                session_id,
+                external_session_id: "qwen-session-1".to_owned(),
+            },
+        )
+        .await;
+
+        let response = create_response.await.expect("create response task");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read create session body");
+        let info: agenter_core::SessionInfo =
+            serde_json::from_slice(&body).expect("session info json");
+        assert_eq!(info.provider_id.as_str(), AgentProviderId::QWEN);
+        assert_eq!(info.external_session_id.as_deref(), Some("qwen-session-1"));
+    }
+
+    #[tokio::test]
     async fn refresh_workspace_sessions_sends_runner_command_and_rewrites_history() {
         let state = AppState::new_with_bootstrap_admin(
             "dev-token".to_owned(),
@@ -2008,13 +2103,13 @@ mod tests {
             event: RunnerEvent::SessionsDiscovered(agenter_protocol::runner::DiscoveredSessions {
                 workspace,
                 provider_id: AgentProviderId::from(AgentProviderId::CODEX),
-                        sessions: vec![agenter_protocol::runner::DiscoveredSession {
-                            external_session_id: "codex-large-thread".to_owned(),
-                            title: Some("Large Thread".to_owned()),
-                            updated_at: None,
-                            history_status:
-                                agenter_protocol::runner::DiscoveredSessionHistoryStatus::Loaded,
-                            history: vec![
+                sessions: vec![agenter_protocol::runner::DiscoveredSession {
+                    external_session_id: "codex-large-thread".to_owned(),
+                    title: Some("Large Thread".to_owned()),
+                    updated_at: None,
+                    history_status:
+                        agenter_protocol::runner::DiscoveredSessionHistoryStatus::Loaded,
+                    history: vec![
                         agenter_protocol::runner::DiscoveredSessionHistoryItem::FileChange {
                             change_id: "change-large".to_owned(),
                             path: "large.patch".to_owned(),

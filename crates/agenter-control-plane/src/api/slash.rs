@@ -296,8 +296,7 @@ async fn create_session_from_slash(
 ) -> Response {
     let source_session_id = source.session_id;
     let session_id = agenter_core::SessionId::new();
-    let external_session_id = if source.provider_id.as_str() == agenter_core::AgentProviderId::CODEX
-    {
+    let external_session_id = {
         let request_id = agenter_protocol::RequestId::from(uuid::Uuid::new_v4().to_string());
         let command = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
             agenter_protocol::runner::RunnerCommandEnvelope {
@@ -386,8 +385,6 @@ async fn create_session_from_slash(
                 .await;
             }
         }
-    } else {
-        None
     };
 
     let session = state

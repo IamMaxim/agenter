@@ -529,13 +529,21 @@ impl AppState {
     }
 
     pub async fn disconnect_runner(&self, runner_id: RunnerId, connection_id: Uuid) {
-        let mut connections = self.inner.runner_connections.lock().await;
-        if connections
-            .get(&runner_id)
-            .is_some_and(|connection| connection.connection_id == connection_id)
-        {
-            connections.remove(&runner_id);
+        let disconnected = {
+            let mut connections = self.inner.runner_connections.lock().await;
+            if connections
+                .get(&runner_id)
+                .is_some_and(|connection| connection.connection_id == connection_id)
+            {
+                connections.remove(&runner_id);
+                true
+            } else {
+                false
+            }
+        };
+        if disconnected {
             tracing::info!(%runner_id, %connection_id, "runner disconnected");
+            self.mark_runner_sessions_stopped(runner_id).await;
         } else {
             tracing::debug!(%runner_id, %connection_id, "ignored stale runner disconnect");
         }
@@ -823,7 +831,7 @@ impl AppState {
             runner_id: registration.runner_id,
             workspace: registration.workspace,
             provider_id: registration.provider_id,
-            status: SessionStatus::Running,
+            status: SessionStatus::Idle,
             title: registration.title,
             external_session_id: registration.external_session_id,
             turn_settings: registration.turn_settings,
@@ -1264,6 +1272,10 @@ impl AppState {
                     question.resolved = true;
                 }
             }
+            AppEvent::SessionStatusChanged(status) => {
+                self.apply_session_status(status.session_id, status.status.clone())
+                    .await;
+            }
             AppEvent::ProviderEvent(provider_event)
             | AppEvent::TurnDiffUpdated(provider_event)
             | AppEvent::ItemReasoning(provider_event)
@@ -1292,6 +1304,53 @@ impl AppState {
         }
 
         self.store_event(session_id, envelope).await
+    }
+
+    async fn apply_session_status(&self, session_id: SessionId, status: SessionStatus) {
+        {
+            let mut registry = self.inner.registry.lock().await;
+            if let Some(session) = registry.sessions.get_mut(&session_id) {
+                session.status = status.clone();
+                session.updated_at = Utc::now();
+            }
+        }
+        if let Some(pool) = &self.inner.db_pool {
+            if let Err(error) =
+                agenter_db::update_session_status_by_id(pool, session_id, status).await
+            {
+                tracing::warn!(
+                    %session_id,
+                    %error,
+                    "failed to persist session status update"
+                );
+            }
+        }
+    }
+
+    async fn mark_runner_sessions_stopped(&self, runner_id: RunnerId) {
+        let sessions = {
+            let registry = self.inner.registry.lock().await;
+            registry
+                .sessions
+                .values()
+                .filter(|session| {
+                    session.runner_id == runner_id
+                        && should_stop_on_runner_disconnect(&session.status)
+                })
+                .map(|session| session.session_id)
+                .collect::<Vec<_>>()
+        };
+        for session_id in sessions {
+            self.publish_event(
+                session_id,
+                AppEvent::SessionStatusChanged(agenter_core::SessionStatusChangedEvent {
+                    session_id,
+                    status: SessionStatus::Stopped,
+                    reason: Some("Runner disconnected.".to_owned()),
+                }),
+            )
+            .await;
+        }
     }
 
     async fn apply_provider_usage_event(
@@ -1507,13 +1566,15 @@ impl AppState {
             let session = if let Some(pool) = &self.inner.db_pool {
                 match agenter_db::upsert_session_by_external_id(
                     pool,
-                    owner_user_id,
-                    runner_id,
-                    discovered.workspace.workspace_id,
-                    discovered.provider_id.clone(),
-                    &discovered_session.external_session_id,
-                    discovered_session.title.as_deref(),
-                    discovered_session_updated_at,
+                    agenter_db::UpsertSessionByExternalId {
+                        owner_user_id,
+                        runner_id,
+                        workspace_id: discovered.workspace.workspace_id,
+                        provider_id: discovered.provider_id.clone(),
+                        external_session_id: &discovered_session.external_session_id,
+                        title: discovered_session.title.as_deref(),
+                        updated_at: discovered_session_updated_at,
+                    },
                 )
                 .await
                 {
@@ -1557,15 +1618,15 @@ impl AppState {
                 {
                     existing
                 } else {
-                        let now = Utc::now();
-                        let updated_at = discovered_session_updated_at.unwrap_or(now);
+                    let now = Utc::now();
+                    let updated_at = discovered_session_updated_at.unwrap_or(now);
                     RegisteredSession {
                         session_id: SessionId::new(),
                         owner_user_id,
                         runner_id,
                         workspace: discovered.workspace.clone(),
                         provider_id: discovered.provider_id.clone(),
-                        status: SessionStatus::Running,
+                        status: SessionStatus::Idle,
                         title: discovered_session.title.clone(),
                         external_session_id: Some(discovered_session.external_session_id.clone()),
                         turn_settings: None,
@@ -1820,6 +1881,18 @@ fn discovered_history_events(
         .collect()
 }
 
+fn should_stop_on_runner_disconnect(status: &SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::Starting
+            | SessionStatus::Running
+            | SessionStatus::WaitingForInput
+            | SessionStatus::WaitingForApproval
+            | SessionStatus::Idle
+            | SessionStatus::Completed
+    )
+}
+
 fn app_event_name(event: &AppEvent) -> &'static str {
     match event {
         AppEvent::SessionStarted(_) => "session_started",
@@ -2026,27 +2099,21 @@ fn usage_window_at(
 }
 
 fn discovered_session_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
-    let Some(value) = value else {
-        return None;
-    };
+    let value = value?;
 
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
         .ok()
         .or_else(|| {
-            value
-                .trim()
-                .parse::<i64>()
-                .ok()
-                .and_then(|value| {
-                    if value.abs() > 10_000_000_000_000 {
-                        let secs = value / 1000;
-                        let nanos = ((value % 1000).unsigned_abs() as u32) * 1_000_000;
-                        DateTime::from_timestamp(secs, nanos)
-                    } else {
-                        DateTime::from_timestamp(value, 0)
-                    }
-                })
+            value.trim().parse::<i64>().ok().and_then(|value| {
+                if value.abs() > 10_000_000_000_000 {
+                    let secs = value / 1000;
+                    let nanos = ((value % 1000).unsigned_abs() as u32) * 1_000_000;
+                    DateTime::from_timestamp(secs, nanos)
+                } else {
+                    DateTime::from_timestamp(value, 0)
+                }
+            })
         })
         .or_else(|| {
             value
@@ -2224,6 +2291,138 @@ mod tests {
             usage.week.and_then(|window| window.remaining_percent),
             Some(80)
         );
+    }
+
+    #[tokio::test]
+    async fn session_status_event_updates_registered_session_status() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let owner_user_id = state
+            .inner
+            .bootstrap_admin
+            .as_ref()
+            .expect("bootstrap admin")
+            .user
+            .user_id;
+        let runner_id = RunnerId::new();
+        let workspace = WorkspaceRef {
+            workspace_id: WorkspaceId::new(),
+            runner_id,
+            path: "/work/agenter".to_owned(),
+            display_name: Some("agenter".to_owned()),
+        };
+        let session = state
+            .create_session(
+                SessionId::new(),
+                owner_user_id,
+                runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+
+        state
+            .publish_event(
+                session.session_id,
+                AppEvent::SessionStatusChanged(agenter_core::SessionStatusChangedEvent {
+                    session_id: session.session_id,
+                    status: SessionStatus::WaitingForApproval,
+                    reason: Some("waiting".to_owned()),
+                }),
+            )
+            .await;
+
+        let info = state
+            .session(owner_user_id, session.session_id)
+            .await
+            .expect("session")
+            .info();
+        assert_eq!(info.status, SessionStatus::WaitingForApproval);
+    }
+
+    #[tokio::test]
+    async fn runner_disconnect_marks_active_sessions_stopped() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let owner_user_id = state
+            .inner
+            .bootstrap_admin
+            .as_ref()
+            .expect("bootstrap admin")
+            .user
+            .user_id;
+        let runner_id = RunnerId::new();
+        let workspace = WorkspaceRef {
+            workspace_id: WorkspaceId::new(),
+            runner_id,
+            path: "/work/agenter".to_owned(),
+            display_name: Some("agenter".to_owned()),
+        };
+        let active = state
+            .create_session(
+                SessionId::new(),
+                owner_user_id,
+                runner_id,
+                workspace.clone(),
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let failed = state
+            .create_session(
+                SessionId::new(),
+                owner_user_id,
+                runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        state
+            .publish_event(
+                active.session_id,
+                AppEvent::SessionStatusChanged(agenter_core::SessionStatusChangedEvent {
+                    session_id: active.session_id,
+                    status: SessionStatus::Running,
+                    reason: None,
+                }),
+            )
+            .await;
+        state
+            .publish_event(
+                failed.session_id,
+                AppEvent::SessionStatusChanged(agenter_core::SessionStatusChangedEvent {
+                    session_id: failed.session_id,
+                    status: SessionStatus::Failed,
+                    reason: None,
+                }),
+            )
+            .await;
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let connection_id = state.connect_runner(runner_id, sender).await;
+
+        state.disconnect_runner(runner_id, connection_id).await;
+
+        let active_status = state
+            .session(owner_user_id, active.session_id)
+            .await
+            .expect("active session")
+            .status;
+        let failed_status = state
+            .session(owner_user_id, failed.session_id)
+            .await
+            .expect("failed session")
+            .status;
+        assert_eq!(active_status, SessionStatus::Stopped);
+        assert_eq!(failed_status, SessionStatus::Failed);
     }
 
     #[tokio::test]
@@ -2646,9 +2845,7 @@ mod tests {
         let sessions = state.list_sessions(owner_user_id).await;
         let session = sessions
             .iter()
-            .find(|session| {
-                session.external_session_id.as_deref() == Some("codex-thread-1")
-            })
+            .find(|session| session.external_session_id.as_deref() == Some("codex-thread-1"))
             .expect("imported session");
 
         assert_eq!(session.updated_at, Some(source_updated_at));

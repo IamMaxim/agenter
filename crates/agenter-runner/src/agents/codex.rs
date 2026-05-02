@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use crate::agents::approval_state::PendingProviderApproval;
 use crate::agents::codex_approval_context::{
     presentation_for_command_execution_approval, sparse_file_change_fallback_details,
     CodexApprovalItemCache,
@@ -75,16 +76,7 @@ fn codex_request_id_from_value(id: &Value) -> Option<CodexRequestId> {
     }
 }
 
-#[derive(Debug)]
-pub struct PendingCodexApproval {
-    pub response: oneshot::Sender<PendingCodexApprovalDecision>,
-}
-
-#[derive(Debug)]
-pub struct PendingCodexApprovalDecision {
-    pub decision: ApprovalDecision,
-    pub acknowledged: oneshot::Sender<Result<(), String>>,
-}
+pub type PendingCodexApproval = PendingProviderApproval;
 
 #[derive(Debug)]
 pub struct PendingCodexQuestion {
@@ -979,7 +971,7 @@ pub async fn run_codex_turn_on_server(
                 pending_approvals
                     .lock()
                     .await
-                    .insert(approval_id, PendingCodexApproval { response: sender });
+                    .insert(approval_id, PendingCodexApproval::new(sender));
                 event_sender
                     .send(session_status_event(
                         request.session_id,
@@ -1313,7 +1305,7 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
             }),
             session_status_event(
                 session_id,
-                SessionStatus::Completed,
+                SessionStatus::Idle,
                 Some("Codex turn completed.".to_owned()),
             ),
         ],
@@ -1999,7 +1991,7 @@ fn thread_status_changed(session_id: SessionId, message: &Value) -> Vec<AppEvent
         )),
         "idle" => events.push(session_status_event(
             session_id,
-            SessionStatus::Completed,
+            SessionStatus::Idle,
             Some("Codex thread is idle.".to_owned()),
         )),
         _ => {}
@@ -2400,9 +2392,23 @@ fn codex_thread_updated_at(value: &Value) -> Option<String> {
         ],
     )
     .map(str::to_owned)
-    .or_else(||
-        integer_at(value, &["/updatedAt", "/updated_at", "/lastActivityAt", "/last_activity_at", "/timestamp", "/createdAt", "/created_at", "/threadUpdatedAt", "/thread_updated_at"]).map(|value| value.to_string())
-    )
+    .or_else(|| {
+        integer_at(
+            value,
+            &[
+                "/updatedAt",
+                "/updated_at",
+                "/lastActivityAt",
+                "/last_activity_at",
+                "/timestamp",
+                "/createdAt",
+                "/created_at",
+                "/threadUpdatedAt",
+                "/thread_updated_at",
+            ],
+        )
+        .map(|value| value.to_string())
+    })
 }
 
 fn codex_history_from_thread_read_response(message: &Value) -> Vec<DiscoveredSessionHistoryItem> {
@@ -3041,7 +3047,7 @@ mod tests {
         let AppEvent::SessionStatusChanged(status) = &events[0] else {
             panic!("expected session status");
         };
-        assert_eq!(status.status, agenter_core::SessionStatus::Completed);
+        assert_eq!(status.status, agenter_core::SessionStatus::Idle);
         let AppEvent::ProviderEvent(event) = &events[1] else {
             panic!("expected provider event");
         };

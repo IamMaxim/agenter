@@ -11,7 +11,7 @@ agenter-protocol.workspace = true
 anyhow.workspace = true
 futures-util = "0.3"
 serde_json.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = "0.29"
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4", "v5"] }

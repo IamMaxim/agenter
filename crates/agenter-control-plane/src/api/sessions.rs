@@ -151,30 +151,6 @@ pub(super) async fn create_session(
         (!trimmed.is_empty()).then(|| trimmed.to_owned())
     });
     let settings_override = request.settings_override;
-    if provider_id.as_str() != agenter_core::AgentProviderId::CODEX {
-        let session = state
-            .register_session(SessionRegistration {
-                session_id,
-                owner_user_id: user.user_id,
-                runner_id,
-                workspace,
-                provider_id,
-                title: request.title,
-                external_session_id: None,
-                turn_settings: settings_override.clone(),
-                usage: None,
-            })
-            .await;
-        let info = session.info();
-        state
-            .publish_event(
-                session.session_id,
-                agenter_core::AppEvent::SessionStarted(info.clone()),
-            )
-            .await;
-        return (StatusCode::CREATED, Json(info)).into_response();
-    }
-
     let request_id = agenter_protocol::RequestId::from(uuid::Uuid::new_v4().to_string());
     let title = request.title;
     let command = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
@@ -275,12 +251,15 @@ pub(super) async fn create_session(
     if let Some(content) = initial_message {
         if let Err(error) = dispatch_user_message(
             &state,
-            user.user_id,
-            session.session_id,
-            session.runner_id,
-            session.external_session_id.clone(),
-            content,
-            settings_override,
+            DispatchUserMessage {
+                user_id: user.user_id,
+                session_id: session.session_id,
+                runner_id: session.runner_id,
+                provider_id: session.provider_id.clone(),
+                external_session_id: session.external_session_id.clone(),
+                content,
+                settings: settings_override,
+            },
         )
         .await
         {
@@ -307,20 +286,26 @@ struct DispatchError {
     message: String,
 }
 
-async fn dispatch_user_message(
-    state: &crate::state::AppState,
+struct DispatchUserMessage {
     user_id: agenter_core::UserId,
     session_id: agenter_core::SessionId,
     runner_id: agenter_core::RunnerId,
+    provider_id: agenter_core::AgentProviderId,
     external_session_id: Option<String>,
     content: String,
     settings: Option<agenter_core::AgentTurnSettings>,
+}
+
+async fn dispatch_user_message(
+    state: &crate::state::AppState,
+    request: DispatchUserMessage,
 ) -> Result<(), DispatchError> {
+    let session_id = request.session_id;
     let user_message = agenter_core::UserMessageEvent {
         session_id,
         message_id: Some(uuid::Uuid::new_v4().to_string()),
-        author_user_id: Some(user_id),
-        content,
+        author_user_id: Some(request.user_id),
+        content: request.content,
     };
     state
         .publish_event(
@@ -343,8 +328,9 @@ async fn dispatch_user_message(
             command: agenter_protocol::runner::RunnerCommand::AgentSendInput(
                 agenter_protocol::runner::AgentInputCommand {
                     session_id,
-                    external_session_id,
-                    settings,
+                    provider_id: Some(request.provider_id),
+                    external_session_id: request.external_session_id,
+                    settings: request.settings,
                     input: agenter_protocol::runner::AgentInput::UserMessage {
                         payload: user_message,
                     },
@@ -355,7 +341,7 @@ async fn dispatch_user_message(
 
     match state
         .send_runner_command_and_wait(
-            runner_id,
+            request.runner_id,
             request_id.clone(),
             message,
             super::RUNNER_COMMAND_RESPONSE_TIMEOUT,
@@ -555,6 +541,7 @@ pub(super) async fn send_session_message(
             command: agenter_protocol::runner::RunnerCommand::AgentSendInput(
                 agenter_protocol::runner::AgentInputCommand {
                     session_id,
+                    provider_id: Some(session.provider_id),
                     external_session_id: session.external_session_id,
                     settings,
                     input: agenter_protocol::runner::AgentInput::UserMessage {

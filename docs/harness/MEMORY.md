@@ -8,6 +8,7 @@ This file is the project-local memory surface for future agent sessions. Keep it
 - The active implementation plan is `docs/plans/2026-04-30-initial-implementation.md`.
 - The technical spec remains `docs/specs/2026-04-30-remote-agent-control-plane.md`, with the original source discussion in `docs/chatgpt/001_initial.md`.
 - The Rust workspace, browser UI, fake runner flow, Codex adapter, and Qwen adapter are present.
+- ACP support is now tracked in `docs/acp/`, with the durable spec in `docs/specs/2026-05-02-acp-runner-support.md` and the active implementation plan in `docs/plans/2026-05-02-acp-runner-support.md`.
 
 ## Durable Assumptions
 
@@ -35,6 +36,8 @@ Do not store large transcripts here. Link to specs, plans, decisions, and runboo
 
 ## Recent Notes
 
+- 2026-05-02: Accepted `docs/decisions/2026-05-02-runner-session-process-lifecycle.md` and implemented `docs/plans/2026-05-02-runner-session-lifecycle.md`: sessions now use durable `idle`/`stopped` statuses, `SessionStatusChanged` updates registry/database state, runner disconnect marks active sessions stopped, default runner mode advertises Codex plus available ACP providers, and Codex app-server runtime ownership is per Agenter session.
+- 2026-05-02: Added the ACP runner support notebook under `docs/acp/` and accepted `docs/decisions/2026-05-02-generic-acp-runner-runtime.md`: Qwen, Gemini, and OpenCode use a shared runner ACP runtime with provider profiles; provider auth stays local setup.
 - 2026-05-02: Implemented the browser workbench redesign plan in `docs/plans/2026-05-02-workbench-redesign.md`: sidebar from `tmp/mockup-1/Agenter Prototype.html`, chat/tool rows from `tmp/mockup-1/Tool Calls Mockup.html`, with no backend/protocol changes.
 - 2026-05-01: Added Codex-first model/mode/question support: provider-neutral turn settings, model/reasoning/mode option discovery, composer settings in the browser, Codex `turn/start` settings propagation, and question cards for tool input plus MCP elicitation forms.
 - 2026-04-30: Added protocol spike runbooks for Codex app-server (`docs/runbooks/codex-app-server-spike.md`) and Qwen ACP (`docs/runbooks/qwen-acp-spike.md`) so provider JSON-RPC shapes can be captured before adapter APIs are finalized.

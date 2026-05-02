@@ -121,6 +121,15 @@ describe('frontend API normalizers', () => {
     });
   });
 
+  test('accepts idle and stopped session statuses', () => {
+    expect(
+      normalizeSessions([
+        { session_id: 'idle-session', workspace_id: 'workspace-1', status: 'idle' },
+        { session_id: 'stopped-session', workspace_id: 'workspace-1', status: 'stopped' }
+      ]).map((session) => session.status)
+    ).toEqual(['idle', 'stopped']);
+  });
+
   test('normalizes turn settings and browser event envelopes defensively', () => {
     expect(normalizeTurnSettings({ model: 123, reasoning_effort: 'mega', collaboration_mode: 'plan' })).toEqual({
       collaboration_mode: 'plan'

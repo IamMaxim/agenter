@@ -57,6 +57,15 @@ codex-runner workspace=workspace:
 qwen-runner workspace=workspace:
     just runner qwen '{{workspace}}'
 
+acp-runner workspace=workspace:
+    just runner acp '{{workspace}}'
+
+gemini-runner workspace=workspace:
+    just runner gemini '{{workspace}}'
+
+opencode-runner workspace=workspace:
+    just runner opencode '{{workspace}}'
+
 codex-spike workspace prompt="Reply with one short sentence. Do not edit files or run commands.":
     RUST_LOG=codex_app_server_spike=debug,agenter_runner=debug,agenter_core=debug AGENTER_LOG_PAYLOADS=1 AGENTER_SPIKE_PROMPT='{{prompt}}' cargo run -p agenter-runner --bin codex_app_server_spike -- '{{workspace}}'
 

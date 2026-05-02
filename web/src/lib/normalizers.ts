@@ -39,6 +39,8 @@ const sessionStatuses = new Set<SessionStatus>([
   'running',
   'waiting_for_input',
   'waiting_for_approval',
+  'idle',
+  'stopped',
   'completed',
   'interrupted',
   'degraded',

@@ -123,6 +123,8 @@ pub struct ListProviderCommandsCommand {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AgentInputCommand {
     pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<AgentProviderId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -445,6 +447,7 @@ mod tests {
             request_id: RequestId::from("req-1"),
             command: RunnerCommand::AgentSendInput(AgentInputCommand {
                 session_id: SessionId::nil(),
+                provider_id: Some(AgentProviderId::from(AgentProviderId::CODEX)),
                 external_session_id: Some("thread-1".to_owned()),
                 settings: None,
                 input: AgentInput::Text {
@@ -690,6 +693,7 @@ mod tests {
     fn agent_input_command_supports_structured_user_message_payload() {
         let command = RunnerCommand::AgentSendInput(AgentInputCommand {
             session_id: SessionId::nil(),
+            provider_id: Some(AgentProviderId::from(AgentProviderId::CODEX)),
             external_session_id: None,
             settings: None,
             input: AgentInput::UserMessage {
@@ -713,6 +717,7 @@ mod tests {
     fn round_trips_agent_input_settings_without_breaking_absent_settings() {
         let with_settings = RunnerCommand::AgentSendInput(AgentInputCommand {
             session_id: SessionId::nil(),
+            provider_id: Some(AgentProviderId::from(AgentProviderId::CODEX)),
             external_session_id: Some("thread-1".to_owned()),
             settings: Some(AgentTurnSettings {
                 model: Some("gpt-5.4".to_owned()),

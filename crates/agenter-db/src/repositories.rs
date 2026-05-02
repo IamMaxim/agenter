@@ -544,15 +544,19 @@ pub async fn create_session_with_id(
     session_from_row(&row)
 }
 
+pub struct UpsertSessionByExternalId<'a> {
+    pub owner_user_id: UserId,
+    pub runner_id: RunnerId,
+    pub workspace_id: WorkspaceId,
+    pub provider_id: AgentProviderId,
+    pub external_session_id: &'a str,
+    pub title: Option<&'a str>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
 pub async fn upsert_session_by_external_id(
     pool: &PgPool,
-    owner_user_id: UserId,
-    runner_id: RunnerId,
-    workspace_id: WorkspaceId,
-    provider_id: AgentProviderId,
-    external_session_id: &str,
-    title: Option<&str>,
-    updated_at: Option<DateTime<Utc>>,
+    record: UpsertSessionByExternalId<'_>,
 ) -> Result<AgentSession> {
     let row = sqlx::query(
         "insert into agent_sessions (
@@ -577,14 +581,14 @@ pub async fn upsert_session_by_external_id(
          returning session_id, owner_user_id, runner_id, workspace_id, provider_id,
              external_session_id, status, title, usage_snapshot, turn_settings, created_at, updated_at",
     )
-    .bind(owner_user_id.as_uuid())
-    .bind(runner_id.as_uuid())
-    .bind(workspace_id.as_uuid())
-    .bind(provider_id.as_str())
-    .bind(external_session_id)
-    .bind(session_status_to_db(&SessionStatus::Running))
-    .bind(title)
-    .bind(updated_at)
+    .bind(record.owner_user_id.as_uuid())
+    .bind(record.runner_id.as_uuid())
+    .bind(record.workspace_id.as_uuid())
+    .bind(record.provider_id.as_str())
+    .bind(record.external_session_id)
+    .bind(session_status_to_db(&SessionStatus::Idle))
+    .bind(record.title)
+    .bind(record.updated_at)
     .fetch_one(pool)
     .await?;
 
@@ -732,6 +736,27 @@ pub async fn update_session_status(
              external_session_id, status, title, usage_snapshot, turn_settings, created_at, updated_at",
     )
     .bind(owner_user_id.as_uuid())
+    .bind(session_id.as_uuid())
+    .bind(session_status_to_db(&status))
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(session_from_row).transpose()
+}
+
+pub async fn update_session_status_by_id(
+    pool: &PgPool,
+    session_id: SessionId,
+    status: SessionStatus,
+) -> Result<Option<AgentSession>> {
+    let row = sqlx::query(
+        "update agent_sessions
+         set status = $2,
+             updated_at = now()
+         where session_id = $1
+         returning session_id, owner_user_id, runner_id, workspace_id, provider_id,
+             external_session_id, status, title, usage_snapshot, turn_settings, created_at, updated_at",
+    )
     .bind(session_id.as_uuid())
     .bind(session_status_to_db(&status))
     .fetch_optional(pool)
@@ -1217,6 +1242,8 @@ fn session_status_to_db(status: &SessionStatus) -> &'static str {
         SessionStatus::Running => "running",
         SessionStatus::WaitingForInput => "waiting_for_input",
         SessionStatus::WaitingForApproval => "waiting_for_approval",
+        SessionStatus::Idle => "idle",
+        SessionStatus::Stopped => "stopped",
         SessionStatus::Completed => "completed",
         SessionStatus::Interrupted => "interrupted",
         SessionStatus::Degraded => "degraded",
@@ -1231,6 +1258,8 @@ fn session_status_from_db(value: &str) -> Result<SessionStatus> {
         "running" => Ok(SessionStatus::Running),
         "waiting_for_input" => Ok(SessionStatus::WaitingForInput),
         "waiting_for_approval" => Ok(SessionStatus::WaitingForApproval),
+        "idle" => Ok(SessionStatus::Idle),
+        "stopped" => Ok(SessionStatus::Stopped),
         "completed" => Ok(SessionStatus::Completed),
         "interrupted" => Ok(SessionStatus::Interrupted),
         "degraded" => Ok(SessionStatus::Degraded),
@@ -1407,25 +1436,29 @@ mod tests {
 
         let imported = upsert_session_by_external_id(
             &pool,
-            user.user_id,
-            runner.runner_id,
-            workspace.workspace_id,
-            AgentProviderId::from(AgentProviderId::CODEX),
-            "codex-thread-imported",
-            Some("Imported Codex Thread"),
-            None,
+            UpsertSessionByExternalId {
+                owner_user_id: user.user_id,
+                runner_id: runner.runner_id,
+                workspace_id: workspace.workspace_id,
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                external_session_id: "codex-thread-imported",
+                title: Some("Imported Codex Thread"),
+                updated_at: None,
+            },
         )
         .await
         .expect("upsert imported session");
         let duplicate = upsert_session_by_external_id(
             &pool,
-            user.user_id,
-            runner.runner_id,
-            workspace.workspace_id,
-            AgentProviderId::from(AgentProviderId::CODEX),
-            "codex-thread-imported",
-            Some("Renamed Codex Thread"),
-            None,
+            UpsertSessionByExternalId {
+                owner_user_id: user.user_id,
+                runner_id: runner.runner_id,
+                workspace_id: workspace.workspace_id,
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                external_session_id: "codex-thread-imported",
+                title: Some("Renamed Codex Thread"),
+                updated_at: None,
+            },
         )
         .await
         .expect("upsert duplicate imported session");
@@ -1438,13 +1471,15 @@ mod tests {
             .with_timezone(&Utc);
         let with_timestamp = upsert_session_by_external_id(
             &pool,
-            user.user_id,
-            runner.runner_id,
-            workspace.workspace_id,
-            AgentProviderId::from(AgentProviderId::CODEX),
-            "codex-thread-imported",
-            Some("Timestamped Codex Thread"),
-            Some(source_updated_at),
+            UpsertSessionByExternalId {
+                owner_user_id: user.user_id,
+                runner_id: runner.runner_id,
+                workspace_id: workspace.workspace_id,
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                external_session_id: "codex-thread-imported",
+                title: Some("Timestamped Codex Thread"),
+                updated_at: Some(source_updated_at),
+            },
         )
         .await
         .expect("upsert imported session with timestamp");
@@ -1452,13 +1487,15 @@ mod tests {
 
         let preserved = upsert_session_by_external_id(
             &pool,
-            user.user_id,
-            runner.runner_id,
-            workspace.workspace_id,
-            AgentProviderId::from(AgentProviderId::CODEX),
-            "codex-thread-imported",
-            Some("Preserved Timestamp"),
-            None,
+            UpsertSessionByExternalId {
+                owner_user_id: user.user_id,
+                runner_id: runner.runner_id,
+                workspace_id: workspace.workspace_id,
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                external_session_id: "codex-thread-imported",
+                title: Some("Preserved Timestamp"),
+                updated_at: None,
+            },
         )
         .await
         .expect("upsert imported session without timestamp");

@@ -186,6 +186,7 @@ mod runner_transport_tests {
                 command: crate::runner::RunnerCommand::AgentSendInput(
                     crate::runner::AgentInputCommand {
                         session_id: SessionId::nil(),
+                        provider_id: Some(agenter_core::AgentProviderId::from("codex")),
                         external_session_id: Some("thread-large".to_owned()),
                         settings: None,
                         input: crate::runner::AgentInput::Text {

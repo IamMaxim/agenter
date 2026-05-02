@@ -738,6 +738,9 @@
     if (status === 'completed') {
       return 'done';
     }
+    if (status === 'idle' || status === 'stopped') {
+      return 'idle';
+    }
     return 'idle';
   }
 
@@ -754,6 +757,10 @@
         return 'error';
       case 'completed':
         return 'done';
+      case 'idle':
+        return 'idle';
+      case 'stopped':
+        return 'stopped';
       case 'starting':
         return 'starting';
       default:

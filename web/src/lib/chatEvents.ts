@@ -566,6 +566,10 @@ function statusLabel(status: string | undefined): string {
       return 'Waiting for approval';
     case 'waiting_for_input':
       return 'Waiting for input';
+    case 'idle':
+      return 'Idle';
+    case 'stopped':
+      return 'Stopped';
     case 'completed':
       return 'Turn complete';
     case 'failed':

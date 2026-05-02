@@ -6,13 +6,15 @@ use crate::QuestionId;
 
 use crate::{RunnerId, SessionId, UserId, WorkspaceId};
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct AgentProviderId(String);
 
 impl AgentProviderId {
     pub const CODEX: &'static str = "codex";
     pub const QWEN: &'static str = "qwen";
+    pub const GEMINI: &'static str = "gemini";
+    pub const OPENCODE: &'static str = "opencode";
 
     #[must_use]
     pub fn new(value: impl Into<String>) -> Self {
@@ -50,6 +52,8 @@ pub enum SessionStatus {
     Running,
     WaitingForInput,
     WaitingForApproval,
+    Idle,
+    Stopped,
     Completed,
     Interrupted,
     Degraded,
