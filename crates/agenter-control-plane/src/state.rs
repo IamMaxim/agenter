@@ -1,10 +1,10 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use agenter_core::{
-    AgentProviderId, AgentQuestionAnswer, AgentTurnSettings, AppEvent, ApprovalId, CommandAction,
-    CommandOutputStream, ProviderEvent, QuestionId, RunnerId, SessionId, SessionInfo,
-    SessionStatus, SessionUsageContext, SessionUsageSnapshot, SessionUsageWindow, UserId,
-    WorkspaceId, WorkspaceRef,
+    AgentProviderId, AgentQuestionAnswer, AgentTurnSettings, AppEvent, ApprovalDecision,
+    ApprovalId, ApprovalResolutionState, CommandAction, CommandOutputStream, ProviderEvent,
+    QuestionId, RunnerId, SessionId, SessionInfo, SessionStatus, SessionUsageContext,
+    SessionUsageSnapshot, SessionUsageWindow, UserId, WorkspaceId, WorkspaceRef,
 };
 use agenter_protocol::{
     browser::BrowserEventEnvelope,
@@ -45,6 +45,7 @@ struct AppStateInner {
     runner_connections: Mutex<HashMap<RunnerId, RunnerConnection>>,
     pending_runner_responses:
         Mutex<HashMap<(RunnerId, RequestId), oneshot::Sender<RunnerResponseOutcome>>>,
+    runner_command_operations: Mutex<HashMap<RequestId, RunnerCommandOperation>>,
     refresh_summaries: Mutex<HashMap<RequestId, WorkspaceSessionRefreshSummary>>,
 }
 
@@ -73,8 +74,29 @@ pub struct RegisteredQuestion {
 #[derive(Clone, Debug)]
 enum ApprovalStatus {
     Pending(Box<BrowserEventEnvelope>),
-    Resolving(Box<BrowserEventEnvelope>),
+    Resolving {
+        request: Box<BrowserEventEnvelope>,
+        decision: ApprovalDecision,
+    },
     Resolved(Box<BrowserEventEnvelope>),
+}
+
+#[derive(Debug)]
+struct RunnerCommandOperation {
+    runner_id: RunnerId,
+    request_id: RequestId,
+    status: RunnerCommandOperationStatus,
+    waiters: Vec<oneshot::Sender<Result<RunnerResponseOutcome, RunnerCommandWaitError>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunnerCommandOperationStatus {
+    Queued,
+    Delivered,
+    Waiting,
+    Succeeded,
+    Failed,
+    TimedOut,
 }
 
 fn envelope_references_approval_id(
@@ -88,37 +110,65 @@ fn envelope_references_approval_id(
     }
 }
 
+fn approval_request_envelope_with_state(
+    envelope: &BrowserEventEnvelope,
+    state: ApprovalResolutionState,
+    decision: Option<ApprovalDecision>,
+) -> BrowserEventEnvelope {
+    let mut envelope = envelope.clone();
+    if let AppEvent::ApprovalRequested(request) = &mut envelope.event {
+        request.resolution_state = Some(state);
+        request.resolving_decision = decision;
+    }
+    envelope
+}
+
 fn merge_pending_approval_envelopes_for_session(
     session_id: SessionId,
     mut envelopes: Vec<BrowserEventEnvelope>,
     registry: &Registry,
 ) -> Vec<BrowserEventEnvelope> {
-    let mut injections = Vec::<BrowserEventEnvelope>::new();
     for (&approval_id, approval) in &registry.approvals {
         if approval.session_id != session_id {
             continue;
         }
-        match &approval.status {
-            ApprovalStatus::Pending(request) | ApprovalStatus::Resolving(request) => {
-                if envelopes
-                    .iter()
-                    .any(|e| envelope_references_approval_id(e, approval_id))
-                {
-                    continue;
-                }
-                injections.push((**request).clone());
+        let replacement = match &approval.status {
+            ApprovalStatus::Pending(request) => approval_request_envelope_with_state(
+                request,
+                ApprovalResolutionState::Pending,
+                None,
+            ),
+            ApprovalStatus::Resolving { request, decision } => {
+                approval_request_envelope_with_state(
+                    request,
+                    ApprovalResolutionState::Resolving,
+                    Some(decision.clone()),
+                )
             }
-            ApprovalStatus::Resolved(_) => {}
+            ApprovalStatus::Resolved(_) => continue,
+        };
+        match envelopes
+            .iter()
+            .position(|e| envelope_references_approval_id(e, approval_id))
+        {
+            Some(index) => {
+                if matches!(envelopes[index].event, AppEvent::ApprovalRequested(_)) {
+                    envelopes[index] = replacement;
+                }
+            }
+            None => envelopes.push(replacement),
         }
     }
-    envelopes.extend(injections);
     envelopes
 }
 
 #[derive(Clone, Debug)]
 pub enum ApprovalResolutionStart {
     Missing,
-    InProgress,
+    InProgress {
+        session_id: SessionId,
+        envelope: Box<BrowserEventEnvelope>,
+    },
     AlreadyResolved {
         session_id: SessionId,
         envelope: Box<BrowserEventEnvelope>,
@@ -237,6 +287,7 @@ impl AppState {
                 sessions: Mutex::new(HashMap::new()),
                 runner_connections: Mutex::new(HashMap::new()),
                 pending_runner_responses: Mutex::new(HashMap::new()),
+                runner_command_operations: Mutex::new(HashMap::new()),
                 refresh_summaries: Mutex::new(HashMap::new()),
             }),
         }
@@ -268,6 +319,7 @@ impl AppState {
                 sessions: Mutex::new(HashMap::new()),
                 runner_connections: Mutex::new(HashMap::new()),
                 pending_runner_responses: Mutex::new(HashMap::new()),
+                runner_command_operations: Mutex::new(HashMap::new()),
                 refresh_summaries: Mutex::new(HashMap::new()),
             }),
         })
@@ -311,6 +363,7 @@ impl AppState {
                 sessions: Mutex::new(HashMap::new()),
                 runner_connections: Mutex::new(HashMap::new()),
                 pending_runner_responses: Mutex::new(HashMap::new()),
+                runner_command_operations: Mutex::new(HashMap::new()),
                 refresh_summaries: Mutex::new(HashMap::new()),
             }),
         })
@@ -530,6 +583,52 @@ impl AppState {
         message: RunnerServerMessage,
         wait_for: Duration,
     ) -> Result<RunnerResponseOutcome, RunnerCommandWaitError> {
+        let receiver = self
+            .start_runner_command_operation(runner_id, request_id, message, wait_for)
+            .await;
+        receiver
+            .await
+            .unwrap_or(Err(RunnerCommandWaitError::Closed))
+    }
+
+    pub async fn start_runner_command_operation(
+        &self,
+        runner_id: RunnerId,
+        request_id: RequestId,
+        message: RunnerServerMessage,
+        wait_for: Duration,
+    ) -> oneshot::Receiver<Result<RunnerResponseOutcome, RunnerCommandWaitError>> {
+        let (waiter, receiver) = oneshot::channel();
+        self.inner.runner_command_operations.lock().await.insert(
+            request_id.clone(),
+            RunnerCommandOperation {
+                runner_id,
+                request_id: request_id.clone(),
+                status: RunnerCommandOperationStatus::Queued,
+                waiters: vec![waiter],
+            },
+        );
+
+        let state = self.clone();
+        tokio::spawn(async move {
+            let result = state
+                .run_runner_command_operation(runner_id, request_id.clone(), message, wait_for)
+                .await;
+            state
+                .complete_runner_command_operation(request_id, result)
+                .await;
+        });
+
+        receiver
+    }
+
+    async fn run_runner_command_operation(
+        &self,
+        runner_id: RunnerId,
+        request_id: RequestId,
+        message: RunnerServerMessage,
+        wait_for: Duration,
+    ) -> Result<RunnerResponseOutcome, RunnerCommandWaitError> {
         let (response_sender, response_receiver) = oneshot::channel();
         self.inner
             .pending_runner_responses
@@ -537,6 +636,11 @@ impl AppState {
             .await
             .insert((runner_id, request_id.clone()), response_sender);
 
+        self.update_runner_command_operation_status(
+            &request_id,
+            RunnerCommandOperationStatus::Delivered,
+        )
+        .await;
         if let Err(error) = self.send_runner_message(runner_id, message).await {
             self.inner
                 .pending_runner_responses
@@ -550,6 +654,11 @@ impl AppState {
             });
         }
 
+        self.update_runner_command_operation_status(
+            &request_id,
+            RunnerCommandOperationStatus::Waiting,
+        )
+        .await;
         match timeout(wait_for, response_receiver).await {
             Ok(Ok(outcome)) => Ok(outcome),
             Ok(Err(_)) => Err(RunnerCommandWaitError::Closed),
@@ -560,6 +669,57 @@ impl AppState {
                     .await
                     .remove(&(runner_id, request_id));
                 Err(RunnerCommandWaitError::TimedOut)
+            }
+        }
+    }
+
+    async fn update_runner_command_operation_status(
+        &self,
+        request_id: &RequestId,
+        status: RunnerCommandOperationStatus,
+    ) {
+        if let Some(operation) = self
+            .inner
+            .runner_command_operations
+            .lock()
+            .await
+            .get_mut(request_id)
+        {
+            operation.status = status;
+            tracing::debug!(
+                runner_id = %operation.runner_id,
+                request_id = %operation.request_id,
+                ?status,
+                "runner command operation status changed"
+            );
+        }
+    }
+
+    async fn complete_runner_command_operation(
+        &self,
+        request_id: RequestId,
+        result: Result<RunnerResponseOutcome, RunnerCommandWaitError>,
+    ) {
+        let mut operation = self
+            .inner
+            .runner_command_operations
+            .lock()
+            .await
+            .remove(&request_id);
+        if let Some(operation) = &mut operation {
+            operation.status = match &result {
+                Ok(_) => RunnerCommandOperationStatus::Succeeded,
+                Err(RunnerCommandWaitError::TimedOut) => RunnerCommandOperationStatus::TimedOut,
+                Err(_) => RunnerCommandOperationStatus::Failed,
+            };
+            tracing::debug!(
+                runner_id = %operation.runner_id,
+                request_id = %operation.request_id,
+                status = ?operation.status,
+                "runner command operation completed"
+            );
+            for waiter in operation.waiters.drain(..) {
+                waiter.send(result.clone()).ok();
             }
         }
     }
@@ -966,8 +1126,19 @@ impl AppState {
                 continue;
             }
             match &approval.status {
-                ApprovalStatus::Pending(env) | ApprovalStatus::Resolving(env) => {
-                    out.push((**env).clone());
+                ApprovalStatus::Pending(env) => {
+                    out.push(approval_request_envelope_with_state(
+                        env,
+                        ApprovalResolutionState::Pending,
+                        None,
+                    ));
+                }
+                ApprovalStatus::Resolving { request, decision } => {
+                    out.push(approval_request_envelope_with_state(
+                        request,
+                        ApprovalResolutionState::Resolving,
+                        Some(decision.clone()),
+                    ));
                 }
                 ApprovalStatus::Resolved(_) => {}
             }
@@ -1058,7 +1229,7 @@ impl AppState {
                 match registry.approvals.get_mut(&resolved.approval_id) {
                     Some(approval) => match &approval.status {
                         ApprovalStatus::Resolved(existing) => return *existing.clone(),
-                        ApprovalStatus::Pending(_) | ApprovalStatus::Resolving(_) => {
+                        ApprovalStatus::Pending(_) | ApprovalStatus::Resolving { .. } => {
                             approval.status = ApprovalStatus::Resolved(Box::new(envelope.clone()));
                         }
                     },
@@ -1142,6 +1313,7 @@ impl AppState {
     pub async fn begin_approval_resolution(
         &self,
         approval_id: ApprovalId,
+        decision: ApprovalDecision,
     ) -> ApprovalResolutionStart {
         let mut registry = self.inner.registry.lock().await;
         let Some(approval) = registry.approvals.get_mut(&approval_id) else {
@@ -1149,13 +1321,25 @@ impl AppState {
         };
         match &approval.status {
             ApprovalStatus::Pending(request_env) => {
-                approval.status = ApprovalStatus::Resolving(request_env.clone());
+                approval.status = ApprovalStatus::Resolving {
+                    request: request_env.clone(),
+                    decision,
+                };
                 tracing::debug!(%approval_id, session_id = %approval.session_id, "approval resolution started");
                 ApprovalResolutionStart::Started {
                     session_id: approval.session_id,
                 }
             }
-            ApprovalStatus::Resolving(_) => ApprovalResolutionStart::InProgress,
+            ApprovalStatus::Resolving { request, decision } => {
+                ApprovalResolutionStart::InProgress {
+                    session_id: approval.session_id,
+                    envelope: Box::new(approval_request_envelope_with_state(
+                        request,
+                        ApprovalResolutionState::Resolving,
+                        Some(decision.clone()),
+                    )),
+                }
+            }
             ApprovalStatus::Resolved(envelope) => ApprovalResolutionStart::AlreadyResolved {
                 session_id: approval.session_id,
                 envelope: envelope.clone(),
@@ -1168,8 +1352,8 @@ impl AppState {
         let Some(approval) = registry.approvals.get_mut(&approval_id) else {
             return;
         };
-        if let ApprovalStatus::Resolving(request_env) = &approval.status {
-            approval.status = ApprovalStatus::Pending(request_env.clone());
+        if let ApprovalStatus::Resolving { request, .. } = &approval.status {
+            approval.status = ApprovalStatus::Pending(request.clone());
         }
     }
 
@@ -1180,7 +1364,7 @@ impl AppState {
             .await
             .approvals
             .get(&approval_id)
-            .is_some_and(|approval| matches!(approval.status, ApprovalStatus::Resolving(_)))
+            .is_some_and(|approval| matches!(approval.status, ApprovalStatus::Resolving { .. }))
     }
 
     pub async fn finish_approval_resolution(
@@ -1202,7 +1386,7 @@ impl AppState {
             match &approval.status {
                 ApprovalStatus::Resolved(existing) => return Some(*existing.clone()),
                 ApprovalStatus::Pending(_) => return None,
-                ApprovalStatus::Resolving(_) => {
+                ApprovalStatus::Resolving { .. } => {
                     approval.status = ApprovalStatus::Resolved(Box::new(envelope.clone()));
                 }
             }
@@ -1318,6 +1502,8 @@ impl AppState {
         }
 
         for discovered_session in discovered.sessions {
+            let discovered_session_updated_at =
+                discovered_session_timestamp(discovered_session.updated_at.as_deref());
             let session = if let Some(pool) = &self.inner.db_pool {
                 match agenter_db::upsert_session_by_external_id(
                     pool,
@@ -1327,6 +1513,7 @@ impl AppState {
                     discovered.provider_id.clone(),
                     &discovered_session.external_session_id,
                     discovered_session.title.as_deref(),
+                    discovered_session_updated_at,
                 )
                 .await
                 {
@@ -1370,7 +1557,8 @@ impl AppState {
                 {
                     existing
                 } else {
-                    let now = Utc::now();
+                        let now = Utc::now();
+                        let updated_at = discovered_session_updated_at.unwrap_or(now);
                     RegisteredSession {
                         session_id: SessionId::new(),
                         owner_user_id,
@@ -1383,7 +1571,7 @@ impl AppState {
                         turn_settings: None,
                         usage: None,
                         created_at: now,
-                        updated_at: now,
+                        updated_at,
                     }
                 }
             };
@@ -1837,6 +2025,39 @@ fn usage_window_at(
     })
 }
 
+fn discovered_session_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
+    let Some(value) = value else {
+        return None;
+    };
+
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            value
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .and_then(|value| {
+                    if value.abs() > 10_000_000_000_000 {
+                        let secs = value / 1000;
+                        let nanos = ((value % 1000).unsigned_abs() as u32) * 1_000_000;
+                        DateTime::from_timestamp(secs, nanos)
+                    } else {
+                        DateTime::from_timestamp(value, 0)
+                    }
+                })
+        })
+        .or_else(|| {
+            value
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .map(|seconds| seconds.round() as i64)
+                .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
+        })
+}
+
 fn integer_at(value: &Value, pointers: &[&str]) -> Option<u64> {
     pointers.iter().find_map(|pointer| {
         let value = value.pointer(pointer)?;
@@ -1864,8 +2085,8 @@ fn sort_session_infos(sessions: &mut [SessionInfo]) {
 #[cfg(test)]
 mod tests {
     use agenter_core::{
-        AgentProviderId, AppEvent, ApprovalId, ApprovalKind, ApprovalRequestEvent, RunnerId,
-        SessionId, UserMessageEvent, WorkspaceId, WorkspaceRef,
+        AgentProviderId, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind,
+        ApprovalRequestEvent, RunnerId, SessionId, UserMessageEvent, WorkspaceId, WorkspaceRef,
     };
     use agenter_protocol::runner::{RunnerHeartbeatAck, RunnerServerMessage};
 
@@ -2044,6 +2265,8 @@ mod tests {
                     details: Some("files".to_owned()),
                     expires_at: None,
                     presentation: None,
+                    resolution_state: None,
+                    resolving_decision: None,
                     provider_payload: None,
                 }),
             )
@@ -2093,6 +2316,77 @@ mod tests {
         let pending = state.pending_approval_request_envelopes(sid).await;
         assert_eq!(pending.len(), 1);
         assert!(matches!(pending[0].event, AppEvent::ApprovalRequested(_)));
+    }
+
+    #[tokio::test]
+    async fn resolving_approval_replay_carries_in_flight_decision() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("bootstrap");
+        let owner = state.inner.bootstrap_admin.as_ref().unwrap().user.user_id;
+        let runner_id = RunnerId::new();
+        let workspace = WorkspaceRef {
+            workspace_id: WorkspaceId::new(),
+            runner_id,
+            path: "/tmp/agenter-test".to_owned(),
+            display_name: None,
+        };
+        let session = state
+            .create_session(
+                SessionId::new(),
+                owner,
+                runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let sid = session.session_id;
+        let approval_id = ApprovalId::new();
+        state
+            .publish_event(
+                sid,
+                AppEvent::ApprovalRequested(ApprovalRequestEvent {
+                    session_id: sid,
+                    approval_id,
+                    kind: ApprovalKind::FileChange,
+                    title: "Approve change".to_owned(),
+                    details: Some("files".to_owned()),
+                    expires_at: None,
+                    presentation: None,
+                    resolution_state: None,
+                    resolving_decision: None,
+                    provider_payload: None,
+                }),
+            )
+            .await;
+
+        let started = state
+            .begin_approval_resolution(approval_id, ApprovalDecision::Accept)
+            .await;
+        assert!(matches!(
+            started,
+            ApprovalResolutionStart::Started { session_id } if session_id == sid
+        ));
+
+        let history = state.session_history(owner, sid).await.expect("history");
+        let approval = history
+            .iter()
+            .find_map(|env| match &env.event {
+                AppEvent::ApprovalRequested(req) if req.approval_id == approval_id => Some(req),
+                _ => None,
+            })
+            .expect("replayed approval");
+        let approval_json = serde_json::to_value(approval).expect("approval json");
+        assert_eq!(approval_json["resolution_state"], "resolving");
+        assert_eq!(approval_json["resolving_decision"]["decision"], "accept");
+
+        let pending = state.pending_approval_request_envelopes(sid).await;
+        let pending_json = serde_json::to_value(&pending[0].event).expect("pending json");
+        assert_eq!(pending_json["payload"]["resolution_state"], "resolving");
     }
 
     #[tokio::test]
@@ -2185,6 +2479,7 @@ mod tests {
                     sessions: vec![agenter_protocol::DiscoveredSession {
                         external_session_id: "codex-thread-1".to_owned(),
                         title: Some("New".to_owned()),
+                        updated_at: None,
                         history_status: DiscoveredSessionHistoryStatus::Loaded,
                         history: vec![DiscoveredSessionHistoryItem::AgentMessage {
                             message_id: "agent-new".to_owned(),
@@ -2272,6 +2567,7 @@ mod tests {
                     sessions: vec![agenter_protocol::DiscoveredSession {
                         external_session_id: "codex-thread-1".to_owned(),
                         title: Some("New".to_owned()),
+                        updated_at: None,
                         history_status: DiscoveredSessionHistoryStatus::Failed {
                             message: "thread/read failed".to_owned(),
                         },
@@ -2296,6 +2592,66 @@ mod tests {
         );
         assert_eq!(history.len(), 1);
         assert!(matches!(history[0].event, AppEvent::UserMessage(_)));
+    }
+
+    #[tokio::test]
+    async fn discovered_session_timestamp_is_preserved_when_provided_by_runner() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let owner_user_id = state
+            .inner
+            .bootstrap_admin
+            .as_ref()
+            .expect("bootstrap admin")
+            .user
+            .user_id;
+        let runner_id = RunnerId::new();
+        let workspace = WorkspaceRef {
+            workspace_id: WorkspaceId::new(),
+            runner_id,
+            path: "/work/agenter".to_owned(),
+            display_name: Some("agenter".to_owned()),
+        };
+
+        let source_updated_at = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("parse fixed timestamp")
+            .with_timezone(&Utc);
+
+        state
+            .import_discovered_sessions(
+                runner_id,
+                DiscoveredSessions {
+                    workspace,
+                    provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                    sessions: vec![agenter_protocol::DiscoveredSession {
+                        external_session_id: "codex-thread-1".to_owned(),
+                        title: Some("New".to_owned()),
+                        updated_at: Some(source_updated_at.to_rfc3339()),
+                        history_status: DiscoveredSessionHistoryStatus::Loaded,
+                        history: vec![DiscoveredSessionHistoryItem::AgentMessage {
+                            message_id: "agent-new".to_owned(),
+                            content: "new cache".to_owned(),
+                        }],
+                    }],
+                },
+                SessionImportMode::Forced,
+            )
+            .await;
+
+        let sessions = state.list_sessions(owner_user_id).await;
+        let session = sessions
+            .iter()
+            .find(|session| {
+                session.external_session_id.as_deref() == Some("codex-thread-1")
+            })
+            .expect("imported session");
+
+        assert_eq!(session.updated_at, Some(source_updated_at));
     }
 
     #[test]

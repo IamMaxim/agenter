@@ -26,7 +26,13 @@ pub struct QwenTurnRequest {
 
 #[derive(Debug)]
 pub struct PendingQwenApproval {
-    pub response: oneshot::Sender<ApprovalDecision>,
+    pub response: tokio::sync::oneshot::Sender<PendingQwenApprovalDecision>,
+}
+
+#[derive(Debug)]
+pub struct PendingQwenApprovalDecision {
+    pub decision: ApprovalDecision,
+    pub acknowledged: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
 #[derive(Debug)]
@@ -292,13 +298,16 @@ pub async fn run_qwen_turn(
                 "qwen permission request pending"
             );
             event_sender.send(event).ok();
-            if let Ok(decision) = receiver.await {
-                server
+            if let Ok(answer) = receiver.await {
+                let result = server
                     .respond(
                         native_request_id,
-                        qwen_permission_response(&message, decision),
+                        qwen_permission_response(&message, answer.decision),
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| error.to_string());
+                answer.acknowledged.send(result.clone()).ok();
+                result.map_err(anyhow::Error::msg)?;
                 event_sender
                     .send(AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
                         session_id: request.session_id,
@@ -456,6 +465,8 @@ pub fn normalize_qwen_permission_request(
         details,
         expires_at: None,
         presentation: None,
+        resolution_state: None,
+        resolving_decision: None,
         provider_payload: Some(message.clone()),
     });
     Some((approval_id, native_request_id, event))

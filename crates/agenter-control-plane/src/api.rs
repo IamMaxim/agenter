@@ -686,6 +686,7 @@ mod tests {
                         sessions: vec![agenter_protocol::runner::DiscoveredSession {
                             external_session_id: "codex-thread-1".to_owned(),
                             title: Some("Refreshed".to_owned()),
+                            updated_at: None,
                             history_status: agenter_protocol::runner::DiscoveredSessionHistoryStatus::Loaded,
                             history: vec![agenter_protocol::runner::DiscoveredSessionHistoryItem::AgentMessage {
                                 message_id: "agent-new".to_owned(),
@@ -1297,6 +1298,8 @@ mod tests {
                 details: Some("printf ok".to_owned()),
                 expires_at: None,
                 presentation: None,
+                resolution_state: None,
+                resolving_decision: None,
                 provider_payload: None,
             }),
         )
@@ -1333,9 +1336,8 @@ mod tests {
         assert!(saw_approval, "browser receives approval event");
         assert!(saw_delta, "browser receives agent delta event");
 
-        let decision_response = app_service
-            .clone()
-            .oneshot(
+        let decision_task = tokio::spawn(
+            app_service.clone().oneshot(
                 Request::builder()
                     .method("POST")
                     .uri(format!("/api/approvals/{approval_id}/decision"))
@@ -1346,19 +1348,22 @@ mod tests {
                             .expect("serialize approval decision"),
                     ))
                     .expect("build approval decision request"),
-            )
-            .await
-            .expect("route approval decision");
-        assert_eq!(decision_response.status(), StatusCode::OK);
-
+            ),
+        );
         let approval_command = next_runner_command(&mut runner_receiver).await;
         let agenter_protocol::runner::RunnerCommand::AnswerApproval(answer) =
-            approval_command.command
+            approval_command.command.clone()
         else {
             panic!("expected approval answer command");
         };
         assert_eq!(answer.approval_id, approval_id);
         send_runner_response(&mut runner_sender, approval_command.request_id).await;
+
+        let decision_response = decision_task
+            .await
+            .expect("join approval decision")
+            .expect("route approval decision");
+        assert_eq!(decision_response.status(), StatusCode::OK);
 
         let history_response = app_service
             .oneshot(
@@ -1391,7 +1396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_decision_publishes_resolved_event_for_owned_session() {
+    async fn approval_decision_resolves_only_after_runner_ack() {
         let state = AppState::new_with_bootstrap_admin(
             "dev-token".to_owned(),
             "admin@example.test".to_owned(),
@@ -1443,6 +1448,8 @@ mod tests {
                     details: Some("cargo test".to_owned()),
                     expires_at: None,
                     presentation: None,
+                    resolution_state: None,
+                    resolving_decision: None,
                     provider_payload: None,
                 }),
             )
@@ -1451,11 +1458,10 @@ mod tests {
             .login_password("admin@example.test", "correct horse battery staple")
             .await
             .expect("login bootstrap admin");
-        let app = app(state);
+        let app = app(state.clone());
 
-        let response = app
-            .clone()
-            .oneshot(
+        let mut response_task = tokio::spawn(
+            app.clone().oneshot(
                 Request::builder()
                     .method("POST")
                     .uri(format!("/api/approvals/{approval_id}/decision"))
@@ -1469,9 +1475,58 @@ mod tests {
                             .expect("serialize decision"),
                     ))
                     .expect("build approval decision request"),
-            )
+            ),
+        );
+
+        let RunnerServerMessage::Command(command) =
+            timeout(Duration::from_millis(250), observed_receiver.recv())
+                .await
+                .expect("runner command should be sent")
+                .expect("runner receives approval answer")
+        else {
+            panic!("expected runner command");
+        };
+        let agenter_protocol::runner::RunnerCommand::AnswerApproval(answer) =
+            command.command.clone()
+        else {
+            panic!("expected approval answer command");
+        };
+        assert_eq!(answer.approval_id, approval_id);
+
+        tokio::select! {
+            result = &mut response_task => {
+                panic!("approval HTTP response finished before runner acknowledgement: {result:?}");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        let history = state
+            .session_history(user_id, session_id)
             .await
-            .expect("route approval decision");
+            .expect("history while resolving");
+        assert!(
+            !history
+                .iter()
+                .any(|entry| matches!(entry.event, AppEvent::ApprovalResolved(_))),
+            "approval must not resolve before the runner acknowledges provider delivery"
+        );
+        let pending = state.pending_approval_request_envelopes(session_id).await;
+        let pending_json = serde_json::to_value(&pending[0].event).expect("pending json");
+        assert_eq!(pending_json["payload"]["resolution_state"], "resolving");
+
+        state
+            .finish_runner_response(
+                runner.runner_id,
+                command.request_id,
+                agenter_protocol::runner::RunnerResponseOutcome::Ok {
+                    result: agenter_protocol::runner::RunnerCommandResult::Accepted,
+                },
+            )
+            .await;
+
+        let response = response_task
+            .await
+            .expect("join approval response")
+            .expect("route duplicate approval decision");
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX)
@@ -1480,18 +1535,6 @@ mod tests {
         let envelope: BrowserEventEnvelope =
             serde_json::from_slice(&body).expect("approval response json");
         assert!(matches!(envelope.event, AppEvent::ApprovalResolved(_)));
-
-        let RunnerServerMessage::Command(command) = observed_receiver
-            .try_recv()
-            .expect("runner receives approval answer")
-        else {
-            panic!("expected runner command");
-        };
-        let agenter_protocol::runner::RunnerCommand::AnswerApproval(answer) = command.command
-        else {
-            panic!("expected approval answer command");
-        };
-        assert_eq!(answer.approval_id, approval_id);
 
         let duplicate_response = app
             .oneshot(
@@ -1617,6 +1660,8 @@ mod tests {
                     details: Some("cargo test".to_owned()),
                     expires_at: None,
                     presentation: None,
+                    resolution_state: None,
+                    resolving_decision: None,
                     provider_payload: None,
                 }),
             )
@@ -1963,12 +2008,13 @@ mod tests {
             event: RunnerEvent::SessionsDiscovered(agenter_protocol::runner::DiscoveredSessions {
                 workspace,
                 provider_id: AgentProviderId::from(AgentProviderId::CODEX),
-                sessions: vec![agenter_protocol::runner::DiscoveredSession {
-                    external_session_id: "codex-large-thread".to_owned(),
-                    title: Some("Large Thread".to_owned()),
-                    history_status:
-                        agenter_protocol::runner::DiscoveredSessionHistoryStatus::Loaded,
-                    history: vec![
+                        sessions: vec![agenter_protocol::runner::DiscoveredSession {
+                            external_session_id: "codex-large-thread".to_owned(),
+                            title: Some("Large Thread".to_owned()),
+                            updated_at: None,
+                            history_status:
+                                agenter_protocol::runner::DiscoveredSessionHistoryStatus::Loaded,
+                            history: vec![
                         agenter_protocol::runner::DiscoveredSessionHistoryItem::FileChange {
                             change_id: "change-large".to_owned(),
                             path: "large.patch".to_owned(),

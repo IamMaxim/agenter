@@ -1,4 +1,4 @@
-use crate::state::{ApprovalResolutionStart, RunnerSendError};
+use crate::state::{ApprovalResolutionStart, RunnerCommandWaitError};
 use agenter_core::SessionId;
 use axum::{
     extract::{Path, Query, State},
@@ -61,7 +61,10 @@ pub(super) async fn decide_approval(
         tracing::debug!(%approval_id, "approval decision rejected missing or invalid session");
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let session_id = match state.begin_approval_resolution(approval_id).await {
+    let session_id = match state
+        .begin_approval_resolution(approval_id, decision.clone())
+        .await
+    {
         ApprovalResolutionStart::Started { session_id } => session_id,
         ApprovalResolutionStart::AlreadyResolved {
             session_id,
@@ -72,9 +75,15 @@ pub(super) async fn decide_approval(
             }
             return Json(*envelope).into_response();
         }
-        ApprovalResolutionStart::InProgress => {
-            tracing::warn!(%approval_id, "approval decision rejected because resolution is already in progress");
-            return StatusCode::CONFLICT.into_response();
+        ApprovalResolutionStart::InProgress {
+            session_id,
+            envelope,
+        } => {
+            if state.session(user.user_id, session_id).await.is_none() {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            tracing::debug!(%approval_id, "approval decision already resolving");
+            return Json(*envelope).into_response();
         }
         ApprovalResolutionStart::Missing => {
             tracing::warn!(%approval_id, "approval decision rejected missing approval");
@@ -87,9 +96,10 @@ pub(super) async fn decide_approval(
         return StatusCode::NOT_FOUND.into_response();
     };
 
+    let request_id = agenter_protocol::RequestId::from(Uuid::new_v4().to_string());
     let command = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
         agenter_protocol::runner::RunnerCommandEnvelope {
-            request_id: agenter_protocol::RequestId::from(Uuid::new_v4().to_string()),
+            request_id: request_id.clone(),
             command: agenter_protocol::runner::RunnerCommand::AnswerApproval(
                 agenter_protocol::runner::ApprovalAnswerCommand {
                     session_id,
@@ -99,55 +109,145 @@ pub(super) async fn decide_approval(
             ),
         },
     ));
-    match state.send_runner_message(session.runner_id, command).await {
-        Ok(()) => {}
-        Err(RunnerSendError::NotConnected | RunnerSendError::Closed) => {
-            state.cancel_approval_resolution(approval_id).await;
-            tracing::warn!(
-                user_id = %user.user_id,
-                %approval_id,
-                %session_id,
-                runner_id = %session.runner_id,
-                "approval decision failed because runner is unavailable"
-            );
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-        Err(RunnerSendError::StaleApproval) => {
-            tracing::warn!(%approval_id, %session_id, "approval decision raced with runner-side resolution");
-            return match state.begin_approval_resolution(approval_id).await {
-                ApprovalResolutionStart::AlreadyResolved {
+    let operation = state
+        .start_runner_command_operation(
+            session.runner_id,
+            request_id,
+            command,
+            super::RUNNER_COMMAND_RESPONSE_TIMEOUT,
+        )
+        .await;
+    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    let state_for_resolution = state.clone();
+    let decision_for_resolution = decision.clone();
+    let user_id = user.user_id;
+    tokio::spawn(async move {
+        let outcome = operation
+            .await
+            .unwrap_or(Err(RunnerCommandWaitError::Closed));
+        let result = finish_approval_operation(
+            state_for_resolution,
+            approval_id,
+            session_id,
+            decision_for_resolution,
+            Some(user_id),
+            outcome,
+        )
+        .await;
+        result_sender.send(result).ok();
+    });
+
+    match result_receiver
+        .await
+        .unwrap_or(Err(StatusCode::BAD_GATEWAY))
+    {
+        Ok(envelope) => Json(envelope).into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn finish_approval_operation(
+    state: crate::state::AppState,
+    approval_id: agenter_core::ApprovalId,
+    session_id: SessionId,
+    decision: agenter_core::ApprovalDecision,
+    resolved_by_user_id: Option<agenter_core::UserId>,
+    outcome: Result<
+        agenter_protocol::runner::RunnerResponseOutcome,
+        crate::state::RunnerCommandWaitError,
+    >,
+) -> Result<agenter_protocol::browser::BrowserEventEnvelope, StatusCode> {
+    match outcome {
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok {
+            result: agenter_protocol::runner::RunnerCommandResult::Accepted,
+        }) => {
+            let resolved =
+                agenter_core::AppEvent::ApprovalResolved(agenter_core::ApprovalResolvedEvent {
                     session_id,
-                    envelope,
-                } => {
-                    if state.session(user.user_id, session_id).await.is_none() {
-                        StatusCode::NOT_FOUND.into_response()
-                    } else {
-                        Json(*envelope).into_response()
-                    }
-                }
-                _ => StatusCode::CONFLICT.into_response(),
+                    approval_id,
+                    decision,
+                    resolved_by_user_id,
+                    resolved_at: Utc::now(),
+                    provider_payload: None,
+                });
+            let Some(envelope) = state
+                .finish_approval_resolution(approval_id, session_id, resolved)
+                .await
+            else {
+                tracing::warn!(%approval_id, %session_id, "approval decision could not finish resolution");
+                return Err(StatusCode::CONFLICT);
             };
+            tracing::info!(%approval_id, %session_id, "approval decision resolved after runner acknowledgement");
+            Ok(envelope)
+        }
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Error { error }) => {
+            cancel_failed_approval_resolution(
+                &state,
+                approval_id,
+                session_id,
+                "approval_rejected_by_runner",
+                format!(
+                    "Approval decision was rejected by the runner: {}",
+                    error.message
+                ),
+            )
+            .await;
+            Err(StatusCode::BAD_GATEWAY)
+        }
+        Ok(other) => {
+            cancel_failed_approval_resolution(
+                &state,
+                approval_id,
+                session_id,
+                "approval_unexpected_runner_response",
+                format!("Approval decision received an unexpected runner response: {other:?}"),
+            )
+            .await;
+            Err(StatusCode::BAD_GATEWAY)
+        }
+        Err(error) => {
+            cancel_failed_approval_resolution(
+                &state,
+                approval_id,
+                session_id,
+                "approval_runner_unavailable",
+                format!("Approval decision could not reach the runner: {error:?}"),
+            )
+            .await;
+            Err(super::runner_wait_error_status(error))
         }
     }
+}
 
-    let resolved = agenter_core::AppEvent::ApprovalResolved(agenter_core::ApprovalResolvedEvent {
-        session_id,
-        approval_id,
-        decision: decision.clone(),
-        resolved_by_user_id: Some(user.user_id),
-        resolved_at: Utc::now(),
-        provider_payload: None,
-    });
-    let Some(envelope) = state
-        .finish_approval_resolution(approval_id, session_id, resolved)
-        .await
-    else {
-        tracing::warn!(%approval_id, %session_id, "approval decision could not finish resolution");
-        return StatusCode::CONFLICT.into_response();
-    };
-
-    tracing::info!(user_id = %user.user_id, %approval_id, %session_id, "approval decision resolved");
-    Json(envelope).into_response()
+async fn cancel_failed_approval_resolution(
+    state: &crate::state::AppState,
+    approval_id: agenter_core::ApprovalId,
+    session_id: SessionId,
+    code: &str,
+    message: String,
+) {
+    state.cancel_approval_resolution(approval_id).await;
+    state
+        .publish_event(
+            session_id,
+            agenter_core::AppEvent::SessionStatusChanged(agenter_core::SessionStatusChangedEvent {
+                session_id,
+                status: agenter_core::SessionStatus::WaitingForApproval,
+                reason: Some("Approval is still waiting.".to_owned()),
+            }),
+        )
+        .await;
+    state
+        .publish_event(
+            session_id,
+            agenter_core::AppEvent::Error(agenter_core::AgentErrorEvent {
+                session_id: Some(session_id),
+                code: Some(code.to_owned()),
+                message,
+                provider_payload: None,
+            }),
+        )
+        .await;
 }
 
 pub(super) async fn answer_question(

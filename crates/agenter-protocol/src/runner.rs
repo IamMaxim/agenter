@@ -247,6 +247,8 @@ pub struct DiscoveredSession {
     pub external_session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
     #[serde(default)]
     pub history_status: DiscoveredSessionHistoryStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -609,6 +611,7 @@ mod tests {
                 sessions: vec![DiscoveredSession {
                     external_session_id: "codex-thread-1".to_owned(),
                     title: Some("Existing Codex Thread".to_owned()),
+                    updated_at: None,
                     history_status: DiscoveredSessionHistoryStatus::Loaded,
                     history: vec![
                         DiscoveredSessionHistoryItem::UserMessage {
@@ -659,6 +662,7 @@ mod tests {
                 sessions: vec![DiscoveredSession {
                     external_session_id: "codex-thread-failed".to_owned(),
                     title: None,
+                    updated_at: None,
                     history_status: DiscoveredSessionHistoryStatus::Failed {
                         message: "thread/read failed".to_owned(),
                     },

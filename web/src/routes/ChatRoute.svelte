@@ -963,12 +963,18 @@
                   </details>
                 {/if}
               {/if}
+              {#if item.resolutionState === 'resolving'}
+                <p class="muted approval-pending-copy">
+                  Resolving {item.resolvingDecision ? resolvedApprovalLabel(item.resolvingDecision) : 'decision'}...
+                </p>
+              {/if}
               <div class="inline-actions approval-actions">
                 {#each approvalUiChoices(item) as decisionBtn}
                   <button
                     class:secondary={decisionBtn === 'decline' || decisionBtn === 'cancel'}
                     class="compact approval-decision"
                     type="button"
+                    disabled={item.resolutionState === 'resolving'}
                     on:click={() => resolveApproval(item, decisionBtn)}
                   >
                     {approvalUiButtonLabel(decisionBtn)}

@@ -1,7 +1,13 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import AgenterIcon from './AgenterIcon.svelte';
-  import { createSession, listRunners, listRunnerWorkspaces, listSessions } from '../api/sessions';
+  import {
+    createSession,
+    listRunners,
+    listRunnerWorkspaces,
+    listSessions,
+    refreshWorkspaceProviderSessions
+  } from '../api/sessions';
   import type { AuthenticatedUser, RunnerInfo, SessionInfo, SessionStatus, WorkspaceRef } from '../api/types';
   import { routeHref, type AppRoute } from '../lib/router';
   import { buildSessionTree, type SessionTreeGroup } from '../lib/sidebarTree';
@@ -23,6 +29,11 @@
   let searchFocused = false;
   let lastRouteKey = '';
   let mounted = false;
+  let contextMenuX = 0;
+  let contextMenuY = 0;
+  let contextMenuGroupId = '';
+  let contextMenuVisible = false;
+  const FALLBACK_REFRESH_PROVIDER = 'codex';
 
   $: groups = buildSessionTree({ runners, workspacesByRunner, sessions });
   $: activeSessionId = route.name === 'chat' ? route.sessionId : undefined;
@@ -41,10 +52,17 @@
     void refreshSidebar();
     const refresh = () => void refreshSidebar();
     window.addEventListener('agenter:sessions-changed', refresh);
-    return () => window.removeEventListener('agenter:sessions-changed', refresh);
+    window.addEventListener('pointerdown', closeContextMenuOutside);
+    window.addEventListener('keydown', closeContextMenuOnEscape);
+    return () => {
+      window.removeEventListener('agenter:sessions-changed', refresh);
+      window.removeEventListener('pointerdown', closeContextMenuOutside);
+      window.removeEventListener('keydown', closeContextMenuOnEscape);
+    };
   });
 
   async function refreshSidebar() {
+    closeContextMenu();
     error = '';
     try {
       runners = await listRunners();
@@ -194,6 +212,95 @@
       creatingGroupId = '';
     }
   }
+
+  function getGroupProviderIds(group: SessionTreeGroup): string[] {
+    return [...new Set(group.sessions.map((session) => session.provider_id))];
+  }
+
+  function openContextMenu(event: MouseEvent, groupId: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    contextMenuVisible = true;
+    contextMenuX = event.pageX;
+    contextMenuY = event.pageY;
+    contextMenuGroupId = groupId;
+  }
+
+  function closeContextMenu() {
+    contextMenuVisible = false;
+    contextMenuGroupId = '';
+  }
+
+  function closeContextMenuOutside(event: PointerEvent) {
+    if (!contextMenuVisible) {
+      return;
+    }
+    const target = event.target as Element | null;
+    if (!target || !target.closest('.runner-context-menu')) {
+      closeContextMenu();
+    }
+  }
+
+  function closeContextMenuOnEscape(event: KeyboardEvent) {
+    if (event.key === 'Escape') {
+      closeContextMenu();
+    }
+  }
+
+  async function reloadRunnerWorkspaceSessions(group: SessionTreeGroup) {
+    const providers = getGroupProviderIds(group);
+    const providerIds = providers.length > 0 ? providers : [FALLBACK_REFRESH_PROVIDER];
+    const startedProviderCount = providerIds.length;
+    const refreshResults = await Promise.allSettled(
+      providerIds.map((providerId) =>
+        refreshWorkspaceProviderSessions(group.workspace.workspace_id, providerId)
+      )
+    );
+
+    const summary = {
+      discovered_count: 0,
+      refreshed_cache_count: 0,
+      skipped_failed_count: 0
+    };
+    const failedProviderIds: string[] = [];
+
+    refreshResults.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        summary.discovered_count += result.value.discovered_count;
+        summary.refreshed_cache_count += result.value.refreshed_cache_count;
+        summary.skipped_failed_count += result.value.skipped_failed_count;
+      } else {
+        failedProviderIds.push(providerIds[index]);
+      }
+    });
+
+    closeContextMenu();
+    if (failedProviderIds.length === 0) {
+      if (startedProviderCount === 1) {
+        pushToast({
+          severity: 'info',
+          message:
+            `Reloaded sessions from ${providerIds[0]}: discovered ${summary.discovered_count}, refreshed ${summary.refreshed_cache_count}, skipped ${summary.skipped_failed_count}.`
+        });
+      } else {
+        pushToast({
+          severity: 'info',
+          message: `Reloaded sessions across ${startedProviderCount} providers: discovered ${summary.discovered_count}, refreshed ${summary.refreshed_cache_count}, skipped ${summary.skipped_failed_count}.`
+        });
+      }
+    } else if (failedProviderIds.length === startedProviderCount) {
+      pushToast({
+        severity: 'error',
+        message: `Could not reload sessions for provider${startedProviderCount > 1 ? 's' : ''}: ${failedProviderIds.join(', ')}.`
+      });
+    } else {
+      pushToast({
+        severity: 'warning',
+        message: `Reloaded sessions with partial success; ${failedProviderIds.length} provider${failedProviderIds.length > 1 ? 's' : ''} failed: ${failedProviderIds.join(', ')}.`
+      });
+    }
+    await refreshSidebar();
+  }
 </script>
 
 <aside class="sidebar">
@@ -241,7 +348,12 @@
     {:else}
       {#each filteredGroups as group (group.id)}
         <section class="tree-group" aria-label={groupTitle(group)}>
-          <button class="tree-group-row" type="button" on:click={() => toggleGroup(group.id)}>
+          <button
+            class="tree-group-row"
+            type="button"
+            on:click={() => toggleGroup(group.id)}
+            on:contextmenu={(event) => openContextMenu(event, group.id)}
+          >
             <span class:open={isGroupOpen(group)} class="tree-chevron" aria-hidden="true">
               <AgenterIcon name="chevron" size={8} />
             </span>
@@ -296,6 +408,23 @@
           >
             <AgenterIcon name="plus" size={11} />
           </button>
+          {#if contextMenuVisible && contextMenuGroupId === group.id}
+            <div
+              aria-label="Session actions"
+              class="runner-context-menu"
+              role="menu"
+              style={`left: ${contextMenuX}px; top: ${contextMenuY}px;`}
+            >
+              <button
+                class="runner-context-menu-item"
+                type="button"
+                role="menuitem"
+                on:click={() => void reloadRunnerWorkspaceSessions(group)}
+              >
+                Reload sessions
+              </button>
+            </div>
+          {/if}
         </section>
       {/each}
     {/if}

@@ -27,9 +27,11 @@ use agenter_protocol::{
 use agents::codex::{
     codex_provider_slash_commands, is_codex_no_rollout_resume_error,
     is_codex_thread_not_found_error, run_codex_turn_on_server, CodexAppServer, CodexTurnRequest,
-    PendingCodexApproval, PendingCodexQuestion,
+    PendingCodexApproval, PendingCodexApprovalDecision, PendingCodexQuestion,
 };
-use agents::qwen_acp::{run_qwen_turn, PendingQwenApproval, QwenTurnRequest};
+use agents::qwen_acp::{
+    run_qwen_turn, PendingQwenApproval, PendingQwenApprovalDecision, QwenTurnRequest,
+};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -129,6 +131,7 @@ impl CodexRunnerRuntime {
             discovered.push(DiscoveredSession {
                 external_session_id: thread.external_session_id,
                 title: thread.title,
+                updated_at: thread.updated_at,
                 history_status,
                 history,
             });
@@ -548,9 +551,39 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                         tracing::info!(session_id = %command.session_id, approval_id = %command.approval_id, "codex runner received approval answer");
                         let pending = pending_approvals.lock().await.remove(&command.approval_id);
                         let outcome = if let Some(pending) = pending {
-                            pending.response.send(command.decision).ok();
-                            RunnerResponseOutcome::Ok {
-                                result: RunnerCommandResult::Accepted,
+                            let (acknowledged, acknowledged_receiver) = tokio::sync::oneshot::channel();
+                            if pending
+                                .response
+                                .send(PendingCodexApprovalDecision {
+                                    decision: command.decision,
+                                    acknowledged,
+                                })
+                                .is_err()
+                            {
+                                RunnerResponseOutcome::Error {
+                                    error: agenter_protocol::runner::RunnerError {
+                                        code: "codex_approval_response_failed".to_owned(),
+                                        message: "Codex approval waiter was dropped before the decision could be delivered".to_owned(),
+                                    },
+                                }
+                            } else {
+                                match acknowledged_receiver.await {
+                                    Ok(Ok(())) => RunnerResponseOutcome::Ok {
+                                        result: RunnerCommandResult::Accepted,
+                                    },
+                                    Ok(Err(message)) => RunnerResponseOutcome::Error {
+                                        error: agenter_protocol::runner::RunnerError {
+                                            code: "codex_approval_response_failed".to_owned(),
+                                            message,
+                                        },
+                                    },
+                                    Err(_) => RunnerResponseOutcome::Error {
+                                        error: agenter_protocol::runner::RunnerError {
+                                            code: "codex_approval_response_failed".to_owned(),
+                                            message: "Codex approval response acknowledgement was dropped".to_owned(),
+                                        },
+                                    },
+                                }
                             }
                         } else {
                             tracing::warn!(approval_id = %command.approval_id, "codex approval answer had no pending provider request");
@@ -718,9 +751,39 @@ async fn run_qwen_runner() -> anyhow::Result<()> {
                         tracing::info!(session_id = %command.session_id, approval_id = %command.approval_id, "qwen runner received approval answer");
                         let pending = pending_approvals.lock().await.remove(&command.approval_id);
                         let outcome = if let Some(pending) = pending {
-                            pending.response.send(command.decision).ok();
-                            RunnerResponseOutcome::Ok {
-                                result: RunnerCommandResult::Accepted,
+                            let (acknowledged, acknowledged_receiver) = tokio::sync::oneshot::channel();
+                            if pending
+                                .response
+                                .send(PendingQwenApprovalDecision {
+                                    decision: command.decision,
+                                    acknowledged,
+                                })
+                                .is_err()
+                            {
+                                RunnerResponseOutcome::Error {
+                                    error: agenter_protocol::runner::RunnerError {
+                                        code: "qwen_approval_response_failed".to_owned(),
+                                        message: "Qwen approval waiter was dropped before the decision could be delivered".to_owned(),
+                                    },
+                                }
+                            } else {
+                                match acknowledged_receiver.await {
+                                    Ok(Ok(())) => RunnerResponseOutcome::Ok {
+                                        result: RunnerCommandResult::Accepted,
+                                    },
+                                    Ok(Err(message)) => RunnerResponseOutcome::Error {
+                                        error: agenter_protocol::runner::RunnerError {
+                                            code: "qwen_approval_response_failed".to_owned(),
+                                            message,
+                                        },
+                                    },
+                                    Err(_) => RunnerResponseOutcome::Error {
+                                        error: agenter_protocol::runner::RunnerError {
+                                            code: "qwen_approval_response_failed".to_owned(),
+                                            message: "Qwen approval response acknowledgement was dropped".to_owned(),
+                                        },
+                                    },
+                                }
                             }
                         } else {
                             tracing::warn!(approval_id = %command.approval_id, "qwen approval answer had no pending provider request");
@@ -1265,6 +1328,8 @@ fn deterministic_fake_events(session_id: SessionId, input: &AgentInput) -> Vec<A
             details: Some("This is an in-memory approval stub.".to_owned()),
             expires_at: None,
             presentation: None,
+            resolution_state: None,
+            resolving_decision: None,
             provider_payload: None,
         }),
         AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {

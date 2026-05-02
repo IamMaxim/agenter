@@ -97,6 +97,7 @@ mod runner_transport_tests {
                 sessions: vec![DiscoveredSession {
                     external_session_id: "thread-large".to_owned(),
                     title: None,
+                    updated_at: None,
                     history_status: DiscoveredSessionHistoryStatus::Loaded,
                     history: vec![DiscoveredSessionHistoryItem::FileChange {
                         change_id: "change-1".to_owned(),

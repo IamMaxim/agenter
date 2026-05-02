@@ -77,7 +77,13 @@ fn codex_request_id_from_value(id: &Value) -> Option<CodexRequestId> {
 
 #[derive(Debug)]
 pub struct PendingCodexApproval {
-    pub response: oneshot::Sender<ApprovalDecision>,
+    pub response: oneshot::Sender<PendingCodexApprovalDecision>,
+}
+
+#[derive(Debug)]
+pub struct PendingCodexApprovalDecision {
+    pub decision: ApprovalDecision,
+    pub acknowledged: oneshot::Sender<Result<(), String>>,
 }
 
 #[derive(Debug)]
@@ -89,6 +95,7 @@ pub struct PendingCodexQuestion {
 pub struct CodexDiscoveredThread {
     pub external_session_id: String,
     pub title: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -988,10 +995,13 @@ pub async fn run_codex_turn_on_server(
                     "codex approval request pending"
                 );
                 event_sender.send(event).ok();
-                if let Ok(decision) = receiver.await {
-                    server
-                        .send_approval_response(native_request_id, approval_kind, decision)
-                        .await?;
+                if let Ok(answer) = receiver.await {
+                    let result = server
+                        .send_approval_response(native_request_id, approval_kind, answer.decision)
+                        .await
+                        .map_err(|error| error.to_string());
+                    answer.acknowledged.send(result.clone()).ok();
+                    result.map_err(anyhow::Error::msg)?;
                     event_sender
                         .send(session_status_event(
                             request.session_id,
@@ -1381,6 +1391,8 @@ pub fn normalize_codex_approval_request(
         details,
         expires_at: None,
         presentation,
+        resolution_state: None,
+        resolving_decision: None,
         provider_payload: Some(message.clone()),
     });
     Some((approval_id, native_request_id, approval_kind, event))
@@ -2308,11 +2320,6 @@ fn codex_message_belongs_to_scope(message: &Value, scope: &CodexTurnScope) -> bo
             return false;
         }
     }
-    if let (Some(expected), Some(actual)) = (scope.turn_id.as_deref(), message_turn_id(message)) {
-        if actual != expected {
-            return false;
-        }
-    }
     true
 }
 
@@ -2369,9 +2376,33 @@ fn codex_threads_from_list_response(message: &Value) -> Vec<CodexDiscoveredThrea
                 external_session_id: external_session_id.to_owned(),
                 title: string_at(thread, &["/title", "/name", "/summary", "/preview"])
                     .map(str::to_owned),
+                updated_at: codex_thread_updated_at(thread),
             })
         })
         .collect()
+}
+
+fn codex_thread_updated_at(value: &Value) -> Option<String> {
+    string_at(
+        value,
+        &[
+            "/updatedAt",
+            "/updated_at",
+            "/lastActivityAt",
+            "/last_activity_at",
+            "/activityAt",
+            "/activity_at",
+            "/timestamp",
+            "/createdAt",
+            "/created_at",
+            "/threadUpdatedAt",
+            "/thread_updated_at",
+        ],
+    )
+    .map(str::to_owned)
+    .or_else(||
+        integer_at(value, &["/updatedAt", "/updated_at", "/lastActivityAt", "/last_activity_at", "/timestamp", "/createdAt", "/created_at", "/threadUpdatedAt", "/thread_updated_at"]).map(|value| value.to_string())
+    )
 }
 
 fn codex_history_from_thread_read_response(message: &Value) -> Vec<DiscoveredSessionHistoryItem> {
@@ -3394,7 +3425,7 @@ mod tests {
     }
 
     #[test]
-    fn filters_live_codex_messages_to_target_thread_and_turn() {
+    fn filters_live_codex_messages_to_target_thread_but_not_turn() {
         let target = CodexTurnScope {
             thread_id: Some("thread-1".to_owned()),
             turn_id: Some("turn-1".to_owned()),
@@ -3417,13 +3448,13 @@ mod tests {
                 "delta": "wrong"
             }
         });
-        let other_turn = json!({
+        let same_thread_other_turn = json!({
             "method": "item/agentMessage/delta",
             "params": {
                 "threadId": "thread-1",
                 "turnId": "turn-2",
-                "itemId": "msg-live-3",
-                "delta": "wrong"
+                "itemId": "msg-live-2",
+                "delta": "still same thread"
             }
         });
 
@@ -3434,8 +3465,10 @@ mod tests {
         assert!(
             normalize_codex_message_for_scope(SessionId::nil(), &other_thread, &target).is_empty()
         );
-        assert!(
-            normalize_codex_message_for_scope(SessionId::nil(), &other_turn, &target).is_empty()
+        assert_eq!(
+            normalize_codex_message_for_scope(SessionId::nil(), &same_thread_other_turn, &target)
+                .len(),
+            1
         );
     }
 
@@ -3563,7 +3596,11 @@ mod tests {
             "id": 4,
             "result": {
                 "threads": [
-                    {"id": "thread-1", "title": "Imported Thread"}
+                    {
+                        "id": "thread-1",
+                        "title": "Imported Thread",
+                        "updatedAt": "2026-01-01T12:00:00Z"
+                    }
                 ]
             }
         });
@@ -3636,6 +3673,7 @@ mod tests {
             vec![CodexDiscoveredThread {
                 external_session_id: "thread-1".to_owned(),
                 title: Some("Imported Thread".to_owned()),
+                updated_at: Some("2026-01-01T12:00:00Z".to_owned()),
             }]
         );
 
@@ -3646,6 +3684,7 @@ mod tests {
                     {
                         "id": "019ddf92-1e65-7e72-b656-c317a83e0b93",
                         "preview": "Let's revamp the frontend.",
+                        "updated_at": 1700000000,
                         "cwd": "/Users/maxim/work/agenter",
                         "source": "cli"
                     }
@@ -3660,6 +3699,7 @@ mod tests {
             vec![CodexDiscoveredThread {
                 external_session_id: "019ddf92-1e65-7e72-b656-c317a83e0b93".to_owned(),
                 title: Some("Let's revamp the frontend.".to_owned()),
+                updated_at: Some("1700000000".to_owned()),
             }]
         );
 

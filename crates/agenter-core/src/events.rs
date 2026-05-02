@@ -342,6 +342,8 @@ mod tests {
             details: Some("cargo test".to_owned()),
             expires_at: None,
             presentation: None,
+            resolution_state: None,
+            resolving_decision: None,
             provider_payload: Some(serde_json::json!({ "native_id": "approval-1" })),
         });
 
@@ -365,6 +367,8 @@ mod tests {
             presentation: Some(
                 serde_json::json!({"variant": "codex_file_change", "paths": ["a.rs"]}),
             ),
+            resolution_state: None,
+            resolving_decision: None,
             provider_payload: None,
         });
         let pj = serde_json::to_value(&with_pres).expect("serialize approval with presentation");

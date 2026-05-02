@@ -139,6 +139,56 @@ describe('chat event state', () => {
     }
   });
 
+  test('stores resolving approval state from replayed approval requests', () => {
+    let state = createChatState();
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-approval-resolving',
+      event: {
+        type: 'approval_requested',
+        payload: {
+          session_id: 's1',
+          approval_id: 'pa-resolving',
+          kind: 'command',
+          title: 'Run command',
+          details: 'cargo test',
+          resolution_state: 'resolving',
+          resolving_decision: { decision: 'accept' }
+        }
+      }
+    });
+
+    const row = state.items[0];
+    expect(row.kind).toBe('approval');
+    if (row.kind !== 'approval') {
+      throw new Error('expected approval');
+    }
+    expect(row.resolutionState).toBe('resolving');
+    expect(row.resolvingDecision).toBe('accept');
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-approval-resolved',
+      event: {
+        type: 'approval_resolved',
+        payload: {
+          session_id: 's1',
+          approval_id: 'pa-resolving',
+          decision: { decision: 'accept' },
+          resolved_at: '2026-05-02T12:00:00Z'
+        }
+      }
+    });
+
+    const resolved = state.items[0];
+    expect(resolved.kind).toBe('approval');
+    if (resolved.kind === 'approval') {
+      expect(resolved.resolutionState).toBeUndefined();
+      expect(resolved.resolvingDecision).toBeUndefined();
+      expect(resolved.resolvedDecision).toBe('accept');
+    }
+  });
+
   test('maps codex_command available_decisions strings to approval API choices', () => {
     const item = {
       id: 'approval:cmd',

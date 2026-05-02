@@ -55,3 +55,11 @@ Align the browser workbench with the checked-in mockups: sidebar/navigation from
 - Tightened the running glyph into a true circular spinner and limited spinners to active command/tool rows, so generic status/provider rows do not spin.
 - Collapsed resolved approvals into a compact transcript row that keeps the decision visible without leaving the full approval panel open.
 - Verification: `cd web && npm run check`, `npm run lint`, `npm run test`, and `npm run build` passed on 2026-05-02.
+
+## 2026-05-02 Sidebar Session Reload Menu
+
+- Added a right-click context menu on each runner/workspace row in `SessionTreeSidebar.svelte`.
+- Menu action `Reload sessions` now calls `refreshWorkspaceProviderSessions` directly for providers inferred from sessions in that workspace, with `codex` fallback when there are none.
+- Sidebar now refreshes in-place after reload completion and shows success/partial-failure/error toast feedback.
+- Added minimal fixed-position menu styling in `web/src/styles.css` (`.runner-context-menu` and `.runner-context-menu-item`) and menu close behavior for outside-click, `Escape`, and route-triggered refreshes.
+- Verification plan remains: `cd web && npm run check && npm run lint && npm run test && npm run build` plus manual browser menu-flow validation.

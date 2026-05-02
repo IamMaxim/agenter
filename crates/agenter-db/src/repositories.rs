@@ -552,6 +552,7 @@ pub async fn upsert_session_by_external_id(
     provider_id: AgentProviderId,
     external_session_id: &str,
     title: Option<&str>,
+    updated_at: Option<DateTime<Utc>>,
 ) -> Result<AgentSession> {
     let row = sqlx::query(
         "insert into agent_sessions (
@@ -561,9 +562,10 @@ pub async fn upsert_session_by_external_id(
             provider_id,
             external_session_id,
             status,
-            title
+            title,
+            updated_at
          )
-         values ($1, $2, $3, $4, $5, $6, $7)
+         values ($1, $2, $3, $4, $5, $6, $7, coalesce($8, now()))
          on conflict (runner_id, workspace_id, provider_id, external_session_id)
          where external_session_id is not null
          do update set title = coalesce(excluded.title, agent_sessions.title),
@@ -571,7 +573,7 @@ pub async fn upsert_session_by_external_id(
                            when agent_sessions.status = 'archived' then agent_sessions.status
                            else excluded.status
                        end,
-                       updated_at = now()
+                       updated_at = coalesce(excluded.updated_at, agent_sessions.updated_at)
          returning session_id, owner_user_id, runner_id, workspace_id, provider_id,
              external_session_id, status, title, usage_snapshot, turn_settings, created_at, updated_at",
     )
@@ -582,6 +584,7 @@ pub async fn upsert_session_by_external_id(
     .bind(external_session_id)
     .bind(session_status_to_db(&SessionStatus::Running))
     .bind(title)
+    .bind(updated_at)
     .fetch_one(pool)
     .await?;
 
@@ -1410,6 +1413,7 @@ mod tests {
             AgentProviderId::from(AgentProviderId::CODEX),
             "codex-thread-imported",
             Some("Imported Codex Thread"),
+            None,
         )
         .await
         .expect("upsert imported session");
@@ -1421,12 +1425,44 @@ mod tests {
             AgentProviderId::from(AgentProviderId::CODEX),
             "codex-thread-imported",
             Some("Renamed Codex Thread"),
+            None,
         )
         .await
         .expect("upsert duplicate imported session");
 
         assert_eq!(imported.session_id, duplicate.session_id);
         assert_eq!(duplicate.title.as_deref(), Some("Renamed Codex Thread"));
+
+        let source_updated_at = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("parse fixed timestamp")
+            .with_timezone(&Utc);
+        let with_timestamp = upsert_session_by_external_id(
+            &pool,
+            user.user_id,
+            runner.runner_id,
+            workspace.workspace_id,
+            AgentProviderId::from(AgentProviderId::CODEX),
+            "codex-thread-imported",
+            Some("Timestamped Codex Thread"),
+            Some(source_updated_at),
+        )
+        .await
+        .expect("upsert imported session with timestamp");
+        assert_eq!(with_timestamp.updated_at, source_updated_at);
+
+        let preserved = upsert_session_by_external_id(
+            &pool,
+            user.user_id,
+            runner.runner_id,
+            workspace.workspace_id,
+            AgentProviderId::from(AgentProviderId::CODEX),
+            "codex-thread-imported",
+            Some("Preserved Timestamp"),
+            None,
+        )
+        .await
+        .expect("upsert imported session without timestamp");
+        assert_eq!(preserved.updated_at, source_updated_at);
 
         append_event_cache(
             &pool,

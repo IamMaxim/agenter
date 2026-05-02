@@ -8,7 +8,10 @@ pub mod session;
 pub mod slash_command;
 pub mod workspace;
 
-pub use approval::{ApprovalDecision, ApprovalKind, ApprovalRequestEvent, ApprovalResolvedEvent};
+pub use approval::{
+    ApprovalDecision, ApprovalKind, ApprovalRequestEvent, ApprovalResolutionState,
+    ApprovalResolvedEvent,
+};
 pub use events::{
     AgentErrorEvent, AgentMessageDeltaEvent, AppEvent, CommandAction, CommandCompletedEvent,
     CommandEvent, CommandOutputEvent, CommandOutputStream, FileChangeEvent, FileChangeKind,

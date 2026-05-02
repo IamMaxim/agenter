@@ -16,7 +16,12 @@ Pending Codex approvals can outlive individual `approval_requested` rows in the 
 
 3. **`GET /api/approvals?session_id=…`** returns the same pending/resolving request envelopes for an owned session (auth + `can_access_session`).
 
+4. **Resolution means provider-adapter acknowledgement, not WebSocket delivery.** Browser approval decisions move the registry to `Resolving` and start an in-memory runner command operation. The approval becomes `Resolved` only after the runner confirms the native Codex/Qwen approval response was written successfully. If the runner rejects, disconnects, times out, or loses the provider request, the control plane returns the approval to `Pending` and emits a visible error/status event.
+
+5. **Replay exposes in-flight state.** Replayed unresolved approval requests may include `resolution_state: "pending" | "resolving"` and, while resolving, `resolving_decision`. Browser clients render resolving approvals as disabled/in-flight rather than resolved.
+
 ## Consequences
 
 - Memory per pending approval grows by one boxed envelope until resolution.
 - Resolved approvals do not retain the original request envelope in the registry.
+- In-flight operation state is process-local for this iteration; control-plane restarts still lose unresolved command operations.

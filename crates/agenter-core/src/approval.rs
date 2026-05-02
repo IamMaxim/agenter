@@ -22,6 +22,13 @@ pub enum ApprovalKind {
     ProviderSpecific,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalResolutionState {
+    Pending,
+    Resolving,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ApprovalRequestEvent {
     pub session_id: SessionId,
@@ -35,6 +42,10 @@ pub struct ApprovalRequestEvent {
     /// Provider-neutral UI hints (Codex-correlated today). Browsers render rich approval cards from this shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presentation: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_state: Option<ApprovalResolutionState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolving_decision: Option<ApprovalDecision>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_payload: Option<serde_json::Value>,
 }

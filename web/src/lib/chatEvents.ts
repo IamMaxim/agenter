@@ -71,6 +71,8 @@ export type ChatItem =
       detail?: string;
       /** Serialized shapes from runners (Codex-correlated today). See runner `presentation` on `approval_requested`. */
       presentation?: Record<string, unknown>;
+      resolutionState?: 'pending' | 'resolving';
+      resolvingDecision?: string;
       resolvedDecision?: string;
     }
   | {
@@ -316,7 +318,9 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
         approvalId: stringField(payload, 'approval_id') ?? fallbackId(event),
         title: stringField(payload, 'title') ?? 'Approval requested',
         detail: stringField(payload, 'details'),
-        presentation: approvalPresentation(payload)
+        presentation: approvalPresentation(payload),
+        resolutionState: approvalResolutionState(payload),
+        resolvingDecision: approvalDecisionLabel(payload.resolving_decision)
       });
     case 'approval_resolved':
       return updateApprovalResolved(items, payload);
@@ -494,10 +498,9 @@ function updateApprovalResolved(items: ChatItem[], payload: Record<string, unkno
     title: existing?.kind === 'approval' ? existing.title : 'Approval resolved',
     detail: existing?.kind === 'approval' ? existing.detail : undefined,
     presentation: existing?.kind === 'approval' ? existing.presentation : undefined,
-    resolvedDecision:
-      typeof decision === 'object' && decision !== null && 'decision' in decision
-        ? String(decision.decision)
-        : undefined
+    resolutionState: undefined,
+    resolvingDecision: undefined,
+    resolvedDecision: approvalDecisionLabel(decision)
   });
 }
 
@@ -588,6 +591,17 @@ function approvalPresentation(payload: Record<string, unknown>): Record<string, 
     return raw as Record<string, unknown>;
   }
   return undefined;
+}
+
+function approvalResolutionState(payload: Record<string, unknown>): 'pending' | 'resolving' | undefined {
+  const state = stringField(payload, 'resolution_state');
+  return state === 'pending' || state === 'resolving' ? state : undefined;
+}
+
+function approvalDecisionLabel(decision: unknown): string | undefined {
+  return typeof decision === 'object' && decision !== null && 'decision' in decision
+    ? String(decision.decision)
+    : undefined;
 }
 
 const DEFAULT_APPROVAL_ACTIONS: ApprovalDecisionName[] = [
