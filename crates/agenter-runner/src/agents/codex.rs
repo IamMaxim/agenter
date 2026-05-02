@@ -3364,6 +3364,46 @@ mod tests {
     }
 
     #[test]
+    fn turn_start_params_round_trip_default_mode_with_no_developer_instructions() {
+        // Regression test for the "Implement the plan." handoff: the browser
+        // sets `collaboration_mode = "default"` via `settings_override` and
+        // the runner must forward `collaborationMode.mode = "default"` so
+        // Codex's app-server normalizer can fill in the Default preset's
+        // developer instructions. If the field is missing, Codex retains the
+        // thread's previous Plan mode and re-emits the plan.
+        let request = CodexTurnRequest {
+            session_id: SessionId::nil(),
+            workspace_path: PathBuf::from("/work/agenter"),
+            external_session_id: Some("thread-1".to_owned()),
+            prompt: "Implement the plan.".to_owned(),
+            settings: Some(agenter_core::AgentTurnSettings {
+                model: None,
+                reasoning_effort: None,
+                collaboration_mode: Some("default".to_owned()),
+            }),
+        };
+
+        let params = codex_turn_start_params("thread-1", &request);
+
+        assert_eq!(params["collaborationMode"]["mode"], "default");
+        // Without explicit overrides the runner should still produce a
+        // payload Codex will accept; model nulls out and reasoning_effort is
+        // omitted so the app-server normalizer fills in the preset.
+        assert_eq!(
+            params["collaborationMode"]["settings"]["model"],
+            Value::Null
+        );
+        assert!(
+            params["collaborationMode"]
+                .as_object()
+                .expect("collaboration mode payload object")
+                .get("developer_instructions")
+                .is_none(),
+            "developer_instructions must be omitted so Codex's normalizer fills the Default preset"
+        );
+    }
+
+    #[test]
     fn normalizes_tool_user_input_request_with_multiple_answer_values() {
         let message = json!({
             "id": 99,

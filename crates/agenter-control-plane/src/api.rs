@@ -1030,6 +1030,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_session_message_with_settings_override_persists_and_forwards_to_runner() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let browser_session_token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let user = state
+            .authenticated_user(&browser_session_token)
+            .await
+            .expect("authenticate bootstrap admin");
+        let app_service = app(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("read listener address");
+        tokio::spawn(async move {
+            axum::serve(listener, app(state.clone()))
+                .await
+                .expect("serve app");
+        });
+
+        let (runner_socket, _) = connect_async(format!("ws://{addr}/api/runner/ws"))
+            .await
+            .expect("connect runner");
+        let (mut runner_sender, mut runner_receiver) = runner_socket.split();
+        let hello = fake_hello();
+        let workspace_id = hello.workspaces[0].workspace_id;
+        runner_sender
+            .send(Message::Text(
+                serde_json::to_string(&RunnerClientMessage::Hello(hello))
+                    .expect("serialize hello")
+                    .into(),
+            ))
+            .await
+            .expect("send runner hello");
+        expect_no_runner_command(&mut runner_receiver).await;
+
+        let cookie = format!("{}={browser_session_token}", SESSION_COOKIE_NAME);
+        let session = create_session_through_runner(
+            app_service.clone(),
+            &cookie,
+            workspace_id,
+            &mut runner_sender,
+            &mut runner_receiver,
+        )
+        .await;
+
+        let app_state_handle = app_service.clone();
+        let send_response = tokio::spawn({
+            let app_service = app_state_handle.clone();
+            let cookie = cookie.clone();
+            let session_id = session.session_id;
+            async move {
+                app_service
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(format!("/api/sessions/{session_id}/messages"))
+                            .header(header::COOKIE, &cookie)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                serde_json::json!({
+                                    "content": "Implement the plan.",
+                                    "settings_override": {
+                                        "collaboration_mode": "default"
+                                    }
+                                })
+                                .to_string(),
+                            ))
+                            .expect("build message request"),
+                    )
+                    .await
+                    .expect("route message request")
+            }
+        });
+
+        let command = next_runner_command(&mut runner_receiver).await;
+        let agenter_protocol::runner::RunnerCommand::AgentSendInput(input_command) =
+            &command.command
+        else {
+            panic!("expected agent send input command");
+        };
+        assert_eq!(input_command.session_id, session.session_id);
+        let forwarded = input_command
+            .settings
+            .as_ref()
+            .expect("settings forwarded with override");
+        assert_eq!(forwarded.collaboration_mode.as_deref(), Some("default"));
+        send_runner_response(&mut runner_sender, command.request_id).await;
+        let send_response = send_response.await.expect("send response task");
+        assert_eq!(send_response.status(), StatusCode::ACCEPTED);
+
+        let settings_response = app_service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{}/settings", session.session_id))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .expect("build settings request"),
+            )
+            .await
+            .expect("route settings request");
+        assert_eq!(settings_response.status(), StatusCode::OK);
+        let body = to_bytes(settings_response.into_body(), usize::MAX)
+            .await
+            .expect("read settings body");
+        let persisted: agenter_core::AgentTurnSettings =
+            serde_json::from_slice(&body).expect("settings json");
+        assert_eq!(persisted.collaboration_mode.as_deref(), Some("default"));
+        let _ = user;
+    }
+
+    #[tokio::test]
     async fn full_browser_fake_runner_pipeline_routes_messages_events_history_and_approvals() {
         let state = AppState::new_with_bootstrap_admin(
             "dev-token".to_owned(),

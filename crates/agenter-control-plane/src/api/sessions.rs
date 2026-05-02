@@ -14,11 +14,29 @@ pub(super) struct CreateSessionRequest {
     pub(super) workspace_id: agenter_core::WorkspaceId,
     pub(super) provider_id: agenter_core::AgentProviderId,
     pub(super) title: Option<String>,
+    /// Optional first user message to seed the new session with. When present,
+    /// the control plane dispatches it to the runner immediately after
+    /// registration, mirroring Codex TUI's "Clear context and implement"
+    /// handoff which spawns a fresh thread carrying the prior plan content.
+    #[serde(default)]
+    pub(super) initial_message: Option<String>,
+    /// Optional turn-settings override applied to the seed message and
+    /// persisted as the new session's sticky settings.
+    #[serde(default)]
+    pub(super) settings_override: Option<agenter_core::AgentTurnSettings>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(super) struct SendMessageRequest {
     pub(super) content: String,
+    /// Atomic per-turn settings override. When present we persist these
+    /// settings as the session's sticky configuration BEFORE forwarding the
+    /// runner command, so the model sees the new collaboration mode on this
+    /// turn and every subsequent turn until the user changes it again. This
+    /// mirrors Codex TUI's `SubmitUserMessageWithMode` event and lets the
+    /// browser implement the "Implement plan" handoff in one round-trip.
+    #[serde(default)]
+    pub(super) settings_override: Option<agenter_core::AgentTurnSettings>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +146,11 @@ pub(super) async fn create_session(
         return StatusCode::NOT_FOUND.into_response();
     };
     let session_id = agenter_core::SessionId::new();
+    let initial_message = request.initial_message.and_then(|content| {
+        let trimmed = content.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    });
+    let settings_override = request.settings_override;
     if provider_id.as_str() != agenter_core::AgentProviderId::CODEX {
         let session = state
             .register_session(SessionRegistration {
@@ -138,7 +161,7 @@ pub(super) async fn create_session(
                 provider_id,
                 title: request.title,
                 external_session_id: None,
-                turn_settings: None,
+                turn_settings: settings_override.clone(),
                 usage: None,
             })
             .await;
@@ -228,7 +251,7 @@ pub(super) async fn create_session(
             provider_id,
             title,
             external_session_id: Some(external_session_id),
-            turn_settings: None,
+            turn_settings: settings_override.clone(),
             usage: None,
         })
         .await;
@@ -249,7 +272,169 @@ pub(super) async fn create_session(
         )
         .await;
 
+    if let Some(content) = initial_message {
+        if let Err(error) = dispatch_user_message(
+            &state,
+            user.user_id,
+            session.session_id,
+            session.runner_id,
+            session.external_session_id.clone(),
+            content,
+            settings_override,
+        )
+        .await
+        {
+            tracing::warn!(
+                user_id = %user.user_id,
+                session_id = %session.session_id,
+                ?error,
+                "initial session message dispatch failed"
+            );
+        }
+    }
+
     (StatusCode::CREATED, Json(info)).into_response()
+}
+
+/// Internal helper used by both `send_session_message` and `create_session`'s
+/// initial-message path. Performs the `AgentSendInput` round-trip with the
+/// given (already-resolved) settings, publishes the user-message event, and
+/// emits status events on success/failure.
+#[derive(Debug)]
+#[allow(dead_code)]
+struct DispatchError {
+    code: String,
+    message: String,
+}
+
+async fn dispatch_user_message(
+    state: &crate::state::AppState,
+    user_id: agenter_core::UserId,
+    session_id: agenter_core::SessionId,
+    runner_id: agenter_core::RunnerId,
+    external_session_id: Option<String>,
+    content: String,
+    settings: Option<agenter_core::AgentTurnSettings>,
+) -> Result<(), DispatchError> {
+    let user_message = agenter_core::UserMessageEvent {
+        session_id,
+        message_id: Some(uuid::Uuid::new_v4().to_string()),
+        author_user_id: Some(user_id),
+        content,
+    };
+    state
+        .publish_event(
+            session_id,
+            agenter_core::AppEvent::UserMessage(user_message.clone()),
+        )
+        .await;
+    super::publish_session_status_event(
+        state,
+        session_id,
+        agenter_core::SessionStatus::Running,
+        Some("Message dispatched to runner.".to_owned()),
+    )
+    .await;
+
+    let request_id = agenter_protocol::RequestId::from(uuid::Uuid::new_v4().to_string());
+    let message = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
+        agenter_protocol::runner::RunnerCommandEnvelope {
+            request_id: request_id.clone(),
+            command: agenter_protocol::runner::RunnerCommand::AgentSendInput(
+                agenter_protocol::runner::AgentInputCommand {
+                    session_id,
+                    external_session_id,
+                    settings,
+                    input: agenter_protocol::runner::AgentInput::UserMessage {
+                        payload: user_message,
+                    },
+                },
+            ),
+        },
+    ));
+
+    match state
+        .send_runner_command_and_wait(
+            runner_id,
+            request_id.clone(),
+            message,
+            super::RUNNER_COMMAND_RESPONSE_TIMEOUT,
+        )
+        .await
+    {
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok {
+            result: agenter_protocol::runner::RunnerCommandResult::Accepted,
+        }) => Ok(()),
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Error { error }) => {
+            super::publish_runner_error_event(
+                state,
+                session_id,
+                "send_session_message",
+                Some(&request_id),
+                &error.code,
+                &error.message,
+            )
+            .await;
+            super::publish_session_status_event(
+                state,
+                session_id,
+                agenter_core::SessionStatus::Failed,
+                Some(error.message.clone()),
+            )
+            .await;
+            Err(DispatchError {
+                code: error.code,
+                message: error.message,
+            })
+        }
+        Ok(other) => {
+            let detail = format!("unexpected runner response: {other:?}");
+            super::publish_runner_error_event(
+                state,
+                session_id,
+                "send_session_message",
+                Some(&request_id),
+                "unexpected_runner_response",
+                &detail,
+            )
+            .await;
+            super::publish_session_status_event(
+                state,
+                session_id,
+                agenter_core::SessionStatus::Failed,
+                Some(detail.clone()),
+            )
+            .await;
+            Err(DispatchError {
+                code: "unexpected_runner_response".to_owned(),
+                message: detail,
+            })
+        }
+        Err(error) => {
+            let code = super::runner_wait_error_code(error);
+            let message = super::runner_wait_error_message(error);
+            super::publish_runner_error_event(
+                state,
+                session_id,
+                "send_session_message",
+                Some(&request_id),
+                code,
+                message,
+            )
+            .await;
+            super::publish_session_status_event(
+                state,
+                session_id,
+                agenter_core::SessionStatus::Failed,
+                Some(message.to_owned()),
+            )
+            .await;
+            Err(DispatchError {
+                code: code.to_owned(),
+                message: message.to_owned(),
+            })
+        }
+    }
 }
 
 pub(super) async fn refresh_workspace_provider_sessions(
@@ -337,7 +522,13 @@ pub(super) async fn send_session_message(
         tracing::debug!(user_id = %user.user_id, %session_id, "send session message rejected empty content");
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let settings = state.session_turn_settings(user.user_id, session_id).await;
+    let settings = if let Some(override_settings) = request.settings_override {
+        state
+            .update_session_turn_settings(user.user_id, session_id, override_settings)
+            .await
+    } else {
+        state.session_turn_settings(user.user_id, session_id).await
+    };
     let user_message = agenter_core::UserMessageEvent {
         session_id,
         message_id: Some(uuid::Uuid::new_v4().to_string()),

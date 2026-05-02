@@ -26,10 +26,29 @@ export interface CreateSessionRequest {
   workspace_id: string;
   provider_id: string;
   title?: string;
+  /**
+   * Optional first user message dispatched to the runner immediately after
+   * the session is registered. Used by the "Implement plan in fresh thread"
+   * handoff so the new session starts with the prior plan content already in
+   * the model's context.
+   */
+  initial_message?: string;
+  /**
+   * Sticky turn-settings to apply to the new session. When `initial_message`
+   * is also present, the override is applied to that first turn as well.
+   */
+  settings_override?: AgentTurnSettings;
 }
 
 export interface SendMessageRequest {
   content: string;
+  /**
+   * Atomic per-turn settings override. The control plane persists these as
+   * the session's sticky settings BEFORE forwarding the runner command, so
+   * the model sees the new collaboration mode on this very turn. Mirrors
+   * Codex TUI's `SubmitUserMessageWithMode` event.
+   */
+  settings_override?: AgentTurnSettings;
 }
 
 export interface RenameSessionRequest {

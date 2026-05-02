@@ -256,6 +256,98 @@ describe('chat event state', () => {
     ]);
   });
 
+  test('tracks the latest plan id and marks the turn complete after streaming ends', () => {
+    let state = createChatState();
+    expect(state.latestPlanId).toBeUndefined();
+    expect(state.planTurnComplete).toBe(false);
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-running',
+      event: {
+        type: 'session_status_changed',
+        payload: { session_id: 's1', status: 'running' }
+      }
+    });
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-plan-1',
+      event: {
+        type: 'plan_updated',
+        payload: {
+          session_id: 's1',
+          plan_id: 'plan-a',
+          title: 'Plan',
+          content: 'step 1'
+        }
+      }
+    });
+
+    expect(state.latestPlanId).toBe('plan:plan-a');
+    expect(state.planTurnComplete).toBe(false);
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-plan-1-delta',
+      event: {
+        type: 'plan_updated',
+        payload: {
+          session_id: 's1',
+          plan_id: 'plan-a',
+          content: ' done',
+          append: true
+        }
+      }
+    });
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-completed',
+      event: {
+        type: 'session_status_changed',
+        payload: { session_id: 's1', status: 'completed' }
+      }
+    });
+
+    expect(state.latestPlanId).toBe('plan:plan-a');
+    expect(state.planTurnComplete).toBe(true);
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-running-2',
+      event: {
+        type: 'session_status_changed',
+        payload: { session_id: 's1', status: 'running' }
+      }
+    });
+
+    expect(state.planTurnComplete).toBe(false);
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-plan-2',
+      event: {
+        type: 'plan_updated',
+        payload: {
+          session_id: 's1',
+          plan_id: 'plan-b',
+          title: 'Plan B',
+          content: 'rev 2'
+        }
+      }
+    });
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-completed-2',
+      event: {
+        type: 'session_status_changed',
+        payload: { session_id: 's1', status: 'completed' }
+      }
+    });
+
+    expect(state.latestPlanId).toBe('plan:plan-b');
+    expect(state.planTurnComplete).toBe(true);
+  });
+
   test('renders plan updates as dedicated plan cards', () => {
     let state = createChatState();
 

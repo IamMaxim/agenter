@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 
-import { executeSlashCommand, listSlashCommands, refreshWorkspaceProviderSessions } from './sessions';
+import {
+  createSession,
+  executeSlashCommand,
+  listSlashCommands,
+  refreshWorkspaceProviderSessions,
+  sendSessionMessage
+} from './sessions';
 
 describe('session APIs', () => {
   afterEach(() => {
@@ -110,6 +116,74 @@ describe('session APIs', () => {
           arguments: { command: 'pwd' },
           raw_input: '/shell pwd',
           confirmed: true
+        })
+      })
+    );
+  });
+
+  test('sendSessionMessage forwards content and settings_override to the control plane', async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 202,
+      text: () => Promise.resolve('')
+    });
+    vi.stubGlobal('fetch', fetch);
+
+    await sendSessionMessage('session 1', {
+      content: 'Implement the plan.',
+      settings_override: { collaboration_mode: 'default' }
+    });
+
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/sessions/session%201/messages',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          content: 'Implement the plan.',
+          settings_override: { collaboration_mode: 'default' }
+        })
+      })
+    );
+  });
+
+  test('createSession forwards initial_message and settings_override for the fresh-thread handoff', async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      text: () =>
+        Promise.resolve(
+          JSON.stringify({
+            session_id: 's2',
+            owner_user_id: 'u1',
+            runner_id: 'r1',
+            workspace_id: 'w1',
+            provider_id: 'codex',
+            status: 'starting',
+            external_session_id: 'codex-thread-2',
+            title: 'Implement plan'
+          })
+        )
+    });
+    vi.stubGlobal('fetch', fetch);
+
+    await createSession({
+      workspace_id: 'w1',
+      provider_id: 'codex',
+      title: 'Implement plan',
+      initial_message: 'PREAMBLE\n\nplan body',
+      settings_override: { collaboration_mode: 'default' }
+    });
+
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/sessions',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          workspace_id: 'w1',
+          provider_id: 'codex',
+          title: 'Implement plan',
+          initial_message: 'PREAMBLE\n\nplan body',
+          settings_override: { collaboration_mode: 'default' }
         })
       })
     );

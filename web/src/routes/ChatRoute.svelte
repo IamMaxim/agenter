@@ -8,6 +8,7 @@
   import { connectSessionEvents, type BrowserEventSocket } from '../api/events';
   import {
     answerQuestion,
+    createSession,
     decideApproval,
     getSessionAgentOptions,
     getSessionSettings,
@@ -19,6 +20,7 @@
     sendSessionMessage,
     updateSessionSettings
   } from '../api/sessions';
+  import { routeHref } from '../lib/router';
   import type {
     AgentOptions,
     AgentQuestionAnswer,
@@ -80,6 +82,18 @@
   let pendingDangerCommand:
     | { command: SlashCommandDefinition; request: SlashCommandRequest }
     | undefined;
+  let dismissedPlanIds: Set<string> = new Set();
+
+  // Verbatim copy of Codex TUI's PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX
+  // (`tmp/codex/codex-rs/tui/src/chatwidget/plan_implementation.rs`). Mirrors
+  // the exact wording so the model interprets a fresh-thread implementation
+  // request the same way Codex does.
+  const PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX =
+    "A previous agent produced the plan below to accomplish the user's task. " +
+    'Implement the plan in a fresh context. Treat the plan as the source of ' +
+    'user intent, re-read files as needed, and carry the work through ' +
+    'implementation and verification.';
+  const PLAN_IMPLEMENTATION_CODING_MESSAGE = 'Implement the plan.';
 
   $: items = chatState.items;
   $: turnActivity = chatState.activity;
@@ -89,7 +103,12 @@
   $: parsedSlash = parseSlashCommand(draft, slashCommands);
   $: slashMenuOpen = isSlashDraft(draft) && slashSuggestions.length > 0;
   $: usage = session?.usage ?? null;
-  $: modeValue = turnSettings.collaboration_mode ?? usage?.mode_label ?? '';
+  $: defaultModeId = resolveDefaultModeId(agentOptions.collaboration_modes);
+  $: defaultModeAvailable = defaultModeId !== null;
+  $: modeValue =
+    turnSettings.collaboration_mode ?? usage?.mode_label ?? defaultModeId ?? '';
+  $: latestPlanId = chatState.latestPlanId;
+  $: planTurnComplete = chatState.planTurnComplete;
   $: modelValue = turnSettings.model ?? usage?.model ?? '';
   $: reasoningValue = turnSettings.reasoning_effort ?? usage?.reasoning_effort ?? '';
   $: contextLabel = percentLabel(usage?.context?.used_percent);
@@ -128,6 +147,7 @@
       reconnectTimer = undefined;
     }
     chatState = createChatState();
+    dismissedPlanIds = new Set();
     session = undefined;
     sendError = '';
     decisionError = '';
@@ -499,11 +519,102 @@
     });
   }
 
+  function resolveDefaultModeId(
+    modes: AgentOptions['collaboration_modes']
+  ): string | null {
+    if (modes.length === 0) {
+      return null;
+    }
+    const explicit = modes.find((mode) => mode.id === 'default');
+    if (explicit) {
+      return explicit.id;
+    }
+    return modes[0]?.id ?? null;
+  }
+
+  async function handleImplementPlan() {
+    if (!session) {
+      return;
+    }
+    if (!defaultModeId) {
+      sendError = 'Default mode unavailable.';
+      pushToast({ severity: 'error', message: sendError });
+      return;
+    }
+    const override: AgentTurnSettings = {
+      ...turnSettings,
+      collaboration_mode: defaultModeId
+    };
+    turnSettings = override;
+    sendError = '';
+    submitting = true;
+    try {
+      await sendSessionMessage(sessionId, {
+        content: PLAN_IMPLEMENTATION_CODING_MESSAGE,
+        settings_override: override
+      });
+    } catch (error) {
+      sendError = apiErrorMessage(error, 'Could not implement plan.');
+      pushToast({ severity: 'error', message: sendError });
+    } finally {
+      submitting = false;
+    }
+  }
+
+  async function handleClearContextImplement(planContent: string) {
+    if (!session) {
+      return;
+    }
+    if (!defaultModeId) {
+      sendError = 'Default mode unavailable.';
+      pushToast({ severity: 'error', message: sendError });
+      return;
+    }
+    const trimmed = planContent.trim();
+    if (!trimmed) {
+      sendError = 'No approved plan available.';
+      pushToast({ severity: 'error', message: sendError });
+      return;
+    }
+    sendError = '';
+    submitting = true;
+    try {
+      const newSession = await createSession({
+        workspace_id: session.workspace_id,
+        provider_id: session.provider_id,
+        title: session.title ?? undefined,
+        initial_message: `${PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX}\n\n${trimmed}`,
+        settings_override: { collaboration_mode: defaultModeId }
+      });
+      window.dispatchEvent(new CustomEvent('agenter:sessions-changed'));
+      window.location.hash = routeHref({
+        name: 'chat',
+        sessionId: newSession.session_id
+      }).slice(1);
+    } catch (error) {
+      sendError = apiErrorMessage(
+        error,
+        'Could not start a fresh thread to implement the plan.'
+      );
+      pushToast({ severity: 'error', message: sendError });
+    } finally {
+      submitting = false;
+    }
+  }
+
+  function handleStayInPlan(planId: string) {
+    dismissedPlanIds = new Set([...dismissedPlanIds, planId]);
+  }
+
   function setCollaborationMode(collaboration_mode: string) {
-    const mode = agentOptions.collaboration_modes.find((option) => option.id === collaboration_mode);
+    const resolvedId = collaboration_mode || defaultModeId;
+    if (!resolvedId) {
+      return;
+    }
+    const mode = agentOptions.collaboration_modes.find((option) => option.id === resolvedId);
     void saveSettings({
       ...turnSettings,
-      collaboration_mode: collaboration_mode || null,
+      collaboration_mode: resolvedId,
       model: mode?.model ?? turnSettings.model ?? null,
       reasoning_effort: mode?.reasoning_effort ?? turnSettings.reasoning_effort ?? null
     });
@@ -672,7 +783,17 @@
         {:else if item.kind === 'subagent'}
           <SubagentEventRow {item} />
         {:else if item.kind === 'plan'}
-          <PlanCard {item} />
+          <PlanCard
+            {item}
+            pendingHandoff={item.id === latestPlanId &&
+              planTurnComplete &&
+              !dismissedPlanIds.has(item.id)}
+            {turnActive}
+            {defaultModeAvailable}
+            onImplement={() => handleImplementPlan()}
+            onClearContextImplement={() => handleClearContextImplement(item.content)}
+            onStayInPlan={() => handleStayInPlan(item.id)}
+          />
         {:else if item.kind === 'approval'}
           <article class="event-card approval-card">
             <div class="card-heading">
@@ -840,12 +961,16 @@
         aria-label="Collaboration mode"
         class="composer-inline-select"
         value={modeValue}
+        disabled={agentOptions.collaboration_modes.length === 0}
         on:change={(event) => setCollaborationMode(event.currentTarget.value)}
       >
-        <option value="">default</option>
-        {#each agentOptions.collaboration_modes as mode}
-          <option value={mode.id}>{mode.label}</option>
-        {/each}
+        {#if agentOptions.collaboration_modes.length === 0}
+          <option value="">default</option>
+        {:else}
+          {#each agentOptions.collaboration_modes as mode}
+            <option value={mode.id}>{mode.label}</option>
+          {/each}
+        {/if}
       </select>
       <span class="composer-dot" aria-hidden="true">·</span>
       <select

@@ -105,13 +105,29 @@ export interface ChatState {
   seenEventIds: Set<string>;
   items: ChatItem[];
   activity?: ChatActivity;
+  /**
+   * Item id of the most recently emitted/updated `kind: 'plan'` row, or
+   * `undefined` if no plan has been seen in this session yet. Set every time
+   * a `plan_updated` event arrives and reset only when a fresh plan with a
+   * different id replaces it.
+   */
+  latestPlanId?: string;
+  /**
+   * True when the turn that produced `latestPlanId` has finished (status
+   * transitioned to a non-`running` state). Mirrors Codex TUI's
+   * `latest_proposed_plan_markdown` gate: the "Implement plan" handoff is
+   * only offered once the model has stopped streaming the plan.
+   */
+  planTurnComplete: boolean;
 }
 
 export function createChatState(): ChatState {
   return {
     seenEventIds: new Set(),
     items: [],
-    activity: undefined
+    activity: undefined,
+    latestPlanId: undefined,
+    planTurnComplete: false
   };
 }
 
@@ -125,10 +141,55 @@ export function applyChatEnvelope(state: ChatState, envelope: BrowserEventEnvelo
     seenEventIds.add(envelope.event_id);
   }
 
+  const items = applyAppEvent(state.items, envelope.event, envelope.event_id);
+  const activity = applyActivity(state.activity, envelope.event);
+  const { latestPlanId, planTurnComplete } = applyPlanTracking(
+    state,
+    envelope.event,
+    items
+  );
+
   return {
     seenEventIds,
-    items: applyAppEvent(state.items, envelope.event, envelope.event_id),
-    activity: applyActivity(state.activity, envelope.event)
+    items,
+    activity,
+    latestPlanId,
+    planTurnComplete
+  };
+}
+
+function applyPlanTracking(
+  state: ChatState,
+  event: AppEvent,
+  items: ChatItem[]
+): { latestPlanId: string | undefined; planTurnComplete: boolean } {
+  if (event.type === 'plan_updated') {
+    const newest = [...items].reverse().find((item) => item.kind === 'plan');
+    return {
+      latestPlanId: newest?.id ?? state.latestPlanId,
+      // A fresh plan delta means the model is still working on this plan, so
+      // the handoff stays gated until the turn settles below.
+      planTurnComplete: false
+    };
+  }
+  if (event.type === 'session_status_changed') {
+    const status = stringField(event.payload, 'status');
+    if (status && status !== 'running' && state.latestPlanId !== undefined) {
+      return {
+        latestPlanId: state.latestPlanId,
+        planTurnComplete: true
+      };
+    }
+    if (status === 'running') {
+      return {
+        latestPlanId: state.latestPlanId,
+        planTurnComplete: false
+      };
+    }
+  }
+  return {
+    latestPlanId: state.latestPlanId,
+    planTurnComplete: state.planTurnComplete
   };
 }
 
