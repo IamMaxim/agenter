@@ -302,12 +302,6 @@
   </nav>
 
   <div class="sidebar-footer">
-    <a class="utility-link" class:active={route.name === 'sessions'} href={routeHref({ name: 'sessions' })}>
-      sessions
-    </a>
-    <a class="utility-link" class:active={route.name === 'workspaces'} href={routeHref({ name: 'workspaces' })}>
-      workspaces
-    </a>
     <span class="footer-status">
       <span>browser</span>
       <span class="tree-separator">·</span>

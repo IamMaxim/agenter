@@ -735,6 +735,7 @@ async fn publish_slash_result_event(
                     request.command_id.replace('.', "-"),
                     uuid::Uuid::new_v4()
                 )),
+                method: "slash_command_result".to_owned(),
                 category: "slash_command".to_owned(),
                 title: format!("/{}", definition.name),
                 detail: Some(result.message.clone()),

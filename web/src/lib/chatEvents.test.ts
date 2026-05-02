@@ -5,7 +5,7 @@ import {
   createChatState,
   fileChangeApprovalFiles
 } from './chatEvents';
-import type { BrowserEventEnvelope } from '../api/types';
+import type { AppEventType, BrowserEventEnvelope } from '../api/types';
 
 describe('chat event state', () => {
   test('accumulates assistant deltas by message id and ignores duplicate event ids', () => {
@@ -876,6 +876,132 @@ describe('chat event state', () => {
     ]);
   });
 
+  test('renders codex high-value notification variants as inline provider rows', () => {
+    let state = createChatState();
+
+    const events: Array<{ type: AppEventType; event: Record<string, unknown> }> = [
+      {
+        type: 'turn_diff_updated',
+        event: {
+          session_id: 's1',
+          provider_id: 'codex',
+          event_id: 'turn-diff-1',
+          method: 'turn/diff/updated',
+          category: 'turn',
+          title: 'Turn diff updated',
+          detail: 'turn diff details',
+          status: 'updated'
+        }
+      },
+      {
+        type: 'item_reasoning',
+        event: {
+          session_id: 's1',
+          provider_id: 'codex',
+          event_id: 'reasoning-1',
+          method: 'item/reasoning/textDelta',
+          category: 'reasoning',
+          title: 'Reasoning update',
+          detail: 'reasoning delta',
+          status: 'updated'
+        }
+      },
+      {
+        type: 'server_request_resolved',
+        event: {
+          session_id: 's1',
+          provider_id: 'codex',
+          event_id: 'server-1',
+          method: 'serverRequest/resolved',
+          category: 'server',
+          title: 'Server request resolved',
+          detail: 'server resolved',
+          status: 'resolved'
+        }
+      },
+      {
+        type: 'mcp_tool_call_progress',
+        event: {
+          session_id: 's1',
+          provider_id: 'codex',
+          event_id: 'mcp-1',
+          method: 'item/mcpToolCall/progress',
+          category: 'mcp',
+          title: 'MCP progress',
+          detail: 'mcp step',
+          status: 'running'
+        }
+      },
+      {
+        type: 'thread_realtime_event',
+        event: {
+          session_id: 's1',
+          provider_id: 'codex',
+          event_id: 'realtime-1',
+          method: 'thread/realtime/update',
+          category: 'realtime',
+          title: 'Thread realtime event',
+          detail: 'realtime update',
+          status: 'updated'
+        }
+      }
+    ];
+
+    for (const item of events) {
+      state = applyChatEnvelope(state, {
+        type: 'app_event',
+        event_id: `evt-${item.type}`,
+        event: {
+          type: item.type,
+          payload: item.event
+        }
+      });
+    }
+
+    expect(state.items).toEqual([
+      {
+        id: 'event:provider:turn-diff-1',
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        title: 'Turn diff updated',
+        detail: 'turn diff details',
+        status: 'updated'
+      },
+      {
+        id: 'event:provider:reasoning-1',
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        title: 'Reasoning update',
+        detail: 'reasoning delta',
+        status: 'updated'
+      },
+      {
+        id: 'event:provider:server-1',
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        title: 'Server request resolved',
+        detail: 'server resolved',
+        status: 'resolved'
+      },
+      {
+        id: 'event:provider:mcp-1',
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        title: 'MCP progress',
+        detail: 'mcp step',
+        status: 'running'
+      },
+      {
+        id: 'event:provider:realtime-1',
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        title: 'Thread realtime event',
+        detail: 'realtime update',
+        status: 'updated'
+      }
+    ]);
+  });
+
   test('renders slash command echo and execution result without merging them', () => {
     let state = createChatState();
 
@@ -957,5 +1083,31 @@ describe('chat event state', () => {
     expect(state.items[0]).toMatchObject({
       detail: expect.stringContaining('thread not found')
     });
+  });
+
+  test('prepends Codex runner auth refresh operator guidance when code matches', () => {
+    let state = createChatState();
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-auth',
+      event: {
+        type: 'error',
+        payload: {
+          session_id: 's1',
+          code: 'codex_auth_refresh_required',
+          message: 'SSH to runner and authenticate with Codex.',
+          provider_payload: { method: 'account/chatgptAuthTokens/refresh' }
+        }
+      }
+    });
+
+    const item = state.items[0];
+    expect(item?.kind).toBe('error');
+    if (item?.kind !== 'error') throw new Error('expected error chat item');
+    expect(item.detail).toContain('Operator action');
+    expect(item.detail).toContain('codex_auth_refresh_required');
+    expect(item.detail).toContain('SSH into the machine');
+    expect(item.title).toContain('authenticate');
   });
 });

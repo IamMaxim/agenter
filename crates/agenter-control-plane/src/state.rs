@@ -1093,7 +1093,12 @@ impl AppState {
                     question.resolved = true;
                 }
             }
-            AppEvent::ProviderEvent(provider_event) => {
+            AppEvent::ProviderEvent(provider_event)
+            | AppEvent::TurnDiffUpdated(provider_event)
+            | AppEvent::ItemReasoning(provider_event)
+            | AppEvent::ServerRequestResolved(provider_event)
+            | AppEvent::McpToolCallProgress(provider_event)
+            | AppEvent::ThreadRealtimeEvent(provider_event) => {
                 if let Some(usage) = self
                     .apply_provider_usage_event(session_id, provider_event)
                     .await
@@ -1615,6 +1620,7 @@ fn discovered_history_events(
             } => vec![AppEvent::ProviderEvent(agenter_core::ProviderEvent {
                 session_id,
                 provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                method: category.clone(),
                 event_id: event_id.clone(),
                 category: category.clone(),
                 title: title.clone(),
@@ -1647,6 +1653,11 @@ fn app_event_name(event: &AppEvent) -> &'static str {
         AppEvent::ApprovalResolved(_) => "approval_resolved",
         AppEvent::QuestionRequested(_) => "question_requested",
         AppEvent::QuestionAnswered(_) => "question_answered",
+        AppEvent::TurnDiffUpdated(_) => "turn_diff_updated",
+        AppEvent::ItemReasoning(_) => "item_reasoning",
+        AppEvent::ServerRequestResolved(_) => "server_request_resolved",
+        AppEvent::McpToolCallProgress(_) => "mcp_tool_call_progress",
+        AppEvent::ThreadRealtimeEvent(_) => "thread_realtime_event",
         AppEvent::ProviderEvent(_) => "provider_event",
         AppEvent::Error(_) => "error",
     }
@@ -1932,6 +1943,7 @@ mod tests {
                     session_id: session.session_id,
                     provider_id: AgentProviderId::from(AgentProviderId::CODEX),
                     event_id: None,
+                    method: "thread/tokenUsage/updated".to_owned(),
                     category: "token_usage".to_owned(),
                     title: "Token usage updated".to_owned(),
                     detail: None,
@@ -1954,6 +1966,7 @@ mod tests {
                     session_id: session.session_id,
                     provider_id: AgentProviderId::from(AgentProviderId::CODEX),
                     event_id: None,
+                    method: "account/rateLimits/updated".to_owned(),
                     category: "rate_limits".to_owned(),
                     title: "Rate limits updated".to_owned(),
                     detail: None,

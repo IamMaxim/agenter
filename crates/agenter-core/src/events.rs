@@ -27,6 +27,11 @@ pub enum AppEvent {
     ApprovalResolved(ApprovalResolvedEvent),
     QuestionRequested(QuestionRequestedEvent),
     QuestionAnswered(QuestionAnsweredEvent),
+    TurnDiffUpdated(ProviderEvent),
+    ItemReasoning(ProviderEvent),
+    ServerRequestResolved(ProviderEvent),
+    McpToolCallProgress(ProviderEvent),
+    ThreadRealtimeEvent(ProviderEvent),
     ProviderEvent(ProviderEvent),
     Error(AgentErrorEvent),
 }
@@ -206,6 +211,7 @@ pub struct ProviderEvent {
     pub provider_id: AgentProviderId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
+    pub method: String,
     pub category: String,
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -286,6 +292,7 @@ mod tests {
             session_id: SessionId::nil(),
             provider_id: AgentProviderId::from(AgentProviderId::CODEX),
             event_id: Some("compact-1".to_owned()),
+            method: "thread/compacted".to_owned(),
             category: "compaction".to_owned(),
             title: "Context compacted".to_owned(),
             detail: Some("Codex compacted the active thread context".to_owned()),

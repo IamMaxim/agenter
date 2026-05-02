@@ -238,8 +238,7 @@ nav a:hover {
   padding-right: 0.15rem;
 }
 
-.tree-heading,
-.utility-link {
+.tree-heading {
   display: block;
   border-radius: 6px;
   padding: 0.35rem 0.5rem;
@@ -248,9 +247,7 @@ nav a:hover {
 }
 
 .tree-heading.active,
-.tree-heading:hover,
-.utility-link.active,
-.utility-link:hover {
+.tree-heading:hover {
   color: #f1f3f7;
   background: #1b202b;
 }
@@ -375,6 +372,11 @@ nav a:hover {
 
 .content {
   min-width: 0;
+}
+
+.content-home {
+  margin: 1.5rem;
+  align-self: start;
 }
 
 .page-section {
@@ -1944,26 +1946,11 @@ code {
   font-size: 11px;
 }
 
-.utility-link {
-  border: 1px solid transparent;
-  border-radius: 4px;
-  padding: 3px 8px;
-  color: var(--fg-muted);
-  font: inherit;
-}
-
-.utility-link:hover,
-.utility-link.active {
-  color: var(--fg);
-  background: var(--raised);
-}
-
 .footer-status {
   display: flex;
   align-items: center;
   min-width: 0;
   gap: 8px;
-  margin-left: auto;
 }
 
 .footer-status .running {
@@ -2348,14 +2335,13 @@ code {
   overflow: hidden;
 }
 
-.sidebar-footer .utility-link,
 .footer-status,
 .sidebar-signout {
   flex: 0 0 auto;
 }
 
-.footer-status {
-  margin-left: 0;
+.sidebar-signout {
+  margin-left: auto;
 }
 
 .chat-layout {

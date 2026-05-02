@@ -332,6 +332,11 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
       });
     case 'question_answered':
       return updateQuestionAnswered(items, payload);
+    case 'turn_diff_updated':
+    case 'item_reasoning':
+    case 'server_request_resolved':
+    case 'mcp_tool_call_progress':
+    case 'thread_realtime_event':
     case 'provider_event':
       return upsert(items, {
         id: `event:provider:${stringField(payload, 'event_id') ?? eventId ?? fallbackId(event)}`,
@@ -341,16 +346,28 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
         detail: stringField(payload, 'detail') ?? providerEventDetail(payload),
         status: stringField(payload, 'status') ?? 'received'
       });
-    case 'error':
+    case 'error': {
+      const code = stringField(payload, 'code');
+      const operatorPreamble =
+        code === 'codex_auth_refresh_required'
+          ? [
+              'Operator action (runner host): SSH into the machine running the Codex-backed Agenter runner.',
+              'Authenticate with the Codex CLI in that environment—the browser cannot mint or refresh tokens.',
+              'Then retry after login succeeds on the runner.'
+            ].join('\n\n')
+          : '';
       return [
         ...items,
         {
           id: `error:${items.length}`,
           kind: 'error',
           title: stringField(payload, 'message') ?? 'Agent error',
-          detail: errorDetail(payload)
+          detail: operatorPreamble
+            ? [operatorPreamble, errorDetail(payload)].filter(Boolean).join('\n\n')
+            : errorDetail(payload)
         }
       ];
+    }
     default:
       return [
         ...items,

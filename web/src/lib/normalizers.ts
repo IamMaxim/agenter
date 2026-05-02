@@ -66,6 +66,11 @@ const appEventTypes = new Set<AppEventType>([
   'approval_resolved',
   'question_requested',
   'question_answered',
+  'turn_diff_updated',
+  'item_reasoning',
+  'server_request_resolved',
+  'mcp_tool_call_progress',
+  'thread_realtime_event',
   'provider_event',
   'error'
 ]);

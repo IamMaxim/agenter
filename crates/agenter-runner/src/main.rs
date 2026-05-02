@@ -1176,7 +1176,12 @@ fn app_event_session_id(event: &AppEvent) -> Option<SessionId> {
         AppEvent::ApprovalResolved(event) => Some(event.session_id),
         AppEvent::QuestionRequested(event) => Some(event.session_id),
         AppEvent::QuestionAnswered(event) => Some(event.session_id),
-        AppEvent::ProviderEvent(event) => Some(event.session_id),
+        AppEvent::TurnDiffUpdated(event)
+        | AppEvent::ItemReasoning(event)
+        | AppEvent::ServerRequestResolved(event)
+        | AppEvent::McpToolCallProgress(event)
+        | AppEvent::ThreadRealtimeEvent(event)
+        | AppEvent::ProviderEvent(event) => Some(event.session_id),
         AppEvent::Error(event) => event.session_id,
     }
 }

@@ -9,8 +9,6 @@
   import { pushToast } from './lib/toasts';
   import ChatRoute from './routes/ChatRoute.svelte';
   import LoginRoute from './routes/LoginRoute.svelte';
-  import SessionListRoute from './routes/SessionListRoute.svelte';
-  import WorkspaceListRoute from './routes/WorkspaceListRoute.svelte';
 
   let route: AppRoute = parseRoute(window.location.hash);
   let user: AuthenticatedUser | null = null;
@@ -22,7 +20,7 @@
 
   function afterLogin(nextUser: AuthenticatedUser) {
     user = nextUser;
-    window.location.hash = '/sessions';
+    window.location.hash = '#/';
   }
 
   async function signOut() {
@@ -50,7 +48,7 @@
       .then((nextUser) => {
         user = nextUser;
         if (route.name === 'login') {
-          window.location.hash = '/sessions';
+          window.location.hash = '#/';
         }
       })
       .catch((err) => {
@@ -83,12 +81,12 @@
     <SessionTreeSidebar {user} {route} onSignOut={signOut} />
 
     <main class="content">
-      {#if route.name === 'workspaces'}
-        <WorkspaceListRoute />
-      {:else if route.name === 'chat'}
+      {#if route.name === 'chat'}
         <ChatRoute sessionId={route.sessionId} />
       {:else}
-        <SessionListRoute />
+        <section class="content-home empty-state" aria-label="Home">
+          <p class="muted">Choose a session in the sidebar, or start one with <strong>+</strong> next to a workspace.</p>
+        </section>
       {/if}
     </main>
   </div>

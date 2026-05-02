@@ -36,6 +36,9 @@ use tokio::{
 const STARTUP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const RECENT_STDERR_LINES: usize = 20;
 
+/// Shown when Codex emits `account/chatgptAuthTokens/refresh` — browser cannot authenticate the runner host.
+pub const CODEX_AUTH_REFRESH_OPERATOR_MESSAGE: &str = "Codex login or token refresh is required on the runner host (for example HTTP 401 from the Codex backend). SSH into the machine running `agenter-runner`, sign in using the Codex CLI in that environment, then retry this chat.";
+
 #[derive(Clone, Debug)]
 pub struct CodexTurnRequest {
     pub session_id: SessionId,
@@ -43,6 +46,33 @@ pub struct CodexTurnRequest {
     pub external_session_id: Option<String>,
     pub prompt: String,
     pub settings: Option<AgentTurnSettings>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexRequestId {
+    Integer(i64),
+    String(String),
+}
+
+impl CodexRequestId {
+    fn as_value(&self) -> Value {
+        match self {
+            Self::Integer(value) => json!(*value),
+            Self::String(value) => json!(value),
+        }
+    }
+
+    fn numeric(value: i64) -> Self {
+        Self::Integer(value)
+    }
+}
+
+fn codex_request_id_from_value(id: &Value) -> Option<CodexRequestId> {
+    match id {
+        Value::Number(value) => value.as_i64().map(CodexRequestId::numeric),
+        Value::String(value) => Some(CodexRequestId::String(value.to_owned())),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -66,6 +96,10 @@ pub enum CodexApprovalKind {
     Command,
     FileChange,
     Permissions,
+    /// Wire method `execCommandApproval` (`ServerRequest::ExecCommandApproval`).
+    LegacyExecCommand,
+    /// Wire method `applyPatchApproval` (`ServerRequest::ApplyPatchApproval`).
+    LegacyApplyPatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,15 +113,25 @@ pub struct CodexAppServer {
     _child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
-    next_id: u64,
+    next_id: i64,
     thread_id: Option<String>,
     turn_id: Option<String>,
     initialized: bool,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// Responses/notifications/read while awaiting a synchronous request; drained by `next_message`.
+    interleaved_messages: VecDeque<Value>,
+    initialize_capabilities: Vec<String>,
 }
 
 impl CodexAppServer {
     pub fn spawn(workspace_path: PathBuf) -> anyhow::Result<Self> {
+        Self::spawn_with_initialize_capabilities(workspace_path, Vec::new())
+    }
+
+    pub fn spawn_with_initialize_capabilities(
+        workspace_path: PathBuf,
+        opt_out_notification_methods: Vec<String>,
+    ) -> anyhow::Result<Self> {
         tracing::info!(workspace = %workspace_path.display(), "spawning codex app-server");
         let mut child = Command::new("codex")
             .args(["app-server", "--listen", "stdio://"])
@@ -127,6 +171,8 @@ impl CodexAppServer {
             turn_id: None,
             initialized: false,
             stderr_tail,
+            interleaved_messages: VecDeque::new(),
+            initialize_capabilities: opt_out_notification_methods,
         })
     }
 
@@ -143,11 +189,11 @@ impl CodexAppServer {
                         "title": "Agenter Runner",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "capabilities": {"experimentalApi": true}
+                    "capabilities": self.initialize_capabilities_payload(),
                 }),
             )
             .await?;
-        self.read_response(initialize_id, "initialize").await?;
+        self.read_response(&initialize_id, "initialize").await?;
         self.initialized = true;
         Ok(())
     }
@@ -158,7 +204,7 @@ impl CodexAppServer {
         let start_id = self
             .send_request("thread/start", codex_thread_start_params(workspace_path))
             .await?;
-        let response = self.read_response(start_id, "thread/start").await?;
+        let response = self.read_response(&start_id, "thread/start").await?;
         if let Some(thread_id) = codex_thread_id(&response) {
             self.thread_id = Some(thread_id.to_owned());
         }
@@ -192,7 +238,7 @@ impl CodexAppServer {
                 }),
             )
             .await?;
-        self.read_response(resume_id, "thread/resume").await?;
+        self.read_response(&resume_id, "thread/resume").await?;
         Ok(())
     }
 
@@ -211,7 +257,7 @@ impl CodexAppServer {
                 }),
             )
             .await?;
-        let response = self.read_response(list_id, "thread/list").await?;
+        let response = self.read_response(&list_id, "thread/list").await?;
         Ok(codex_threads_from_list_response(&response))
     }
 
@@ -229,7 +275,7 @@ impl CodexAppServer {
                 }),
             )
             .await?;
-        let response = self.read_response(read_id, "thread/read").await?;
+        let response = self.read_response(&read_id, "thread/read").await?;
         Ok(codex_history_from_thread_read_response(&response))
     }
 
@@ -238,12 +284,12 @@ impl CodexAppServer {
         let models_id = self
             .send_request("model/list", json!({"includeHidden": false}))
             .await?;
-        let models = self.read_response(models_id, "model/list").await?;
+        let models = self.read_response(&models_id, "model/list").await?;
         let modes_id = self
             .send_request("collaborationMode/list", json!({}))
             .await?;
         let modes = self
-            .read_response(modes_id, "collaborationMode/list")
+            .read_response(&modes_id, "collaborationMode/list")
             .await?;
         Ok(codex_agent_options_from_responses(&models, &modes))
     }
@@ -267,7 +313,7 @@ impl CodexAppServer {
         )?;
         tracing::info!(provider_thread_id = %thread_id, method, command_id = %request.command_id, "executing codex provider command");
         let request_id = self.send_request(method, params).await?;
-        let response = self.read_response(request_id, method).await?;
+        let response = self.read_response(&request_id, method).await?;
         if let Some(thread_id) = codex_thread_id(&response) {
             self.thread_id = Some(thread_id.to_owned());
         }
@@ -303,7 +349,7 @@ impl CodexAppServer {
         let turn_start_id = self
             .send_request("turn/start", codex_turn_start_params(thread_id, request))
             .await?;
-        let response = self.read_response(turn_start_id, "turn/start").await?;
+        let response = self.read_response(&turn_start_id, "turn/start").await?;
         if let Some(turn_id) = codex_turn_id(&response) {
             self.turn_id = Some(turn_id.to_owned());
         }
@@ -311,29 +357,27 @@ impl CodexAppServer {
     }
 
     pub async fn next_message(&mut self) -> anyhow::Result<Option<Value>> {
-        let mut line = String::new();
-        if self.stdout.read_line(&mut line).await? == 0 {
-            return Ok(None);
-        }
-        let message = serde_json::from_str::<Value>(line.trim())
-            .with_context(|| format!("codex emitted invalid JSON-RPC line: {line}"))?;
+        let message = match self.interleaved_messages.pop_front() {
+            Some(m) => m,
+            None => match self.read_codex_stdio_json_line().await? {
+                Some(m) => {
+                    Self::observe_codex_thread_turn_targets(self, &m);
+                    m
+                }
+                None => return Ok(None),
+            },
+        };
+
         tracing::debug!(
             method = message.get("method").and_then(serde_json::Value::as_str),
             id = ?message.get("id"),
             payload_preview = agenter_core::logging::payload_preview(
                 &message,
                 agenter_core::logging::payload_logging_enabled()
-            ).as_deref(),
+            )
+            .as_deref(),
             "received codex json-rpc message"
         );
-        if let Some(thread_id) = codex_thread_id(&message) {
-            self.thread_id = Some(thread_id.to_owned());
-            tracing::info!(provider_thread_id = %thread_id, "observed codex thread id");
-        }
-        if let Some(turn_id) = codex_turn_id(&message) {
-            self.turn_id = Some(turn_id.to_owned());
-            tracing::debug!(provider_turn_id = %turn_id, "observed codex turn id");
-        }
         Ok(Some(message))
     }
 
@@ -398,11 +442,37 @@ impl CodexAppServer {
         .await
     }
 
-    async fn send_request(&mut self, method: &str, params: Value) -> anyhow::Result<u64> {
+    pub async fn send_jsonrpc_application_error_response(
+        &mut self,
+        native_request_id: Value,
+        code: i64,
+        message: &str,
+        data: Option<Value>,
+    ) -> anyhow::Result<()> {
+        let mut envelope = json!({
+            "id": native_request_id,
+            "error": {
+                "code": code,
+                "message": message,
+            }
+        });
+        if let Some(ref d) = data {
+            envelope["error"]["data"] = d.clone();
+        }
+        tracing::warn!(%code, %message, "sending codex json-rpc application error response");
+        write_json(&mut self.stdin, &envelope).await
+    }
+
+    async fn send_request(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> anyhow::Result<CodexRequestId> {
         let id = self.next_id;
         self.next_id += 1;
+        let request_id = CodexRequestId::numeric(id);
         tracing::debug!(
-            id,
+            request_id = ?request_id,
             method,
             payload_preview = agenter_core::logging::payload_preview(
                 &params,
@@ -414,41 +484,115 @@ impl CodexAppServer {
         write_json(
             &mut self.stdin,
             &json!({
-                "id": id,
+                "id": request_id.as_value(),
                 "method": method,
                 "params": params
             }),
         )
         .await?;
-        Ok(id)
+        Ok(request_id)
     }
 
-    async fn read_response(&mut self, request_id: u64, method: &str) -> anyhow::Result<Value> {
+    fn initialize_capabilities_payload(&self) -> Value {
+        let mut capabilities = json!({"experimentalApi": true});
+        if !self.initialize_capabilities.is_empty() {
+            capabilities["optOutNotificationMethods"] = Value::Array(
+                self.initialize_capabilities
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            );
+        }
+        capabilities
+    }
+
+    async fn read_response(
+        &mut self,
+        request_id: &CodexRequestId,
+        method: &str,
+    ) -> anyhow::Result<Value> {
+        let message = timeout(
+            STARTUP_RESPONSE_TIMEOUT,
+            self.take_pending_codex_jsonrpc_response(request_id),
+        )
+        .await
+        .with_context(|| {
+            startup_error_with_stderr(
+                format!("timed out waiting for codex {method} response"),
+                &self.recent_stderr(),
+            )
+        })??;
+        let Some(message) = message else {
+            return Err(anyhow!(startup_error_with_stderr(
+                format!("codex exited before {method} response"),
+                &self.recent_stderr()
+            )));
+        };
+        if let Some(summary) = codex_jsonrpc_error_summary(method, &message) {
+            return Err(anyhow!(startup_error_with_stderr(
+                summary,
+                &self.recent_stderr()
+            )));
+        }
+        Ok(message)
+    }
+
+    async fn take_pending_codex_jsonrpc_response(
+        &mut self,
+        request_id: &CodexRequestId,
+    ) -> anyhow::Result<Option<Value>> {
         loop {
-            let message = timeout(STARTUP_RESPONSE_TIMEOUT, self.next_message())
-                .await
-                .with_context(|| {
-                    startup_error_with_stderr(
-                        format!("timed out waiting for codex {method} response"),
-                        &self.recent_stderr(),
-                    )
-                })??;
-            let Some(message) = message else {
-                return Err(anyhow!(startup_error_with_stderr(
-                    format!("codex exited before {method} response"),
-                    &self.recent_stderr()
-                )));
-            };
-            if message.get("id").and_then(Value::as_u64) != Some(request_id) {
-                continue;
+            for i in 0..self.interleaved_messages.len() {
+                let Some(candidate_ref) = self.interleaved_messages.get(i) else {
+                    continue;
+                };
+                if codex_rpc_is_response_matching_request(candidate_ref, request_id) {
+                    let matched = self
+                        .interleaved_messages
+                        .remove(i)
+                        .expect("interleaved dequeue index bounded by iteration");
+                    Self::observe_codex_thread_turn_targets(self, &matched);
+                    return Ok(Some(matched));
+                }
             }
-            if let Some(summary) = codex_jsonrpc_error_summary(method, &message) {
-                return Err(anyhow!(startup_error_with_stderr(
-                    summary,
-                    &self.recent_stderr()
-                )));
+            match self.read_codex_stdio_json_line().await? {
+                None => return Ok(None),
+                Some(m) => {
+                    if let Some(incoming_request_id) =
+                        m.get("id").and_then(codex_request_id_from_value)
+                    {
+                        tracing::trace!(request_id = ?incoming_request_id, "read codex json-rpc message");
+                    }
+                    if codex_rpc_is_response_matching_request(&m, request_id) {
+                        Self::observe_codex_thread_turn_targets(self, &m);
+                        return Ok(Some(m));
+                    }
+                    Self::observe_codex_thread_turn_targets(self, &m);
+                    self.interleaved_messages.push_back(m);
+                }
             }
-            return Ok(message);
+        }
+    }
+
+    async fn read_codex_stdio_json_line(&mut self) -> anyhow::Result<Option<Value>> {
+        let mut line = String::new();
+        if self.stdout.read_line(&mut line).await? == 0 {
+            return Ok(None);
+        }
+        let message = serde_json::from_str::<Value>(line.trim())
+            .with_context(|| format!("codex emitted invalid JSON-RPC line: {line}"))?;
+        Ok(Some(message))
+    }
+
+    fn observe_codex_thread_turn_targets(server: &mut CodexAppServer, message: &Value) {
+        if let Some(thread_id) = codex_thread_id(message) {
+            server.thread_id = Some(thread_id.to_owned());
+            tracing::info!(provider_thread_id = %thread_id, "observed codex thread id");
+        }
+        if let Some(turn_id) = codex_turn_id(message) {
+            server.turn_id = Some(turn_id.to_owned());
+            tracing::debug!(provider_turn_id = %turn_id, "observed codex turn id");
         }
     }
 
@@ -771,101 +915,167 @@ pub async fn run_codex_turn_on_server(
     while let Some(message) = server.next_message().await? {
         scope.observe(&message);
         codex_approval_ctx.observe_jsonrpc_message(&message);
+        let is_server_request = codex_rpc_is_codex_server_to_client_request(&message);
+        let is_server_response = codex_rpc_is_codex_server_to_client_response(&message);
+
+        if is_server_request {
+            if jsonrpc_method(&message) == Some("account/chatgptAuthTokens/refresh") {
+                let Some(native_request_id) = message.get("id").cloned() else {
+                    continue;
+                };
+                event_sender
+                    .send(AppEvent::Error(AgentErrorEvent {
+                        session_id: Some(request.session_id),
+                        code: Some("codex_auth_refresh_required".to_owned()),
+                        message: CODEX_AUTH_REFRESH_OPERATOR_MESSAGE.to_owned(),
+                        provider_payload: Some(message.clone()),
+                    }))
+                    .ok();
+                server
+                    .send_jsonrpc_application_error_response(
+                        native_request_id,
+                        -32002,
+                        "Remote runner cannot refresh Codex auth tokens; authenticate on the runner host.",
+                        Some(json!({ "agenter.reason": "auth_refresh_unreachable_remotely" })),
+                    )
+                    .await?;
+                continue;
+            }
+
+            if jsonrpc_method(&message) == Some("item/tool/call") {
+                let Some(native_request_id) = message.get("id").cloned() else {
+                    continue;
+                };
+                event_sender
+                    .send(AppEvent::Error(AgentErrorEvent {
+                        session_id: Some(request.session_id),
+                        code: Some("codex_dynamic_tool_unsupported".to_owned()),
+                        message: "Codex requested a dynamic tool call that Agenter cannot execute remotely."
+                            .to_owned(),
+                        provider_payload: Some(message.clone()),
+                    }))
+                    .ok();
+                server
+                    .send_unsupported_request_response(native_request_id, "item/tool/call")
+                    .await?;
+                continue;
+            }
+
+            if let Some((approval_id, native_request_id, approval_kind, event)) =
+                normalize_codex_approval_request(
+                    request.session_id,
+                    &message,
+                    Some(&codex_approval_ctx),
+                )
+            {
+                let (sender, receiver) = oneshot::channel();
+                pending_approvals
+                    .lock()
+                    .await
+                    .insert(approval_id, PendingCodexApproval { response: sender });
+                event_sender
+                    .send(session_status_event(
+                        request.session_id,
+                        SessionStatus::WaitingForApproval,
+                        Some("Codex is waiting for approval.".to_owned()),
+                    ))
+                    .ok();
+                tracing::info!(
+                    session_id = %request.session_id,
+                    %approval_id,
+                    native_request_id = ?native_request_id,
+                    ?approval_kind,
+                    "codex approval request pending"
+                );
+                event_sender.send(event).ok();
+                if let Ok(decision) = receiver.await {
+                    server
+                        .send_approval_response(native_request_id, approval_kind, decision)
+                        .await?;
+                    event_sender
+                        .send(session_status_event(
+                            request.session_id,
+                            SessionStatus::Running,
+                            Some("Approval answered.".to_owned()),
+                        ))
+                        .ok();
+                }
+                continue;
+            }
+            if let Some((question_id, native_request_id, event)) =
+                normalize_codex_question_request(request.session_id, &message)
+            {
+                let Some(question_kind) = codex_question_kind(&message) else {
+                    continue;
+                };
+                let (sender, receiver) = oneshot::channel();
+                pending_questions
+                    .lock()
+                    .await
+                    .insert(question_id, PendingCodexQuestion { response: sender });
+                event_sender
+                    .send(session_status_event(
+                        request.session_id,
+                        SessionStatus::WaitingForInput,
+                        Some("Codex is waiting for input.".to_owned()),
+                    ))
+                    .ok();
+                tracing::info!(
+                    session_id = %request.session_id,
+                    %question_id,
+                    ?question_kind,
+                    "codex question request pending"
+                );
+                event_sender.send(event).ok();
+                if let Ok(answer) = receiver.await {
+                    server
+                        .send_question_response(native_request_id, question_kind, answer)
+                        .await?;
+                    event_sender
+                        .send(session_status_event(
+                            request.session_id,
+                            SessionStatus::Running,
+                            Some("Input answered.".to_owned()),
+                        ))
+                        .ok();
+                }
+                continue;
+            }
+            if let Some((native_request_id, method)) = unsupported_codex_server_request(&message) {
+                for event in normalize_codex_message(request.session_id, &message) {
+                    event_sender.send(event).ok();
+                }
+                if let Err(err) = server
+                    .send_unsupported_request_response(native_request_id.clone(), method)
+                    .await
+                {
+                    tracing::warn!(
+                        ?err,
+                        method,
+                        request_id = ?native_request_id,
+                        "failed to send unsupported codex request response"
+                    );
+                }
+                continue;
+            }
+        }
+
+        if is_server_response {
+            tracing::warn!(
+                provider_thread_id = message_thread_id(&message),
+                provider_turn_id = message_turn_id(&message),
+                jsonrpc_request_id = %codex_jsonrpc_request_id_summary(&message),
+                "received unexpected codex response while in turn loop; dropping"
+            );
+            continue;
+        }
+
         if !codex_message_belongs_to_scope(&message, &scope) {
             tracing::debug!(
                 provider_thread_id = message_thread_id(&message),
                 provider_turn_id = message_turn_id(&message),
                 "ignored codex message outside active turn scope"
             );
-            continue;
-        }
-        if let Some((approval_id, native_request_id, approval_kind, event)) =
-            normalize_codex_approval_request(
-                request.session_id,
-                &message,
-                Some(&codex_approval_ctx),
-            )
-        {
-            let (sender, receiver) = oneshot::channel();
-            pending_approvals
-                .lock()
-                .await
-                .insert(approval_id, PendingCodexApproval { response: sender });
-            event_sender
-                .send(session_status_event(
-                    request.session_id,
-                    SessionStatus::WaitingForApproval,
-                    Some("Codex is waiting for approval.".to_owned()),
-                ))
-                .ok();
-            tracing::info!(
-                session_id = %request.session_id,
-                %approval_id,
-                native_request_id = ?native_request_id,
-                ?approval_kind,
-                "codex approval request pending"
-            );
-            event_sender.send(event).ok();
-            if let Ok(decision) = receiver.await {
-                server
-                    .send_approval_response(native_request_id, approval_kind, decision)
-                    .await?;
-                event_sender
-                    .send(session_status_event(
-                        request.session_id,
-                        SessionStatus::Running,
-                        Some("Approval answered.".to_owned()),
-                    ))
-                    .ok();
-            }
-            continue;
-        }
-        if let Some((question_id, native_request_id, event)) =
-            normalize_codex_question_request(request.session_id, &message)
-        {
-            let Some(question_kind) = codex_question_kind(&message) else {
-                continue;
-            };
-            let (sender, receiver) = oneshot::channel();
-            pending_questions
-                .lock()
-                .await
-                .insert(question_id, PendingCodexQuestion { response: sender });
-            event_sender
-                .send(session_status_event(
-                    request.session_id,
-                    SessionStatus::WaitingForInput,
-                    Some("Codex is waiting for input.".to_owned()),
-                ))
-                .ok();
-            tracing::info!(
-                session_id = %request.session_id,
-                %question_id,
-                ?question_kind,
-                "codex question request pending"
-            );
-            event_sender.send(event).ok();
-            if let Ok(answer) = receiver.await {
-                server
-                    .send_question_response(native_request_id, question_kind, answer)
-                    .await?;
-                event_sender
-                    .send(session_status_event(
-                        request.session_id,
-                        SessionStatus::Running,
-                        Some("Input answered.".to_owned()),
-                    ))
-                    .ok();
-            }
-            continue;
-        }
-        if let Some((native_request_id, method)) = unsupported_codex_server_request(&message) {
-            for event in normalize_codex_message_for_scope(request.session_id, &message, &scope) {
-                event_sender.send(event).ok();
-            }
-            server
-                .send_unsupported_request_response(native_request_id, method)
-                .await?;
             continue;
         }
 
@@ -999,13 +1209,60 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
         "thread/status/changed" => thread_status_changed(session_id, message),
         "thread/tokenUsage/updated" => vec![token_usage_updated(session_id, message)],
         "account/rateLimits/updated" => vec![rate_limits_updated(session_id, message)],
-        "thread/compacted" => vec![provider_event(
+        "thread/compacted" => vec![AppEvent::ProviderEvent(provider_event(
             session_id,
             message,
+            "thread/compacted",
             "compaction",
             "Context compacted",
             Some("completed"),
-        )],
+        ))],
+        "turn/diff/updated" => vec![AppEvent::TurnDiffUpdated(provider_event(
+            session_id,
+            message,
+            "turn/diff/updated",
+            provider_event_category("turn/diff/updated"),
+            provider_event_title("turn/diff/updated"),
+            None,
+        ))],
+        "item/reasoning/summaryTextDelta"
+        | "item/reasoning/summaryPartAdded"
+        | "item/reasoning/textDelta" => {
+            vec![AppEvent::ItemReasoning(provider_event(
+                session_id,
+                message,
+                method,
+                provider_event_category(method),
+                provider_event_title(method),
+                None,
+            ))]
+        }
+        "serverRequest/resolved" => vec![AppEvent::ServerRequestResolved(provider_event(
+            session_id,
+            message,
+            "serverRequest/resolved",
+            provider_event_category("serverRequest/resolved"),
+            provider_event_title("serverRequest/resolved"),
+            None,
+        ))],
+        "item/mcpToolCall/progress" => vec![AppEvent::McpToolCallProgress(provider_event(
+            session_id,
+            message,
+            "item/mcpToolCall/progress",
+            provider_event_category("item/mcpToolCall/progress"),
+            provider_event_title("item/mcpToolCall/progress"),
+            None,
+        ))],
+        method if method.starts_with("mcpServer/") => {
+            vec![AppEvent::McpToolCallProgress(provider_event(
+                session_id,
+                message,
+                method,
+                provider_event_category(method),
+                provider_event_title(method),
+                None,
+            ))]
+        }
         "turn/plan/updated" => turn_plan_updated(session_id, message).into_iter().collect(),
         "item/plan/delta" => plan_delta(session_id, message).into_iter().collect(),
         "item/commandExecution/outputDelta" | "command/exec/outputDelta" => {
@@ -1013,13 +1270,26 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
                 .into_iter()
                 .collect()
         }
-        "item/fileChange/outputDelta" | "item/fileChange/patchUpdated" => vec![provider_event(
-            session_id,
-            message,
-            "file",
-            provider_event_title(method),
-            Some("updated"),
-        )],
+        "item/fileChange/outputDelta" | "item/fileChange/patchUpdated" => {
+            vec![AppEvent::ProviderEvent(provider_event(
+                session_id,
+                message,
+                method,
+                "file",
+                provider_event_title(method),
+                Some("updated"),
+            ))]
+        }
+        method if method.starts_with("thread/realtime/") => {
+            vec![AppEvent::ThreadRealtimeEvent(provider_event(
+                session_id,
+                message,
+                method,
+                provider_event_category(method),
+                provider_event_title(method),
+                Some("updated"),
+            ))]
+        }
         "item/started" => item_started(session_id, message).into_iter().collect(),
         "item/completed" => item_completed(session_id, message).into_iter().collect(),
         "turn/completed" => vec![
@@ -1045,13 +1315,14 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
                 .to_owned(),
             provider_payload: Some(message.clone()),
         })],
-        _ => vec![provider_event(
+        _ => vec![AppEvent::ProviderEvent(provider_event(
             session_id,
             message,
+            method,
             provider_event_category(method),
             provider_event_title(method),
             None,
-        )],
+        ))],
     }
 }
 
@@ -1072,23 +1343,41 @@ pub fn normalize_codex_approval_request(
             ApprovalKind::ProviderSpecific,
             CodexApprovalKind::Permissions,
         ),
+        // Deprecated server requests for legacy APIs (`sendUserTurn` / `sendUserMessage`).
+        "execCommandApproval" => (ApprovalKind::Command, CodexApprovalKind::LegacyExecCommand),
+        "applyPatchApproval" => (
+            ApprovalKind::FileChange,
+            CodexApprovalKind::LegacyApplyPatch,
+        ),
         _ => return None,
     };
     let native_request_id = message.get("id")?.clone();
     let approval_id = ApprovalId::new();
-    let title = match kind {
-        ApprovalKind::Command => "Approve Codex command",
-        ApprovalKind::FileChange => "Approve Codex file change",
-        ApprovalKind::ProviderSpecific | ApprovalKind::Tool => "Approve Codex permission",
+    let title = match approval_kind {
+        CodexApprovalKind::LegacyExecCommand => "Approve Codex command (legacy)",
+        CodexApprovalKind::LegacyApplyPatch => "Approve Codex file change (legacy)",
+        _ => match kind {
+            ApprovalKind::Command => "Approve Codex command",
+            ApprovalKind::FileChange => "Approve Codex file change",
+            ApprovalKind::ProviderSpecific | ApprovalKind::Tool => "Approve Codex permission",
+        },
     };
 
     let params = message.get("params").unwrap_or(&Value::Null);
-    let (presentation, details) = synthesize_codex_approval_details(&kind, params, cache, message);
+    let (presentation, details) = match approval_kind {
+        CodexApprovalKind::LegacyExecCommand => {
+            synthesize_codex_legacy_exec_approval_details(params)
+        }
+        CodexApprovalKind::LegacyApplyPatch => {
+            synthesize_codex_legacy_patch_approval_details(params)
+        }
+        _ => synthesize_codex_approval_details(&kind, params, cache, message),
+    };
     let event = AppEvent::ApprovalRequested(ApprovalRequestEvent {
         session_id,
         approval_id,
         kind,
-        title: title.to_owned(),
+        title: title.to_string(),
         details,
         expires_at: None,
         presentation,
@@ -1158,6 +1447,81 @@ fn synthesize_codex_approval_details(
             (None, extracted.or_else(|| codex_fallback_item_hint(params)))
         }
     }
+}
+
+fn synthesize_codex_legacy_exec_approval_details(
+    params: &Value,
+) -> (Option<Value>, Option<String>) {
+    let argv = params
+        .get("command")
+        .and_then(Value::as_array)
+        .map(|parts| parts.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let cmdline = argv.join(" ");
+    let cwd = params
+        .pointer("/cwd")
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .or_else(|| {
+            params
+                .get("cwd")
+                .and_then(|v| v.as_str().map(str::to_owned))
+        });
+    let reason = params
+        .pointer("/reason")
+        .and_then(|v| v.as_str())
+        .or_else(|| params.get("reason").and_then(Value::as_str));
+    let body = Some(cmdline.trim().to_owned())
+        .filter(|c| !c.is_empty())
+        .map(|cmdline| {
+            let mut blob = cmdline.to_owned();
+            if let Some(cwd_line) = &cwd {
+                blob.push('\n');
+                blob.push_str("cwd: ");
+                blob.push_str(cwd_line);
+            }
+            if let Some(reason) = reason.filter(|t| !t.is_empty()) {
+                blob.push_str("\n\n");
+                blob.push_str(reason);
+            }
+            blob
+        });
+    (
+        None,
+        body.or_else(|| Some("Approve this shell command.".to_owned())),
+    )
+}
+
+fn synthesize_codex_legacy_patch_approval_details(
+    params: &Value,
+) -> (Option<Value>, Option<String>) {
+    let mut paths: Vec<String> = params
+        .pointer("/fileChanges")
+        .and_then(Value::as_object)
+        .or_else(|| params.get("fileChanges").and_then(Value::as_object))
+        .into_iter()
+        .flat_map(|paths| paths.keys().cloned())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    let bullets = paths
+        .into_iter()
+        .map(|p| format!("• {p}"))
+        .collect::<Vec<_>>();
+    let head = (!bullets.is_empty()).then(|| format!("Paths:\n{}", bullets.join("\n")));
+    let reason = params
+        .pointer("/reason")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("reason").and_then(Value::as_str));
+    let tail = reason
+        .filter(|t| !t.is_empty())
+        .map(|r| format!("Reason: {r}"));
+    let details = match (head, tail) {
+        (Some(h), Some(t)) => Some(format!("{h}\n\n{t}")),
+        (Some(h), None) => Some(h),
+        (None, Some(t)) => Some(t),
+        (None, None) => Some("Codex proposes file edits.".to_owned()),
+    };
+    (None, details)
 }
 
 fn codex_fallback_item_hint(params: &Value) -> Option<String> {
@@ -1231,6 +1595,9 @@ fn codex_question_kind(message: &Value) -> Option<CodexQuestionKind> {
 }
 
 fn unsupported_codex_server_request(message: &Value) -> Option<(Value, &str)> {
+    if !codex_rpc_is_codex_server_to_client_request(message) {
+        return None;
+    }
     let native_request_id = message.get("id")?.clone();
     let method = jsonrpc_method(message)?;
     Some((native_request_id, method))
@@ -1427,12 +1794,29 @@ pub fn approval_response_for_decision(
         };
     }
 
+    if matches!(
+        approval_kind,
+        CodexApprovalKind::LegacyExecCommand | CodexApprovalKind::LegacyApplyPatch
+    ) {
+        return json!({ "decision": legacy_codex_review_decision_wire(&decision) });
+    }
+
     match decision {
         ApprovalDecision::Accept => json!({"decision": "accept"}),
         ApprovalDecision::AcceptForSession => json!({"decision": "acceptForSession"}),
         ApprovalDecision::Decline => json!({"decision": "decline"}),
         ApprovalDecision::Cancel => json!({"decision": "cancel"}),
         ApprovalDecision::ProviderSpecific { payload } => payload,
+    }
+}
+
+fn legacy_codex_review_decision_wire(decision: &ApprovalDecision) -> &'static str {
+    match decision {
+        ApprovalDecision::Accept => "approved",
+        ApprovalDecision::AcceptForSession => "approved_for_session",
+        ApprovalDecision::Decline => "denied",
+        ApprovalDecision::Cancel => "abort",
+        ApprovalDecision::ProviderSpecific { .. } => "denied",
     }
 }
 
@@ -1565,6 +1949,7 @@ fn codex_slash_command_result(session_id: SessionId, message: &Value) -> AppEven
         session_id,
         provider_id: AgentProviderId::from(AgentProviderId::CODEX),
         event_id: string_at(message, &["/command_id"]).map(str::to_owned),
+        method: "codex/slash_command_result".to_owned(),
         category: "slash_command".to_owned(),
         title: string_at(message, &["/raw_input", "/command_id"])
             .unwrap_or("Provider command")
@@ -1580,6 +1965,7 @@ fn codex_context_compaction_event(session_id: SessionId, message: &Value) -> App
         session_id,
         provider_id: AgentProviderId::from(AgentProviderId::CODEX),
         event_id: string_at(message, &["/id", "/itemId", "/item/id"]).map(str::to_owned),
+        method: "item/contextCompaction".to_owned(),
         category: "compaction".to_owned(),
         title: "Context compacted".to_owned(),
         detail: None,
@@ -1610,6 +1996,7 @@ fn thread_status_changed(session_id: SessionId, message: &Value) -> Vec<AppEvent
         session_id,
         provider_id: AgentProviderId::from(AgentProviderId::CODEX),
         event_id: string_at(message, &["/params/threadId"]).map(str::to_owned),
+        method: "thread/status/changed".to_owned(),
         category: "thread".to_owned(),
         title: "Thread status changed".to_owned(),
         detail: Some(format!("status: {provider_status}")),
@@ -1633,6 +2020,7 @@ fn turn_started(session_id: SessionId, message: &Value) -> Vec<AppEvent> {
         session_id,
         provider_id: AgentProviderId::from(AgentProviderId::CODEX),
         event_id: string_at(message, &["/params/turn/id", "/params/turnId"]).map(str::to_owned),
+        method: "turn/started".to_owned(),
         category: "turn".to_owned(),
         title: "Turn started".to_owned(),
         detail: None,
@@ -1650,6 +2038,7 @@ fn token_usage_updated(session_id: SessionId, message: &Value) -> AppEvent {
         session_id,
         provider_id: AgentProviderId::from(AgentProviderId::CODEX),
         event_id: string_at(message, &["/params/turnId", "/params/threadId"]).map(str::to_owned),
+        method: "thread/tokenUsage/updated".to_owned(),
         category: "token_usage".to_owned(),
         title: "Token usage updated".to_owned(),
         detail: Some(
@@ -1678,6 +2067,7 @@ fn rate_limits_updated(session_id: SessionId, message: &Value) -> AppEvent {
         session_id,
         provider_id: AgentProviderId::from(AgentProviderId::CODEX),
         event_id: string_at(message, &["/params/rateLimits/limitId"]).map(str::to_owned),
+        method: "account/rateLimits/updated".to_owned(),
         category: "rate_limits".to_owned(),
         title: "Rate limits updated".to_owned(),
         detail: Some(
@@ -1713,13 +2103,15 @@ fn session_status_event(
 fn provider_event(
     session_id: SessionId,
     message: &Value,
+    method: &str,
     category: impl Into<String>,
     title: impl Into<String>,
     status: Option<&str>,
-) -> AppEvent {
-    AppEvent::ProviderEvent(ProviderEvent {
+) -> ProviderEvent {
+    ProviderEvent {
         session_id,
         provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+        method: method.to_owned(),
         event_id: string_at(
             message,
             &[
@@ -1737,7 +2129,7 @@ fn provider_event(
         detail: provider_event_detail(message),
         status: status.map(str::to_owned),
         provider_payload: Some(message.clone()),
-    })
+    }
 }
 
 fn item_started(session_id: SessionId, message: &Value) -> Option<AppEvent> {
@@ -1764,7 +2156,8 @@ fn item_started(session_id: SessionId, message: &Value) -> Option<AppEvent> {
         session_id,
         tool_call_id: item_id(message),
         name: string_at(message, &["/params/name", "/params/item/name"])
-            .unwrap_or("codex_item")
+            .or_else(|| item_type(message))
+            .unwrap_or("tool")
             .to_owned(),
         title: string_at(message, &["/params/title", "/params/item/title"]).map(str::to_owned),
         input: message.pointer("/params/input").cloned(),
@@ -1778,13 +2171,14 @@ fn item_completed(session_id: SessionId, message: &Value) -> Option<AppEvent> {
         return message_completed(session_id, message);
     }
     if item_type(message) == Some("contextCompaction") {
-        return Some(provider_event(
+        return Some(AppEvent::ProviderEvent(provider_event(
             session_id,
             message,
+            "item/contextCompaction",
             "compaction",
             "Context compacted",
             Some("completed"),
-        ));
+        )));
     }
     if should_ignore_item_event(message) {
         return None;
@@ -1817,7 +2211,8 @@ fn item_completed(session_id: SessionId, message: &Value) -> Option<AppEvent> {
         session_id,
         tool_call_id: item_id(message),
         name: string_at(message, &["/params/name", "/params/item/name"])
-            .unwrap_or("codex_item")
+            .or_else(|| item_type(message))
+            .unwrap_or("tool")
             .to_owned(),
         title: string_at(message, &["/params/title", "/params/item/title"]).map(str::to_owned),
         input: None,
@@ -1837,6 +2232,56 @@ fn file_change_kind(message: &Value) -> FileChangeKind {
 
 fn jsonrpc_method(message: &Value) -> Option<&str> {
     message.get("method")?.as_str()
+}
+
+/// Inbound JSON-RPC from Codex with `method`, `id`, and no top-level `result` / `error`.
+fn codex_rpc_is_codex_server_to_client_request(message: &Value) -> bool {
+    jsonrpc_method(message).is_some()
+        && message.get("id").is_some()
+        && message.get("result").is_none()
+        && message.get("error").is_none()
+}
+
+/// Inbound JSON-RPC from Codex with `id` and top-level `result` or `error`.
+fn codex_rpc_is_codex_server_to_client_response(message: &Value) -> bool {
+    message.get("id").is_some()
+        && (message.get("result").is_some() || message.get("error").is_some())
+}
+
+fn codex_jsonrpc_request_id_summary(message: &Value) -> String {
+    match message.get("id") {
+        Some(id) if id.is_string() => id.as_str().unwrap_or("<non-scalar id>").to_owned(),
+        Some(id) if id.is_number() => id.to_string(),
+        Some(id) => id.to_string(),
+        None => "<missing id>".to_owned(),
+    }
+}
+
+fn codex_jsonrpc_request_ids_equal(id: Option<&Value>, expected: &CodexRequestId) -> bool {
+    let Some(id) = id else {
+        return false;
+    };
+    match id {
+        Value::Number(n) => match expected {
+            CodexRequestId::Integer(value) => n.as_i64() == Some(*value),
+            CodexRequestId::String(value) => n.to_string() == *value,
+        },
+        Value::String(s) => match expected {
+            CodexRequestId::Integer(value) => {
+                s.trim().parse::<i64>().ok() == Some(*value) || s.trim() == value.to_string()
+            }
+            CodexRequestId::String(value) => s.trim() == value,
+        },
+        _ => false,
+    }
+}
+
+fn codex_rpc_is_response_matching_request(
+    message: &Value,
+    pending_client_request_id: &CodexRequestId,
+) -> bool {
+    codex_jsonrpc_request_ids_equal(message.get("id"), pending_client_request_id)
+        && (message.get("result").is_some() || message.get("error").is_some())
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2737,6 +3182,106 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_turn_diff_updated_as_turn_diff_event() {
+        let message = json!({
+            "method": "turn/diff/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "message": "Added 3 lines"
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        let AppEvent::TurnDiffUpdated(event) = &events[0] else {
+            panic!("expected turn diff event");
+        };
+        assert_eq!(event.method, "turn/diff/updated");
+        assert_eq!(event.title, "Turn Diff Updated");
+        assert_eq!(event.status.as_deref(), None);
+    }
+
+    #[test]
+    fn normalizes_reasoning_updates_as_reasoning_events() {
+        let message = json!({
+            "method": "item/reasoning/textDelta",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "message": "Thinking..."
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        let AppEvent::ItemReasoning(event) = &events[0] else {
+            panic!("expected item reasoning event");
+        };
+        assert_eq!(event.method, "item/reasoning/textDelta");
+        assert_eq!(event.title, "Item Reasoning TextDelta");
+    }
+
+    #[test]
+    fn normalizes_server_request_resolved_as_server_request_event() {
+        let message = json!({
+            "method": "serverRequest/resolved",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1"
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        let AppEvent::ServerRequestResolved(event) = &events[0] else {
+            panic!("expected server request resolved event");
+        };
+        assert_eq!(event.method, "serverRequest/resolved");
+        assert_eq!(event.title, "ServerRequest Resolved");
+    }
+
+    #[test]
+    fn normalizes_mcp_tool_call_progress_as_mcp_tool_call_progress_event() {
+        let message = json!({
+            "method": "item/mcpToolCall/progress",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "message": "Connecting"
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        let AppEvent::McpToolCallProgress(event) = &events[0] else {
+            panic!("expected mcp tool call progress event");
+        };
+        assert_eq!(event.method, "item/mcpToolCall/progress");
+        assert_eq!(event.title, "Item McpToolCall Progress");
+    }
+
+    #[test]
+    fn normalizes_thread_realtime_events_as_thread_realtime_event() {
+        let message = json!({
+            "method": "thread/realtime/update",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "message": "streaming"
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        let AppEvent::ThreadRealtimeEvent(event) = &events[0] else {
+            panic!("expected thread realtime event");
+        };
+        assert_eq!(event.method, "thread/realtime/update");
+        assert_eq!(event.title, "Thread Realtime Update");
+    }
+
+    #[test]
     fn builds_error_response_for_unsupported_codex_server_request() {
         let message = json!({
             "id": "tool-call-1",
@@ -3428,6 +3973,137 @@ mod tests {
                 ApprovalDecision::Accept
             ),
             json!({"permissions": {"fileSystem": null, "network": null}, "scope": "turn"})
+        );
+        assert_eq!(
+            approval_response_for_decision(
+                CodexApprovalKind::LegacyExecCommand,
+                ApprovalDecision::Accept
+            ),
+            json!({"decision": "approved"})
+        );
+        assert_eq!(
+            approval_response_for_decision(
+                CodexApprovalKind::LegacyApplyPatch,
+                ApprovalDecision::Decline
+            ),
+            json!({"decision": "denied"})
+        );
+    }
+
+    #[test]
+    fn normalizes_legacy_exec_command_approval_fixture() {
+        let msg = json!({
+            "method": "execCommandApproval",
+            "id": "req-legacy-exec",
+            "params": {
+                "conversationId": "conv-1",
+                "callId": "call-1",
+                "command": ["echo", "legacy"],
+                "cwd": "/tmp/ws",
+                "reason": "verify mapping"
+            }
+        });
+        let Some((_, _, codex_kind, AppEvent::ApprovalRequested(req))) =
+            normalize_codex_approval_request(SessionId::nil(), &msg, None)
+        else {
+            panic!("expected legacy exec approval mapping");
+        };
+        assert_eq!(codex_kind, CodexApprovalKind::LegacyExecCommand);
+        let details = req.details.expect("legacy exec details");
+        assert!(details.contains("echo legacy"));
+        assert!(details.contains("/tmp/ws"));
+    }
+
+    #[test]
+    fn normalizes_legacy_apply_patch_approval_fixture() {
+        let msg = json!({
+            "method": "applyPatchApproval",
+            "id": 991,
+            "params": {
+                "conversationId": "conv-1",
+                "callId": "call-42",
+                "fileChanges": {
+                    "/proj/a.rs": {},
+                    "/proj/b.rs": {}
+                },
+                "reason": "touch two files"
+            }
+        });
+        let Some((_, _, codex_kind, AppEvent::ApprovalRequested(req))) =
+            normalize_codex_approval_request(SessionId::nil(), &msg, None)
+        else {
+            panic!("expected legacy patch approval mapping");
+        };
+        assert_eq!(codex_kind, CodexApprovalKind::LegacyApplyPatch);
+        let details = req.details.expect("legacy patch details");
+        assert!(details.contains("a.rs"));
+        assert!(details.contains("b.rs"));
+    }
+
+    #[test]
+    fn codex_jsonrpc_request_ids_equal_accepts_numbers_and_numeric_strings() {
+        let id = CodexRequestId::numeric(4);
+        assert!(codex_jsonrpc_request_ids_equal(Some(&json!(4)), &id));
+        assert!(codex_jsonrpc_request_ids_equal(Some(&json!("4")), &id));
+        assert!(!codex_jsonrpc_request_ids_equal(Some(&json!("5")), &id));
+
+        let string_id = CodexRequestId::String("tool-call-1".to_owned());
+        assert!(codex_jsonrpc_request_ids_equal(
+            Some(&json!("tool-call-1")),
+            &string_id
+        ));
+        assert!(!codex_jsonrpc_request_ids_equal(
+            Some(&json!("other-tool-call")),
+            &string_id
+        ));
+    }
+
+    #[test]
+    fn codex_rpc_classifies_responses_and_server_requests() {
+        let id = CodexRequestId::numeric(2);
+        assert!(codex_rpc_is_response_matching_request(
+            &json!({"id": 2, "result": {}}),
+            &id
+        ));
+        assert!(!codex_rpc_is_codex_server_to_client_request(
+            &json!({"id": 2, "result": {}})
+        ));
+        assert!(unsupported_codex_server_request(&json!({"id": 2, "result": {}})).is_none());
+        assert!(codex_rpc_is_codex_server_to_client_request(
+            &json!({"id": 2, "method": "item/tool/requestUserInput", "params": {}})
+        ));
+        assert!(codex_rpc_is_codex_server_to_client_response(
+            &json!({"id": "2", "result": {"ok": true}})
+        ));
+        assert_eq!(codex_jsonrpc_request_id_summary(&json!({"id": 12})), "12");
+        assert_eq!(
+            codex_jsonrpc_request_id_summary(&json!({"id": "turn-1"})),
+            "turn-1"
+        );
+        assert_eq!(
+            codex_jsonrpc_request_id_summary(&json!({"id": null})),
+            "null"
+        );
+        assert_eq!(codex_jsonrpc_request_id_summary(&json!({})), "<missing id>");
+    }
+
+    #[test]
+    fn scope_allows_thread_notifications_without_turn_id_when_turn_scope_is_known() {
+        let target = CodexTurnScope {
+            thread_id: Some("thread-1".to_owned()),
+            turn_id: Some("turn-1".to_owned()),
+        };
+        let thread_only = json!({
+            "method": "thread/status/changed",
+            "params": {
+                "threadId": "thread-1",
+                "status": {"type": "active"}
+            }
+        });
+
+        assert_eq!(
+            normalize_codex_message_for_scope(SessionId::nil(), &thread_only, &target).len(),
+            2
         );
     }
 
