@@ -138,11 +138,15 @@
   onMount(() => {
     mounted = true;
     activeSessionId = sessionId;
+    window.addEventListener('pointerdown', closeComposerMenuOnOutsideClick);
+    window.addEventListener('keydown', closeComposerMenuOnEscape);
     void reloadAndConnect();
   });
 
   onDestroy(() => {
     closedByRoute = true;
+    window.removeEventListener('pointerdown', closeComposerMenuOnOutsideClick);
+    window.removeEventListener('keydown', closeComposerMenuOnEscape);
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
     }
@@ -151,6 +155,7 @@
 
   async function reloadAndConnect() {
     const generation = ++connectionGeneration;
+    openComposerMenu = null;
     socket?.close();
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
@@ -305,6 +310,27 @@
       }
       slashCommands = [];
       pushToast({ severity: 'warning', message: 'Slash commands are unavailable.' });
+    }
+  }
+
+  function closeComposerMenu() {
+    openComposerMenu = null;
+  }
+
+  function closeComposerMenuOnOutsideClick(event: PointerEvent) {
+    if (openComposerMenu === null) {
+      return;
+    }
+    const target = event.target as Element | null;
+    if (!target || !target.closest('.composer-chip') && !target.closest('.composer-chip-menu')) {
+      closeComposerMenu();
+    }
+  }
+
+  function closeComposerMenuOnEscape(event: KeyboardEvent) {
+    if (event.key === 'Escape' && openComposerMenu !== null) {
+      event.preventDefault();
+      closeComposerMenu();
     }
   }
 
