@@ -3,11 +3,11 @@
 use std::{collections::HashMap, future::Future, pin::Pin};
 
 use agenter_core::{
-    AgentCapabilities, AgentOptions, AgentProviderId, AppEvent, ApprovalDecision, ApprovalId,
-    ApprovalOption, ApprovalRequest, ApprovalRequestEvent, ApprovalStatus, CapabilitySet,
-    CommandAction, CommandOutputStream, ContentBlock, ContentBlockKind, DiffFile, DiffState,
-    FileChangeEvent, ItemId, ItemRole, ItemState, ItemStatus, NativeRef, PlanSource, PlanState,
-    PlanStatus, ProviderEvent, SessionId, SlashCommandDefinition, SlashCommandRequest,
+    AgentCapabilities, AgentOptions, AgentProviderId, ApprovalDecision, ApprovalId, ApprovalOption,
+    ApprovalRequest, ApprovalRequestEvent, ApprovalStatus, CapabilitySet, CommandAction,
+    CommandOutputStream, ContentBlock, ContentBlockKind, DiffFile, DiffState, FileChangeEvent,
+    ItemId, ItemRole, ItemState, ItemStatus, NativeNotification, NativeRef, NormalizedEvent,
+    PlanSource, PlanState, PlanStatus, SessionId, SlashCommandDefinition, SlashCommandRequest,
     SlashCommandResult, ToolActionProjection, ToolCommandProjection, ToolEvent, ToolMcpProjection,
     ToolProjection, ToolProjectionKind, ToolSubagentOperation, ToolSubagentProjection,
     ToolSubagentStateProjection, TurnId, TurnState, TurnStatus, UniversalCommandEnvelope,
@@ -106,61 +106,135 @@ impl AdapterRuntime {
     ) -> Option<&AdapterProviderRegistration> {
         self.registry.resolve_provider(session_id, provider_id)
     }
-
-    #[must_use]
-    pub fn project_legacy_event(
-        &self,
-        provider_id: AgentProviderId,
-        protocol: impl Into<String>,
-        method: Option<&str>,
-        legacy: AppEvent,
-    ) -> AdapterEvent {
-        AdapterEvent::from_legacy(provider_id, protocol, method, legacy)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AdapterEvent {
     pub universal: AdapterUniversalEvent,
-    pub legacy: Option<AppEvent>,
 }
 
 impl AdapterEvent {
     #[must_use]
-    pub fn from_legacy(
-        provider_id: AgentProviderId,
-        protocol: impl Into<String>,
-        method: Option<&str>,
-        legacy: AppEvent,
+    pub fn new(
+        session_id: Option<SessionId>,
+        turn_id: Option<TurnId>,
+        item_id: Option<ItemId>,
+        source: UniversalEventSource,
+        native: Option<NativeRef>,
+        event: UniversalEventKind,
     ) -> Self {
-        let session_id = app_event_session_id(&legacy);
-        let native = NativeRef {
-            protocol: protocol.into(),
-            method: method.map(str::to_owned),
-            kind: Some(provider_id.to_string()),
-            native_id: app_event_native_id(&legacy),
-            summary: Some(app_event_summary(&legacy)),
-            hash: None,
-            pointer: None,
-        };
-        let (turn_id, item_id, event) = universal_event_from_legacy(&legacy, &native);
-        let universal = AdapterUniversalEvent {
-            session_id,
-            turn_id,
-            item_id,
-            source: UniversalEventSource::Native,
-            native: Some(native),
-            event,
-        };
         Self {
-            universal,
-            legacy: Some(legacy),
+            universal: AdapterUniversalEvent {
+                session_id,
+                turn_id,
+                item_id,
+                source,
+                native,
+                event,
+            },
         }
     }
 
     #[must_use]
-    pub fn legacy_projection(&self) -> Option<&AppEvent> {
-        self.legacy.as_ref()
+    pub fn from_universal(
+        session_id: SessionId,
+        turn_id: Option<TurnId>,
+        item_id: Option<ItemId>,
+        native: Option<NativeRef>,
+        event: UniversalEventKind,
+    ) -> Self {
+        Self::new(
+            Some(session_id),
+            turn_id,
+            item_id,
+            UniversalEventSource::Native,
+            native,
+            event,
+        )
+    }
+
+    #[must_use]
+    pub fn session_status(
+        provider_id: AgentProviderId,
+        protocol: impl Into<String>,
+        method: Option<&str>,
+        session_id: SessionId,
+        status: agenter_core::SessionStatus,
+        reason: Option<String>,
+    ) -> Self {
+        Self::new(
+            Some(session_id),
+            None,
+            None,
+            UniversalEventSource::Native,
+            Some(NativeRef {
+                protocol: protocol.into(),
+                method: method.map(str::to_owned),
+                kind: Some(provider_id.to_string()),
+                native_id: None,
+                summary: Some("session status changed".to_owned()),
+                hash: None,
+                pointer: None,
+            }),
+            UniversalEventKind::SessionStatusChanged { status, reason },
+        )
+    }
+
+    #[must_use]
+    pub fn error(
+        provider_id: AgentProviderId,
+        protocol: impl Into<String>,
+        method: Option<&str>,
+        session_id: SessionId,
+        code: Option<String>,
+        message: String,
+    ) -> Self {
+        Self::new(
+            Some(session_id),
+            None,
+            None,
+            UniversalEventSource::Native,
+            Some(NativeRef {
+                protocol: protocol.into(),
+                method: method.map(str::to_owned),
+                kind: Some(provider_id.to_string()),
+                native_id: None,
+                summary: Some("error reported".to_owned()),
+                hash: None,
+                pointer: None,
+            }),
+            UniversalEventKind::ErrorReported { code, message },
+        )
+    }
+
+    #[must_use]
+    pub fn from_normalized_event(
+        provider_id: AgentProviderId,
+        protocol: impl Into<String>,
+        method: Option<&str>,
+        event: NormalizedEvent,
+    ) -> Self {
+        let session_id = normalized_event_session_id(&event);
+        let native = NativeRef {
+            protocol: protocol.into(),
+            method: method.map(str::to_owned),
+            kind: Some(provider_id.to_string()),
+            native_id: normalized_event_native_id(&event),
+            summary: Some(normalized_event_summary(&event)),
+            hash: None,
+            pointer: None,
+        };
+        let (turn_id, item_id, event) = universal_event_from_normalized(&event, &native);
+        Self {
+            universal: AdapterUniversalEvent {
+                session_id,
+                turn_id,
+                item_id,
+                source: UniversalEventSource::Native,
+                native: Some(native),
+                event,
+            },
+        }
     }
 
     #[must_use]
@@ -211,9 +285,11 @@ impl AdapterEvent {
                 artifact.turn_id = Some(turn_id);
             }
             UniversalEventKind::SessionCreated { .. }
+            | UniversalEventKind::SessionStatusChanged { .. }
             | UniversalEventKind::ContentDelta { .. }
             | UniversalEventKind::ContentCompleted { .. }
             | UniversalEventKind::UsageUpdated { .. }
+            | UniversalEventKind::ErrorReported { .. }
             | UniversalEventKind::NativeUnknown { .. } => {}
         }
         self
@@ -407,32 +483,34 @@ pub fn runner_error(code: impl Into<String>, error: anyhow::Error) -> RunnerErro
 }
 
 #[must_use]
-pub fn legacy_events_to_adapter_events(
+pub fn normalized_events_to_adapter_events(
     provider_id: AgentProviderId,
     protocol: &'static str,
     method: Option<&str>,
-    events: Vec<AppEvent>,
+    events: Vec<NormalizedEvent>,
 ) -> Vec<AdapterEvent> {
     events
         .into_iter()
-        .map(|event| AdapterEvent::from_legacy(provider_id.clone(), protocol, method, event))
+        .map(|event| {
+            AdapterEvent::from_normalized_event(provider_id.clone(), protocol, method, event)
+        })
         .collect()
 }
 
-fn universal_event_from_legacy(
-    event: &AppEvent,
+fn universal_event_from_normalized(
+    event: &NormalizedEvent,
     native: &NativeRef,
 ) -> (Option<TurnId>, Option<ItemId>, UniversalEventKind) {
     match event {
-        AppEvent::SessionStarted(info) => (
+        NormalizedEvent::SessionStarted(info) => (
             None,
             None,
             UniversalEventKind::SessionCreated {
                 session: Box::new(info.clone()),
             },
         ),
-        AppEvent::AgentMessageDelta(event) => {
-            let turn_id = turn_id_from_legacy_payload(event.provider_payload.as_ref())
+        NormalizedEvent::AgentMessageDelta(event) => {
+            let turn_id = turn_id_from_provider_payload(event.provider_payload.as_ref())
                 .or_else(|| native.native_id.as_deref().map(stable_turn_id));
             let item_id = Some(stable_item_id(&format!(
                 "assistant:{}:{}",
@@ -448,10 +526,10 @@ fn universal_event_from_legacy(
                 },
             )
         }
-        AppEvent::AgentMessageCompleted(event) => {
-            let turn_id = turn_id_from_legacy_payload(event.provider_payload.as_ref())
+        NormalizedEvent::AgentMessageCompleted(event) => {
+            let turn_id = turn_id_from_provider_payload(event.provider_payload.as_ref())
                 .or_else(|| native.native_id.as_deref().map(stable_turn_id));
-            if legacy_method(event.provider_payload.as_ref()) == Some("turn/completed") {
+            if provider_method(event.provider_payload.as_ref()) == Some("turn/completed") {
                 let turn_id = turn_id.unwrap_or_else(|| stable_turn_id(&event.message_id));
                 return (
                     Some(turn_id),
@@ -475,12 +553,12 @@ fn universal_event_from_legacy(
                 },
             )
         }
-        AppEvent::PlanUpdated(event) => {
+        NormalizedEvent::PlanUpdated(event) => {
             let turn_id = event
                 .plan_id
                 .as_deref()
                 .map(stable_turn_id)
-                .or_else(|| turn_id_from_legacy_payload(event.provider_payload.as_ref()));
+                .or_else(|| turn_id_from_provider_payload(event.provider_payload.as_ref()));
             let plan_id = stable_plan_id(&format!(
                 "plan:{}:{}",
                 event.session_id,
@@ -517,21 +595,21 @@ fn universal_event_from_legacy(
                 },
             )
         }
-        AppEvent::ToolStarted(event)
-        | AppEvent::ToolUpdated(event)
-        | AppEvent::ToolCompleted(event)
+        NormalizedEvent::ToolStarted(event)
+        | NormalizedEvent::ToolUpdated(event)
+        | NormalizedEvent::ToolCompleted(event)
             if is_todo_tool(event) && has_todo_plan_entries(event) =>
         {
             let plan_id =
                 stable_plan_id(&format!("todo:{}:{}", event.session_id, event.tool_call_id));
             (
-                turn_id_from_legacy_payload(event.provider_payload.as_ref()),
+                turn_id_from_provider_payload(event.provider_payload.as_ref()),
                 None,
                 UniversalEventKind::PlanUpdated {
                     plan: PlanState {
                         plan_id,
                         session_id: event.session_id,
-                        turn_id: turn_id_from_legacy_payload(event.provider_payload.as_ref()),
+                        turn_id: turn_id_from_provider_payload(event.provider_payload.as_ref()),
                         status: todo_plan_status(event),
                         title: event.title.clone().or_else(|| Some("Todo plan".to_owned())),
                         content: None,
@@ -544,11 +622,11 @@ fn universal_event_from_legacy(
                 },
             )
         }
-        AppEvent::ToolStarted(event) | AppEvent::ToolUpdated(event) => {
+        NormalizedEvent::ToolStarted(event) | NormalizedEvent::ToolUpdated(event) => {
             let item_id =
                 stable_item_id(&format!("tool:{}:{}", event.session_id, event.tool_call_id));
             (
-                turn_id_from_legacy_payload(event.provider_payload.as_ref()),
+                turn_id_from_provider_payload(event.provider_payload.as_ref()),
                 Some(item_id),
                 UniversalEventKind::ItemCreated {
                     item: Box::new(tool_item(
@@ -560,11 +638,11 @@ fn universal_event_from_legacy(
                 },
             )
         }
-        AppEvent::ToolCompleted(event) => {
+        NormalizedEvent::ToolCompleted(event) => {
             let item_id =
                 stable_item_id(&format!("tool:{}:{}", event.session_id, event.tool_call_id));
             (
-                turn_id_from_legacy_payload(event.provider_payload.as_ref()),
+                turn_id_from_provider_payload(event.provider_payload.as_ref()),
                 Some(item_id),
                 UniversalEventKind::ItemCreated {
                     item: Box::new(tool_item(
@@ -576,8 +654,8 @@ fn universal_event_from_legacy(
                 },
             )
         }
-        AppEvent::CommandStarted(event) => {
-            let turn_id = turn_id_from_legacy_payload(event.provider_payload.as_ref());
+        NormalizedEvent::CommandStarted(event) => {
+            let turn_id = turn_id_from_provider_payload(event.provider_payload.as_ref());
             let item_id = stable_item_id(&format!(
                 "command:{}:{}",
                 event.session_id, event.command_id
@@ -605,8 +683,8 @@ fn universal_event_from_legacy(
                 },
             )
         }
-        AppEvent::CommandOutputDelta(event) => {
-            let turn_id = turn_id_from_legacy_payload(event.provider_payload.as_ref());
+        NormalizedEvent::CommandOutputDelta(event) => {
+            let turn_id = turn_id_from_provider_payload(event.provider_payload.as_ref());
             let item_id = stable_item_id(&format!(
                 "command:{}:{}",
                 event.session_id, event.command_id
@@ -621,8 +699,8 @@ fn universal_event_from_legacy(
                 },
             )
         }
-        AppEvent::CommandCompleted(event) => {
-            let turn_id = turn_id_from_legacy_payload(event.provider_payload.as_ref());
+        NormalizedEvent::CommandCompleted(event) => {
+            let turn_id = turn_id_from_provider_payload(event.provider_payload.as_ref());
             let item_id = stable_item_id(&format!(
                 "command:{}:{}",
                 event.session_id, event.command_id
@@ -641,10 +719,10 @@ fn universal_event_from_legacy(
                 },
             )
         }
-        AppEvent::FileChangeProposed(event)
-        | AppEvent::FileChangeApplied(event)
-        | AppEvent::FileChangeRejected(event) => {
-            let turn_id = turn_id_from_legacy_payload(event.provider_payload.as_ref());
+        NormalizedEvent::FileChangeProposed(event)
+        | NormalizedEvent::FileChangeApplied(event)
+        | NormalizedEvent::FileChangeRejected(event) => {
+            let turn_id = turn_id_from_provider_payload(event.provider_payload.as_ref());
             (
                 turn_id,
                 None,
@@ -653,15 +731,15 @@ fn universal_event_from_legacy(
                 },
             )
         }
-        AppEvent::ApprovalRequested(event) => (
-            turn_id_from_legacy_payload(event.provider_payload.as_ref()),
+        NormalizedEvent::ApprovalRequested(event) => (
+            turn_id_from_provider_payload(event.provider_payload.as_ref()),
             None,
             UniversalEventKind::ApprovalRequested {
                 approval: Box::new(approval_request(event, native.clone())),
             },
         ),
-        AppEvent::TurnDiffUpdated(event) => {
-            let turn_id = turn_id_from_legacy_payload(event.provider_payload.as_ref())
+        NormalizedEvent::TurnDiffUpdated(event) => {
+            let turn_id = turn_id_from_provider_payload(event.provider_payload.as_ref())
                 .or_else(|| event.event_id.as_deref().map(stable_turn_id));
             (
                 turn_id,
@@ -671,8 +749,8 @@ fn universal_event_from_legacy(
                 },
             )
         }
-        AppEvent::ItemReasoning(event) => {
-            let turn_id = turn_id_from_legacy_payload(event.provider_payload.as_ref())
+        NormalizedEvent::ItemReasoning(event) => {
+            let turn_id = turn_id_from_provider_payload(event.provider_payload.as_ref())
                 .or_else(|| event.event_id.as_deref().map(stable_turn_id));
             let item_key = event.event_id.as_deref().unwrap_or("reasoning");
             let item_id = stable_item_id(&format!("reasoning:{}:{item_key}", event.session_id));
@@ -686,7 +764,7 @@ fn universal_event_from_legacy(
                 },
             )
         }
-        AppEvent::ProviderEvent(event) if event.method == "turn/started" => {
+        NormalizedEvent::NativeNotification(event) if event.method == "turn/started" => {
             let turn_id = event
                 .event_id
                 .as_deref()
@@ -700,8 +778,8 @@ fn universal_event_from_legacy(
                 },
             )
         }
-        AppEvent::ProviderEvent(event) if event.category == "compaction" => {
-            let turn_id = turn_id_from_legacy_payload(event.provider_payload.as_ref())
+        NormalizedEvent::NativeNotification(event) if event.category == "compaction" => {
+            let turn_id = turn_id_from_provider_payload(event.provider_payload.as_ref())
                 .or_else(|| event.event_id.as_deref().map(stable_turn_id));
             let item_id = stable_item_id(&format!(
                 "compaction:{}:{}",
@@ -731,8 +809,8 @@ fn universal_event_from_legacy(
                 },
             )
         }
-        AppEvent::McpToolCallProgress(event) => {
-            let turn_id = turn_id_from_legacy_payload(event.provider_payload.as_ref())
+        NormalizedEvent::McpToolCallProgress(event) => {
+            let turn_id = turn_id_from_provider_payload(event.provider_payload.as_ref())
                 .or_else(|| event.event_id.as_deref().map(stable_turn_id));
             let item_id = stable_item_id(&format!(
                 "native-tool:{}:{}",
@@ -762,7 +840,7 @@ fn universal_event_from_legacy(
                 },
             )
         }
-        AppEvent::Error(event) if event.session_id.is_some() => (
+        NormalizedEvent::Error(event) if event.session_id.is_some() => (
             None,
             None,
             UniversalEventKind::TurnFailed {
@@ -781,7 +859,7 @@ fn universal_event_from_legacy(
             None,
             None,
             UniversalEventKind::NativeUnknown {
-                summary: Some(app_event_summary(event)),
+                summary: Some(normalized_event_summary(event)),
             },
         ),
     }
@@ -824,7 +902,7 @@ fn stable_diff_id(value: &str) -> agenter_core::DiffId {
     agenter_core::DiffId::from_uuid(stable_uuid("diff", value))
 }
 
-fn turn_id_from_legacy_payload(payload: Option<&Value>) -> Option<TurnId> {
+fn turn_id_from_provider_payload(payload: Option<&Value>) -> Option<TurnId> {
     let payload = payload?;
     string_at_value(
         payload,
@@ -841,7 +919,7 @@ fn turn_id_from_legacy_payload(payload: Option<&Value>) -> Option<TurnId> {
     .map(stable_turn_id)
 }
 
-fn legacy_method(payload: Option<&Value>) -> Option<&str> {
+fn provider_method(payload: Option<&Value>) -> Option<&str> {
     payload
         .and_then(|payload| payload.get("method"))
         .and_then(Value::as_str)
@@ -881,7 +959,7 @@ fn tool_item(
     ItemState {
         item_id,
         session_id: event.session_id,
-        turn_id: turn_id_from_legacy_payload(event.provider_payload.as_ref()),
+        turn_id: turn_id_from_provider_payload(event.provider_payload.as_ref()),
         role: ItemRole::Tool,
         status: status.clone(),
         content: vec![ContentBlock {
@@ -955,7 +1033,7 @@ fn tool_projection(event: &ToolEvent, status: ItemStatus) -> ToolProjection {
     }
 }
 
-fn provider_tool_projection(event: &ProviderEvent) -> ToolProjection {
+fn provider_tool_projection(event: &NativeNotification) -> ToolProjection {
     ToolProjection {
         kind: ToolProjectionKind::Mcp,
         name: event.title.clone(),
@@ -1145,7 +1223,7 @@ fn file_change_diff(event: &FileChangeEvent, turn_id: Option<TurnId>) -> DiffSta
     }
 }
 
-fn provider_diff(event: &ProviderEvent, turn_id: Option<TurnId>) -> DiffState {
+fn provider_diff(event: &NativeNotification, turn_id: Option<TurnId>) -> DiffState {
     DiffState {
         diff_id: stable_diff_id(&format!(
             "provider:{}:{}",
@@ -1164,7 +1242,7 @@ fn approval_request(event: &ApprovalRequestEvent, native: NativeRef) -> Approval
     ApprovalRequest {
         approval_id: event.approval_id,
         session_id: event.session_id,
-        turn_id: turn_id_from_legacy_payload(event.provider_payload.as_ref()),
+        turn_id: turn_id_from_provider_payload(event.provider_payload.as_ref()),
         item_id: None,
         kind: event.kind.clone(),
         title: event.title.clone(),
@@ -1191,7 +1269,7 @@ fn approval_request(event: &ApprovalRequestEvent, native: NativeRef) -> Approval
     }
 }
 
-fn provider_item_status(event: &ProviderEvent) -> ItemStatus {
+fn provider_item_status(event: &NativeNotification) -> ItemStatus {
     match event.status.as_deref() {
         Some("completed" | "complete" | "done" | "success") => ItemStatus::Completed,
         Some("failed" | "error") => ItemStatus::Failed,
@@ -1357,90 +1435,90 @@ fn string_array_at_value(value: &Value, pointer: &str) -> Vec<String> {
         .collect()
 }
 
-fn app_event_session_id(event: &AppEvent) -> Option<SessionId> {
+fn normalized_event_session_id(event: &NormalizedEvent) -> Option<SessionId> {
     match event {
-        AppEvent::SessionStarted(info) => Some(info.session_id),
-        AppEvent::SessionStatusChanged(event) => Some(event.session_id),
-        AppEvent::UserMessage(event) => Some(event.session_id),
-        AppEvent::AgentMessageDelta(event) => Some(event.session_id),
-        AppEvent::AgentMessageCompleted(event) => Some(event.session_id),
-        AppEvent::PlanUpdated(event) => Some(event.session_id),
-        AppEvent::ToolStarted(event)
-        | AppEvent::ToolUpdated(event)
-        | AppEvent::ToolCompleted(event) => Some(event.session_id),
-        AppEvent::CommandStarted(event) => Some(event.session_id),
-        AppEvent::CommandOutputDelta(event) => Some(event.session_id),
-        AppEvent::CommandCompleted(event) => Some(event.session_id),
-        AppEvent::FileChangeProposed(event)
-        | AppEvent::FileChangeApplied(event)
-        | AppEvent::FileChangeRejected(event) => Some(event.session_id),
-        AppEvent::ApprovalRequested(event) => Some(event.session_id),
-        AppEvent::ApprovalResolved(event) => Some(event.session_id),
-        AppEvent::QuestionRequested(event) => Some(event.session_id),
-        AppEvent::QuestionAnswered(event) => Some(event.session_id),
-        AppEvent::TurnDiffUpdated(event)
-        | AppEvent::ItemReasoning(event)
-        | AppEvent::ServerRequestResolved(event)
-        | AppEvent::McpToolCallProgress(event)
-        | AppEvent::ThreadRealtimeEvent(event)
-        | AppEvent::ProviderEvent(event) => Some(event.session_id),
-        AppEvent::Error(event) => event.session_id,
+        NormalizedEvent::SessionStarted(info) => Some(info.session_id),
+        NormalizedEvent::SessionStatusChanged(event) => Some(event.session_id),
+        NormalizedEvent::UserMessage(event) => Some(event.session_id),
+        NormalizedEvent::AgentMessageDelta(event) => Some(event.session_id),
+        NormalizedEvent::AgentMessageCompleted(event) => Some(event.session_id),
+        NormalizedEvent::PlanUpdated(event) => Some(event.session_id),
+        NormalizedEvent::ToolStarted(event)
+        | NormalizedEvent::ToolUpdated(event)
+        | NormalizedEvent::ToolCompleted(event) => Some(event.session_id),
+        NormalizedEvent::CommandStarted(event) => Some(event.session_id),
+        NormalizedEvent::CommandOutputDelta(event) => Some(event.session_id),
+        NormalizedEvent::CommandCompleted(event) => Some(event.session_id),
+        NormalizedEvent::FileChangeProposed(event)
+        | NormalizedEvent::FileChangeApplied(event)
+        | NormalizedEvent::FileChangeRejected(event) => Some(event.session_id),
+        NormalizedEvent::ApprovalRequested(event) => Some(event.session_id),
+        NormalizedEvent::ApprovalResolved(event) => Some(event.session_id),
+        NormalizedEvent::QuestionRequested(event) => Some(event.session_id),
+        NormalizedEvent::QuestionAnswered(event) => Some(event.session_id),
+        NormalizedEvent::TurnDiffUpdated(event)
+        | NormalizedEvent::ItemReasoning(event)
+        | NormalizedEvent::ServerRequestResolved(event)
+        | NormalizedEvent::McpToolCallProgress(event)
+        | NormalizedEvent::ThreadRealtimeEvent(event)
+        | NormalizedEvent::NativeNotification(event) => Some(event.session_id),
+        NormalizedEvent::Error(event) => event.session_id,
     }
 }
 
-fn app_event_native_id(event: &AppEvent) -> Option<String> {
+fn normalized_event_native_id(event: &NormalizedEvent) -> Option<String> {
     match event {
-        AppEvent::AgentMessageDelta(event) => Some(event.message_id.clone()),
-        AppEvent::AgentMessageCompleted(event) => Some(event.message_id.clone()),
-        AppEvent::PlanUpdated(event) => event.plan_id.clone(),
-        AppEvent::ToolStarted(event)
-        | AppEvent::ToolUpdated(event)
-        | AppEvent::ToolCompleted(event) => Some(event.tool_call_id.clone()),
-        AppEvent::CommandStarted(event) => Some(event.command_id.clone()),
-        AppEvent::CommandOutputDelta(event) => Some(event.command_id.clone()),
-        AppEvent::CommandCompleted(event) => Some(event.command_id.clone()),
-        AppEvent::ApprovalRequested(event) => Some(event.approval_id.to_string()),
-        AppEvent::ApprovalResolved(event) => Some(event.approval_id.to_string()),
-        AppEvent::QuestionRequested(event) => Some(event.question_id.to_string()),
-        AppEvent::QuestionAnswered(event) => Some(event.answer.question_id.to_string()),
-        AppEvent::TurnDiffUpdated(event)
-        | AppEvent::ItemReasoning(event)
-        | AppEvent::ServerRequestResolved(event)
-        | AppEvent::McpToolCallProgress(event)
-        | AppEvent::ThreadRealtimeEvent(event)
-        | AppEvent::ProviderEvent(event) => event.event_id.clone(),
+        NormalizedEvent::AgentMessageDelta(event) => Some(event.message_id.clone()),
+        NormalizedEvent::AgentMessageCompleted(event) => Some(event.message_id.clone()),
+        NormalizedEvent::PlanUpdated(event) => event.plan_id.clone(),
+        NormalizedEvent::ToolStarted(event)
+        | NormalizedEvent::ToolUpdated(event)
+        | NormalizedEvent::ToolCompleted(event) => Some(event.tool_call_id.clone()),
+        NormalizedEvent::CommandStarted(event) => Some(event.command_id.clone()),
+        NormalizedEvent::CommandOutputDelta(event) => Some(event.command_id.clone()),
+        NormalizedEvent::CommandCompleted(event) => Some(event.command_id.clone()),
+        NormalizedEvent::ApprovalRequested(event) => Some(event.approval_id.to_string()),
+        NormalizedEvent::ApprovalResolved(event) => Some(event.approval_id.to_string()),
+        NormalizedEvent::QuestionRequested(event) => Some(event.question_id.to_string()),
+        NormalizedEvent::QuestionAnswered(event) => Some(event.answer.question_id.to_string()),
+        NormalizedEvent::TurnDiffUpdated(event)
+        | NormalizedEvent::ItemReasoning(event)
+        | NormalizedEvent::ServerRequestResolved(event)
+        | NormalizedEvent::McpToolCallProgress(event)
+        | NormalizedEvent::ThreadRealtimeEvent(event)
+        | NormalizedEvent::NativeNotification(event) => event.event_id.clone(),
         _ => None,
     }
 }
 
-fn app_event_summary(event: &AppEvent) -> String {
+fn normalized_event_summary(event: &NormalizedEvent) -> String {
     match event {
-        AppEvent::SessionStarted(_) => "session started",
-        AppEvent::SessionStatusChanged(_) => "session status changed",
-        AppEvent::UserMessage(_) => "user message",
-        AppEvent::AgentMessageDelta(_) => "assistant message delta",
-        AppEvent::AgentMessageCompleted(_) => "assistant message completed",
-        AppEvent::PlanUpdated(_) => "plan updated",
-        AppEvent::ToolStarted(_) => "tool started",
-        AppEvent::ToolUpdated(_) => "tool updated",
-        AppEvent::ToolCompleted(_) => "tool completed",
-        AppEvent::CommandStarted(_) => "command started",
-        AppEvent::CommandOutputDelta(_) => "command output delta",
-        AppEvent::CommandCompleted(_) => "command completed",
-        AppEvent::FileChangeProposed(_) => "file change proposed",
-        AppEvent::FileChangeApplied(_) => "file change applied",
-        AppEvent::FileChangeRejected(_) => "file change rejected",
-        AppEvent::ApprovalRequested(_) => "approval requested",
-        AppEvent::ApprovalResolved(_) => "approval resolved",
-        AppEvent::QuestionRequested(_) => "question requested",
-        AppEvent::QuestionAnswered(_) => "question answered",
-        AppEvent::TurnDiffUpdated(_) => "turn diff updated",
-        AppEvent::ItemReasoning(_) => "item reasoning",
-        AppEvent::ServerRequestResolved(_) => "server request resolved",
-        AppEvent::McpToolCallProgress(_) => "mcp tool call progress",
-        AppEvent::ThreadRealtimeEvent(_) => "thread realtime event",
-        AppEvent::ProviderEvent(_) => "provider event",
-        AppEvent::Error(_) => "error",
+        NormalizedEvent::SessionStarted(_) => "session started",
+        NormalizedEvent::SessionStatusChanged(_) => "session status changed",
+        NormalizedEvent::UserMessage(_) => "user message",
+        NormalizedEvent::AgentMessageDelta(_) => "assistant message delta",
+        NormalizedEvent::AgentMessageCompleted(_) => "assistant message completed",
+        NormalizedEvent::PlanUpdated(_) => "plan updated",
+        NormalizedEvent::ToolStarted(_) => "tool started",
+        NormalizedEvent::ToolUpdated(_) => "tool updated",
+        NormalizedEvent::ToolCompleted(_) => "tool completed",
+        NormalizedEvent::CommandStarted(_) => "command started",
+        NormalizedEvent::CommandOutputDelta(_) => "command output delta",
+        NormalizedEvent::CommandCompleted(_) => "command completed",
+        NormalizedEvent::FileChangeProposed(_) => "file change proposed",
+        NormalizedEvent::FileChangeApplied(_) => "file change applied",
+        NormalizedEvent::FileChangeRejected(_) => "file change rejected",
+        NormalizedEvent::ApprovalRequested(_) => "approval requested",
+        NormalizedEvent::ApprovalResolved(_) => "approval resolved",
+        NormalizedEvent::QuestionRequested(_) => "question requested",
+        NormalizedEvent::QuestionAnswered(_) => "question answered",
+        NormalizedEvent::TurnDiffUpdated(_) => "turn diff updated",
+        NormalizedEvent::ItemReasoning(_) => "item reasoning",
+        NormalizedEvent::ServerRequestResolved(_) => "server request resolved",
+        NormalizedEvent::McpToolCallProgress(_) => "mcp tool call progress",
+        NormalizedEvent::ThreadRealtimeEvent(_) => "thread realtime event",
+        NormalizedEvent::NativeNotification(_) => "native notification",
+        NormalizedEvent::Error(_) => "error",
     }
     .to_owned()
 }
@@ -1448,8 +1526,8 @@ fn app_event_summary(event: &AppEvent) -> String {
 #[cfg(test)]
 mod tests {
     use agenter_core::{
-        AgentCapabilities, AgentErrorEvent, AgentMessageDeltaEvent, AgentProviderId, AppEvent,
-        CapabilitySet, CommandAction, CommandEvent, PlanEntry, PlanEntryStatus, PlanEvent,
+        AgentCapabilities, AgentErrorEvent, AgentMessageDeltaEvent, AgentProviderId, CapabilitySet,
+        CommandAction, CommandEvent, NormalizedEvent, PlanEntry, PlanEntryStatus, PlanEvent,
         PlanSource, PlanStatus, SessionId, ToolEvent, UniversalEventKind,
     };
 
@@ -1497,23 +1575,22 @@ mod tests {
     }
 
     #[test]
-    fn adapter_event_preserves_legacy_projection_and_adds_universal_content_delta() {
+    fn adapter_event_adds_universal_content_delta() {
         let session_id = SessionId::nil();
-        let legacy = AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {
+        let source = NormalizedEvent::AgentMessageDelta(AgentMessageDeltaEvent {
             session_id,
             message_id: "message-1".to_owned(),
             delta: "hello".to_owned(),
             provider_payload: Some(serde_json::json!({"raw": "do-not-copy"})),
         });
 
-        let event = super::AdapterEvent::from_legacy(
+        let event = super::AdapterEvent::from_normalized_event(
             AgentProviderId::from(AgentProviderId::CODEX),
             "codex-app-server",
             Some("agentMessage/delta"),
-            legacy.clone(),
+            source.clone(),
         );
 
-        assert_eq!(event.legacy_projection(), Some(&legacy));
         let wal_event = event.universal_projection_for_wal().expect("wal event");
         assert_eq!(wal_event.session_id, session_id);
         assert!(matches!(
@@ -1545,7 +1622,7 @@ mod tests {
     #[test]
     fn command_projection_serializes_semantic_tool_metadata() {
         let session_id = SessionId::new();
-        let legacy = AppEvent::CommandStarted(CommandEvent {
+        let source = NormalizedEvent::CommandStarted(CommandEvent {
             session_id,
             command_id: "cmd-1".to_owned(),
             command: "cargo test".to_owned(),
@@ -1563,11 +1640,11 @@ mod tests {
             provider_payload: Some(serde_json::json!({"raw": "do-not-copy"})),
         });
 
-        let event = super::AdapterEvent::from_legacy(
+        let event = super::AdapterEvent::from_normalized_event(
             AgentProviderId::from(AgentProviderId::CODEX),
             "codex-app-server",
             Some("item/started"),
-            legacy,
+            source,
         );
 
         let UniversalEventKind::ItemCreated { item } = &event.universal.event else {
@@ -1589,7 +1666,7 @@ mod tests {
     #[test]
     fn codex_collab_tool_projection_serializes_subagent_metadata() {
         let session_id = SessionId::new();
-        let legacy = AppEvent::ToolCompleted(ToolEvent {
+        let source = NormalizedEvent::ToolCompleted(ToolEvent {
             session_id,
             tool_call_id: "tool-1".to_owned(),
             name: "spawnAgent".to_owned(),
@@ -1607,11 +1684,11 @@ mod tests {
             })),
         });
 
-        let event = super::AdapterEvent::from_legacy(
+        let event = super::AdapterEvent::from_normalized_event(
             AgentProviderId::from(AgentProviderId::CODEX),
             "codex-app-server",
             Some("item/completed"),
-            legacy,
+            source,
         );
 
         let UniversalEventKind::ItemCreated { item } = &event.universal.event else {
@@ -1629,7 +1706,7 @@ mod tests {
     #[test]
     fn codex_mcp_tool_projection_serializes_safe_tool_metadata() {
         let session_id = SessionId::new();
-        let legacy = AppEvent::ToolCompleted(ToolEvent {
+        let source = NormalizedEvent::ToolCompleted(ToolEvent {
             session_id,
             tool_call_id: "mcp-1".to_owned(),
             name: "read_file".to_owned(),
@@ -1651,11 +1728,11 @@ mod tests {
             })),
         });
 
-        let event = super::AdapterEvent::from_legacy(
+        let event = super::AdapterEvent::from_normalized_event(
             AgentProviderId::from(AgentProviderId::CODEX),
             "codex-app-server",
             Some("item/completed"),
-            legacy,
+            source,
         );
 
         let UniversalEventKind::ItemCreated { item } = &event.universal.event else {
@@ -1674,19 +1751,19 @@ mod tests {
     }
 
     #[test]
-    fn adapter_event_does_not_fabricate_nil_session_for_sessionless_legacy_event() {
-        let legacy = AppEvent::Error(AgentErrorEvent {
+    fn adapter_event_does_not_fabricate_nil_session_for_sessionless_normalized_event() {
+        let source = NormalizedEvent::Error(AgentErrorEvent {
             session_id: None,
             code: Some("runner_error".to_owned()),
             message: "provider failed before session binding".to_owned(),
             provider_payload: Some(serde_json::json!({"raw": "do-not-copy"})),
         });
 
-        let event = super::AdapterEvent::from_legacy(
+        let event = super::AdapterEvent::from_normalized_event(
             AgentProviderId::from(AgentProviderId::QWEN),
             "acp-stdio",
             Some("session/update"),
-            legacy,
+            source,
         );
 
         assert_eq!(event.universal.session_id, None);
@@ -1699,7 +1776,7 @@ mod tests {
     #[test]
     fn plan_update_uses_native_status_and_partial_marker() {
         let session_id = SessionId::new();
-        let legacy = AppEvent::PlanUpdated(PlanEvent {
+        let source = NormalizedEvent::PlanUpdated(PlanEvent {
             session_id,
             plan_id: Some("turn-1".to_owned()),
             title: Some("Implementation plan".to_owned()),
@@ -1720,11 +1797,11 @@ mod tests {
             })),
         });
 
-        let event = super::AdapterEvent::from_legacy(
+        let event = super::AdapterEvent::from_normalized_event(
             AgentProviderId::from(AgentProviderId::GEMINI),
             "acp-stdio",
             Some("session/update"),
-            legacy,
+            source,
         );
 
         let UniversalEventKind::PlanUpdated { plan } = &event.universal.event else {
@@ -1740,7 +1817,7 @@ mod tests {
     #[test]
     fn opencode_todowrite_tool_output_becomes_synthetic_plan_state() {
         let session_id = SessionId::new();
-        let legacy = AppEvent::ToolCompleted(ToolEvent {
+        let source = NormalizedEvent::ToolCompleted(ToolEvent {
             session_id,
             tool_call_id: "todo-1".to_owned(),
             name: "todowrite".to_owned(),
@@ -1762,17 +1839,13 @@ mod tests {
             })),
         });
 
-        let event = super::AdapterEvent::from_legacy(
+        let event = super::AdapterEvent::from_normalized_event(
             AgentProviderId::from(AgentProviderId::OPENCODE),
             "acp-stdio",
             Some("session/update"),
-            legacy,
+            source,
         );
 
-        assert!(matches!(
-            event.legacy_projection(),
-            Some(AppEvent::ToolCompleted(_))
-        ));
         let UniversalEventKind::PlanUpdated { plan } = &event.universal.event else {
             panic!("expected plan update");
         };
@@ -1786,7 +1859,7 @@ mod tests {
     #[test]
     fn todowrite_without_structured_todos_stays_tool_projection() {
         let session_id = SessionId::new();
-        let legacy = AppEvent::ToolCompleted(ToolEvent {
+        let source = NormalizedEvent::ToolCompleted(ToolEvent {
             session_id,
             tool_call_id: "todo-1".to_owned(),
             name: "todowrite".to_owned(),
@@ -1803,11 +1876,11 @@ mod tests {
             })),
         });
 
-        let event = super::AdapterEvent::from_legacy(
+        let event = super::AdapterEvent::from_normalized_event(
             AgentProviderId::from(AgentProviderId::OPENCODE),
             "acp-stdio",
             Some("session/update"),
-            legacy,
+            source,
         );
 
         assert!(matches!(

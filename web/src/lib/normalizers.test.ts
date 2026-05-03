@@ -4,7 +4,6 @@ import {
   defaultReasoningEfforts,
   effortsForSelectedModel,
   normalizeAgentOptions,
-  normalizeBrowserEventEnvelope,
   normalizeRunners,
   normalizeSessions,
   normalizeTurnSettings,
@@ -130,26 +129,9 @@ describe('frontend API normalizers', () => {
     ).toEqual(['idle', 'stopped']);
   });
 
-  test('normalizes turn settings and browser event envelopes defensively', () => {
+  test('normalizes turn settings defensively', () => {
     expect(normalizeTurnSettings({ model: 123, reasoning_effort: 'mega', collaboration_mode: 'plan' })).toEqual({
       collaboration_mode: 'plan'
-    });
-
-    const envelope = normalizeBrowserEventEnvelope({
-      type: 'app_event',
-      event_id: 5,
-      event: {
-        type: 'agent_message_delta',
-        payload: null
-      }
-    });
-
-    expect(envelope).toEqual({
-      type: 'app_event',
-      event: {
-        type: 'agent_message_delta',
-        payload: {}
-      }
     });
   });
 });

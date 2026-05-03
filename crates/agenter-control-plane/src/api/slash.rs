@@ -566,7 +566,7 @@ async fn create_session_from_slash(
     state
         .publish_event(
             info.session_id,
-            agenter_core::AppEvent::SessionStarted(info.clone()),
+            agenter_core::NormalizedEvent::SessionStarted(info.clone()),
         )
         .await;
     let result = agenter_core::SlashCommandResult {
@@ -607,10 +607,7 @@ fn slash_command_envelope(
             .universal_command_id
             .unwrap_or_else(agenter_core::CommandId::new),
         idempotency_key: request.idempotency_key.clone().unwrap_or_else(|| {
-            format!(
-                "legacy:slash:{user_id}:{session_id}:{}",
-                uuid::Uuid::new_v4()
-            )
+            format!("uap:slash:{user_id}:{session_id}:{}", uuid::Uuid::new_v4())
         }),
         session_id: Some(session_id),
         turn_id: None,
@@ -874,7 +871,7 @@ async fn execute_provider_slash_command(
                     state
                         .publish_event(
                             session.session_id,
-                            agenter_core::AppEvent::SessionStatusChanged(
+                            agenter_core::NormalizedEvent::SessionStatusChanged(
                                 agenter_core::SessionStatusChangedEvent {
                                     session_id: session.session_id,
                                     status,
@@ -1014,7 +1011,7 @@ async fn publish_slash_user_echo(
     state
         .publish_event(
             session_id,
-            agenter_core::AppEvent::UserMessage(agenter_core::UserMessageEvent {
+            agenter_core::NormalizedEvent::UserMessage(agenter_core::UserMessageEvent {
                 session_id,
                 message_id: Some(uuid::Uuid::new_v4().to_string()),
                 author_user_id: Some(user_id),
@@ -1046,7 +1043,7 @@ async fn publish_slash_result_event(
     state
         .publish_event(
             session_id,
-            agenter_core::AppEvent::ProviderEvent(agenter_core::ProviderEvent {
+            agenter_core::NormalizedEvent::NativeNotification(agenter_core::NativeNotification {
                 session_id,
                 provider_id: definition
                     .provider_id
@@ -1123,7 +1120,7 @@ async fn register_forked_session_from_provider_result(
     state
         .publish_event(
             info.session_id,
-            agenter_core::AppEvent::SessionStarted(info.clone()),
+            agenter_core::NormalizedEvent::SessionStarted(info.clone()),
         )
         .await;
     Some(info)

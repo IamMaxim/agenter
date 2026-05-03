@@ -7,6 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::agents::adapter::AdapterEvent;
 use crate::agents::approval_state::PendingProviderApproval;
 use crate::agents::codex_approval_context::{
     presentation_for_command_execution_approval, sparse_file_change_fallback_details,
@@ -15,13 +16,13 @@ use crate::agents::codex_approval_context::{
 use agenter_core::{
     AgentCollaborationMode, AgentErrorEvent, AgentMessageDeltaEvent, AgentModelOption,
     AgentOptions, AgentProviderId, AgentQuestionAnswer, AgentQuestionChoice, AgentQuestionField,
-    AgentReasoningEffort, AgentTurnSettings, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind,
+    AgentReasoningEffort, AgentTurnSettings, ApprovalDecision, ApprovalId, ApprovalKind,
     ApprovalRequestEvent, CommandCompletedEvent, CommandEvent, CommandOutputEvent,
-    CommandOutputStream, FileChangeEvent, FileChangeKind, MessageCompletedEvent, PlanEntry,
-    PlanEntryStatus, PlanEvent, ProviderEvent, QuestionId, QuestionRequestedEvent, SessionId,
-    SessionStatus, SessionStatusChangedEvent, SlashCommandArgument, SlashCommandArgumentKind,
-    SlashCommandDangerLevel, SlashCommandDefinition, SlashCommandRequest, SlashCommandResult,
-    SlashCommandTarget,
+    CommandOutputStream, FileChangeEvent, FileChangeKind, MessageCompletedEvent,
+    NativeNotification, NormalizedEvent, PlanEntry, PlanEntryStatus, PlanEvent, QuestionId,
+    QuestionRequestedEvent, SessionId, SessionStatus, SessionStatusChangedEvent,
+    SlashCommandArgument, SlashCommandArgumentKind, SlashCommandDangerLevel,
+    SlashCommandDefinition, SlashCommandRequest, SlashCommandResult, SlashCommandTarget,
 };
 use agenter_protocol::{
     DiscoveredCommandAction, DiscoveredFileChangeStatus, DiscoveredSessionHistoryItem,
@@ -99,9 +100,9 @@ pub enum CodexApprovalKind {
     FileChange,
     Permissions,
     /// Wire method `execCommandApproval` (`ServerRequest::ExecCommandApproval`).
-    LegacyExecCommand,
+    ExecCommandApproval,
     /// Wire method `applyPatchApproval` (`ServerRequest::ApplyPatchApproval`).
-    LegacyApplyPatch,
+    ApplyPatchApproval,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1167,7 +1168,7 @@ fn codex_slash_command(id: &str, name: &str, description: &str) -> CodexSlashCom
 pub async fn run_codex_turn_on_server(
     server: &mut CodexAppServer,
     request: CodexTurnRequest,
-    event_sender: mpsc::UnboundedSender<AppEvent>,
+    event_sender: mpsc::UnboundedSender<AdapterEvent>,
     pending_approvals: std::sync::Arc<
         tokio::sync::Mutex<HashMap<ApprovalId, PendingCodexApproval>>,
     >,
@@ -1181,8 +1182,9 @@ pub async fn run_codex_turn_on_server(
             return Err(anyhow!("codex exited before returning a thread id"));
         };
         codex_approval_ctx.observe_jsonrpc_message(&message);
+        let method = jsonrpc_method(&message);
         for event in normalize_codex_message(request.session_id, &message) {
-            event_sender.send(event).ok();
+            send_codex_event(&event_sender, method, event);
         }
     }
 
@@ -1202,14 +1204,16 @@ pub async fn run_codex_turn_on_server(
                 let Some(native_request_id) = message.get("id").cloned() else {
                     continue;
                 };
-                event_sender
-                    .send(AppEvent::Error(AgentErrorEvent {
+                send_codex_event(
+                    &event_sender,
+                    jsonrpc_method(&message),
+                    NormalizedEvent::Error(AgentErrorEvent {
                         session_id: Some(request.session_id),
                         code: Some("codex_auth_refresh_required".to_owned()),
                         message: CODEX_AUTH_REFRESH_OPERATOR_MESSAGE.to_owned(),
                         provider_payload: Some(message.clone()),
-                    }))
-                    .ok();
+                    }),
+                );
                 server
                     .send_jsonrpc_application_error_response(
                         native_request_id,
@@ -1225,15 +1229,17 @@ pub async fn run_codex_turn_on_server(
                 let Some(native_request_id) = message.get("id").cloned() else {
                     continue;
                 };
-                event_sender
-                    .send(AppEvent::Error(AgentErrorEvent {
+                send_codex_event(
+                    &event_sender,
+                    jsonrpc_method(&message),
+                    NormalizedEvent::Error(AgentErrorEvent {
                         session_id: Some(request.session_id),
                         code: Some("codex_dynamic_tool_unsupported".to_owned()),
                         message: "Codex requested a dynamic tool call that Agenter cannot execute remotely."
                             .to_owned(),
                         provider_payload: Some(message.clone()),
-                    }))
-                    .ok();
+                    }),
+                );
                 server
                     .send_unsupported_request_response(native_request_id, "item/tool/call")
                     .await?;
@@ -1252,13 +1258,15 @@ pub async fn run_codex_turn_on_server(
                     approval_id,
                     PendingCodexApproval::new(request.session_id, sender),
                 );
-                event_sender
-                    .send(session_status_event(
+                send_codex_event(
+                    &event_sender,
+                    jsonrpc_method(&message),
+                    session_status_event(
                         request.session_id,
                         SessionStatus::WaitingForApproval,
                         Some("Codex is waiting for approval.".to_owned()),
-                    ))
-                    .ok();
+                    ),
+                );
                 tracing::info!(
                     session_id = %request.session_id,
                     %approval_id,
@@ -1269,7 +1277,7 @@ pub async fn run_codex_turn_on_server(
                     method = jsonrpc_method(&message),
                     "codex approval request pending"
                 );
-                event_sender.send(event).ok();
+                send_codex_event(&event_sender, jsonrpc_method(&message), event);
                 if let Ok(answer) = receiver.await {
                     tracing::info!(
                         session_id = %request.session_id,
@@ -1285,13 +1293,15 @@ pub async fn run_codex_turn_on_server(
                         .map_err(|error| error.to_string());
                     answer.acknowledged.send(result.clone()).ok();
                     result.map_err(anyhow::Error::msg)?;
-                    event_sender
-                        .send(session_status_event(
+                    send_codex_event(
+                        &event_sender,
+                        jsonrpc_method(&message),
+                        session_status_event(
                             request.session_id,
                             SessionStatus::Running,
                             Some("Approval answered.".to_owned()),
-                        ))
-                        .ok();
+                        ),
+                    );
                 }
                 continue;
             }
@@ -1306,13 +1316,15 @@ pub async fn run_codex_turn_on_server(
                     .lock()
                     .await
                     .insert(question_id, PendingCodexQuestion { response: sender });
-                event_sender
-                    .send(session_status_event(
+                send_codex_event(
+                    &event_sender,
+                    jsonrpc_method(&message),
+                    session_status_event(
                         request.session_id,
                         SessionStatus::WaitingForInput,
                         Some("Codex is waiting for input.".to_owned()),
-                    ))
-                    .ok();
+                    ),
+                );
                 tracing::info!(
                     session_id = %request.session_id,
                     %question_id,
@@ -1323,7 +1335,7 @@ pub async fn run_codex_turn_on_server(
                     method = jsonrpc_method(&message),
                     "codex question request pending"
                 );
-                event_sender.send(event).ok();
+                send_codex_event(&event_sender, jsonrpc_method(&message), event);
                 if let Ok(answer) = receiver.await {
                     tracing::info!(
                         session_id = %request.session_id,
@@ -1335,13 +1347,15 @@ pub async fn run_codex_turn_on_server(
                     server
                         .send_question_response(native_request_id, question_kind, answer)
                         .await?;
-                    event_sender
-                        .send(session_status_event(
+                    send_codex_event(
+                        &event_sender,
+                        jsonrpc_method(&message),
+                        session_status_event(
                             request.session_id,
                             SessionStatus::Running,
                             Some("Input answered.".to_owned()),
-                        ))
-                        .ok();
+                        ),
+                    );
                 }
                 continue;
             }
@@ -1354,8 +1368,9 @@ pub async fn run_codex_turn_on_server(
                     provider_turn_id = message_turn_id(&message),
                     "unsupported codex server request observed in turn loop"
                 );
+                let event_method = jsonrpc_method(&message);
                 for event in normalize_codex_message(request.session_id, &message) {
-                    event_sender.send(event).ok();
+                    send_codex_event(&event_sender, event_method, event);
                 }
                 if let Err(err) = server
                     .send_unsupported_request_response(native_request_id.clone(), method)
@@ -1408,8 +1423,9 @@ pub async fn run_codex_turn_on_server(
         }
 
         let completed = jsonrpc_method(&message) == Some("turn/completed");
+        let event_method = jsonrpc_method(&message);
         for event in normalize_codex_message_for_scope(request.session_id, &message, &scope) {
-            event_sender.send(event).ok();
+            send_codex_event(&event_sender, event_method, event);
         }
         if completed {
             tracing::info!(session_id = %request.session_id, "codex turn completed");
@@ -1418,6 +1434,23 @@ pub async fn run_codex_turn_on_server(
     }
 
     Ok(())
+}
+
+fn codex_adapter_event(method: Option<&str>, event: NormalizedEvent) -> AdapterEvent {
+    AdapterEvent::from_normalized_event(
+        AgentProviderId::from(AgentProviderId::CODEX),
+        "codex-app-server",
+        method,
+        event,
+    )
+}
+
+fn send_codex_event(
+    event_sender: &mpsc::UnboundedSender<AdapterEvent>,
+    method: Option<&str>,
+    event: NormalizedEvent,
+) {
+    event_sender.send(codex_adapter_event(method, event)).ok();
 }
 
 pub fn codex_agent_options_from_responses(models: &Value, modes: &Value) -> AgentOptions {
@@ -1554,7 +1587,7 @@ fn insert_optional_string(output: &mut Value, key: &str, value: Option<String>) 
     }
 }
 
-pub fn normalize_codex_message(session_id: SessionId, message: &Value) -> Vec<AppEvent> {
+pub fn normalize_codex_message(session_id: SessionId, message: &Value) -> Vec<NormalizedEvent> {
     normalize_codex_message_inner(session_id, message)
 }
 
@@ -1573,12 +1606,12 @@ pub mod codex_reducer {
     use agenter_core::{AgentProviderId, SessionId};
     use serde_json::Value;
 
-    use crate::agents::adapter::{legacy_events_to_adapter_events, AdapterEvent};
+    use crate::agents::adapter::{normalized_events_to_adapter_events, AdapterEvent};
 
     #[must_use]
     pub fn reduce_native_message(session_id: SessionId, message: &Value) -> Vec<AdapterEvent> {
         let method = super::codex_codec::method(message);
-        legacy_events_to_adapter_events(
+        normalized_events_to_adapter_events(
             AgentProviderId::from(AgentProviderId::CODEX),
             "codex-app-server",
             method,
@@ -1591,14 +1624,14 @@ fn normalize_codex_message_for_scope(
     session_id: SessionId,
     message: &Value,
     scope: &CodexTurnScope,
-) -> Vec<AppEvent> {
+) -> Vec<NormalizedEvent> {
     if !codex_message_belongs_to_scope(message, scope) {
         return Vec::new();
     }
     normalize_codex_message_inner(session_id, message)
 }
 
-fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<AppEvent> {
+fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<NormalizedEvent> {
     if let Some(events) = normalize_codex_non_jsonrpc_message(session_id, message) {
         return events;
     }
@@ -1616,7 +1649,7 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
         "thread/status/changed" => thread_status_changed(session_id, message),
         "thread/tokenUsage/updated" => vec![token_usage_updated(session_id, message)],
         "account/rateLimits/updated" => vec![rate_limits_updated(session_id, message)],
-        "thread/compacted" => vec![AppEvent::ProviderEvent(provider_event(
+        "thread/compacted" => vec![NormalizedEvent::NativeNotification(native_notification(
             session_id,
             message,
             "thread/compacted",
@@ -1624,49 +1657,53 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
             "Context compacted",
             Some("completed"),
         ))],
-        "turn/diff/updated" => vec![AppEvent::TurnDiffUpdated(provider_event(
+        "turn/diff/updated" => vec![NormalizedEvent::TurnDiffUpdated(native_notification(
             session_id,
             message,
             "turn/diff/updated",
-            provider_event_category("turn/diff/updated"),
-            provider_event_title("turn/diff/updated"),
+            native_notification_category("turn/diff/updated"),
+            native_notification_title("turn/diff/updated"),
             None,
         ))],
         "item/reasoning/summaryTextDelta"
         | "item/reasoning/summaryPartAdded"
         | "item/reasoning/textDelta" => {
-            vec![AppEvent::ItemReasoning(provider_event(
+            vec![NormalizedEvent::ItemReasoning(native_notification(
                 session_id,
                 message,
                 method,
-                provider_event_category(method),
-                provider_event_title(method),
+                native_notification_category(method),
+                native_notification_title(method),
                 None,
             ))]
         }
-        "serverRequest/resolved" => vec![AppEvent::ServerRequestResolved(provider_event(
-            session_id,
-            message,
-            "serverRequest/resolved",
-            provider_event_category("serverRequest/resolved"),
-            provider_event_title("serverRequest/resolved"),
-            None,
-        ))],
-        "item/mcpToolCall/progress" => vec![AppEvent::McpToolCallProgress(provider_event(
-            session_id,
-            message,
-            "item/mcpToolCall/progress",
-            provider_event_category("item/mcpToolCall/progress"),
-            provider_event_title("item/mcpToolCall/progress"),
-            None,
-        ))],
+        "serverRequest/resolved" => {
+            vec![NormalizedEvent::ServerRequestResolved(native_notification(
+                session_id,
+                message,
+                "serverRequest/resolved",
+                native_notification_category("serverRequest/resolved"),
+                native_notification_title("serverRequest/resolved"),
+                None,
+            ))]
+        }
+        "item/mcpToolCall/progress" => {
+            vec![NormalizedEvent::McpToolCallProgress(native_notification(
+                session_id,
+                message,
+                "item/mcpToolCall/progress",
+                native_notification_category("item/mcpToolCall/progress"),
+                native_notification_title("item/mcpToolCall/progress"),
+                None,
+            ))]
+        }
         method if method.starts_with("mcpServer/") => {
-            vec![AppEvent::McpToolCallProgress(provider_event(
+            vec![NormalizedEvent::McpToolCallProgress(native_notification(
                 session_id,
                 message,
                 method,
-                provider_event_category(method),
-                provider_event_title(method),
+                native_notification_category(method),
+                native_notification_title(method),
                 None,
             ))]
         }
@@ -1678,29 +1715,29 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
                 .collect()
         }
         "item/fileChange/outputDelta" | "item/fileChange/patchUpdated" => {
-            vec![AppEvent::ProviderEvent(provider_event(
+            vec![NormalizedEvent::NativeNotification(native_notification(
                 session_id,
                 message,
                 method,
                 "file",
-                provider_event_title(method),
+                native_notification_title(method),
                 Some("updated"),
             ))]
         }
         method if method.starts_with("thread/realtime/") => {
-            vec![AppEvent::ThreadRealtimeEvent(provider_event(
+            vec![NormalizedEvent::ThreadRealtimeEvent(native_notification(
                 session_id,
                 message,
                 method,
-                provider_event_category(method),
-                provider_event_title(method),
+                native_notification_category(method),
+                native_notification_title(method),
                 Some("updated"),
             ))]
         }
         "item/started" => item_started(session_id, message).into_iter().collect(),
         "item/completed" => item_completed(session_id, message).into_iter().collect(),
         "turn/completed" => vec![
-            AppEvent::AgentMessageCompleted(MessageCompletedEvent {
+            NormalizedEvent::AgentMessageCompleted(MessageCompletedEvent {
                 session_id,
                 message_id: string_at(message, &["/params/turnId", "/params/id"])
                     .unwrap_or("codex-turn")
@@ -1714,7 +1751,7 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
                 Some("Codex turn completed.".to_owned()),
             ),
         ],
-        "error" => vec![AppEvent::Error(AgentErrorEvent {
+        "error" => vec![NormalizedEvent::Error(AgentErrorEvent {
             session_id: Some(session_id),
             code: string_at(message, &["/params/code"]).map(str::to_owned),
             message: string_at(message, &["/params/message"])
@@ -1722,12 +1759,12 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
                 .to_owned(),
             provider_payload: Some(message.clone()),
         })],
-        _ => vec![AppEvent::ProviderEvent(provider_event(
+        _ => vec![NormalizedEvent::NativeNotification(native_notification(
             session_id,
             message,
             method,
-            provider_event_category(method),
-            provider_event_title(method),
+            native_notification_category(method),
+            native_notification_title(method),
             None,
         ))],
     }
@@ -1737,7 +1774,7 @@ pub fn normalize_codex_approval_request(
     session_id: SessionId,
     message: &Value,
     cache: Option<&CodexApprovalItemCache>,
-) -> Option<(ApprovalId, Value, CodexApprovalKind, AppEvent)> {
+) -> Option<(ApprovalId, Value, CodexApprovalKind, NormalizedEvent)> {
     let method = jsonrpc_method(message)?;
     let (kind, approval_kind) = match method {
         "item/commandExecution/requestApproval" => {
@@ -1750,19 +1787,22 @@ pub fn normalize_codex_approval_request(
             ApprovalKind::ProviderSpecific,
             CodexApprovalKind::Permissions,
         ),
-        // Deprecated server requests for legacy APIs (`sendUserTurn` / `sendUserMessage`).
-        "execCommandApproval" => (ApprovalKind::Command, CodexApprovalKind::LegacyExecCommand),
+        // Older Codex server request aliases.
+        "execCommandApproval" => (
+            ApprovalKind::Command,
+            CodexApprovalKind::ExecCommandApproval,
+        ),
         "applyPatchApproval" => (
             ApprovalKind::FileChange,
-            CodexApprovalKind::LegacyApplyPatch,
+            CodexApprovalKind::ApplyPatchApproval,
         ),
         _ => return None,
     };
     let native_request_id = message.get("id")?.clone();
     let approval_id = ApprovalId::new();
     let title = match approval_kind {
-        CodexApprovalKind::LegacyExecCommand => "Approve Codex command (legacy)",
-        CodexApprovalKind::LegacyApplyPatch => "Approve Codex file change (legacy)",
+        CodexApprovalKind::ExecCommandApproval => "Approve Codex command",
+        CodexApprovalKind::ApplyPatchApproval => "Approve Codex file change",
         _ => match kind {
             ApprovalKind::Command => "Approve Codex command",
             ApprovalKind::FileChange => "Approve Codex file change",
@@ -1772,15 +1812,11 @@ pub fn normalize_codex_approval_request(
 
     let params = message.get("params").unwrap_or(&Value::Null);
     let (presentation, details) = match approval_kind {
-        CodexApprovalKind::LegacyExecCommand => {
-            synthesize_codex_legacy_exec_approval_details(params)
-        }
-        CodexApprovalKind::LegacyApplyPatch => {
-            synthesize_codex_legacy_patch_approval_details(params)
-        }
+        CodexApprovalKind::ExecCommandApproval => synthesize_codex_exec_approval_details(params),
+        CodexApprovalKind::ApplyPatchApproval => synthesize_codex_patch_approval_details(params),
         _ => synthesize_codex_approval_details(&kind, params, cache, message),
     };
-    let event = AppEvent::ApprovalRequested(ApprovalRequestEvent {
+    let event = NormalizedEvent::ApprovalRequested(ApprovalRequestEvent {
         session_id,
         approval_id,
         kind,
@@ -1867,9 +1903,7 @@ fn synthesize_codex_approval_details(
     }
 }
 
-fn synthesize_codex_legacy_exec_approval_details(
-    params: &Value,
-) -> (Option<Value>, Option<String>) {
+fn synthesize_codex_exec_approval_details(params: &Value) -> (Option<Value>, Option<String>) {
     let argv = params
         .get("command")
         .and_then(Value::as_array)
@@ -1909,9 +1943,7 @@ fn synthesize_codex_legacy_exec_approval_details(
     )
 }
 
-fn synthesize_codex_legacy_patch_approval_details(
-    params: &Value,
-) -> (Option<Value>, Option<String>) {
+fn synthesize_codex_patch_approval_details(params: &Value) -> (Option<Value>, Option<String>) {
     let mut paths: Vec<String> = params
         .pointer("/fileChanges")
         .and_then(Value::as_object)
@@ -1971,7 +2003,7 @@ fn join_sparse_prelude_then_body(params: &Value, tail: Option<String>) -> Option
 pub fn normalize_codex_question_request(
     session_id: SessionId,
     message: &Value,
-) -> Option<(QuestionId, Value, AppEvent)> {
+) -> Option<(QuestionId, Value, NormalizedEvent)> {
     let method = jsonrpc_method(message)?;
     let native_request_id = message.get("id")?.clone();
     let question_id = QuestionId::new();
@@ -1993,7 +2025,7 @@ pub fn normalize_codex_question_request(
         }
         _ => return None,
     };
-    let event = AppEvent::QuestionRequested(QuestionRequestedEvent {
+    let event = NormalizedEvent::QuestionRequested(QuestionRequestedEvent {
         session_id,
         question_id,
         title,
@@ -2214,9 +2246,9 @@ pub fn approval_response_for_decision(
 
     if matches!(
         approval_kind,
-        CodexApprovalKind::LegacyExecCommand | CodexApprovalKind::LegacyApplyPatch
+        CodexApprovalKind::ExecCommandApproval | CodexApprovalKind::ApplyPatchApproval
     ) {
-        return json!({ "decision": legacy_codex_review_decision_wire(&decision) });
+        return json!({ "decision": codex_review_decision_wire(&decision) });
     }
 
     match decision {
@@ -2228,7 +2260,7 @@ pub fn approval_response_for_decision(
     }
 }
 
-fn legacy_codex_review_decision_wire(decision: &ApprovalDecision) -> &'static str {
+fn codex_review_decision_wire(decision: &ApprovalDecision) -> &'static str {
     match decision {
         ApprovalDecision::Accept => "approved",
         ApprovalDecision::AcceptForSession => "approved_for_session",
@@ -2238,7 +2270,7 @@ fn legacy_codex_review_decision_wire(decision: &ApprovalDecision) -> &'static st
     }
 }
 
-fn text_delta(session_id: SessionId, message: &Value) -> Option<AppEvent> {
+fn text_delta(session_id: SessionId, message: &Value) -> Option<NormalizedEvent> {
     let delta = string_at(
         message,
         &[
@@ -2249,7 +2281,7 @@ fn text_delta(session_id: SessionId, message: &Value) -> Option<AppEvent> {
             "/params/item/text",
         ],
     )?;
-    Some(AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {
+    Some(NormalizedEvent::AgentMessageDelta(AgentMessageDeltaEvent {
         session_id,
         message_id: message_id(message),
         delta: delta.to_owned(),
@@ -2257,26 +2289,28 @@ fn text_delta(session_id: SessionId, message: &Value) -> Option<AppEvent> {
     }))
 }
 
-fn message_completed(session_id: SessionId, message: &Value) -> Option<AppEvent> {
-    Some(AppEvent::AgentMessageCompleted(MessageCompletedEvent {
-        session_id,
-        message_id: message_id(message),
-        content: string_at(
-            message,
-            &[
-                "/params/content",
-                "/params/text",
-                "/params/message",
-                "/params/item/text",
-                "/params/item/content",
-            ],
-        )
-        .map(str::to_owned),
-        provider_payload: Some(message.clone()),
-    }))
+fn message_completed(session_id: SessionId, message: &Value) -> Option<NormalizedEvent> {
+    Some(NormalizedEvent::AgentMessageCompleted(
+        MessageCompletedEvent {
+            session_id,
+            message_id: message_id(message),
+            content: string_at(
+                message,
+                &[
+                    "/params/content",
+                    "/params/text",
+                    "/params/message",
+                    "/params/item/text",
+                    "/params/item/content",
+                ],
+            )
+            .map(str::to_owned),
+            provider_payload: Some(message.clone()),
+        },
+    ))
 }
 
-fn turn_plan_updated(session_id: SessionId, message: &Value) -> Option<AppEvent> {
+fn turn_plan_updated(session_id: SessionId, message: &Value) -> Option<NormalizedEvent> {
     let entries = message
         .pointer("/params/plan")
         .and_then(Value::as_array)
@@ -2299,7 +2333,7 @@ fn turn_plan_updated(session_id: SessionId, message: &Value) -> Option<AppEvent>
     if entries.is_empty() && string_at(message, &["/params/explanation"]).is_none() {
         return None;
     }
-    Some(AppEvent::PlanUpdated(PlanEvent {
+    Some(NormalizedEvent::PlanUpdated(PlanEvent {
         session_id,
         plan_id: string_at(message, &["/params/turnId", "/params/id"]).map(str::to_owned),
         title: Some("Implementation plan".to_owned()),
@@ -2310,12 +2344,12 @@ fn turn_plan_updated(session_id: SessionId, message: &Value) -> Option<AppEvent>
     }))
 }
 
-fn plan_delta(session_id: SessionId, message: &Value) -> Option<AppEvent> {
+fn plan_delta(session_id: SessionId, message: &Value) -> Option<NormalizedEvent> {
     let content = string_at(
         message,
         &["/params/delta", "/params/text", "/params/content"],
     )?;
-    Some(AppEvent::PlanUpdated(PlanEvent {
+    Some(NormalizedEvent::PlanUpdated(PlanEvent {
         session_id,
         plan_id: string_at(
             message,
@@ -2336,12 +2370,12 @@ fn plan_delta(session_id: SessionId, message: &Value) -> Option<AppEvent> {
     }))
 }
 
-fn command_output_delta(session_id: SessionId, message: &Value) -> Option<AppEvent> {
+fn command_output_delta(session_id: SessionId, message: &Value) -> Option<NormalizedEvent> {
     let delta = string_at(
         message,
         &["/params/delta", "/params/text", "/params/output"],
     )?;
-    Some(AppEvent::CommandOutputDelta(CommandOutputEvent {
+    Some(NormalizedEvent::CommandOutputDelta(CommandOutputEvent {
         session_id,
         command_id: item_id(message),
         stream: match string_at(message, &["/params/stream"]) {
@@ -2356,7 +2390,7 @@ fn command_output_delta(session_id: SessionId, message: &Value) -> Option<AppEve
 fn normalize_codex_non_jsonrpc_message(
     session_id: SessionId,
     message: &Value,
-) -> Option<Vec<AppEvent>> {
+) -> Option<Vec<NormalizedEvent>> {
     if message.get("method").is_some() {
         return None;
     }
@@ -2369,9 +2403,9 @@ fn normalize_codex_non_jsonrpc_message(
     None
 }
 
-fn codex_slash_command_result(session_id: SessionId, message: &Value) -> AppEvent {
+fn codex_slash_command_result(session_id: SessionId, message: &Value) -> NormalizedEvent {
     let accepted = bool_at(message, &["/accepted"]).unwrap_or(false);
-    AppEvent::ProviderEvent(ProviderEvent {
+    NormalizedEvent::NativeNotification(NativeNotification {
         session_id,
         provider_id: AgentProviderId::from(AgentProviderId::CODEX),
         event_id: string_at(message, &["/command_id"]).map(str::to_owned),
@@ -2386,8 +2420,8 @@ fn codex_slash_command_result(session_id: SessionId, message: &Value) -> AppEven
     })
 }
 
-fn codex_context_compaction_event(session_id: SessionId, message: &Value) -> AppEvent {
-    AppEvent::ProviderEvent(ProviderEvent {
+fn codex_context_compaction_event(session_id: SessionId, message: &Value) -> NormalizedEvent {
+    NormalizedEvent::NativeNotification(NativeNotification {
         session_id,
         provider_id: AgentProviderId::from(AgentProviderId::CODEX),
         event_id: string_at(message, &["/id", "/itemId", "/item/id"]).map(str::to_owned),
@@ -2400,7 +2434,7 @@ fn codex_context_compaction_event(session_id: SessionId, message: &Value) -> App
     })
 }
 
-fn thread_status_changed(session_id: SessionId, message: &Value) -> Vec<AppEvent> {
+fn thread_status_changed(session_id: SessionId, message: &Value) -> Vec<NormalizedEvent> {
     let provider_status = string_at(message, &["/params/status/type"])
         .or_else(|| string_at(message, &["/params/status"]))
         .unwrap_or("updated");
@@ -2418,7 +2452,7 @@ fn thread_status_changed(session_id: SessionId, message: &Value) -> Vec<AppEvent
         )),
         _ => {}
     }
-    events.push(AppEvent::ProviderEvent(ProviderEvent {
+    events.push(NormalizedEvent::NativeNotification(NativeNotification {
         session_id,
         provider_id: AgentProviderId::from(AgentProviderId::CODEX),
         event_id: string_at(message, &["/params/threadId"]).map(str::to_owned),
@@ -2432,7 +2466,7 @@ fn thread_status_changed(session_id: SessionId, message: &Value) -> Vec<AppEvent
     events
 }
 
-fn turn_started(session_id: SessionId, message: &Value) -> Vec<AppEvent> {
+fn turn_started(session_id: SessionId, message: &Value) -> Vec<NormalizedEvent> {
     let status = string_at(message, &["/params/turn/status"]).unwrap_or("running");
     let mut events = Vec::new();
     if matches!(status, "inProgress" | "running") {
@@ -2442,7 +2476,7 @@ fn turn_started(session_id: SessionId, message: &Value) -> Vec<AppEvent> {
             Some("Codex turn started.".to_owned()),
         ));
     }
-    events.push(AppEvent::ProviderEvent(ProviderEvent {
+    events.push(NormalizedEvent::NativeNotification(NativeNotification {
         session_id,
         provider_id: AgentProviderId::from(AgentProviderId::CODEX),
         event_id: string_at(message, &["/params/turn/id", "/params/turnId"]).map(str::to_owned),
@@ -2456,11 +2490,11 @@ fn turn_started(session_id: SessionId, message: &Value) -> Vec<AppEvent> {
     events
 }
 
-fn token_usage_updated(session_id: SessionId, message: &Value) -> AppEvent {
+fn token_usage_updated(session_id: SessionId, message: &Value) -> NormalizedEvent {
     let last = integer_at(message, &["/params/tokenUsage/last/totalTokens"]);
     let total = integer_at(message, &["/params/tokenUsage/total/totalTokens"]);
     let window = integer_at(message, &["/params/tokenUsage/modelContextWindow"]);
-    AppEvent::ProviderEvent(ProviderEvent {
+    NormalizedEvent::NativeNotification(NativeNotification {
         session_id,
         provider_id: AgentProviderId::from(AgentProviderId::CODEX),
         event_id: string_at(message, &["/params/turnId", "/params/threadId"]).map(str::to_owned),
@@ -2484,12 +2518,12 @@ fn token_usage_updated(session_id: SessionId, message: &Value) -> AppEvent {
     })
 }
 
-fn rate_limits_updated(session_id: SessionId, message: &Value) -> AppEvent {
+fn rate_limits_updated(session_id: SessionId, message: &Value) -> NormalizedEvent {
     let plan = string_at(message, &["/params/rateLimits/planType"]);
     let primary = integer_at(message, &["/params/rateLimits/primary/usedPercent"]);
     let secondary = integer_at(message, &["/params/rateLimits/secondary/usedPercent"]);
     let reached = string_at(message, &["/params/rateLimits/rateLimitReachedType"]);
-    AppEvent::ProviderEvent(ProviderEvent {
+    NormalizedEvent::NativeNotification(NativeNotification {
         session_id,
         provider_id: AgentProviderId::from(AgentProviderId::CODEX),
         event_id: string_at(message, &["/params/rateLimits/limitId"]).map(str::to_owned),
@@ -2518,23 +2552,23 @@ fn session_status_event(
     session_id: SessionId,
     status: SessionStatus,
     reason: Option<String>,
-) -> AppEvent {
-    AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
+) -> NormalizedEvent {
+    NormalizedEvent::SessionStatusChanged(SessionStatusChangedEvent {
         session_id,
         status,
         reason,
     })
 }
 
-fn provider_event(
+fn native_notification(
     session_id: SessionId,
     message: &Value,
     method: &str,
     category: impl Into<String>,
     title: impl Into<String>,
     status: Option<&str>,
-) -> ProviderEvent {
-    ProviderEvent {
+) -> NativeNotification {
+    NativeNotification {
         session_id,
         provider_id: AgentProviderId::from(AgentProviderId::CODEX),
         method: method.to_owned(),
@@ -2552,19 +2586,19 @@ fn provider_event(
         .map(str::to_owned),
         category: category.into(),
         title: title.into(),
-        detail: provider_event_detail(message),
+        detail: native_notification_detail(message),
         status: status.map(str::to_owned),
         provider_payload: Some(message.clone()),
     }
 }
 
-fn item_started(session_id: SessionId, message: &Value) -> Option<AppEvent> {
+fn item_started(session_id: SessionId, message: &Value) -> Option<NormalizedEvent> {
     if should_ignore_item_event(message) {
         return None;
     }
 
     if let Some(command) = string_at(message, &["/params/command", "/params/item/command"]) {
-        return Some(AppEvent::CommandStarted(CommandEvent {
+        return Some(NormalizedEvent::CommandStarted(CommandEvent {
             session_id,
             command_id: item_id(message),
             command: command.to_owned(),
@@ -2578,7 +2612,7 @@ fn item_started(session_id: SessionId, message: &Value) -> Option<AppEvent> {
         }));
     }
 
-    Some(AppEvent::ToolStarted(agenter_core::ToolEvent {
+    Some(NormalizedEvent::ToolStarted(agenter_core::ToolEvent {
         session_id,
         tool_call_id: item_id(message),
         name: string_at(message, &["/params/name", "/params/item/name"])
@@ -2592,12 +2626,12 @@ fn item_started(session_id: SessionId, message: &Value) -> Option<AppEvent> {
     }))
 }
 
-fn item_completed(session_id: SessionId, message: &Value) -> Option<AppEvent> {
+fn item_completed(session_id: SessionId, message: &Value) -> Option<NormalizedEvent> {
     if item_type(message) == Some("agentMessage") {
         return message_completed(session_id, message);
     }
     if item_type(message) == Some("contextCompaction") {
-        return Some(AppEvent::ProviderEvent(provider_event(
+        return Some(NormalizedEvent::NativeNotification(native_notification(
             session_id,
             message,
             "item/contextCompaction",
@@ -2611,7 +2645,7 @@ fn item_completed(session_id: SessionId, message: &Value) -> Option<AppEvent> {
     }
 
     if string_at(message, &["/params/command", "/params/item/command"]).is_some() {
-        return Some(AppEvent::CommandCompleted(CommandCompletedEvent {
+        return Some(NormalizedEvent::CommandCompleted(CommandCompletedEvent {
             session_id,
             command_id: item_id(message),
             exit_code: integer_at(message, &["/params/exitCode", "/params/item/exitCode"])
@@ -2624,7 +2658,7 @@ fn item_completed(session_id: SessionId, message: &Value) -> Option<AppEvent> {
     }
 
     if let Some(path) = string_at(message, &["/params/path", "/params/item/path"]) {
-        return Some(AppEvent::FileChangeProposed(FileChangeEvent {
+        return Some(NormalizedEvent::FileChangeProposed(FileChangeEvent {
             session_id,
             path: path.to_owned(),
             change_kind: file_change_kind(message),
@@ -2633,7 +2667,7 @@ fn item_completed(session_id: SessionId, message: &Value) -> Option<AppEvent> {
         }));
     }
 
-    Some(AppEvent::ToolCompleted(agenter_core::ToolEvent {
+    Some(NormalizedEvent::ToolCompleted(agenter_core::ToolEvent {
         session_id,
         tool_call_id: item_id(message),
         name: string_at(message, &["/params/name", "/params/item/name"])
@@ -2922,12 +2956,12 @@ fn codex_history_command_line(value: &Value) -> Option<String> {
     .filter(|line| !line.is_empty())
 }
 
-fn codex_history_thread_item_provider_event(
+fn codex_history_thread_item_native_notification(
     value: &Value,
     wire_type: &str,
 ) -> DiscoveredSessionHistoryItem {
     let detail = string_at(value, &["/summary", "/prompt", "/message"]).map(str::to_owned);
-    DiscoveredSessionHistoryItem::ProviderEvent {
+    DiscoveredSessionHistoryItem::NativeNotification {
         event_id: string_at(value, &["/id", "/messageId"]).map(str::to_owned),
         category: "codex_thread_item".to_owned(),
         title: wire_type.to_owned(),
@@ -2950,7 +2984,9 @@ fn collect_codex_history_item(value: &Value, items: &mut Vec<DiscoveredSessionHi
                     content,
                 });
             } else if codex_history_message_has_fallback_content(value) {
-                items.push(codex_history_thread_item_provider_event(value, wire_type));
+                items.push(codex_history_thread_item_native_notification(
+                    value, wire_type,
+                ));
             }
         }
         "agentMessage" => {
@@ -2962,7 +2998,9 @@ fn collect_codex_history_item(value: &Value, items: &mut Vec<DiscoveredSessionHi
                     content,
                 });
             } else if codex_history_message_has_fallback_content(value) {
-                items.push(codex_history_thread_item_provider_event(value, wire_type));
+                items.push(codex_history_thread_item_native_notification(
+                    value, wire_type,
+                ));
             }
         }
         "commandExecution" => {
@@ -2989,7 +3027,9 @@ fn collect_codex_history_item(value: &Value, items: &mut Vec<DiscoveredSessionHi
                     provider_payload: Some(value.clone()),
                 });
             } else {
-                items.push(codex_history_thread_item_provider_event(value, wire_type));
+                items.push(codex_history_thread_item_native_notification(
+                    value, wire_type,
+                ));
             }
         }
         "fileChange" => {
@@ -3015,7 +3055,9 @@ fn collect_codex_history_item(value: &Value, items: &mut Vec<DiscoveredSessionHi
                 }
             }
             if !pushed {
-                items.push(codex_history_thread_item_provider_event(value, wire_type));
+                items.push(codex_history_thread_item_native_notification(
+                    value, wire_type,
+                ));
             }
         }
         "collabAgentToolCall" => {
@@ -3068,11 +3110,13 @@ fn collect_codex_history_item(value: &Value, items: &mut Vec<DiscoveredSessionHi
                     provider_payload: Some(value.clone()),
                 });
             } else {
-                items.push(codex_history_thread_item_provider_event(value, wire_type));
+                items.push(codex_history_thread_item_native_notification(
+                    value, wire_type,
+                ));
             }
         }
         "contextCompaction" => {
-            items.push(DiscoveredSessionHistoryItem::ProviderEvent {
+            items.push(DiscoveredSessionHistoryItem::NativeNotification {
                 event_id: string_at(value, &["/id"]).map(str::to_owned),
                 category: "compaction".to_owned(),
                 title: "Context compacted".to_owned(),
@@ -3082,7 +3126,9 @@ fn collect_codex_history_item(value: &Value, items: &mut Vec<DiscoveredSessionHi
             });
         }
         _ => {
-            items.push(codex_history_thread_item_provider_event(value, wire_type));
+            items.push(codex_history_thread_item_native_notification(
+                value, wire_type,
+            ));
         }
     }
 }
@@ -3255,7 +3301,7 @@ fn should_ignore_item_event(message: &Value) -> bool {
     matches!(item_type(message), Some("userMessage" | "reasoning"))
 }
 
-fn provider_event_category(method: &str) -> &'static str {
+fn native_notification_category(method: &str) -> &'static str {
     match method {
         "error" | "warning" | "guardianWarning" | "deprecationNotice" | "configWarning" => {
             "warning"
@@ -3276,7 +3322,7 @@ fn provider_event_category(method: &str) -> &'static str {
     }
 }
 
-fn provider_event_title(method: &str) -> String {
+fn native_notification_title(method: &str) -> String {
     match method {
         "model/rerouted" => "Model rerouted".to_owned(),
         "model/verification" => "Model verification".to_owned(),
@@ -3305,7 +3351,7 @@ fn provider_event_title(method: &str) -> String {
     }
 }
 
-fn provider_event_detail(message: &Value) -> Option<String> {
+fn native_notification_detail(message: &Value) -> Option<String> {
     string_at(
         message,
         &[
@@ -3377,7 +3423,7 @@ mod tests {
         let events = normalize_codex_message(SessionId::nil(), &message);
 
         assert_eq!(events.len(), 1);
-        let AppEvent::AgentMessageDelta(delta) = &events[0] else {
+        let NormalizedEvent::AgentMessageDelta(delta) = &events[0] else {
             panic!("expected message delta");
         };
         assert_eq!(delta.message_id, "msg-1");
@@ -3385,7 +3431,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_semantic_reducer_preserves_legacy_projection() {
+    fn codex_semantic_reducer_emits_universal_projection() {
         let session_id = SessionId::nil();
         let message = json!({
             "method": "agentMessage/delta",
@@ -3395,11 +3441,10 @@ mod tests {
             }
         });
 
-        let legacy = normalize_codex_message(session_id, &message);
+        let normalized = normalize_codex_message(session_id, &message);
         let semantic = super::codex_reducer::reduce_native_message(session_id, &message);
 
-        assert_eq!(semantic.len(), legacy.len());
-        assert_eq!(semantic[0].legacy_projection(), Some(&legacy[0]));
+        assert_eq!(semantic.len(), normalized.len());
         assert_eq!(semantic[0].universal.session_id, Some(session_id));
         let native = semantic[0].universal.native.as_ref().expect("native ref");
         assert_eq!(native.protocol, "codex-app-server");
@@ -3522,13 +3567,13 @@ mod tests {
                 "command": "cargo test"
             }
         });
-        let (_approval_id, _native_request_id, _kind, legacy) =
+        let (_approval_id, _native_request_id, _kind, normalized) =
             normalize_codex_approval_request(session_id, &approval, None).expect("approval");
-        let semantic = crate::agents::adapter::AdapterEvent::from_legacy(
+        let semantic = crate::agents::adapter::AdapterEvent::from_normalized_event(
             AgentProviderId::from(AgentProviderId::CODEX),
             "codex-app-server",
             Some("item/commandExecution/requestApproval"),
-            legacy,
+            normalized,
         );
         assert!(matches!(
             semantic.universal.event,
@@ -3594,15 +3639,15 @@ mod tests {
                 Some("item/commandExecution/requestApproval" | "item/fileChange/requestApproval")
             )
         }) {
-            let (_approval_id, native_request_id, _kind, legacy) =
+            let (_approval_id, native_request_id, _kind, normalized) =
                 normalize_codex_approval_request(session_id, approval, None)
                     .expect("approval should normalize");
             assert!(native_request_id.is_string());
-            let semantic = crate::agents::adapter::AdapterEvent::from_legacy(
+            let semantic = crate::agents::adapter::AdapterEvent::from_normalized_event(
                 AgentProviderId::from(AgentProviderId::CODEX),
                 "codex-app-server",
                 jsonrpc_method(approval),
-                legacy,
+                normalized,
             );
             let agenter_core::UniversalEventKind::ApprovalRequested { approval } =
                 semantic.universal.event
@@ -3637,7 +3682,7 @@ mod tests {
         else {
             panic!("expected unknown native event");
         };
-        assert_eq!(summary.as_deref(), Some("provider event"));
+        assert_eq!(summary.as_deref(), Some("native notification"));
         assert_eq!(
             semantic[0]
                 .universal
@@ -3663,7 +3708,7 @@ mod tests {
         let events = normalize_codex_message(SessionId::nil(), &message);
 
         assert_eq!(events.len(), 1);
-        let AppEvent::AgentMessageDelta(delta) = &events[0] else {
+        let NormalizedEvent::AgentMessageDelta(delta) = &events[0] else {
             panic!("expected message delta");
         };
         assert_eq!(delta.message_id, "msg-live-1");
@@ -3688,7 +3733,7 @@ mod tests {
         let events = normalize_codex_message(SessionId::nil(), &message);
 
         assert_eq!(events.len(), 1);
-        let AppEvent::AgentMessageCompleted(completed) = &events[0] else {
+        let NormalizedEvent::AgentMessageCompleted(completed) = &events[0] else {
             panic!("expected message completed");
         };
         assert_eq!(completed.message_id, "msg-live-1");
@@ -3696,7 +3741,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_codex_thread_compacted_as_provider_event() {
+    fn normalizes_codex_thread_compacted_as_native_notification() {
         let message = json!({
             "method": "thread/compacted",
             "params": {
@@ -3708,8 +3753,8 @@ mod tests {
         let events = normalize_codex_message(SessionId::nil(), &message);
 
         assert_eq!(events.len(), 1);
-        let AppEvent::ProviderEvent(event) = &events[0] else {
-            panic!("expected provider event");
+        let NormalizedEvent::NativeNotification(event) = &events[0] else {
+            panic!("expected native notification");
         };
         assert_eq!(event.provider_id.as_str(), AgentProviderId::CODEX);
         assert_eq!(event.category, "compaction");
@@ -3718,7 +3763,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_raw_codex_context_compaction_item_as_provider_event() {
+    fn normalizes_raw_codex_context_compaction_item_as_native_notification() {
         let message = json!({
             "id": "item-237",
             "type": "contextCompaction"
@@ -3727,8 +3772,8 @@ mod tests {
         let events = normalize_codex_message(SessionId::nil(), &message);
 
         assert_eq!(events.len(), 1);
-        let AppEvent::ProviderEvent(event) = &events[0] else {
-            panic!("expected provider event");
+        let NormalizedEvent::NativeNotification(event) = &events[0] else {
+            panic!("expected native notification");
         };
         assert_eq!(event.event_id.as_deref(), Some("item-237"));
         assert_eq!(event.category, "compaction");
@@ -3738,7 +3783,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_codex_context_compaction_item_as_provider_event() {
+    fn normalizes_codex_context_compaction_item_as_native_notification() {
         let message = json!({
             "method": "item/completed",
             "params": {
@@ -3754,8 +3799,8 @@ mod tests {
         let events = normalize_codex_message(SessionId::nil(), &message);
 
         assert_eq!(events.len(), 1);
-        let AppEvent::ProviderEvent(event) = &events[0] else {
-            panic!("expected provider event");
+        let NormalizedEvent::NativeNotification(event) = &events[0] else {
+            panic!("expected native notification");
         };
         assert_eq!(event.event_id.as_deref(), Some("compact-1"));
         assert_eq!(event.category, "compaction");
@@ -3763,7 +3808,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_codex_slash_command_result_object_as_provider_event() {
+    fn normalizes_codex_slash_command_result_object_as_native_notification() {
         let message = json!({
             "accepted": true,
             "arguments": {},
@@ -3781,8 +3826,8 @@ mod tests {
         let events = normalize_codex_message(SessionId::nil(), &message);
 
         assert_eq!(events.len(), 1);
-        let AppEvent::ProviderEvent(event) = &events[0] else {
-            panic!("expected provider event");
+        let NormalizedEvent::NativeNotification(event) = &events[0] else {
+            panic!("expected native notification");
         };
         assert_eq!(event.category, "slash_command");
         assert_eq!(event.title, "/compact");
@@ -3792,7 +3837,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_active_thread_status_as_running_status_and_provider_event() {
+    fn normalizes_active_thread_status_as_running_status_and_native_notification() {
         let message = json!({
             "method": "thread/status/changed",
             "params": {
@@ -3807,19 +3852,19 @@ mod tests {
         let events = normalize_codex_message(SessionId::nil(), &message);
 
         assert_eq!(events.len(), 2);
-        let AppEvent::SessionStatusChanged(status) = &events[0] else {
+        let NormalizedEvent::SessionStatusChanged(status) = &events[0] else {
             panic!("expected session status");
         };
         assert_eq!(status.status, agenter_core::SessionStatus::Running);
-        let AppEvent::ProviderEvent(event) = &events[1] else {
-            panic!("expected provider event");
+        let NormalizedEvent::NativeNotification(event) = &events[1] else {
+            panic!("expected native notification");
         };
         assert_eq!(event.category, "thread");
         assert_eq!(event.status.as_deref(), Some("active"));
     }
 
     #[test]
-    fn normalizes_idle_thread_status_as_completed_status_and_provider_event() {
+    fn normalizes_idle_thread_status_as_completed_status_and_native_notification() {
         let message = json!({
             "method": "thread/status/changed",
             "params": {
@@ -3833,19 +3878,19 @@ mod tests {
         let events = normalize_codex_message(SessionId::nil(), &message);
 
         assert_eq!(events.len(), 2);
-        let AppEvent::SessionStatusChanged(status) = &events[0] else {
+        let NormalizedEvent::SessionStatusChanged(status) = &events[0] else {
             panic!("expected session status");
         };
         assert_eq!(status.status, agenter_core::SessionStatus::Idle);
-        let AppEvent::ProviderEvent(event) = &events[1] else {
-            panic!("expected provider event");
+        let NormalizedEvent::NativeNotification(event) = &events[1] else {
+            panic!("expected native notification");
         };
         assert_eq!(event.category, "thread");
         assert_eq!(event.status.as_deref(), Some("idle"));
     }
 
     #[test]
-    fn normalizes_turn_started_as_running_status_and_provider_event() {
+    fn normalizes_turn_started_as_running_status_and_native_notification() {
         let message = json!({
             "method": "turn/started",
             "params": {
@@ -3865,12 +3910,12 @@ mod tests {
         let events = normalize_codex_message(SessionId::nil(), &message);
 
         assert_eq!(events.len(), 2);
-        let AppEvent::SessionStatusChanged(status) = &events[0] else {
+        let NormalizedEvent::SessionStatusChanged(status) = &events[0] else {
             panic!("expected session status");
         };
         assert_eq!(status.status, agenter_core::SessionStatus::Running);
-        let AppEvent::ProviderEvent(event) = &events[1] else {
-            panic!("expected provider event");
+        let NormalizedEvent::NativeNotification(event) = &events[1] else {
+            panic!("expected native notification");
         };
         assert_eq!(
             event.event_id.as_deref(),
@@ -3881,7 +3926,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_token_usage_update_as_provider_event_with_summary() {
+    fn normalizes_token_usage_update_as_native_notification_with_summary() {
         let message = json!({
             "method": "thread/tokenUsage/updated",
             "params": {
@@ -3910,8 +3955,8 @@ mod tests {
         let events = normalize_codex_message(SessionId::nil(), &message);
 
         assert_eq!(events.len(), 1);
-        let AppEvent::ProviderEvent(event) = &events[0] else {
-            panic!("expected provider event");
+        let NormalizedEvent::NativeNotification(event) = &events[0] else {
+            panic!("expected native notification");
         };
         assert_eq!(event.category, "token_usage");
         assert_eq!(event.title, "Token usage updated");
@@ -3934,7 +3979,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_rate_limit_update_as_provider_event_with_summary() {
+    fn normalizes_rate_limit_update_as_native_notification_with_summary() {
         let message = json!({
             "method": "account/rateLimits/updated",
             "params": {
@@ -3961,8 +4006,8 @@ mod tests {
         let events = normalize_codex_message(SessionId::nil(), &message);
 
         assert_eq!(events.len(), 1);
-        let AppEvent::ProviderEvent(event) = &events[0] else {
-            panic!("expected provider event");
+        let NormalizedEvent::NativeNotification(event) = &events[0] else {
+            panic!("expected native notification");
         };
         assert_eq!(event.category, "rate_limits");
         assert_eq!(event.title, "Rate limits updated");
@@ -3985,7 +4030,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_unknown_codex_notification_as_provider_event() {
+    fn normalizes_unknown_codex_notification_as_native_notification() {
         let message = json!({
             "method": "model/rerouted",
             "params": {
@@ -3999,8 +4044,8 @@ mod tests {
         let events = normalize_codex_message(SessionId::nil(), &message);
 
         assert_eq!(events.len(), 1);
-        let AppEvent::ProviderEvent(event) = &events[0] else {
-            panic!("expected provider event");
+        let NormalizedEvent::NativeNotification(event) = &events[0] else {
+            panic!("expected native notification");
         };
         assert_eq!(event.category, "model");
         assert_eq!(event.title, "Model rerouted");
@@ -4020,7 +4065,7 @@ mod tests {
 
         let events = normalize_codex_message(SessionId::nil(), &message);
 
-        let AppEvent::TurnDiffUpdated(event) = &events[0] else {
+        let NormalizedEvent::TurnDiffUpdated(event) = &events[0] else {
             panic!("expected turn diff event");
         };
         assert_eq!(event.method, "turn/diff/updated");
@@ -4041,7 +4086,7 @@ mod tests {
 
         let events = normalize_codex_message(SessionId::nil(), &message);
 
-        let AppEvent::ItemReasoning(event) = &events[0] else {
+        let NormalizedEvent::ItemReasoning(event) = &events[0] else {
             panic!("expected item reasoning event");
         };
         assert_eq!(event.method, "item/reasoning/textDelta");
@@ -4060,7 +4105,7 @@ mod tests {
 
         let events = normalize_codex_message(SessionId::nil(), &message);
 
-        let AppEvent::ServerRequestResolved(event) = &events[0] else {
+        let NormalizedEvent::ServerRequestResolved(event) = &events[0] else {
             panic!("expected server request resolved event");
         };
         assert_eq!(event.method, "serverRequest/resolved");
@@ -4080,7 +4125,7 @@ mod tests {
 
         let events = normalize_codex_message(SessionId::nil(), &message);
 
-        let AppEvent::McpToolCallProgress(event) = &events[0] else {
+        let NormalizedEvent::McpToolCallProgress(event) = &events[0] else {
             panic!("expected mcp tool call progress event");
         };
         assert_eq!(event.method, "item/mcpToolCall/progress");
@@ -4100,7 +4145,7 @@ mod tests {
 
         let events = normalize_codex_message(SessionId::nil(), &message);
 
-        let AppEvent::ThreadRealtimeEvent(event) = &events[0] else {
+        let NormalizedEvent::ThreadRealtimeEvent(event) = &events[0] else {
             panic!("expected thread realtime event");
         };
         assert_eq!(event.method, "thread/realtime/update");
@@ -4156,7 +4201,7 @@ mod tests {
         let events = normalize_codex_message(SessionId::nil(), &message);
 
         assert_eq!(events.len(), 1);
-        let AppEvent::PlanUpdated(plan) = &events[0] else {
+        let NormalizedEvent::PlanUpdated(plan) = &events[0] else {
             panic!("expected plan update");
         };
         assert_eq!(plan.plan_id.as_deref(), Some("turn-1"));
@@ -4183,7 +4228,7 @@ mod tests {
         let events = normalize_codex_message(SessionId::nil(), &message);
 
         assert_eq!(events.len(), 1);
-        let AppEvent::PlanUpdated(plan) = &events[0] else {
+        let NormalizedEvent::PlanUpdated(plan) = &events[0] else {
             panic!("expected plan update");
         };
         assert_eq!(plan.plan_id.as_deref(), Some("turn-1"));
@@ -4207,7 +4252,7 @@ mod tests {
         let events = normalize_codex_message(SessionId::nil(), &message);
 
         assert_eq!(events.len(), 1);
-        let AppEvent::CommandOutputDelta(output) = &events[0] else {
+        let NormalizedEvent::CommandOutputDelta(output) = &events[0] else {
             panic!("expected command output");
         };
         assert_eq!(output.command_id, "cmd-1");
@@ -4308,7 +4353,7 @@ mod tests {
 
         assert_eq!(native_request_id, json!("approval-1"));
         assert_eq!(approval_kind, CodexApprovalKind::Command);
-        let AppEvent::ApprovalRequested(request) = event else {
+        let NormalizedEvent::ApprovalRequested(request) = event else {
             panic!("expected approval request");
         };
         assert_eq!(request.kind, ApprovalKind::Command);
@@ -4352,7 +4397,7 @@ mod tests {
         assert_eq!(rid, json!(1));
         assert_eq!(ak, CodexApprovalKind::FileChange);
 
-        let AppEvent::ApprovalRequested(request) = ev else {
+        let NormalizedEvent::ApprovalRequested(request) = ev else {
             panic!("expected approval");
         };
         let pres = request.presentation.expect("presentation");
@@ -4626,7 +4671,7 @@ mod tests {
                         "text": "# Plan\n\n1. Test"
                     })),
                 },
-                DiscoveredSessionHistoryItem::ProviderEvent {
+                DiscoveredSessionHistoryItem::NativeNotification {
                     event_id: Some("compact-1".to_owned()),
                     category: "compaction".to_owned(),
                     title: "Context compacted".to_owned(),
@@ -4724,7 +4769,7 @@ mod tests {
                         "arguments": {"path": "README.md"}
                     })),
                 },
-                DiscoveredSessionHistoryItem::ProviderEvent {
+                DiscoveredSessionHistoryItem::NativeNotification {
                     event_id: Some("og-1".to_owned()),
                     category: "codex_thread_item".to_owned(),
                     title: "orphanGadget".to_owned(),
@@ -4742,7 +4787,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_history_user_message_multimodal_falls_back_to_provider_event() {
+    fn codex_history_user_message_multimodal_falls_back_to_native_notification() {
         let read_response = json!({
             "result": {
                 "thread": {
@@ -4763,7 +4808,7 @@ mod tests {
 
         assert_eq!(
             codex_history_from_thread_read_response(&read_response),
-            vec![DiscoveredSessionHistoryItem::ProviderEvent {
+            vec![DiscoveredSessionHistoryItem::NativeNotification {
                 event_id: Some("u-img".to_owned()),
                 category: "codex_thread_item".to_owned(),
                 title: "userMessage".to_owned(),
@@ -4981,14 +5026,14 @@ mod tests {
         );
         assert_eq!(
             approval_response_for_decision(
-                CodexApprovalKind::LegacyExecCommand,
+                CodexApprovalKind::ExecCommandApproval,
                 ApprovalDecision::Accept
             ),
             json!({"decision": "approved"})
         );
         assert_eq!(
             approval_response_for_decision(
-                CodexApprovalKind::LegacyApplyPatch,
+                CodexApprovalKind::ApplyPatchApproval,
                 ApprovalDecision::Decline
             ),
             json!({"decision": "denied"})
@@ -4996,31 +5041,31 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_legacy_exec_command_approval_fixture() {
+    fn normalizes_exec_command_approval_alias_fixture() {
         let msg = json!({
             "method": "execCommandApproval",
-            "id": "req-legacy-exec",
+            "id": "req-exec-alias",
             "params": {
                 "conversationId": "conv-1",
                 "callId": "call-1",
-                "command": ["echo", "legacy"],
+                "command": ["echo", "alias"],
                 "cwd": "/tmp/ws",
                 "reason": "verify mapping"
             }
         });
-        let Some((_, _, codex_kind, AppEvent::ApprovalRequested(req))) =
+        let Some((_, _, codex_kind, NormalizedEvent::ApprovalRequested(req))) =
             normalize_codex_approval_request(SessionId::nil(), &msg, None)
         else {
-            panic!("expected legacy exec approval mapping");
+            panic!("expected exec approval mapping");
         };
-        assert_eq!(codex_kind, CodexApprovalKind::LegacyExecCommand);
-        let details = req.details.expect("legacy exec details");
-        assert!(details.contains("echo legacy"));
+        assert_eq!(codex_kind, CodexApprovalKind::ExecCommandApproval);
+        let details = req.details.expect("exec details");
+        assert!(details.contains("echo alias"));
         assert!(details.contains("/tmp/ws"));
     }
 
     #[test]
-    fn normalizes_legacy_apply_patch_approval_fixture() {
+    fn normalizes_apply_patch_approval_alias_fixture() {
         let msg = json!({
             "method": "applyPatchApproval",
             "id": 991,
@@ -5034,13 +5079,13 @@ mod tests {
                 "reason": "touch two files"
             }
         });
-        let Some((_, _, codex_kind, AppEvent::ApprovalRequested(req))) =
+        let Some((_, _, codex_kind, NormalizedEvent::ApprovalRequested(req))) =
             normalize_codex_approval_request(SessionId::nil(), &msg, None)
         else {
-            panic!("expected legacy patch approval mapping");
+            panic!("expected patch approval mapping");
         };
-        assert_eq!(codex_kind, CodexApprovalKind::LegacyApplyPatch);
-        let details = req.details.expect("legacy patch details");
+        assert_eq!(codex_kind, CodexApprovalKind::ApplyPatchApproval);
+        let details = req.details.expect("patch details");
         assert!(details.contains("a.rs"));
         assert!(details.contains("b.rs"));
     }
@@ -5378,7 +5423,7 @@ mod tests {
         };
 
         assert_eq!(native_request_id, json!(99));
-        if let AppEvent::QuestionRequested(payload) = event {
+        if let NormalizedEvent::QuestionRequested(payload) = event {
             assert_eq!(payload.question_id, question_id);
             assert_eq!(payload.fields[0].kind, "single_select");
             assert_eq!(payload.fields[0].choices[1].value, "Runner");
@@ -5423,7 +5468,7 @@ mod tests {
             panic!("expected question request");
         };
 
-        if let AppEvent::QuestionRequested(payload) = event {
+        if let NormalizedEvent::QuestionRequested(payload) = event {
             assert_eq!(payload.title, "demo");
             assert_eq!(payload.description.as_deref(), Some("Pick targets"));
             assert_eq!(payload.fields[0].kind, "multi_select");

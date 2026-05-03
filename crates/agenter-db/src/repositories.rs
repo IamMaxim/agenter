@@ -932,7 +932,7 @@ pub async fn session_turn_settings(
     Ok(settings.and_then(|settings| serde_json::from_value(settings).ok()))
 }
 
-/// Clears Agenter's compatibility projection for a session before rewriting history
+/// Clears Agenter's universal projection for a session before rewriting history
 /// from native-agent discovery. Native harness history remains the source of truth.
 pub async fn clear_session_event_projection(pool: &PgPool, session_id: SessionId) -> Result<()> {
     let mut tx = pool.begin().await?;
@@ -1959,6 +1959,7 @@ fn parse_control_plane_event_id(value: &str) -> Result<Uuid> {
 fn universal_event_type(event: &UniversalEventKind) -> &'static str {
     match event {
         UniversalEventKind::SessionCreated { .. } => "session.created",
+        UniversalEventKind::SessionStatusChanged { .. } => "session.status_changed",
         UniversalEventKind::TurnStarted { .. } => "turn.started",
         UniversalEventKind::TurnStatusChanged { .. } => "turn.status_changed",
         UniversalEventKind::TurnCompleted { .. } => "turn.completed",
@@ -1976,6 +1977,7 @@ fn universal_event_type(event: &UniversalEventKind) -> &'static str {
         UniversalEventKind::DiffUpdated { .. } => "diff.updated",
         UniversalEventKind::ArtifactCreated { .. } => "artifact.created",
         UniversalEventKind::UsageUpdated { .. } => "usage.updated",
+        UniversalEventKind::ErrorReported { .. } => "error.reported",
         UniversalEventKind::NativeUnknown { .. } => "native.unknown",
     }
 }
@@ -2419,7 +2421,7 @@ mod tests {
 
         clear_session_event_projection(&pool, session.session_id)
             .await
-            .expect("clear compatibility projection");
+            .expect("clear universal projection");
         assert!(
             list_universal_events_after(&pool, session.session_id, None, 10)
                 .await

@@ -251,20 +251,26 @@ async fn publish_runner_error_event(
     message: &str,
 ) {
     state
-        .publish_event(
+        .publish_universal_event(
             session_id,
-            agenter_core::AppEvent::Error(agenter_core::AgentErrorEvent {
-                session_id: Some(session_id),
+            None,
+            None,
+            agenter_core::UniversalEventKind::ErrorReported {
                 code: Some(code.to_owned()),
                 message: message.to_owned(),
-                provider_payload: Some(serde_json::json!({
-                    "operation": operation,
-                    "request_id": request_id.map(|id| id.to_string()),
-                    "detail": message,
-                })),
-            }),
+            },
         )
-        .await;
+        .await
+        .map(|_| ())
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                %session_id,
+                operation,
+                request_id = request_id.map(ToString::to_string).as_deref(),
+                %error,
+                "failed to publish universal runner error event"
+            );
+        });
 }
 
 async fn publish_session_status_event(
@@ -274,15 +280,21 @@ async fn publish_session_status_event(
     reason: Option<String>,
 ) {
     state
-        .publish_event(
+        .publish_universal_event(
             session_id,
-            agenter_core::AppEvent::SessionStatusChanged(agenter_core::SessionStatusChangedEvent {
-                session_id,
-                status,
-                reason,
-            }),
+            None,
+            None,
+            agenter_core::UniversalEventKind::SessionStatusChanged { status, reason },
         )
-        .await;
+        .await
+        .map(|_| ())
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                %session_id,
+                %error,
+                "failed to publish universal session status event"
+            );
+        });
 }
 
 async fn authenticated_user_from_headers(
@@ -297,9 +309,9 @@ async fn authenticated_user_from_headers(
 mod tests {
     use crate::auth::SESSION_COOKIE_NAME;
     use agenter_core::{
-        AgentCapabilities, AgentMessageDeltaEvent, AgentProviderId, AppEvent, ApprovalDecision,
-        ApprovalId, ApprovalKind, ApprovalRequestEvent, FileChangeKind, RunnerId, SessionId,
-        SessionInfo, UserMessageEvent, WorkspaceId,
+        AgentCapabilities, AgentProviderId, ApprovalDecision, ApprovalId, ApprovalKind,
+        ApprovalRequestEvent, FileChangeKind, NormalizedEvent, RunnerId, SessionId, SessionInfo,
+        UserMessageEvent, WorkspaceId,
     };
     use agenter_protocol::{
         browser::{BrowserClientMessage, BrowserServerMessage, SubscribeSession},
@@ -311,18 +323,7 @@ mod tests {
         },
         RequestId, RunnerTransportOutboundFrame,
     };
-    type BrowserEventEnvelope = crate::state::AppEventEnvelope;
-
-    fn app_event_name_for_test(event: &AppEvent) -> &'static str {
-        match event {
-            AppEvent::AgentMessageDelta(_) => "agent_message_delta",
-            AppEvent::AgentMessageCompleted(_) => "agent_message_completed",
-            AppEvent::UserMessage(_) => "user_message",
-            AppEvent::ApprovalRequested(_) => "approval_requested",
-            AppEvent::ApprovalResolved(_) => "approval_resolved",
-            _ => "app_event",
-        }
-    }
+    type BrowserEventEnvelope = crate::state::CachedEventEnvelope;
     use axum::{
         body::{to_bytes, Body},
         http::{header, Request, StatusCode},
@@ -393,7 +394,7 @@ mod tests {
             .filter(|entry| {
                 matches!(
                     &entry.event,
-                    AppEvent::UserMessage(message) if message.content == content
+                    NormalizedEvent::UserMessage(message) if message.content == content
                 )
             })
             .count()
@@ -435,7 +436,7 @@ mod tests {
     ) -> agenter_core::UniversalCommandEnvelope {
         agenter_core::UniversalCommandEnvelope {
             command_id: agenter_core::CommandId::new(),
-            idempotency_key: format!("legacy:approval:{user_id}:{approval_id}:{option_id}"),
+            idempotency_key: format!("uap:approval:{user_id}:{approval_id}:{option_id}"),
             session_id: Some(session_id),
             turn_id: None,
             command: agenter_core::UniversalCommand::ResolveApproval {
@@ -1070,87 +1071,8 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert!(matches!(
             history[0].event,
-            AppEvent::AgentMessageCompleted(_)
+            NormalizedEvent::AgentMessageCompleted(_)
         ));
-    }
-
-    async fn send_runner_app_event(
-        sender: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
-        request_id: Option<RequestId>,
-        session_id: SessionId,
-        event: AppEvent,
-    ) {
-        sender
-            .send(Message::Text(
-                serde_json::to_string(&RunnerClientMessage::Event(Box::new(RunnerEventEnvelope {
-                    request_id,
-                    runner_event_seq: None,
-                    acked_runner_event_seq: None,
-                    event: RunnerEvent::AgentEvent(Box::new(AgentUniversalEvent {
-                        session_id,
-                        event_id: None,
-                        turn_id: None,
-                        item_id: None,
-                        ts: None,
-                        source: agenter_core::UniversalEventSource::Native,
-                        native: None,
-                        event: agenter_core::UniversalEventKind::NativeUnknown {
-                            summary: Some(app_event_name_for_test(&event).to_owned()),
-                        },
-                    })),
-                })))
-                .expect("serialize runner event")
-                .into(),
-            ))
-            .await
-            .expect("send runner event");
-    }
-
-    async fn next_browser_event(
-        receiver: &mut futures_util::stream::SplitStream<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-        >,
-    ) -> BrowserEventEnvelope {
-        loop {
-            let frame = timeout(Duration::from_secs(2), receiver.next())
-                .await
-                .expect("browser event timeout")
-                .expect("browser event frame")
-                .expect("browser event websocket result");
-            let Message::Text(text) = frame else {
-                continue;
-            };
-            match serde_json::from_str::<BrowserServerMessage>(&text)
-                .expect("decode browser message")
-            {
-                BrowserServerMessage::UniversalEvent(event) => {
-                    return BrowserEventEnvelope {
-                        event_id: Some(event.event_id.into()),
-                        event: AppEvent::ProviderEvent(agenter_core::ProviderEvent {
-                            session_id: event.session_id,
-                            provider_id: AgentProviderId::from("universal"),
-                            event_id: None,
-                            category: "universal".to_owned(),
-                            method: "universal_event".to_owned(),
-                            title: "Universal event".to_owned(),
-                            detail: None,
-                            status: None,
-                            provider_payload: None,
-                        }),
-                    };
-                }
-                BrowserServerMessage::Ack(_) => continue,
-                BrowserServerMessage::SessionSnapshot(_) => continue,
-                BrowserServerMessage::Error(error) => panic!("unexpected browser error: {error:?}"),
-            }
-        }
     }
 
     async fn next_browser_message(
@@ -1297,7 +1219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_truncated_universal_snapshot_stops_before_live_events() {
+    async fn subscribe_truncated_universal_snapshot_continues_with_live_events() {
         let state = AppState::new_with_bootstrap_admin(
             "dev-token".to_owned(),
             "admin@example.test".to_owned(),
@@ -1328,7 +1250,7 @@ mod tests {
             state
                 .publish_event(
                     session.session_id,
-                    AppEvent::UserMessage(UserMessageEvent {
+                    NormalizedEvent::UserMessage(UserMessageEvent {
                         session_id: session.session_id,
                         message_id: Some(format!("replay-{i}")),
                         author_user_id: None,
@@ -1390,13 +1312,129 @@ mod tests {
             panic!("expected session snapshot");
         };
         assert!(snapshot.has_more);
+        state
+            .publish_event(
+                session.session_id,
+                NormalizedEvent::UserMessage(UserMessageEvent {
+                    session_id: session.session_id,
+                    message_id: Some("live-after-truncated-snapshot".to_owned()),
+                    author_user_id: None,
+                    content: "live".to_owned(),
+                }),
+            )
+            .await;
+        let BrowserServerMessage::UniversalEvent(event) =
+            next_browser_message(&mut browser_receiver).await
+        else {
+            panic!("expected live universal event after truncated snapshot");
+        };
+        assert!(
+            event.seq > snapshot.latest_seq.expect("truncated replay cursor"),
+            "live event should advance beyond the truncated replay cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_truncated_replay_without_snapshot_stops_before_live_events() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let user_id = state.bootstrap_user_id().expect("bootstrap user");
+        let runner = fake_hello();
+        let workspace = runner.workspaces[0].clone();
+        state
+            .register_runner(
+                runner.runner_id,
+                runner.capabilities.clone(),
+                runner.workspaces.clone(),
+            )
+            .await;
+        let session = state
+            .create_session(
+                SessionId::new(),
+                user_id,
+                runner.runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        for i in 0..1026 {
+            state
+                .publish_event(
+                    session.session_id,
+                    NormalizedEvent::UserMessage(UserMessageEvent {
+                        session_id: session.session_id,
+                        message_id: Some(format!("replay-only-{i}")),
+                        author_user_id: None,
+                        content: "replay".to_owned(),
+                    }),
+                )
+                .await;
+        }
+
+        let browser_session_token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let server_state = state.clone();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("read listener address");
+        tokio::spawn(async move {
+            axum::serve(listener, app(server_state))
+                .await
+                .expect("serve app");
+        });
+
+        let mut browser_request = format!("ws://{addr}/api/browser/ws")
+            .into_client_request()
+            .expect("build browser websocket request");
+        browser_request.headers_mut().insert(
+            header::COOKIE,
+            format!("{}={browser_session_token}", SESSION_COOKIE_NAME)
+                .parse()
+                .expect("cookie header"),
+        );
+        let (browser_socket, _) = connect_async(browser_request)
+            .await
+            .expect("connect browser");
+        let (mut browser_sender, mut browser_receiver) = browser_socket.split();
+        browser_sender
+            .send(Message::Text(
+                serde_json::to_string(&BrowserClientMessage::SubscribeSession(SubscribeSession {
+                    request_id: Some(RequestId::from("sub-truncated-replay-only")),
+                    session_id: session.session_id,
+                    after_seq: Some(agenter_core::UniversalSeq::zero()),
+                    include_snapshot: false,
+                }))
+                .expect("serialize subscribe")
+                .into(),
+            ))
+            .await
+            .expect("send browser subscription");
+
+        assert!(matches!(
+            next_browser_message(&mut browser_receiver).await,
+            BrowserServerMessage::Ack(_)
+        ));
+        let BrowserServerMessage::SessionSnapshot(snapshot) =
+            next_browser_message(&mut browser_receiver).await
+        else {
+            panic!("expected replay frame");
+        };
+        assert!(snapshot.has_more);
         let safe_latest_seq = snapshot.latest_seq;
         state
             .publish_event(
                 session.session_id,
-                AppEvent::UserMessage(UserMessageEvent {
+                NormalizedEvent::UserMessage(UserMessageEvent {
                     session_id: session.session_id,
-                    message_id: Some("live-after-truncated-snapshot".to_owned()),
+                    message_id: Some("live-after-truncated-replay-only".to_owned()),
                     author_user_id: None,
                     content: "live".to_owned(),
                 }),
@@ -1409,7 +1447,7 @@ mod tests {
         assert_eq!(error.code, "snapshot_replay_incomplete");
         assert!(
             error.message.contains("snapshot.latest_seq"),
-            "error should instruct clients to resume from the snapshot cursor: {}",
+            "error should instruct clients to resume from the replay cursor: {}",
             error.message
         );
         assert!(
@@ -1423,7 +1461,7 @@ mod tests {
             .expect("subscription should close instead of waiting for live universal events");
         assert!(
             matches!(next, None | Some(Ok(Message::Close(_))) | Some(Err(_))),
-            "truncated universal subscription must not deliver live events: {next:?}"
+            "truncated replay-only subscription must not deliver live events: {next:?}"
         );
     }
 
@@ -1520,7 +1558,10 @@ mod tests {
         let agenter_protocol::runner::RunnerCommand::AgentSendInput(input_command) =
             &command.command
         else {
-            panic!("expected agent send input command");
+            panic!(
+                "expected agent send input command, got {:?}",
+                command.command
+            );
         };
         assert_eq!(input_command.session_id, session.session_id);
         assert_eq!(
@@ -1547,9 +1588,10 @@ mod tests {
             .expect("read history body");
         let history: Vec<BrowserEventEnvelope> =
             serde_json::from_slice(&history_body).expect("history json");
-        assert!(history
-            .iter()
-            .any(|entry| matches!(entry.event, AppEvent::SessionStarted(_))));
+        assert!(
+            history.is_empty(),
+            "universal-only create/message flow should not backfill cached normalized history"
+        );
     }
 
     #[tokio::test]
@@ -1673,7 +1715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idempotent_send_session_message_replays_legacy_rest_response() {
+    async fn idempotent_send_session_message_replays_rest_response() {
         let state = AppState::new_with_bootstrap_admin(
             "dev-token".to_owned(),
             "admin@example.test".to_owned(),
@@ -1914,7 +1956,7 @@ mod tests {
         state
             .publish_event(
                 session.session_id,
-                AppEvent::QuestionRequested(agenter_core::QuestionRequestedEvent {
+                NormalizedEvent::QuestionRequested(agenter_core::QuestionRequestedEvent {
                     session_id: session.session_id,
                     question_id,
                     title: "Pick target".to_owned(),
@@ -2327,7 +2369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idempotent_legacy_slash_without_key_executes_repeated_invocations() {
+    async fn idempotent_slash_without_key_executes_repeated_invocations() {
         let state = AppState::new_with_bootstrap_admin(
             "dev-token".to_owned(),
             "admin@example.test".to_owned(),
@@ -2792,263 +2834,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "legacy app_event browser pipeline test; replace with universal snapshot pipeline coverage"]
-    async fn full_browser_fake_runner_pipeline_routes_messages_events_history_and_approvals() {
-        let state = AppState::new_with_bootstrap_admin(
-            "dev-token".to_owned(),
-            "admin@example.test".to_owned(),
-            "correct horse battery staple".to_owned(),
-            CookieSecurity::DevelopmentInsecure,
-        )
-        .expect("create bootstrap admin");
-        let browser_session_token = state
-            .login_password("admin@example.test", "correct horse battery staple")
-            .await
-            .expect("login bootstrap admin");
-        let app_service = app(state.clone());
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test listener");
-        let addr = listener.local_addr().expect("read listener address");
-        tokio::spawn(async move {
-            axum::serve(listener, app(state)).await.expect("serve app");
-        });
-
-        let (runner_socket, _) = connect_async(format!("ws://{addr}/api/runner/ws"))
-            .await
-            .expect("connect runner");
-        let (mut runner_sender, mut runner_receiver) = runner_socket.split();
-        let hello = fake_hello();
-        let workspace_id = hello.workspaces[0].workspace_id;
-        runner_sender
-            .send(Message::Text(
-                serde_json::to_string(&RunnerClientMessage::Hello(hello))
-                    .expect("serialize hello")
-                    .into(),
-            ))
-            .await
-            .expect("send runner hello");
-        expect_no_runner_command(&mut runner_receiver).await;
-
-        let cookie = format!("{}={browser_session_token}", SESSION_COOKIE_NAME);
-        let session = create_session_through_runner(
-            app_service.clone(),
-            &cookie,
-            workspace_id,
-            &mut runner_sender,
-            &mut runner_receiver,
-        )
-        .await;
-        let runners_response = app_service
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/runners")
-                    .header(header::COOKIE, &cookie)
-                    .body(Body::empty())
-                    .expect("build runners request"),
-            )
-            .await
-            .expect("route runners request");
-        assert_eq!(runners_response.status(), StatusCode::OK);
-        let runners_body = to_bytes(runners_response.into_body(), usize::MAX)
-            .await
-            .expect("read runners body");
-        let runners: serde_json::Value =
-            serde_json::from_slice(&runners_body).expect("runners json");
-        assert_eq!(runners.as_array().expect("runner list").len(), 1);
-
-        let mut browser_request = format!("ws://{addr}/api/browser/ws")
-            .into_client_request()
-            .expect("build browser websocket request");
-        browser_request
-            .headers_mut()
-            .insert(header::COOKIE, cookie.parse().expect("cookie header"));
-        let (browser_socket, _) = connect_async(browser_request)
-            .await
-            .expect("connect browser");
-        let (mut browser_sender, mut browser_receiver) = browser_socket.split();
-        browser_sender
-            .send(Message::Text(
-                serde_json::to_string(&BrowserClientMessage::SubscribeSession(SubscribeSession {
-                    request_id: Some(RequestId::from("sub-full")),
-                    session_id: session.session_id,
-                    after_seq: None,
-                    include_snapshot: false,
-                }))
-                .expect("serialize subscribe")
-                .into(),
-            ))
-            .await
-            .expect("send browser subscription");
-        let _session_started = next_browser_event(&mut browser_receiver).await;
-
-        let send_response = tokio::spawn({
-            let app_service = app_service.clone();
-            let cookie = cookie.clone();
-            let session_id = session.session_id;
-            async move {
-                app_service
-                    .oneshot(
-                        Request::builder()
-                            .method("POST")
-                            .uri(format!("/api/sessions/{session_id}/messages"))
-                            .header(header::COOKIE, &cookie)
-                            .header(header::CONTENT_TYPE, "application/json")
-                            .body(Body::from(
-                                serde_json::json!({ "content": "full pipeline message" })
-                                    .to_string(),
-                            ))
-                            .expect("build message request"),
-                    )
-                    .await
-                    .expect("route message request")
-            }
-        });
-
-        let message_command = next_runner_command(&mut runner_receiver).await;
-        let agenter_protocol::runner::RunnerCommand::AgentSendInput(input_command) =
-            &message_command.command
-        else {
-            panic!("expected agent input command");
-        };
-        assert_eq!(input_command.session_id, session.session_id);
-        assert_eq!(
-            input_command.external_session_id.as_deref(),
-            Some("codex-thread-1")
-        );
-        send_runner_response(&mut runner_sender, message_command.request_id.clone()).await;
-        let send_response = send_response.await.expect("send response task");
-        assert_eq!(send_response.status(), StatusCode::ACCEPTED);
-
-        let browser_user_echo = next_browser_event(&mut browser_receiver).await;
-        let AppEvent::UserMessage(user_echo) = browser_user_echo.event else {
-            panic!("expected browser-submitted user echo");
-        };
-        assert_eq!(user_echo.session_id, session.session_id);
-        assert_eq!(user_echo.content, "full pipeline message");
-        assert!(user_echo.message_id.is_some());
-
-        let approval_id = ApprovalId::new();
-        send_runner_app_event(
-            &mut runner_sender,
-            Some(message_command.request_id.clone()),
-            session.session_id,
-            AppEvent::ApprovalRequested(ApprovalRequestEvent {
-                session_id: session.session_id,
-                approval_id,
-                kind: ApprovalKind::Command,
-                title: "Approve full pipeline command".to_owned(),
-                details: Some("printf ok".to_owned()),
-                expires_at: None,
-                presentation: None,
-                resolution_state: None,
-                resolving_decision: None,
-                status: None,
-                turn_id: None,
-                item_id: None,
-                options: Vec::new(),
-                risk: None,
-                subject: None,
-                native_request_id: None,
-                native_blocking: true,
-                policy: None,
-                provider_payload: None,
-            }),
-        )
-        .await;
-        send_runner_app_event(
-            &mut runner_sender,
-            Some(message_command.request_id.clone()),
-            session.session_id,
-            AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {
-                session_id: session.session_id,
-                message_id: "agent-full-1".to_owned(),
-                delta: "full pipeline response".to_owned(),
-                provider_payload: None,
-            }),
-        )
-        .await;
-
-        let mut saw_user = true;
-        let mut saw_approval = false;
-        let mut saw_delta = false;
-        for _ in 0..6 {
-            let event = next_browser_event(&mut browser_receiver).await;
-            match event.event {
-                AppEvent::UserMessage(_) => saw_user = true,
-                AppEvent::ApprovalRequested(_) => saw_approval = true,
-                AppEvent::AgentMessageDelta(_) => saw_delta = true,
-                _ => {}
-            }
-            if saw_user && saw_approval && saw_delta {
-                break;
-            }
-        }
-        assert!(saw_user, "browser receives user event");
-        assert!(saw_approval, "browser receives approval event");
-        assert!(saw_delta, "browser receives agent delta event");
-
-        let decision_task = tokio::spawn(
-            app_service.clone().oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/approvals/{approval_id}/decision"))
-                    .header(header::COOKIE, &cookie)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_string(&ApprovalDecision::Accept)
-                            .expect("serialize approval decision"),
-                    ))
-                    .expect("build approval decision request"),
-            ),
-        );
-        let approval_command = next_runner_command(&mut runner_receiver).await;
-        let agenter_protocol::runner::RunnerCommand::AnswerApproval(answer) =
-            approval_command.command.clone()
-        else {
-            panic!("expected approval answer command");
-        };
-        assert_eq!(answer.approval_id, approval_id);
-        send_runner_response(&mut runner_sender, approval_command.request_id).await;
-
-        let decision_response = decision_task
-            .await
-            .expect("join approval decision")
-            .expect("route approval decision");
-        assert_eq!(decision_response.status(), StatusCode::OK);
-
-        let history_response = app_service
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/sessions/{}/history", session.session_id))
-                    .header(header::COOKIE, &cookie)
-                    .body(Body::empty())
-                    .expect("build history request"),
-            )
-            .await
-            .expect("route history request");
-        assert_eq!(history_response.status(), StatusCode::OK);
-        let history_body = to_bytes(history_response.into_body(), usize::MAX)
-            .await
-            .expect("read history body");
-        let history: Vec<BrowserEventEnvelope> =
-            serde_json::from_slice(&history_body).expect("history json");
-        assert!(history
-            .iter()
-            .any(|entry| matches!(entry.event, AppEvent::UserMessage(_))));
-        assert!(history
-            .iter()
-            .any(|entry| matches!(entry.event, AppEvent::ApprovalRequested(_))));
-        assert!(history
-            .iter()
-            .any(|entry| matches!(entry.event, AppEvent::AgentMessageDelta(_))));
-        assert!(history
-            .iter()
-            .any(|entry| matches!(entry.event, AppEvent::ApprovalResolved(_))));
-    }
-
-    #[tokio::test]
     async fn approval_decision_resolves_only_after_runner_ack() {
         let state = AppState::new_with_bootstrap_admin(
             "dev-token".to_owned(),
@@ -3093,7 +2878,7 @@ mod tests {
         state
             .publish_event(
                 session_id,
-                AppEvent::ApprovalRequested(ApprovalRequestEvent {
+                NormalizedEvent::ApprovalRequested(ApprovalRequestEvent {
                     session_id,
                     approval_id,
                     kind: ApprovalKind::Command,
@@ -3168,7 +2953,7 @@ mod tests {
         assert!(
             !history
                 .iter()
-                .any(|entry| matches!(entry.event, AppEvent::ApprovalResolved(_))),
+                .any(|entry| matches!(entry.event, NormalizedEvent::ApprovalResolved(_))),
             "approval must not resolve before the runner acknowledges provider delivery"
         );
         let pending = state.pending_approval_request_envelopes(session_id).await;
@@ -3196,7 +2981,10 @@ mod tests {
             .expect("read approval response");
         let envelope: BrowserEventEnvelope =
             serde_json::from_slice(&body).expect("approval response json");
-        assert!(matches!(envelope.event, AppEvent::ApprovalResolved(_)));
+        assert!(matches!(
+            envelope.event,
+            NormalizedEvent::ApprovalResolved(_)
+        ));
 
         let duplicate_response = app
             .clone()
@@ -3283,7 +3071,7 @@ mod tests {
         state
             .publish_event(
                 session_id,
-                AppEvent::ApprovalRequested(ApprovalRequestEvent {
+                NormalizedEvent::ApprovalRequested(ApprovalRequestEvent {
                     session_id,
                     approval_id,
                     kind: ApprovalKind::Command,
@@ -3412,7 +3200,7 @@ mod tests {
         state
             .publish_event(
                 session_id,
-                AppEvent::ApprovalRequested(approval_request_event(session_id, approval_id)),
+                NormalizedEvent::ApprovalRequested(approval_request_event(session_id, approval_id)),
             )
             .await;
         let other_token = state
@@ -3452,7 +3240,7 @@ mod tests {
             history.iter().all(|entry| {
                 !matches!(
                     &entry.event,
-                    AppEvent::ApprovalRequested(request)
+                    NormalizedEvent::ApprovalRequested(request)
                         if request.approval_id == approval_id
                             && request.resolution_state
                                 == Some(agenter_core::ApprovalResolutionState::Resolving)
@@ -3487,7 +3275,7 @@ mod tests {
         state
             .publish_event(
                 session_id,
-                AppEvent::ApprovalRequested(approval_request_event(session_id, approval_id)),
+                NormalizedEvent::ApprovalRequested(approval_request_event(session_id, approval_id)),
             )
             .await;
         let token = state
@@ -3551,13 +3339,13 @@ mod tests {
         state
             .publish_event(
                 session_id,
-                AppEvent::ApprovalRequested(approval_request_event(session_id, approval_id)),
+                NormalizedEvent::ApprovalRequested(approval_request_event(session_id, approval_id)),
             )
             .await;
         state
             .publish_event(
                 session_id,
-                AppEvent::ApprovalResolved(agenter_core::ApprovalResolvedEvent {
+                NormalizedEvent::ApprovalResolved(agenter_core::ApprovalResolvedEvent {
                     session_id,
                     approval_id,
                     decision: ApprovalDecision::Accept,
@@ -3600,7 +3388,10 @@ mod tests {
                 .expect("read approval body");
             let envelope: BrowserEventEnvelope =
                 serde_json::from_slice(&body).expect("approval envelope");
-            assert!(matches!(envelope.event, AppEvent::ApprovalResolved(_)));
+            assert!(matches!(
+                envelope.event,
+                NormalizedEvent::ApprovalResolved(_)
+            ));
         }
     }
 
@@ -3629,7 +3420,7 @@ mod tests {
         state
             .publish_event(
                 session_id,
-                AppEvent::ApprovalRequested(approval_request_event(session_id, approval_id)),
+                NormalizedEvent::ApprovalRequested(approval_request_event(session_id, approval_id)),
             )
             .await;
         let first_decision = ApprovalDecision::ProviderSpecific {
@@ -3758,7 +3549,7 @@ mod tests {
         state
             .publish_event(
                 session_id,
-                AppEvent::ApprovalRequested(ApprovalRequestEvent {
+                NormalizedEvent::ApprovalRequested(ApprovalRequestEvent {
                     session_id,
                     approval_id,
                     kind: ApprovalKind::Command,
@@ -3784,7 +3575,7 @@ mod tests {
         state
             .publish_event(
                 session_id,
-                AppEvent::ApprovalResolved(agenter_core::ApprovalResolvedEvent {
+                NormalizedEvent::ApprovalResolved(agenter_core::ApprovalResolvedEvent {
                     session_id,
                     approval_id,
                     decision: ApprovalDecision::Decline,

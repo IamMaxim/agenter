@@ -8,6 +8,7 @@ export interface PersistedSessionTab {
 
 export const TAB_STORAGE_KEY = 'agenter.chat.tabs.v1';
 export const MAX_OPEN_TABS = 12;
+export const FALLBACK_TAB_TITLE = 'Untitled session';
 export interface SavedTabsDocument {
   version: 1;
   tabs: PersistedSessionTab[];
@@ -24,6 +25,10 @@ function normalizeSessionId(value: unknown): string | undefined {
   return trimmed;
 }
 
+function normalizeTabTitle(value: unknown): string {
+  return normalizeSessionId(value) ?? '';
+}
+
 function normalizeTab(value: unknown): PersistedSessionTab | undefined {
   if (typeof value !== 'object' || value === null) {
     return undefined;
@@ -33,7 +38,7 @@ function normalizeTab(value: unknown): PersistedSessionTab | undefined {
   if (!sessionId) {
     return undefined;
   }
-  const title = normalizeSessionId(record.title) ?? sessionId;
+  const title = normalizeTabTitle(record.title ?? record.name);
   return {
     sessionId,
     title
@@ -87,7 +92,7 @@ export function serializeTabs(tabs: PersistedSessionTab[]): string {
     seen.add(tab.sessionId);
     next.push({
       sessionId: tab.sessionId,
-      title: normalizeSessionId(tab.title) ?? tab.sessionId
+      title: normalizeTabTitle(tab.title) || FALLBACK_TAB_TITLE
     });
     if (next.length >= MAX_OPEN_TABS) {
       break;

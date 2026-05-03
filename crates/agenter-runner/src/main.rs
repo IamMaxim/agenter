@@ -9,10 +9,10 @@ use std::{
 };
 
 use agenter_core::{
-    AgentCapabilities, AgentErrorEvent, AgentMessageDeltaEvent, AgentProviderId, AppEvent,
-    ApprovalDecision, ApprovalId, ApprovalKind, ApprovalRequestEvent, CommandCompletedEvent,
-    CommandEvent, CommandOutputEvent, CommandOutputStream, FileChangeEvent, FileChangeKind,
-    MessageCompletedEvent, QuestionId, RunnerId, SessionId, SessionStatus,
+    AgentCapabilities, AgentErrorEvent, AgentMessageDeltaEvent, AgentProviderId, ApprovalDecision,
+    ApprovalId, ApprovalKind, ApprovalRequestEvent, CommandCompletedEvent, CommandEvent,
+    CommandOutputEvent, CommandOutputStream, FileChangeEvent, FileChangeKind,
+    MessageCompletedEvent, NormalizedEvent, QuestionId, RunnerId, SessionId, SessionStatus,
     SessionStatusChangedEvent, ToolEvent, UserMessageEvent, WorkspaceId, WorkspaceRef,
 };
 use agenter_protocol::runner::{
@@ -335,7 +335,7 @@ impl CodexRunnerRuntime {
     async fn run_turn(
         &self,
         request: CodexTurnRequest,
-        event_sender: mpsc::UnboundedSender<AppEvent>,
+        event_sender: mpsc::UnboundedSender<AdapterEvent>,
         pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingCodexApproval>>>,
         pending_questions: Arc<Mutex<HashMap<QuestionId, PendingCodexQuestion>>>,
     ) -> anyhow::Result<()> {
@@ -613,11 +613,10 @@ async fn run_codex_runner() -> anyhow::Result<()> {
         Arc::new(Mutex::new(HashMap::new()));
     let pending_questions: Arc<Mutex<HashMap<QuestionId, PendingCodexQuestion>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    let (codex_event_sender, mut codex_event_receiver) = mpsc::unbounded_channel::<AppEvent>();
+    let (codex_event_sender, mut codex_event_receiver) = mpsc::unbounded_channel::<AdapterEvent>();
     let (background_event_sender, mut background_event_receiver) =
         mpsc::unbounded_channel::<(Option<RequestId>, RunnerEvent)>();
     let codex_runtime = CodexRunnerRuntime::new(workspace_path.clone());
-    let adapter_runtime = AdapterRuntime::new();
     if let Some(workspace) = advertised_workspace {
         let runtime = codex_runtime.clone();
         let sender = background_event_sender.clone();
@@ -668,13 +667,7 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                 let Some(event) = event else {
                     continue;
                 };
-                let adapter_event = adapter_runtime.project_legacy_event(
-                    AgentProviderId::from(AgentProviderId::CODEX),
-                    "codex-app-server",
-                    None,
-                    event,
-                );
-                let Some(agent_event) = adapter_event.universal_projection_for_wal() else {
+                let Some(agent_event) = event.universal_projection_for_wal() else {
                     continue;
                 };
                 let session_id = agent_event.session_id;
@@ -857,17 +850,22 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                         tokio::spawn(async move {
                             if let Err(error) = runtime.run_turn(request, event_sender.clone(), pending, pending_question_answers).await {
                                 tracing::error!(%session_id, %error, "codex turn failed");
-                                event_sender.send(AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
+                                event_sender.send(AdapterEvent::session_status(
+                                    AgentProviderId::from(AgentProviderId::CODEX),
+                                    "codex-app-server",
+                                    None,
                                     session_id,
-                                    status: SessionStatus::Failed,
-                                    reason: Some(error.to_string()),
-                                })).ok();
-                                event_sender.send(AppEvent::Error(AgentErrorEvent {
-                                    session_id: Some(session_id),
-                                    code: Some("codex_adapter_error".to_owned()),
-                                    message: error.to_string(),
-                                    provider_payload: None,
-                                })).ok();
+                                    SessionStatus::Failed,
+                                    Some(error.to_string()),
+                                )).ok();
+                                event_sender.send(AdapterEvent::error(
+                                    AgentProviderId::from(AgentProviderId::CODEX),
+                                    "codex-app-server",
+                                    None,
+                                    session_id,
+                                    Some("codex_adapter_error".to_owned()),
+                                    error.to_string(),
+                                )).ok();
                             }
                         });
                     }
@@ -979,11 +977,14 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                         tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, "codex runner shutting down session runtime");
                         codex_runtime.shutdown_session(command.session_id).await;
                         codex_event_sender
-                            .send(AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
-                                session_id: command.session_id,
-                                status: SessionStatus::Stopped,
-                                reason: Some("Codex session runtime stopped.".to_owned()),
-                            }))
+                            .send(AdapterEvent::session_status(
+                                AgentProviderId::from(AgentProviderId::CODEX),
+                                "codex-app-server",
+                                None,
+                                command.session_id,
+                                SessionStatus::Stopped,
+                                Some("Codex session runtime stopped.".to_owned()),
+                            ))
                             .ok();
                         send_runner_message(
                             &mut sender,
@@ -1083,7 +1084,8 @@ async fn run_acp_runner(
         Arc::new(Mutex::new(HashMap::new()));
     let pending_codex_questions: Arc<Mutex<HashMap<QuestionId, PendingCodexQuestion>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    let (acp_event_sender, mut acp_event_receiver) = mpsc::unbounded_channel::<AppEvent>();
+    let (acp_event_sender, mut acp_event_receiver) = mpsc::unbounded_channel::<NormalizedEvent>();
+    let (codex_event_sender, mut codex_event_receiver) = mpsc::unbounded_channel::<AdapterEvent>();
     let (background_event_sender, mut background_event_receiver) =
         mpsc::unbounded_channel::<(Option<RequestId>, RunnerEvent)>();
     let acp_runtime = AcpRunnerRuntime::new(workspace_path.clone());
@@ -1108,11 +1110,28 @@ async fn run_acp_runner(
                 let Some(event) = event else {
                     continue;
                 };
-                let provider_id = app_event_provider_id(&event)
+                let provider_id = normalized_event_provider_id(&event)
                     .unwrap_or_else(|| AgentProviderId::from("adapter"));
                 let adapter_event =
-                    adapter_runtime.project_legacy_event(provider_id, "runner-adapter", None, event);
+                    AdapterEvent::from_normalized_event(provider_id, "runner-adapter", None, event);
                 let Some(agent_event) = adapter_event.universal_projection_for_wal() else {
+                    continue;
+                };
+                let session_id = agent_event.session_id;
+                send_wal_event(
+                    &mut sender,
+                    &wal,
+                    None,
+                    Some(session_id),
+                    RunnerEvent::AgentEvent(Box::new(agent_event)),
+                )
+                .await?;
+            }
+            event = codex_event_receiver.recv() => {
+                let Some(event) = event else {
+                    continue;
+                };
+                let Some(agent_event) = event.universal_projection_for_wal() else {
                     continue;
                 };
                 let session_id = agent_event.session_id;
@@ -1500,7 +1519,7 @@ async fn run_acp_runner(
                                 prompt,
                                 settings: command.settings,
                             };
-                            let event_sender = acp_event_sender.clone();
+                            let event_sender = codex_event_sender.clone();
                             let pending = pending_codex_approvals.clone();
                             let pending_question_answers = pending_codex_questions.clone();
                             let session_id = request.session_id;
@@ -1516,21 +1535,24 @@ async fn run_acp_runner(
                                 {
                                     tracing::error!(%session_id, %error, "codex turn failed");
                                     event_sender
-                                        .send(AppEvent::SessionStatusChanged(
-                                            SessionStatusChangedEvent {
-                                                session_id,
-                                                status: SessionStatus::Failed,
-                                                reason: Some(error.to_string()),
-                                            },
+                                        .send(AdapterEvent::session_status(
+                                            AgentProviderId::from(AgentProviderId::CODEX),
+                                            "codex-app-server",
+                                            None,
+                                            session_id,
+                                            SessionStatus::Failed,
+                                            Some(error.to_string()),
                                         ))
                                         .ok();
                                     event_sender
-                                        .send(AppEvent::Error(AgentErrorEvent {
-                                            session_id: Some(session_id),
-                                            code: Some("codex_adapter_error".to_owned()),
-                                            message: error.to_string(),
-                                            provider_payload: None,
-                                        }))
+                                        .send(AdapterEvent::error(
+                                            AgentProviderId::from(AgentProviderId::CODEX),
+                                            "codex-app-server",
+                                            None,
+                                            session_id,
+                                            Some("codex_adapter_error".to_owned()),
+                                            error.to_string(),
+                                        ))
                                         .ok();
                                 }
                             });
@@ -1576,12 +1598,12 @@ async fn run_acp_runner(
                         tokio::spawn(async move {
                             if let Err(error) = runtime.run_turn(request, profile, event_sender.clone(), pending).await {
                                 tracing::error!(%session_id, %error, "ACP turn failed");
-                                event_sender.send(AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
+                                event_sender.send(NormalizedEvent::SessionStatusChanged(SessionStatusChangedEvent {
                                     session_id,
                                     status: SessionStatus::Failed,
                                     reason: Some(error.to_string()),
                                 })).ok();
-                                event_sender.send(AppEvent::Error(AgentErrorEvent {
+                                event_sender.send(NormalizedEvent::Error(AgentErrorEvent {
                                     session_id: Some(session_id),
                                     code: Some("acp_adapter_error".to_owned()),
                                     message: error.to_string(),
@@ -1797,7 +1819,7 @@ async fn run_acp_runner(
                         }
                         adapter_runtime.unbind_session(command.session_id);
                         acp_event_sender
-                            .send(AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
+                            .send(NormalizedEvent::SessionStatusChanged(SessionStatusChangedEvent {
                                 session_id: command.session_id,
                                 status: SessionStatus::Stopped,
                                 reason: Some("ACP session runtime stopped.".to_owned()),
@@ -1878,7 +1900,7 @@ async fn run_fake_runner() -> anyhow::Result<()> {
 
                 for event in deterministic_fake_events(command.session_id, &command.input) {
                     tracing::debug!(session_id = %command.session_id, "fake runner emitting event");
-                    let Some(agent_event) = AdapterEvent::from_legacy(
+                    let Some(agent_event) = AdapterEvent::from_normalized_event(
                         AgentProviderId::from("fake"),
                         "fake-runner",
                         None,
@@ -2003,8 +2025,34 @@ async fn send_wal_event(
     session_id: Option<SessionId>,
     event: RunnerEvent,
 ) -> anyhow::Result<()> {
+    if !wal::event_is_replayable(&event) {
+        return send_runner_event(sender, request_id, None, event).await;
+    }
     let record = wal.append(request_id, session_id, event).await?;
     send_wal_record(sender, wal, &record).await
+}
+
+async fn send_runner_event(
+    sender: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        Message,
+    >,
+    request_id: Option<agenter_protocol::RequestId>,
+    acked_runner_event_seq: Option<u64>,
+    event: RunnerEvent,
+) -> anyhow::Result<()> {
+    send_runner_message(
+        sender,
+        RunnerClientMessage::Event(Box::new(RunnerEventEnvelope {
+            request_id,
+            runner_event_seq: None,
+            acked_runner_event_seq,
+            event,
+        })),
+    )
+    .await
 }
 
 async fn send_wal_record(
@@ -2341,19 +2389,19 @@ fn agent_input_text(input: &AgentInput) -> String {
     }
 }
 
-fn app_event_provider_id(event: &AppEvent) -> Option<AgentProviderId> {
+fn normalized_event_provider_id(event: &NormalizedEvent) -> Option<AgentProviderId> {
     match event {
-        AppEvent::TurnDiffUpdated(event)
-        | AppEvent::ItemReasoning(event)
-        | AppEvent::ServerRequestResolved(event)
-        | AppEvent::McpToolCallProgress(event)
-        | AppEvent::ThreadRealtimeEvent(event)
-        | AppEvent::ProviderEvent(event) => Some(event.provider_id.clone()),
+        NormalizedEvent::TurnDiffUpdated(event)
+        | NormalizedEvent::ItemReasoning(event)
+        | NormalizedEvent::ServerRequestResolved(event)
+        | NormalizedEvent::McpToolCallProgress(event)
+        | NormalizedEvent::ThreadRealtimeEvent(event)
+        | NormalizedEvent::NativeNotification(event) => Some(event.provider_id.clone()),
         _ => None,
     }
 }
 
-fn deterministic_fake_events(session_id: SessionId, input: &AgentInput) -> Vec<AppEvent> {
+fn deterministic_fake_events(session_id: SessionId, input: &AgentInput) -> Vec<NormalizedEvent> {
     let content = match input {
         AgentInput::Text { text } => text.clone(),
         AgentInput::UserMessage { payload } => payload.content.clone(),
@@ -2361,13 +2409,13 @@ fn deterministic_fake_events(session_id: SessionId, input: &AgentInput) -> Vec<A
     let response = format!("fake runner received: {content}");
 
     vec![
-        AppEvent::UserMessage(UserMessageEvent {
+        NormalizedEvent::UserMessage(UserMessageEvent {
             session_id,
             message_id: Some("fake-user-1".to_owned()),
             author_user_id: None,
             content,
         }),
-        AppEvent::CommandStarted(CommandEvent {
+        NormalizedEvent::CommandStarted(CommandEvent {
             session_id,
             command_id: "fake-command-1".to_owned(),
             command: "printf fake-runner".to_owned(),
@@ -2377,14 +2425,14 @@ fn deterministic_fake_events(session_id: SessionId, input: &AgentInput) -> Vec<A
             actions: Vec::new(),
             provider_payload: None,
         }),
-        AppEvent::CommandOutputDelta(CommandOutputEvent {
+        NormalizedEvent::CommandOutputDelta(CommandOutputEvent {
             session_id,
             command_id: "fake-command-1".to_owned(),
             stream: CommandOutputStream::Stdout,
             delta: "fake-runner\n".to_owned(),
             provider_payload: None,
         }),
-        AppEvent::CommandCompleted(CommandCompletedEvent {
+        NormalizedEvent::CommandCompleted(CommandCompletedEvent {
             session_id,
             command_id: "fake-command-1".to_owned(),
             exit_code: Some(0),
@@ -2392,7 +2440,7 @@ fn deterministic_fake_events(session_id: SessionId, input: &AgentInput) -> Vec<A
             success: true,
             provider_payload: None,
         }),
-        AppEvent::ToolStarted(ToolEvent {
+        NormalizedEvent::ToolStarted(ToolEvent {
             session_id,
             tool_call_id: "fake-tool-1".to_owned(),
             name: "fake_lookup".to_owned(),
@@ -2401,7 +2449,7 @@ fn deterministic_fake_events(session_id: SessionId, input: &AgentInput) -> Vec<A
             output: None,
             provider_payload: None,
         }),
-        AppEvent::ToolCompleted(ToolEvent {
+        NormalizedEvent::ToolCompleted(ToolEvent {
             session_id,
             tool_call_id: "fake-tool-1".to_owned(),
             name: "fake_lookup".to_owned(),
@@ -2410,21 +2458,21 @@ fn deterministic_fake_events(session_id: SessionId, input: &AgentInput) -> Vec<A
             output: Some(serde_json::json!({ "ok": true })),
             provider_payload: None,
         }),
-        AppEvent::FileChangeProposed(FileChangeEvent {
+        NormalizedEvent::FileChangeProposed(FileChangeEvent {
             session_id,
             path: "fake-output.txt".to_owned(),
             change_kind: FileChangeKind::Modify,
             diff: Some("-old\n+fake runner output\n".to_owned()),
             provider_payload: None,
         }),
-        AppEvent::FileChangeApplied(FileChangeEvent {
+        NormalizedEvent::FileChangeApplied(FileChangeEvent {
             session_id,
             path: "fake-output.txt".to_owned(),
             change_kind: FileChangeKind::Modify,
             diff: None,
             provider_payload: None,
         }),
-        AppEvent::ApprovalRequested(ApprovalRequestEvent {
+        NormalizedEvent::ApprovalRequested(ApprovalRequestEvent {
             session_id,
             approval_id: ApprovalId::from_uuid(Uuid::from_u128(0x44444444444444444444444444444444)),
             kind: ApprovalKind::Command,
@@ -2445,19 +2493,19 @@ fn deterministic_fake_events(session_id: SessionId, input: &AgentInput) -> Vec<A
             policy: None,
             provider_payload: None,
         }),
-        AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {
+        NormalizedEvent::AgentMessageDelta(AgentMessageDeltaEvent {
             session_id,
             message_id: "fake-agent-1".to_owned(),
             delta: response.clone(),
             provider_payload: None,
         }),
-        AppEvent::AgentMessageCompleted(MessageCompletedEvent {
+        NormalizedEvent::AgentMessageCompleted(MessageCompletedEvent {
             session_id,
             message_id: "fake-agent-1".to_owned(),
             content: Some(response),
             provider_payload: None,
         }),
-        AppEvent::Error(AgentErrorEvent {
+        NormalizedEvent::Error(AgentErrorEvent {
             session_id: Some(session_id),
             code: Some("fake_notice".to_owned()),
             message: "Fake runner diagnostic card".to_owned(),
@@ -2481,10 +2529,13 @@ mod tests {
         );
 
         assert_eq!(events.len(), 12);
-        assert!(matches!(events[0], AppEvent::UserMessage(_)));
-        assert!(matches!(events[1], AppEvent::CommandStarted(_)));
-        assert!(matches!(events[9], AppEvent::AgentMessageDelta(_)));
-        assert!(matches!(events[10], AppEvent::AgentMessageCompleted(_)));
+        assert!(matches!(events[0], NormalizedEvent::UserMessage(_)));
+        assert!(matches!(events[1], NormalizedEvent::CommandStarted(_)));
+        assert!(matches!(events[9], NormalizedEvent::AgentMessageDelta(_)));
+        assert!(matches!(
+            events[10],
+            NormalizedEvent::AgentMessageCompleted(_)
+        ));
     }
 
     #[test]

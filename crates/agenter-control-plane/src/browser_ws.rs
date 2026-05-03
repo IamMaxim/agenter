@@ -108,7 +108,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: UserId) {
             tracing::warn!(%user_id, session_id = %subscription.session_id, "browser websocket failed to send session snapshot");
             return;
         }
-        if universal_subscription && replay_incomplete {
+        if universal_subscription && replay_incomplete && !subscription.include_snapshot {
             let _ = send_server_message(
                 &mut sender,
                 BrowserServerMessage::Error(BrowserError {

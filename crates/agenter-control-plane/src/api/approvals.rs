@@ -213,12 +213,12 @@ pub(super) async fn decide_approval(
 }
 
 fn approval_envelope_matches_decision(
-    event: &agenter_core::AppEvent,
+    event: &agenter_core::NormalizedEvent,
     incoming: &agenter_core::ApprovalDecision,
 ) -> bool {
     match event {
-        agenter_core::AppEvent::ApprovalResolved(resolved) => resolved.decision == *incoming,
-        agenter_core::AppEvent::ApprovalRequested(request) => {
+        agenter_core::NormalizedEvent::ApprovalResolved(resolved) => resolved.decision == *incoming,
+        agenter_core::NormalizedEvent::ApprovalRequested(request) => {
             request.resolving_decision.as_ref() == Some(incoming)
         }
         _ => false,
@@ -247,7 +247,7 @@ fn approval_command_envelope(
     let effective_feedback = feedback.or_else(|| approval_feedback(decision));
     agenter_core::UniversalCommandEnvelope {
         command_id: agenter_core::CommandId::new(),
-        idempotency_key: format!("legacy:approval:{user_id}:{approval_id}:{effective_option_id}"),
+        idempotency_key: format!("uap:approval:{user_id}:{approval_id}:{effective_option_id}"),
         session_id: Some(session_id),
         turn_id: None,
         command: agenter_core::UniversalCommand::ResolveApproval {
@@ -290,20 +290,21 @@ async fn finish_approval_operation(
         agenter_protocol::runner::RunnerResponseOutcome,
         crate::state::RunnerCommandWaitError,
     >,
-) -> Result<crate::state::AppEventEnvelope, StatusCode> {
+) -> Result<crate::state::CachedEventEnvelope, StatusCode> {
     match outcome {
         Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok {
             result: agenter_protocol::runner::RunnerCommandResult::Accepted,
         }) => {
-            let resolved =
-                agenter_core::AppEvent::ApprovalResolved(agenter_core::ApprovalResolvedEvent {
+            let resolved = agenter_core::NormalizedEvent::ApprovalResolved(
+                agenter_core::ApprovalResolvedEvent {
                     session_id,
                     approval_id,
                     decision,
                     resolved_by_user_id,
                     resolved_at: Utc::now(),
                     provider_payload: None,
-                });
+                },
+            );
             let Some(envelope) = state
                 .finish_approval_resolution(approval_id, session_id, resolved)
                 .await
@@ -402,26 +403,29 @@ async fn cancel_failed_approval_resolution(
 ) {
     state.cancel_approval_resolution(approval_id).await;
     state
-        .publish_event(
+        .publish_universal_event(
             session_id,
-            agenter_core::AppEvent::SessionStatusChanged(agenter_core::SessionStatusChangedEvent {
-                session_id,
+            None,
+            None,
+            agenter_core::UniversalEventKind::SessionStatusChanged {
                 status: agenter_core::SessionStatus::WaitingForApproval,
                 reason: Some("Approval is still waiting.".to_owned()),
-            }),
+            },
         )
-        .await;
+        .await
+        .ok();
     state
-        .publish_event(
+        .publish_universal_event(
             session_id,
-            agenter_core::AppEvent::Error(agenter_core::AgentErrorEvent {
-                session_id: Some(session_id),
+            None,
+            None,
+            agenter_core::UniversalEventKind::ErrorReported {
                 code: Some(code.to_owned()),
                 message,
-                provider_payload: None,
-            }),
+            },
         )
-        .await;
+        .await
+        .ok();
 }
 
 pub(super) async fn answer_question(
@@ -439,7 +443,7 @@ pub(super) async fn answer_question(
     answer.question_id = question_id;
     let universal_command = agenter_core::UniversalCommandEnvelope {
         command_id: agenter_core::CommandId::new(),
-        idempotency_key: format!("legacy:question:{}:{question_id}", user.user_id),
+        idempotency_key: format!("uap:question:{}:{question_id}", user.user_id),
         session_id: None,
         turn_id: None,
         command: agenter_core::UniversalCommand::AnswerQuestion {

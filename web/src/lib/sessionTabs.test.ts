@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { MAX_OPEN_TABS, parseSavedTabs, serializeTabs } from './sessionTabs';
 
 describe('session tabs persistence', () => {
-  it('parses a legacy plain array payload', () => {
+  it('parses a plain array payload', () => {
     const raw = JSON.stringify([
       { session_id: 's1', title: 'First' },
       { session_id: 's2', title: 'Second' },
@@ -37,6 +37,15 @@ describe('session tabs persistence', () => {
       JSON.stringify({
         version: 1,
         tabs: [{ sessionId: 's1', title: 'One' }]
+      })
+    );
+  });
+
+  it('serializes fallback title when title is missing or empty', () => {
+    expect(serializeTabs([{ sessionId: 's1', title: '' }])).toBe(
+      JSON.stringify({
+        version: 1,
+        tabs: [{ sessionId: 's1', title: 'Untitled session' }]
       })
     );
   });

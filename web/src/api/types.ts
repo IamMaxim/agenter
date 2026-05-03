@@ -480,6 +480,7 @@ export interface SessionSnapshot {
 
 export type UniversalEventKind =
   | { type: 'session.created'; data: { session: SessionInfo } }
+  | { type: 'session.status_changed'; data: { status: SessionStatus; reason?: string | null } }
   | { type: 'turn.started' | 'turn.status_changed' | 'turn.completed' | 'turn.failed' | 'turn.cancelled' | 'turn.interrupted' | 'turn.detached'; data: { turn: TurnState } }
   | { type: 'item.created'; data: { item: ItemState } }
   | { type: 'content.delta'; data: { block_id: string; kind?: ContentBlockKind | null; delta: string } }
@@ -491,6 +492,7 @@ export type UniversalEventKind =
   | { type: 'diff.updated'; data: { diff: DiffState } }
   | { type: 'artifact.created'; data: { artifact: ArtifactState } }
   | { type: 'usage.updated'; data: { usage: SessionUsageSnapshot } }
+  | { type: 'error.reported'; data: { code?: string | null; message: string } }
   | { type: 'native.unknown'; data: { summary?: string | null } };
 
 export interface UniversalEventEnvelope {
@@ -530,45 +532,6 @@ export interface UniversalCommandEnvelope {
   session_id?: string | null;
   turn_id?: string | null;
   command: UniversalCommand;
-}
-
-export type AppEventType =
-  | 'session_started'
-  | 'session_status_changed'
-  | 'user_message'
-  | 'agent_message_delta'
-  | 'agent_message_completed'
-  | 'plan_updated'
-  | 'tool_started'
-  | 'tool_updated'
-  | 'tool_completed'
-  | 'command_started'
-  | 'command_output_delta'
-  | 'command_completed'
-  | 'file_change_proposed'
-  | 'file_change_applied'
-  | 'file_change_rejected'
-  | 'approval_requested'
-  | 'approval_resolved'
-  | 'question_requested'
-  | 'question_answered'
-  | 'turn_diff_updated'
-  | 'item_reasoning'
-  | 'server_request_resolved'
-  | 'mcp_tool_call_progress'
-  | 'thread_realtime_event'
-  | 'provider_event'
-  | 'error';
-
-export interface AppEvent {
-  type: AppEventType;
-  payload: Record<string, unknown>;
-}
-
-export interface BrowserEventEnvelope {
-  type: 'app_event';
-  event_id?: string;
-  event: AppEvent;
 }
 
 export interface BrowserUniversalEventEnvelope extends UniversalEventEnvelope {

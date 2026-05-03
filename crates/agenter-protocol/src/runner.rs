@@ -415,7 +415,7 @@ pub enum DiscoveredSessionHistoryItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         provider_payload: Option<Value>,
     },
-    ProviderEvent {
+    NativeNotification {
         #[serde(skip_serializing_if = "Option::is_none")]
         event_id: Option<String>,
         category: String,
@@ -717,35 +717,6 @@ mod tests {
         assert_eq!(json["type"], "runner_event_ack");
         assert_eq!(json["runner_event_seq"], 123);
         assert_eq!(decoded, message);
-    }
-
-    #[test]
-    fn decodes_runner_event_without_ack_fields() {
-        let json = serde_json::json!({
-            "type": "runner_event",
-            "request_id": "event-1",
-            "event": {
-                "type": "agent_event",
-                "session_id": SessionId::nil(),
-                "source": "native",
-                "event": {
-                    "type": "native.unknown",
-                    "data": {"summary": "hello"}
-                }
-            }
-        });
-
-        let decoded: RunnerClientMessage =
-            serde_json::from_value(json).expect("deserialize legacy runner event");
-
-        match decoded {
-            RunnerClientMessage::Event(envelope) => {
-                assert_eq!(envelope.request_id, Some(RequestId::from("event-1")));
-                assert_eq!(envelope.runner_event_seq, None);
-                assert_eq!(envelope.acked_runner_event_seq, None);
-            }
-            other => panic!("unexpected message {other:?}"),
-        }
     }
 
     #[test]

@@ -332,14 +332,18 @@ button.busy:disabled .button-spinner {
 }
 
 .chat-route-stack {
+  min-width: 0;
   min-height: 0;
   display: grid;
   flex: 1;
+  overflow: hidden;
 }
 
 .chat-route-slot {
+  min-width: 0;
   min-height: 0;
   display: block;
+  overflow: hidden;
 }
 
 .chat-route-slot.hidden {
@@ -1154,8 +1158,9 @@ button.busy:disabled .button-spinner {
 
 .event-stream {
   width: 100%;
-  max-width: 800px;
+  max-width: min(800px, 100%);
   margin: 0 auto;
+  min-width: 0;
   min-height: 0;
   flex: 1 1 auto;
   overflow-x: hidden;
@@ -1755,11 +1760,11 @@ button.busy:disabled .button-spinner {
 
 .working-row {
   position: relative;
-  display: grid;
-  grid-template-columns: auto auto minmax(5rem, 12rem);
-  align-items: center;
-  justify-content: start;
-  gap: 0.55rem;
+  /* display: grid; */
+  /* grid-template-columns: auto auto minmax(5rem, 12rem); */
+  /* align-items: center; */
+  /* justify-content: start; */
+  /* gap: 0.55rem; */
   width: fit-content;
   max-width: 100%;
   min-height: 2rem;
@@ -1770,6 +1775,19 @@ button.busy:disabled .button-spinner {
   font-size: 0.88rem;
 }
 
+.working-shimmer-text {
+  background: linear-gradient(90deg, #777777 20%, #ffffff 50%, #777777 80%);
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: textslide 1.8s ease-in-out infinite;
+}
+@keyframes textslide {
+  from { background-position: 100%; }
+  to   { background-position: -50%; }
+}
+
+/* 
 .working-dot {
   width: 0.45rem;
   height: 0.45rem;
@@ -1796,7 +1814,7 @@ button.busy:disabled .button-spinner {
   background: linear-gradient(90deg, transparent, var(--accent), transparent);
   content: "";
   animation: working-shimmer 1.15s ease-in-out infinite;
-}
+} */
 
 .composer {
   position: relative;
@@ -1812,7 +1830,8 @@ button.busy:disabled .button-spinner {
   background: var(--surface-2);
 
   width: 100%;
-  max-width: 800px;
+  max-width: min(800px, 100%);
+  min-width: 0;
   margin: 0 auto;
 }
 
@@ -2312,6 +2331,7 @@ button.busy:disabled .button-spinner {
   }
 
   .composer {
+    width: calc(100% - 1.5rem);
     margin: 0 0.75rem 0.75rem;
   }
 

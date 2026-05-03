@@ -22,12 +22,7 @@ describe('session APIs', () => {
       text: () =>
         Promise.resolve(
           JSON.stringify({
-            type: 'app_event',
-            event_id: 'evt-approval',
-            event: {
-              type: 'approval_resolved',
-              payload: { approval_id: 'approval 1', decision: { decision: 'decline' } }
-            }
+            status: 'accepted'
           })
         )
     });

@@ -13,6 +13,7 @@ const CLEANUP_RETENTION: usize = 256;
 #[derive(Clone, Debug)]
 pub struct RunnerWal {
     path: PathBuf,
+    ack_path: PathBuf,
     inner: Arc<Mutex<RunnerWalState>>,
 }
 
@@ -38,7 +39,22 @@ pub struct RunnerWalRecord {
 impl RunnerWal {
     pub async fn open(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let path = path.into();
-        let records = read_records(&path).await?;
+        let ack_path = ack_path_for(&path);
+        let read = read_records(&path).await?;
+        let mut records = read.records;
+        let original_record_count = records.len();
+        records.retain(|record| event_is_replayable(&record.event));
+        let removed_non_replayable = original_record_count - records.len();
+        if read.corrupt_tail || removed_non_replayable > 0 {
+            persist_records(&path, &records).await?;
+            if removed_non_replayable > 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    removed_count = removed_non_replayable,
+                    "removed source non-replayable records from runner WAL"
+                );
+            }
+        }
         let next_seq = records
             .iter()
             .map(|record| record.runner_event_seq)
@@ -46,14 +62,16 @@ impl RunnerWal {
             .unwrap_or(0)
             .saturating_add(1)
             .max(1);
-        let acked_seq = records
+        let record_acked_seq = records
             .iter()
             .filter(|record| record.acked)
             .map(|record| record.runner_event_seq)
             .max()
             .unwrap_or(0);
+        let acked_seq = record_acked_seq.max(read_ack_cursor(&ack_path).await?);
         Ok(Self {
             path,
+            ack_path,
             inner: Arc::new(Mutex::new(RunnerWalState {
                 next_seq,
                 acked_seq,
@@ -78,41 +96,37 @@ impl RunnerWal {
         };
         inner.next_seq = inner.next_seq.saturating_add(1);
         inner.records.push(record.clone());
-        persist_records(&self.path, &inner.records).await?;
+        append_record(&self.path, &record).await?;
         Ok(record)
     }
 
     pub async fn ack(&self, runner_event_seq: u64) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().await;
         inner.acked_seq = inner.acked_seq.max(runner_event_seq);
-        for record in &mut inner.records {
-            if record.runner_event_seq <= runner_event_seq {
-                record.acked = true;
-            }
-        }
-        let acked_count = inner.records.iter().filter(|record| record.acked).count();
+        persist_ack_cursor(&self.ack_path, inner.acked_seq).await?;
+        let acked_count = inner
+            .records
+            .iter()
+            .filter(|record| record.runner_event_seq <= inner.acked_seq)
+            .count();
         if acked_count > CLEANUP_RETENTION {
-            let remove_count = acked_count - CLEANUP_RETENTION;
-            let mut removed = 0;
-            inner.records.retain(|record| {
-                if record.acked && removed < remove_count {
-                    removed += 1;
-                    false
-                } else {
-                    true
-                }
-            });
+            let retention_start = inner
+                .acked_seq
+                .saturating_sub(u64::try_from(CLEANUP_RETENTION).unwrap_or(u64::MAX));
+            inner
+                .records
+                .retain(|record| record.runner_event_seq > retention_start);
+            persist_records(&self.path, &inner.records).await?;
         }
-        persist_records(&self.path, &inner.records).await
+        Ok(())
     }
 
     pub async fn unacked(&self) -> Vec<RunnerWalRecord> {
-        self.inner
-            .lock()
-            .await
+        let inner = self.inner.lock().await;
+        inner
             .records
             .iter()
-            .filter(|record| !record.acked)
+            .filter(|record| record.runner_event_seq > inner.acked_seq)
             .cloned()
             .collect()
     }
@@ -122,11 +136,73 @@ impl RunnerWal {
     }
 }
 
-async fn read_records(path: &Path) -> anyhow::Result<Vec<RunnerWalRecord>> {
+#[derive(Debug, Default)]
+struct ReadRecords {
+    records: Vec<RunnerWalRecord>,
+    corrupt_tail: bool,
+}
+
+pub(crate) fn event_is_replayable(event: &RunnerEvent) -> bool {
+    matches!(event, RunnerEvent::AgentEvent(_))
+}
+
+fn ack_path_for(path: &Path) -> PathBuf {
+    path.with_extension(format!(
+        "{}.ack",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("jsonl")
+    ))
+}
+
+async fn read_ack_cursor(path: &Path) -> anyhow::Result<u64> {
     let Ok(contents) = tokio::fs::read_to_string(path).await else {
-        return Ok(Vec::new());
+        return Ok(0);
+    };
+    Ok(contents.trim().parse::<u64>().unwrap_or(0))
+}
+
+async fn persist_ack_cursor(path: &Path, acked_seq: u64) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp_path = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("ack")
+    ));
+    let mut file = tokio::fs::File::create(&tmp_path).await?;
+    file.write_all(acked_seq.to_string().as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&tmp_path, path).await?;
+    Ok(())
+}
+
+async fn append_record(path: &Path, record: &RunnerWalRecord) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    file.write_all(serde_json::to_string(record)?.as_bytes())
+        .await?;
+    file.write_all(b"\n").await?;
+    file.sync_all().await?;
+    Ok(())
+}
+
+async fn read_records(path: &Path) -> anyhow::Result<ReadRecords> {
+    let Ok(contents) = tokio::fs::read_to_string(path).await else {
+        return Ok(ReadRecords::default());
     };
     let mut records = Vec::new();
+    let mut corrupt_tail = false;
     for (line_no, line) in contents.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -137,11 +213,15 @@ async fn read_records(path: &Path) -> anyhow::Result<Vec<RunnerWalRecord>> {
                 line = line_no + 1,
                 "ignoring corrupt trailing runner WAL records"
             );
+            corrupt_tail = true;
             break;
         };
         records.push(record);
     }
-    Ok(records)
+    Ok(ReadRecords {
+        records,
+        corrupt_tail,
+    })
 }
 
 async fn persist_records(path: &Path, records: &[RunnerWalRecord]) -> anyhow::Result<()> {
@@ -174,8 +254,14 @@ async fn persist_records(path: &Path, records: &[RunnerWalRecord]) -> anyhow::Re
 
 #[cfg(test)]
 mod tests {
-    use agenter_core::{NativeRef, SessionId, UniversalEventKind, UniversalEventSource};
-    use agenter_protocol::runner::{AgentUniversalEvent, RunnerEvent};
+    use agenter_core::{
+        AgentProviderId, NativeRef, RunnerId, SessionId, UniversalEventKind, UniversalEventSource,
+        WorkspaceId, WorkspaceRef,
+    };
+    use agenter_protocol::runner::{
+        AgentUniversalEvent, DiscoveredSession, DiscoveredSessionHistoryItem,
+        DiscoveredSessionHistoryStatus, DiscoveredSessions, RunnerEvent,
+    };
     use uuid::Uuid;
 
     use super::*;
@@ -267,5 +353,120 @@ mod tests {
         let recovered = RunnerWal::open(&path).await.expect("open recovered");
         assert_eq!(recovered.unacked().await.len(), 2);
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn wal_ack_persists_cursor_without_rewriting_record_log() {
+        let path =
+            std::env::temp_dir().join(format!("agenter-runner-wal-test-{}.jsonl", Uuid::new_v4()));
+        let wal = RunnerWal::open(&path).await.expect("open wal");
+        let session_id = SessionId::new();
+        let first = wal
+            .append(None, Some(session_id), wal_event(session_id))
+            .await
+            .expect("append first");
+        let second = wal
+            .append(None, Some(session_id), first.event.clone())
+            .await
+            .expect("append second");
+        let before_ack = tokio::fs::read_to_string(&path).await.expect("read wal");
+
+        wal.ack(first.runner_event_seq).await.expect("ack first");
+
+        let after_ack = tokio::fs::read_to_string(&path).await.expect("read wal");
+        assert_eq!(after_ack, before_ack);
+        let reopened = RunnerWal::open(&path).await.expect("reopen wal");
+        assert_eq!(reopened.acked_seq().await, first.runner_event_seq);
+        assert_eq!(
+            reopened
+                .unacked()
+                .await
+                .into_iter()
+                .map(|record| record.runner_event_seq)
+                .collect::<Vec<_>>(),
+            vec![second.runner_event_seq]
+        );
+        let _ = tokio::fs::remove_file(&path).await;
+        let _ = tokio::fs::remove_file(ack_path_for(&path)).await;
+    }
+
+    #[tokio::test]
+    async fn wal_open_drops_source_loaded_discovery_records() {
+        let path =
+            std::env::temp_dir().join(format!("agenter-runner-wal-test-{}.jsonl", Uuid::new_v4()));
+        let session_id = SessionId::new();
+        let source_discovery = RunnerWalRecord {
+            runner_event_seq: 1,
+            request_id: Some(RequestId::from("refresh-1")),
+            session_id: None,
+            event: RunnerEvent::SessionsDiscovered(DiscoveredSessions {
+                workspace: WorkspaceRef {
+                    workspace_id: WorkspaceId::new(),
+                    runner_id: RunnerId::new(),
+                    path: "/tmp/workspace".to_owned(),
+                    display_name: Some("workspace".to_owned()),
+                },
+                provider_id: AgentProviderId::from("codex"),
+                sessions: vec![DiscoveredSession {
+                    external_session_id: "native-session".to_owned(),
+                    title: Some("Native session".to_owned()),
+                    updated_at: None,
+                    history_status: DiscoveredSessionHistoryStatus::Loaded,
+                    history: vec![DiscoveredSessionHistoryItem::UserMessage {
+                        message_id: None,
+                        content: "large imported history".repeat(1024),
+                    }],
+                }],
+            }),
+            acked: false,
+        };
+        let agent_event = RunnerWalRecord {
+            runner_event_seq: 2,
+            request_id: None,
+            session_id: Some(session_id),
+            event: wal_event(session_id),
+            acked: false,
+        };
+        tokio::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&source_discovery).expect("serialize discovery"),
+                serde_json::to_string(&agent_event).expect("serialize agent event")
+            ),
+        )
+        .await
+        .expect("write wal");
+
+        let wal = RunnerWal::open(&path).await.expect("open wal");
+        let unacked = wal.unacked().await;
+
+        assert_eq!(unacked.len(), 1);
+        assert_eq!(unacked[0].runner_event_seq, agent_event.runner_event_seq);
+        assert!(matches!(unacked[0].event, RunnerEvent::AgentEvent(_)));
+        let rewritten = tokio::fs::read_to_string(&path)
+            .await
+            .expect("read repaired wal");
+        assert!(!rewritten.contains("sessions_discovered"));
+        let _ = tokio::fs::remove_file(&path).await;
+        let _ = tokio::fs::remove_file(ack_path_for(&path)).await;
+    }
+
+    #[test]
+    fn only_agent_events_are_runner_wal_replayable() {
+        let session_id = SessionId::new();
+        assert!(event_is_replayable(&wal_event(session_id)));
+        assert!(!event_is_replayable(&RunnerEvent::SessionsDiscovered(
+            DiscoveredSessions {
+                workspace: WorkspaceRef {
+                    workspace_id: WorkspaceId::new(),
+                    runner_id: RunnerId::new(),
+                    path: "/tmp/workspace".to_owned(),
+                    display_name: None,
+                },
+                provider_id: AgentProviderId::from("codex"),
+                sessions: Vec::new(),
+            }
+        )));
     }
 }

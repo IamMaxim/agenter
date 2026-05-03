@@ -10,7 +10,7 @@ use crate::{
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
-pub enum AppEvent {
+pub enum NormalizedEvent {
     SessionStarted(SessionInfo),
     SessionStatusChanged(SessionStatusChangedEvent),
     UserMessage(UserMessageEvent),
@@ -30,12 +30,12 @@ pub enum AppEvent {
     ApprovalResolved(ApprovalResolvedEvent),
     QuestionRequested(QuestionRequestedEvent),
     QuestionAnswered(QuestionAnsweredEvent),
-    TurnDiffUpdated(ProviderEvent),
-    ItemReasoning(ProviderEvent),
-    ServerRequestResolved(ProviderEvent),
-    McpToolCallProgress(ProviderEvent),
-    ThreadRealtimeEvent(ProviderEvent),
-    ProviderEvent(ProviderEvent),
+    TurnDiffUpdated(NativeNotification),
+    ItemReasoning(NativeNotification),
+    ServerRequestResolved(NativeNotification),
+    McpToolCallProgress(NativeNotification),
+    ThreadRealtimeEvent(NativeNotification),
+    NativeNotification(NativeNotification),
     Error(AgentErrorEvent),
 }
 
@@ -311,7 +311,7 @@ pub enum FileChangeKind {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct ProviderEvent {
+pub struct NativeNotification {
     pub session_id: SessionId,
     pub provider_id: AgentProviderId,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -430,6 +430,12 @@ pub struct NativeRef {
 pub enum UniversalEventKind {
     #[serde(rename = "session.created")]
     SessionCreated { session: Box<SessionInfo> },
+    #[serde(rename = "session.status_changed")]
+    SessionStatusChanged {
+        status: SessionStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     #[serde(rename = "turn.started")]
     TurnStarted { turn: TurnState },
     #[serde(rename = "turn.status_changed")]
@@ -476,6 +482,12 @@ pub enum UniversalEventKind {
     #[serde(rename = "usage.updated")]
     UsageUpdated {
         usage: Box<crate::SessionUsageSnapshot>,
+    },
+    #[serde(rename = "error.reported")]
+    ErrorReported {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        message: String,
     },
     #[serde(rename = "native.unknown")]
     NativeUnknown {
@@ -749,10 +761,10 @@ mod tests {
     use crate::{
         AgentCapabilities, AgentCollaborationMode, AgentModelOption, AgentProviderId,
         AgentQuestionAnswer, AgentQuestionChoice, AgentQuestionField, AgentReasoningEffort,
-        AgentTurnSettings, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind, ApprovalOption,
+        AgentTurnSettings, ApprovalDecision, ApprovalId, ApprovalKind, ApprovalOption,
         ApprovalOptionKind, ApprovalRequest, ApprovalRequestEvent, ApprovalResolvedEvent,
         CommandEvent, CommandId, ContentBlock, ContentBlockKind, ItemId, NativeRef,
-        PlanEntryStatus, PlanId, PlanSource, PlanState, PlanStatus, QuestionId,
+        NormalizedEvent, PlanEntryStatus, PlanId, PlanSource, PlanState, PlanStatus, QuestionId,
         QuestionRequestedEvent, RunnerId, SessionId, SessionInfo, SessionStatus, TurnId,
         UniversalCommand, UniversalCommandEnvelope, UniversalEventEnvelope, UniversalEventKind,
         UniversalEventSource, UniversalPlanEntry, UniversalSeq, UserId, UserInput,
@@ -761,7 +773,7 @@ mod tests {
 
     #[test]
     fn serializes_user_message_event_with_adjacent_tag() {
-        let event = AppEvent::UserMessage(UserMessageEvent {
+        let event = NormalizedEvent::UserMessage(UserMessageEvent {
             session_id: SessionId::nil(),
             message_id: Some("msg-1".to_owned()),
             author_user_id: None,
@@ -778,7 +790,7 @@ mod tests {
 
     #[test]
     fn serializes_command_started_event_with_stable_shape() {
-        let event = AppEvent::CommandStarted(CommandEvent {
+        let event = NormalizedEvent::CommandStarted(CommandEvent {
             session_id: SessionId::nil(),
             command_id: "cmd-1".to_owned(),
             command: "cargo test -p agenter-core".to_owned(),
@@ -798,8 +810,8 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_provider_event_with_raw_payload() {
-        let event = AppEvent::ProviderEvent(crate::ProviderEvent {
+    fn round_trips_native_notification_with_raw_payload() {
+        let event = NormalizedEvent::NativeNotification(crate::NativeNotification {
             session_id: SessionId::nil(),
             provider_id: AgentProviderId::from(AgentProviderId::CODEX),
             event_id: Some("compact-1".to_owned()),
@@ -815,9 +827,10 @@ mod tests {
         });
 
         let json = serde_json::to_value(&event).expect("serialize event");
-        let decoded: AppEvent = serde_json::from_value(json.clone()).expect("deserialize event");
+        let decoded: NormalizedEvent =
+            serde_json::from_value(json.clone()).expect("deserialize event");
 
-        assert_eq!(json["type"], "provider_event");
+        assert_eq!(json["type"], "native_notification");
         assert_eq!(json["payload"]["provider_id"], AgentProviderId::CODEX);
         assert_eq!(json["payload"]["category"], "compaction");
         assert_eq!(json["payload"]["status"], "completed");
@@ -826,7 +839,7 @@ mod tests {
 
     #[test]
     fn serializes_plan_delta_marker_only_when_append_is_true() {
-        let event = AppEvent::PlanUpdated(crate::PlanEvent {
+        let event = NormalizedEvent::PlanUpdated(crate::PlanEvent {
             session_id: SessionId::nil(),
             plan_id: Some("plan-1".to_owned()),
             title: Some("Implementation plan".to_owned()),
@@ -885,7 +898,7 @@ mod tests {
     #[test]
     fn serializes_approval_requested_event_with_uuid_ids() {
         let approval_id = ApprovalId::nil();
-        let event = AppEvent::ApprovalRequested(ApprovalRequestEvent {
+        let event = NormalizedEvent::ApprovalRequested(ApprovalRequestEvent {
             session_id: SessionId::nil(),
             approval_id,
             kind: ApprovalKind::Command,
@@ -917,7 +930,7 @@ mod tests {
             "approval-1"
         );
 
-        let with_pres = AppEvent::ApprovalRequested(ApprovalRequestEvent {
+        let with_pres = NormalizedEvent::ApprovalRequested(ApprovalRequestEvent {
             session_id: SessionId::nil(),
             approval_id,
             kind: ApprovalKind::FileChange,
@@ -946,7 +959,7 @@ mod tests {
 
     #[test]
     fn round_trips_session_started_event_with_provider_context() {
-        let event = AppEvent::SessionStarted(SessionInfo {
+        let event = NormalizedEvent::SessionStarted(SessionInfo {
             session_id: SessionId::nil(),
             owner_user_id: UserId::nil(),
             runner_id: RunnerId::nil(),
@@ -961,7 +974,8 @@ mod tests {
         });
 
         let json = serde_json::to_value(&event).expect("serialize event");
-        let decoded: AppEvent = serde_json::from_value(json.clone()).expect("deserialize event");
+        let decoded: NormalizedEvent =
+            serde_json::from_value(json.clone()).expect("deserialize event");
 
         assert_eq!(json["type"], "session_started");
         assert_eq!(json["payload"]["provider_id"], AgentProviderId::CODEX);
@@ -1030,7 +1044,7 @@ mod tests {
     #[test]
     fn round_trips_question_requested_event_with_multi_select() {
         let question_id = QuestionId::nil();
-        let event = AppEvent::QuestionRequested(QuestionRequestedEvent {
+        let event = NormalizedEvent::QuestionRequested(QuestionRequestedEvent {
             session_id: SessionId::nil(),
             question_id,
             title: "Need a choice".to_owned(),
@@ -1069,7 +1083,8 @@ mod tests {
 
         let event_json = serde_json::to_value(&event).expect("serialize question");
         let answer_json = serde_json::to_value(answer).expect("serialize answer");
-        let decoded: AppEvent = serde_json::from_value(event_json.clone()).expect("decode event");
+        let decoded: NormalizedEvent =
+            serde_json::from_value(event_json.clone()).expect("decode event");
 
         assert_eq!(event_json["type"], "question_requested");
         assert_eq!(event_json["payload"]["fields"][0]["kind"], "multi_select");
@@ -1079,7 +1094,7 @@ mod tests {
 
     #[test]
     fn round_trips_approval_resolved_with_provider_specific_decision() {
-        let event = AppEvent::ApprovalResolved(ApprovalResolvedEvent {
+        let event = NormalizedEvent::ApprovalResolved(ApprovalResolvedEvent {
             session_id: SessionId::nil(),
             approval_id: ApprovalId::nil(),
             decision: ApprovalDecision::ProviderSpecific {
@@ -1097,7 +1112,8 @@ mod tests {
         });
 
         let json = serde_json::to_value(&event).expect("serialize event");
-        let decoded: AppEvent = serde_json::from_value(json.clone()).expect("deserialize event");
+        let decoded: NormalizedEvent =
+            serde_json::from_value(json.clone()).expect("deserialize event");
 
         assert_eq!(json["type"], "approval_resolved");
         assert_eq!(
@@ -1281,7 +1297,7 @@ mod tests {
                 approval: Box::new(approval),
             },
             UniversalEventKind::NativeUnknown {
-                summary: Some("unmodeled provider event".to_owned()),
+                summary: Some("unmodeled native notification".to_owned()),
             },
         ];
 

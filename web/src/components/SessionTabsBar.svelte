@@ -1,5 +1,6 @@
 <script lang="ts">
   import AgenterIcon from './AgenterIcon.svelte';
+  import { FALLBACK_TAB_TITLE } from '../lib/sessionTabs';
 
   interface SessionTabSummary {
     sessionId: string;
@@ -26,6 +27,10 @@
       activate(sessionId);
     }
   }
+
+  function tabLabel(title: string) {
+    return title.trim() || FALLBACK_TAB_TITLE;
+  }
 </script>
 
 <div class="session-tabs" aria-label="Open sessions">
@@ -37,14 +42,14 @@
       aria-pressed={tab.sessionId === activeSessionId}
       on:click={() => activate(tab.sessionId)}
       on:keydown={(event) => onTabKeydown(event, tab.sessionId)}
-      title={tab.title || tab.sessionId}
+      title={tabLabel(tab.title)}
     >
-      <span class="session-tab-title">{tab.title || tab.sessionId}</span>
+      <span class="session-tab-title">{tabLabel(tab.title)}</span>
       <span
         class="session-tab-close"
         role="button"
         tabindex="0"
-        aria-label={`Close ${tab.title || tab.sessionId}`}
+        aria-label={`Close ${tabLabel(tab.title)}`}
         on:click={(event) => close(tab.sessionId, event)}
         on:keydown={(event) => {
           if (event.key === 'Enter' || event.key === ' ') {

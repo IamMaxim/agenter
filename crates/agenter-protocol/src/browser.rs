@@ -17,7 +17,6 @@ pub struct SubscribeSession {
     pub session_id: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_seq: Option<UniversalSeq>,
-    #[serde(default, skip_serializing_if = "is_false")]
     pub include_snapshot: bool,
 }
 
@@ -92,28 +91,6 @@ mod tests {
     }
 
     #[test]
-    fn decodes_legacy_browser_subscription_without_replay_options() {
-        let json = serde_json::json!({
-            "type": "subscribe_session",
-            "request_id": "sub-legacy",
-            "session_id": SessionId::nil()
-        });
-
-        let decoded: BrowserClientMessage =
-            serde_json::from_value(json).expect("deserialize legacy subscribe");
-
-        match decoded {
-            BrowserClientMessage::SubscribeSession(subscription) => {
-                assert_eq!(subscription.request_id, Some(RequestId::from("sub-legacy")));
-                assert_eq!(subscription.session_id, SessionId::nil());
-                assert_eq!(subscription.after_seq, None);
-                assert!(!subscription.include_snapshot);
-            }
-            other => panic!("unexpected message {other:?}"),
-        }
-    }
-
-    #[test]
     fn round_trips_browser_session_snapshot_message() {
         let event = UniversalEventEnvelope {
             event_id: "evt-1".to_owned(),
@@ -126,7 +103,7 @@ mod tests {
             source: UniversalEventSource::ControlPlane,
             native: None,
             event: UniversalEventKind::NativeUnknown {
-                summary: Some("legacy projection".to_owned()),
+                summary: Some("native event".to_owned()),
             },
         };
         let message = BrowserServerMessage::SessionSnapshot(BrowserSessionSnapshot {

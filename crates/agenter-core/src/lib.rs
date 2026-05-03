@@ -14,11 +14,11 @@ pub use approval::{
     ApprovalRisk, ApprovalStatus, PolicyAction,
 };
 pub use events::{
-    AgentErrorEvent, AgentMessageDeltaEvent, AppEvent, ArtifactKind, ArtifactState, CommandAction,
+    AgentErrorEvent, AgentMessageDeltaEvent, ArtifactKind, ArtifactState, CommandAction,
     CommandCompletedEvent, CommandEvent, CommandOutputEvent, CommandOutputStream, ContentBlock,
     ContentBlockKind, DiffFile, DiffState, FileChangeEvent, FileChangeKind, ItemRole, ItemState,
-    ItemStatus, MessageCompletedEvent, NativeRef, PlanEntry, PlanEntryStatus, PlanEvent,
-    PlanSource, PlanState, PlanStatus, ProviderEvent, SessionStatusChangedEvent,
+    ItemStatus, MessageCompletedEvent, NativeNotification, NativeRef, NormalizedEvent, PlanEntry,
+    PlanEntryStatus, PlanEvent, PlanSource, PlanState, PlanStatus, SessionStatusChangedEvent,
     ToolActionProjection, ToolCommandProjection, ToolEvent, ToolMcpProjection, ToolProjection,
     ToolProjectionKind, ToolSubagentOperation, ToolSubagentProjection, ToolSubagentStateProjection,
     UniversalCommand, UniversalCommandEnvelope, UniversalEventEnvelope, UniversalEventKind,

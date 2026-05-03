@@ -28,7 +28,7 @@ Implement Agenter's universal agent protocol as a versioned, event-sourced, capa
 
 Current Agenter already has useful foundations:
 
-- `AppEvent` normalizes user, assistant, plan, tool, command, file-change, approval, question, usage-ish provider, and error events in `crates/agenter-core/src/events.rs`.
+- `NormalizedEvent` normalizes user, assistant, plan, tool, command, file-change, approval, question, usage-ish provider, and error events in `crates/agenter-core/src/events.rs`.
 - Runner commands and responses use `RunnerCommandEnvelope { request_id, command }` in `crates/agenter-protocol/src/runner.rs`.
 - Browser WebSocket subscribes to one session and receives universal snapshot/replay frames from `crates/agenter-protocol/src/browser.rs`.
 - Control plane keeps in-memory per-session broadcast state and persists universal `agent_events` plus `session_snapshots`.
@@ -53,12 +53,12 @@ The controller agent maintains the target vision, dispatches exactly one impleme
 
 - Worker subagent: implements the stage in the named files and runs the stage verification.
 - Spec-review subagent: compares the patch against this plan and `docs/chatgpt/002_protocol.md`.
-- Code-quality subagent: reviews local design, tests, compatibility, and migration safety.
+- Code-quality subagent: reviews local design, tests, universal projection, and migration safety.
 - Controller: resolves conflicts, runs or requests final verification, updates this plan's status notes, and dispatches the next stage.
 
 Worker subagents are not alone in the codebase. They must preserve unrelated local changes and avoid reverting work outside their assigned files.
 
-## Stage 0: Contract ADRs And Compatibility Strategy
+## Stage 0: Contract ADRs And Removal Strategy
 
 Owner: documentation worker subagent.
 
@@ -76,13 +76,13 @@ Steps:
 - [x] Write ADR: universal protocol version `uap/1`, Codex-native primary, ACP baseline for Qwen/Gemini/OpenCode, native payload preservation, capability-gated frontend.
 - [x] Write ADR: durable append-only `agent_events` supersedes lightweight `event_cache` for browser replay, while native harnesses remain the canonical history source when history can be reloaded.
 - [x] Update the remote control-plane spec with the universal entities: session, turn, item, content block, approval, plan, diff, artifact, native ref, command envelope.
-- [x] Record the compatibility rule: old `AppEvent` and `event_cache` were migration-only and are no longer Agenter-facing after the `uap/1` cutover.
+- [x] Record the universal projection rule: old `NormalizedEvent` and `event_cache` were migration-only and are no longer Agenter-facing after the `uap/1` cutover.
 - [x] Run documentation verification.
 
 Discovered constraints:
 
 - `agent_events` is a browser/reconnect/control-plane projection log, not an audit-grade canonical full transcript unless a future ADR expands scope.
-- `NativeRef`, `native_json`, event metadata, and compatibility caches store redacted summaries or pointers by default, not raw full provider payloads. Raw payload persistence requires explicit policy; Codex wire logs stay runner-local by default.
+- `NativeRef`, `native_json`, event metadata, and universal projection caches store redacted summaries or pointers by default, not raw full provider payloads. Raw payload persistence requires explicit policy; Codex wire logs stay runner-local by default.
 - `seq` is a global `agent_events` database cursor (`bigint`, Rust `i64`/domain-safe `u64`), serialized as a string over JSON. Browser `after_seq` is that global cursor filtered by session subscription.
 - The recent-turn cache is a persistent correlation/recovery aid, not the transcript source of truth.
 - Lossless runner reconnect requires runner WAL plus control-plane ack after durable append; until both exist, reconnect claims must remain best-effort.
@@ -131,7 +131,7 @@ Steps:
 - [x] Add `NativeRef` with protocol, method/type/id, and redacted summary, hash, or pointer data by default.
 - [x] Add `UniversalCommandEnvelope { command_id, idempotency_key, session_id, turn_id, command }`.
 - [x] Add command variants for start/load/close session, start/cancel turn, send user input, resolve approval, set mode, set model, request diff, revert change, subscribe, and get snapshot.
-- [x] Add nested `CapabilitySet` while keeping `AgentCapabilities` available for compatibility conversion.
+- [x] Add nested `CapabilitySet` while keeping `AgentCapabilities` available for universal projection conversion.
 - [x] Add first-class `TurnState`, `ItemState`, `ContentBlock`, `ApprovalRequest`, `ApprovalOption`, `PlanState`, `PlanEntry`, `DiffState`, `ArtifactState`, and `SessionSnapshot`.
 - [x] Extend browser subscription to include `after_seq` and `include_snapshot` fields while keeping old `subscribe_session` decoding valid.
 - [x] Extend runner event envelopes with optional runner-local sequence/ack placeholders, but keep current runner messages backward-compatible; control-plane-assigned universal `seq` is not known by runner-originated events.
@@ -142,9 +142,9 @@ Stage 1 verification evidence:
 - `cargo fmt --all -- --check` passed.
 - `cargo test -p agenter-core` passed with 26 tests.
 - `cargo test -p agenter-protocol` passed with 22 tests.
-- `cargo check --workspace` passed after downstream compatibility literals were updated with default optional fields.
+- `cargo check --workspace` passed after downstream universal projection literals were updated with default optional fields.
 - Spec review approved with no findings.
-- Quality review approved after removing raw/provider payload paths from universal approval options and approval resolve commands, keeping legacy replay capabilities false, validating non-negative `UniversalSeq`, renaming runner seq placeholders to runner-local fields, and allowing empty snapshots without `latest_seq`.
+- Quality review approved after removing raw/provider payload paths from universal approval options and approval resolve commands, keeping source replay capabilities false, validating non-negative `UniversalSeq`, renaming runner seq placeholders to runner-local fields, and allowing empty snapshots without `latest_seq`.
 
 Verification:
 
@@ -157,7 +157,7 @@ cargo test -p agenter-protocol
 Exit criteria:
 
 - New types compile and serialize predictably.
-- No existing `AppEvent` consumer breaks.
+- No existing `NormalizedEvent` consumer breaks.
 - Browser and runner protocol tests cover backward-compatible old frames and new universal frames.
 
 ## Stage 2: Durable Event Log, Snapshots, And Reducer Storage
@@ -189,13 +189,13 @@ Steps:
 - [x] Write repository methods to load and store `SessionSnapshot`.
 - [x] Write a reducer that applies one universal event to a `SessionSnapshot`.
 - [x] Persist snapshots after append in the same logical operation.
-- [x] Stop writing `event_cache` after the browser cutover; universal app-event compatibility ingress writes only `agent_events` and `session_snapshots`.
+- [x] Stop writing `event_cache` after the browser cutover; universal app-event universal projection ingress writes only `agent_events` and `session_snapshots`.
 - [x] Add tests for monotonic seq, snapshot reconstruction, `after_seq` listing, pending approval materialization, and old event cache coexistence.
 
 Stage 2 verification evidence:
 
 - `cargo fmt --all -- --check` passed.
-- `cargo test -p agenter-db` passed with 2 non-ignored tests and ignored disposable-Postgres integration tests. The ignored universal event log test covers monotonic seq, `after_seq`, snapshot storage, pending approval materialization/resolution, and projection reset without legacy cache tables.
+- `cargo test -p agenter-db` passed with 2 non-ignored tests and ignored disposable-Postgres integration tests. The ignored universal event log test covers monotonic seq, `after_seq`, snapshot storage, pending approval materialization/resolution, and projection reset without source cache tables.
 - `cargo test -p agenter-control-plane snapshot` passed with 5 tests.
 - `cargo test -p agenter-control-plane event` passed with 10 tests.
 - `cargo check --workspace` passed.
@@ -203,9 +203,9 @@ Stage 2 verification evidence:
 Stage 2 notes:
 
 - Runtime browser delivery uses universal snapshot/replay frames only.
-- Legacy `AppEvent` dual-write is explicitly compatibility-only: provider payloads are not copied into universal `native_json`; only safe native IDs/summaries are projected where available.
+- normalized event dual-write is explicitly universal projection-only: provider payloads are not copied into universal `native_json`; only safe native IDs/summaries are projected where available.
 - Universal snapshot writes now lock the parent `agent_sessions` row before assigning/reducing a session event, and snapshot storage rejects `latest_seq` regressions.
-- Durable approval resolution updates `pending_approvals.universal_status`; legacy `ApprovalResolved` events project into universal approval state without raw provider payload persistence.
+- Durable approval resolution updates `pending_approvals.universal_status`; source `ApprovalResolved` events project into universal approval state without raw provider payload persistence.
 - Forced discovered-history refresh clears the session's universal projection (`agent_events`, `session_snapshots`, and recent turn cache) before rewriting imported history. This is not canonical native history deletion.
 - `agent_events.event_id` is a control-plane UUID. Native stable event/request IDs belong in `NativeRef`; non-UUID envelope event IDs fail with a clear error.
 - A narrow compile-only test update was required in `crates/agenter-control-plane/src/api.rs` to ignore the Stage 1 `BrowserServerMessage::SessionSnapshot` test frame while waiting for Stage 3 browser replay wiring.
@@ -222,7 +222,7 @@ cargo test -p agenter-control-plane event
 Exit criteria:
 
 - Universal event append and snapshot reducer work without changing browser behavior yet.
-- `event_cache` is dropped by migration `0008_drop_legacy_event_cache.sql`; new writes must not reference those tables.
+- `event_cache` is dropped by migration `0008_drop_normalized_event_cache.sql`; new writes must not reference those tables.
 - DB migration is append-only and does not rewrite existing migrations.
 
 ## Stage 3: Browser Snapshot Replay And Command Idempotency
@@ -250,7 +250,7 @@ Steps:
 - [x] Return the previous response for duplicate same-key commands.
 - [x] Reject duplicate conflicting commands with a typed error.
 - [x] Preserve the current REST routes by wrapping them internally in universal command envelopes when the frontend has not migrated yet.
-- [x] Add tests for duplicate send message, duplicate approval resolve, conflicting duplicate approval resolve, snapshot replay after cache miss, and legacy REST compatibility.
+- [x] Add tests for duplicate send message, duplicate approval resolve, conflicting duplicate approval resolve, snapshot replay after cache miss, and source REST universal projection.
 
 Stage 3 verification evidence:
 
@@ -265,14 +265,14 @@ Stage 3 verification evidence:
 
 Stage 3 notes:
 
-- Browser WebSocket subscriptions remain legacy-compatible by default. Clients that send `after_seq` or `include_snapshot` receive `session_snapshot` replay and live `universal_event` frames with `seq`.
+- Browser WebSocket subscriptions remain source-compatible by default. Clients that send `after_seq` or `include_snapshot` receive `session_snapshot` replay and live `universal_event` frames with `seq`.
 - `session_snapshot` includes `has_more`; bounded replay fetches one extra event and does not report the full snapshot cursor as the replay cursor when the missed-event window is truncated. DB replay failures also mark `has_more` and keep the replay cursor at the requested `after_seq` so clients cannot advance past unseen events.
-- Universal WebSocket replay tracks `(seq, event_id)` values sent in `session_snapshot.events` and skips matching queued live `universal_event` frames. If replay is incomplete (`has_more`), the server sends `snapshot_replay_incomplete` with instructions to resubscribe/page from `snapshot.latest_seq`, then closes that universal subscription instead of forwarding live universal events that could advance the client past a gap.
+- Universal WebSocket replay tracks `(seq, event_id)` values sent in `session_snapshot.events` and skips matching queued live `universal_event` frames. If replay is incomplete (`has_more`) on a replay-only subscription, the server sends `snapshot_replay_incomplete` with instructions to resubscribe/page from `snapshot.latest_seq`, then closes that subscription before forwarding live universal events. Snapshot subscriptions treat `has_more` as a truncated historical page, keep the materialized snapshot as the current checkpoint, and continue streaming live events.
 - REST routes now create internal universal command envelopes before runner dispatch. Existing clients can omit command ids/keys; retry-capable clients can pass optional idempotency fields on message/settings routes, while approval and question routes derive stable keys from the routed obligation.
 - Duplicate same-key commands replay the stored response when available; pending approval duplicates preserve the existing resolving-envelope behavior; conflicting duplicate commands return a typed `idempotency_conflict` response.
 - Durable idempotency uses `agent_event_idempotency` when Postgres is configured. DB-backed begin failures reject before dispatch, and DB-backed finish failures surface as service errors instead of claiming durable success. No-DB development/tests still use the process-local fallback.
 - Question answers begin idempotency before checking unresolved question state, so same-key retries after success replay the stored response instead of 404.
-- Slash command requests now accept optional universal command/idempotency fields. Explicit `idempotency_key` values are retry keys and conflict on different semantic command bodies; omitted keys get fresh one-shot keys so legacy repeated slash commands still execute again. Slash user echoes publish only after idempotency begin succeeds, so duplicate/conflicting retries do not append duplicate transcript rows.
+- Slash command requests now accept optional universal command/idempotency fields. Explicit `idempotency_key` values are retry keys and conflict on different semantic command bodies; omitted keys get fresh one-shot keys so repeated slash commands still execute again. Slash user echoes publish only after idempotency begin succeeds, so duplicate/conflicting retries do not append duplicate transcript rows.
 - Side-effectful local slash commands are wrapped in universal commands, including `/new`, `/title`, `/refresh`, `/model`, `/mode`, and `/reasoning`; `/help` remains a non-side-effect local command.
 - Narrow updates outside the named Stage 3 files were required: universal command variants for question/provider/settings commands in `agenter-core`, repository APIs/models for `agent_event_idempotency` in `agenter-db`, and focused API tests in `crates/agenter-control-plane/src/api.rs`.
 
@@ -288,7 +288,7 @@ cargo test -p agenter-control-plane idempot
 Exit criteria:
 
 - A browser can reconnect with `after_seq` and receive a snapshot plus missed events.
-- Current frontend still works through compatibility routes.
+- Current frontend still works through universal projection routes.
 - Approval retry after browser/network interruption is idempotent.
 
 ## Stage 4: Runner Event Acks, WAL, And Reconnect Loop
@@ -331,11 +331,11 @@ Stage 4 notes:
 - Runner event acknowledgements are runner-local and cumulative by `runner_event_seq`; they are distinct from control-plane universal `seq`.
 - The runner writes a JSONL WAL under `.agenter/runner-<runner-id>-events.jsonl` by default, or `AGENTER_RUNNER_WAL` when configured. The WAL is written before send through temp-file write, file sync, atomic rename, and best-effort directory sync. Open tolerates a corrupt trailing record after a valid prefix. Records are replayed after hello and cleaned up after ack with bounded retention.
 - Control-plane dedupe is in-memory for this stage and keyed by `(runner_id, runner_event_seq)`. Duplicate checking is read-only; a seq is marked accepted only after event validation and projection acceptance. In DB-backed deployments this still prevents browser-visible duplication during a process lifetime; durable cross-control-plane-restart dedupe should move into the event append/idempotency store in a later hardening pass.
-- Runner-originated `AppEvent` acceptance is fallible. In DB-backed mode, ack is withheld if durable `agent_events` append cannot be guaranteed; in no-DB mode, in-memory append/broadcast is accepted. `SessionsDiscovered` is always processed and forced-refresh summaries are recorded, but it is acked only in no-DB mode for now because strict DB import/reset acceptance still needs a fallible repository path; DB-backed runners will replay unacked discovery WAL records and imports must remain idempotent/best-effort until that path is hardened.
+- Runner-originated `NormalizedEvent` acceptance is fallible. In DB-backed mode, ack is withheld if durable `agent_events` append cannot be guaranteed; in no-DB mode, in-memory append/broadcast is accepted. `SessionsDiscovered` is always processed and forced-refresh summaries are recorded, but it is acked only in no-DB mode for now because strict DB import/reset acceptance still needs a fallible repository path; DB-backed runners will replay unacked discovery WAL records and imports must remain idempotent/best-effort until that path is hardened.
 - In no-DB mode, acked runner WAL records are not replayed after a control-plane process restart because accepted runner seq state is process-local. No-DB mode is therefore not lossless across control-plane restarts; lossless restart requires DB-backed universal event storage plus future durable runner seq dedupe.
 - Control-plane WebSocket disconnect no longer marks runner-owned sessions stopped. Explicit shutdown/session status evidence from the runner is required for stopped state.
 - Live adapter task survival across an already-established control-plane WebSocket disconnect remains incomplete: current runner processes replay unacked WAL records on the next connection/start, but the top-level connection loops still need to be split so provider runtimes and pending approval maps live outside transient socket lifetimes.
-- Stage 4 WAL is compatibility-event persistence and may contain existing redacted-or-legacy payload fields from `RunnerEvent`/`AppEvent`. Deployments should treat the WAL as sensitive local diagnostic/state. Stage 4 does not claim redacted-by-default WAL payloads; Stage 5 should enforce redaction centrally when adapter outputs become universal events first.
+- Stage 4 WAL is universal projection-event persistence and may contain existing redacted-or-normalized payload fields from `RunnerEvent`/`NormalizedEvent`. Deployments should treat the WAL as sensitive local diagnostic/state. Stage 4 does not claim redacted-by-default WAL payloads; Stage 5 should enforce redaction centrally when adapter outputs become universal events first.
 
 Verification:
 
@@ -371,13 +371,13 @@ Steps:
 - [x] Define `HarnessAdapter` with start/load/start_turn/send_user_input/resolve_approval/cancel_turn/set_mode/close/capabilities/event stream behavior.
 - [x] Define adapter request/response structs using universal command and event types.
 - [x] Create an adapter registry keyed by provider id and session id.
-- [x] Move provider/session resolution and compatibility event projection in `main.rs` behind adapter runtime helpers.
+- [x] Move provider/session resolution and universal projection event projection in `main.rs` behind adapter runtime helpers.
 - [ ] Move full command dispatch in `main.rs` behind concrete `HarnessAdapter` trait objects.
 - [x] Split Codex code into transport, codec, and semantic reducer modules without changing observed behavior.
 - [x] Split ACP code into transport/client services, codec, and semantic reducer modules without changing observed behavior.
-- [x] Introduce adapter outputs with safe universal event shells and legacy `AppEvent` compatibility projections.
-- [ ] Convert production runtime outputs to full universal events first, then legacy `AppEvent` only through compatibility projection.
-- [x] Add tests proving Codex and ACP fixture events produce stable universal events and unchanged legacy projections during migration.
+- [x] Introduce adapter outputs with safe universal event shells and normalized event universal projections.
+- [ ] Convert production runtime outputs to full universal events first, then normalized event only through universal projection.
+- [x] Add tests proving Codex and ACP fixture events produce stable universal events and unchanged universal projections during migration.
 
 Stage 5 verification evidence:
 
@@ -389,9 +389,10 @@ Stage 5 notes:
 
 - `HarnessAdapter` is introduced as the shared asynchronous boundary, but the concrete Codex and ACP runtimes are not yet implemented behind trait objects. Full command dispatch remains in the existing runner command loop.
 - The multi-provider runner uses `AdapterRuntime` for provider/session resolution and binds/unbinds sessions as create/resume/shutdown commands flow through the current runner command loop.
-- Codex and ACP reducer seams currently wrap the existing legacy normalizers and emit `AdapterEvent` objects with a safe universal `native.unknown` shell plus unchanged legacy `AppEvent` projection. Stage 6 owns the full turn/item/content/diff/artifact mapping.
-- `AdapterEvent` no longer fabricates nil universal session ids for sessionless legacy events. Sessionless adapter events keep `session_id: None` and are not projected to runner WAL `AgentEvent` records.
-- Runner WAL sending still persists compatibility `RunnerEvent::AgentEvent` records, but those records now carry an optional `universal_event` draft alongside the legacy `AppEvent`. The runner sends both where adapter semantics are available, and the control plane prefers the supplied universal draft for durable append/reducer/broadcast while preserving the legacy event cache projection.
+- Codex and ACP reducer seams now emit `AdapterEvent` as a universal-first runtime object; normalized-event projection remains isolated in adapter/control-plane source-projection helpers until the remaining `NormalizedEvent` storage API is removed.
+- `AdapterEvent` no longer fabricates nil universal session ids for sessionless normalized events. Sessionless adapter events keep `session_id: None` and are not projected to runner WAL `AgentEvent` records.
+- Runner WAL sending persists `RunnerEvent::AgentEvent` records with optional universal event payloads. The control plane prefers supplied universal events for durable append/reducer/broadcast, while remaining source-projection code is explicitly isolated.
+- A cleanup pass removed frontend `normalized_event` API types/tests/reducers, renamed Codex-specific old approval aliases to protocol-neutral names, changed REST session creation/user-message echoes to publish `uap/1` universal events directly, and replaced control-plane projection native refs from `agenter.normalized_event` to `uap.universal_projection`.
 
 Verification:
 
@@ -404,7 +405,7 @@ cargo check --workspace
 
 Exit criteria:
 
-- `main.rs` uses adapter helpers for provider/session resolution and compatibility event projection.
+- `main.rs` uses adapter helpers for provider/session resolution and universal projection event projection.
 - Codex and ACP normalization can be tested as pure reducer logic from native fixtures.
 - Existing provider behavior remains visible to the current frontend.
 - Full trait-object command dispatch and full universal-first runtime output remain explicit follow-up work.
@@ -446,8 +447,8 @@ Stage 6 verification evidence:
 Stage 6 notes:
 
 - `UniversalEventKind` now includes explicit turn lifecycle variants and `content.completed`.
-- The adapter semantic projection maps legacy Codex/ACP normalizer output into universal turn/item/content/plan/diff/approval events while preserving the legacy `AppEvent` projection for the Stage 4 WAL/frontend path.
-- The control-plane compatibility reducer also materializes message content in universal snapshots from current legacy WAL events, so snapshots are no longer limited to `native.unknown` rows for assistant text.
+- The adapter semantic projection maps normalized Codex/ACP normalizer output into universal turn/item/content/plan/diff/approval events while preserving the normalized event projection for the Stage 4 WAL/frontend path.
+- The control-plane universal projection reducer also materializes message content in universal snapshots from current source WAL events, so snapshots are no longer limited to `native.unknown` rows for assistant text.
 - Command completion uses a separate status block, preserving the original command invocation/tool-call block and streamed stdout/stderr blocks in the universal snapshot.
 - ACP has a small stateful reducer object that creates a deterministic prompt turn scoped by provider, session, and native prompt id; it also exposes explicit prompt completion to emit `turn.completed` and clear active turn state. Production command dispatch still needs the Stage 5 follow-up before this state can be the sole live runtime path.
 - `artifact.created` is supported in the universal core and reducer, but this pass does not fabricate artifacts for ordinary structured plan updates. Current Codex/ACP live normalizers do not expose safe plan-file/image/file-ref artifacts without provider payload inspection, so richer artifact extraction remains a Stage 8/adapter hardening follow-up.
@@ -512,7 +513,7 @@ Stage 7 verification evidence:
 
 Stage 7 notes:
 
-- Universal approval requests now carry canonical options, canonical lifecycle status, native request id, native blocking flag, risk/subject, and policy metadata in the redacted universal projection. Legacy approval events are enriched at the control-plane boundary so current provider/browser flows keep working.
+- Universal approval requests now carry canonical options, canonical lifecycle status, native request id, native blocking flag, risk/subject, and policy metadata in the redacted universal projection. source approval events are enriched at the control-plane boundary so current provider/browser flows keep working.
 - Listing pending approvals marks them `presented` and persists that transition. Beginning resolution persists `resolving`; runner-acknowledged resolution persists the final approved/denied/cancelled projection through the existing Stage 3 idempotent route.
 - Question/user-input requests remain `QuestionRequested` / `QuestionAnswered` and do not become danger approvals.
 - The policy surface is intentionally conservative: command/file/tool/provider approval requests currently evaluate to typed `ask` decisions with coarse risk classification; `allow`, `deny`, and `rewrite` are modeled for future rules but not auto-applied to native requests yet.
@@ -615,24 +616,25 @@ Steps:
 - [x] Change WebSocket subscription to send `after_seq` and `include_snapshot`.
 - [x] Track `latestSeq` in route state and use it for reconnect.
 - [x] Apply snapshot first, then replay events after the snapshot seq.
-- [x] Remove legacy history loading fallback after backend `uap/1` readiness.
+- [x] Remove source history loading fallback after backend `uap/1` readiness.
 - [x] Add universal reducer that materializes timeline rows from snapshot state.
 - [x] Render plans from `PlanState.entries` while preserving markdown content and Codex handoff actions.
 - [x] Render approval options from canonical options rather than hard-coded Codex decisions.
 - [x] Render question/user-input requests separately from approvals.
 - [x] Render diff/artifact refs as inline rows first; right-rail organization can remain a later UI polish task.
 - [x] Feature-gate mode/model/reasoning/approval/diff controls from capabilities.
-- [x] Add tests for snapshot apply, after-seq replay, duplicate seq dedupe, approval option rendering, plan state rendering, capability gating, and legacy fallback.
+- [x] Add tests for snapshot apply, after-seq replay, duplicate seq dedupe, approval option rendering, plan state rendering, capability gating, and source fallback.
 
 Stage 9 evidence:
 
 - Added frontend universal protocol types, WebSocket cursor subscription options, browser message normalization for `session_snapshot` and `universal_event`, and snapshot/replay reducers in `web/src/lib/sessionSnapshot.ts` and `web/src/lib/universalEvents.ts`.
 - `ChatRoute.svelte` subscribes with `include_snapshot`, preserves `latestSeq` across reconnect for the same route, and applies only universal snapshot/replay messages without duplicating replay/live boundary events.
+- Removed the deleted browser `normalized_event` envelope types and the dead app-event chat reducer; frontend timeline rendering now goes through universal snapshot/replay materialization.
 - Plans now render structured `PlanState.entries` while preserving markdown content and existing Codex plan handoff actions.
-- Approval buttons are derived from canonical universal options. Question cards now materialize from first-class universal question state instead of dual-delivered legacy events.
+- Approval buttons are derived from canonical universal options. Question cards now materialize from first-class universal question state instead of dual-delivered normalized events.
 - Diff and artifact state materialize as inline rows; richer right-rail organization remains deferred.
-- Capability data gates mode/model/reasoning/approval controls only when the snapshot advertises a real capability signal; controls remain available for legacy/no-capability sessions.
-- Focused tests cover snapshot materialization, after-seq replay, duplicate seq/event-id dedupe, incomplete replay cursor safety, legacy fallback, capability detection, and WebSocket subscription options.
+- Capability data gates mode/model/reasoning/approval controls only when the snapshot advertises a real capability signal; controls remain available for source/no-capability sessions.
+- Focused tests cover snapshot materialization, after-seq replay, duplicate seq/event-id dedupe, truncated replay snapshot checkpointing, source fallback, capability detection, and WebSocket subscription options.
 
 Stage 9 verification evidence:
 
@@ -646,8 +648,8 @@ Stage 9 repair evidence:
 
 - Live universal events at or behind the current `latestSeq` are now ignored even when the `(seq, event_id)` tuple is new, preventing stale replay/live duplication.
 - Malformed universal events without a valid non-negative `seq` or non-empty `event_id` now fail normalization and go through the WebSocket parse-error path instead of becoming applyable seq `0`.
-- Universal approval rows preserve canonical `option_id` when posted from the frontend; the legacy approval REST endpoint accepts the extra `option_id`/`feedback` fields and keeps existing `decision` callers compatible.
-- Universal browser subscriptions dual-deliver legacy question requested/answered app events until `uap/1` grows first-class question event variants.
+- Universal approval rows preserve canonical `option_id` when posted from the frontend; the source approval REST endpoint accepts the extra `option_id`/`feedback` fields and keeps existing `decision` callers compatible.
+- Universal browser subscriptions dual-deliver source question requested/answered normalized events until `uap/1` grows first-class question event variants.
 - Terminal approval states (`approved`, `denied`, `cancelled`, `expired`, `orphaned`) materialize as resolved rows without clickable decision options.
 - Snapshot/replay/live materialization records first-seen row ordering from universal event `seq`/`ts`, so reconnect rendering preserves deterministic timeline order for interleaved assistant, approval, diff, plan, and artifact rows.
 - Repair tests added coverage for same-seq/different-id stale events, older live events, malformed universal frames, canonical approval option posting, terminal approval rows, dual-delivered live questions, and interleaved replay chronology.
@@ -666,6 +668,7 @@ npm run build
 Exit criteria:
 
 - Frontend can reload during a running turn and reconstruct from snapshot+replay.
+- Frontend reloads with long event histories use the materialized snapshot as a live checkpoint instead of showing a fatal incomplete replay popup.
 - No duplicate transcript rows when events are replayed.
 - Existing browser workflows still work for Codex and ACP sessions.
 
@@ -743,6 +746,13 @@ Stage 10 remaining risks:
 - Harness crash during tool remains a manual chaos item in the smoke runbook rather than a new automated harness test.
 - Runner reconnect preserves WAL replay/ack state, but live adapter ownership is still scoped to the runner process and current provider runtime loops. A transient control-plane WebSocket reconnect by the same runner process should not orphan control-plane approvals, but full proof that native waiters/provider runtimes survive every reconnect path remains a Stage 10 risk until those maps/runtimes are hoisted into a reconnect-stable supervisor and covered by an automated chaos test.
 
+Stage 10 runner WAL follow-up:
+
+- `docs/decisions/2026-05-04-runner-discovery-events-are-retryable-operations.md` narrows runner WAL replay to universal `AgentEvent` records only.
+- `SessionsDiscovered`, `OperationUpdated`, health, and runner error events are delivered as retryable operation/control messages without runner WAL sequence numbers.
+- Runner WAL acknowledgements now persist a small cursor instead of rewriting the record log on every ack; source non-replayable discovery records are dropped during WAL startup repair.
+- This closes the observed runner CPU spike where a retained loaded-history `SessionsDiscovered` record made every small ack reserialize a large WAL file.
+
 ## Scheduling And Validation Rules
 
 - Stage 0 must complete before any schema or code work.
@@ -771,5 +781,5 @@ Controller validation before scheduling the next stage:
 - Codex native adapter and ACP adapter both emit universal turns/items/content/plans/approvals while preserving safe native references. Raw full provider payload persistence remains out of scope without a future explicit policy ADR.
 - Approval decisions and user-input answers are idempotent and native blocked requests are answered exactly once.
 - Cancel/interrupt changes real native state only for supported provider hooks or blocked native approval cancellation. Unsupported live-turn cancel returns a typed `provider_cancel_not_supported` error and must not be advertised as a generic capability.
-- Frontend renders from universal capabilities and snapshot state, with legacy fallback only for migration safety.
+- Frontend renders from universal capabilities and snapshot state, with source fallback only for migration safety.
 - Full Rust and frontend verification gates pass, or any environment limitation is recorded in this plan with the exact failed command and next action.

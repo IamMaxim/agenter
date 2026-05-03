@@ -255,12 +255,7 @@ pub(super) async fn create_session(
     );
 
     let info = session.info();
-    state
-        .publish_event(
-            session.session_id,
-            agenter_core::AppEvent::SessionStarted(info.clone()),
-        )
-        .await;
+    publish_session_created(&state, info.clone()).await;
 
     if let Some(content) = initial_message {
         if let Err(error) = dispatch_user_message(
@@ -310,6 +305,64 @@ struct DispatchUserMessage {
     settings: Option<agenter_core::AgentTurnSettings>,
 }
 
+async fn publish_session_created(state: &crate::state::AppState, info: agenter_core::SessionInfo) {
+    if let Err(error) = state
+        .publish_universal_event(
+            info.session_id,
+            None,
+            None,
+            agenter_core::UniversalEventKind::SessionCreated {
+                session: Box::new(info),
+            },
+        )
+        .await
+    {
+        tracing::warn!(%error, "failed to publish universal session.created event");
+    }
+}
+
+async fn publish_user_message(
+    state: &crate::state::AppState,
+    user_message: &agenter_core::UserMessageEvent,
+) {
+    let item_id = agenter_core::ItemId::new();
+    if let Err(error) = state
+        .publish_universal_event(
+            user_message.session_id,
+            None,
+            Some(item_id),
+            agenter_core::UniversalEventKind::ItemCreated {
+                item: Box::new(agenter_core::ItemState {
+                    item_id,
+                    session_id: user_message.session_id,
+                    turn_id: None,
+                    role: agenter_core::ItemRole::User,
+                    status: agenter_core::ItemStatus::Completed,
+                    content: vec![agenter_core::ContentBlock {
+                        block_id: user_message
+                            .message_id
+                            .clone()
+                            .unwrap_or_else(|| item_id.to_string()),
+                        kind: agenter_core::ContentBlockKind::Text,
+                        text: Some(user_message.content.clone()),
+                        mime_type: Some("text/plain".to_owned()),
+                        artifact_id: None,
+                    }],
+                    tool: None,
+                    native: None,
+                }),
+            },
+        )
+        .await
+    {
+        tracing::warn!(
+            session_id = %user_message.session_id,
+            %error,
+            "failed to publish universal user message event"
+        );
+    }
+}
+
 async fn dispatch_user_message(
     state: &crate::state::AppState,
     request: DispatchUserMessage,
@@ -321,12 +374,7 @@ async fn dispatch_user_message(
         author_user_id: Some(request.user_id),
         content: request.content,
     };
-    state
-        .publish_event(
-            session_id,
-            agenter_core::AppEvent::UserMessage(user_message.clone()),
-        )
-        .await;
+    publish_user_message(state, &user_message).await;
     super::publish_session_status_event(
         state,
         session_id,
@@ -541,9 +589,9 @@ pub(super) async fn send_session_message(
         command_id: request
             .command_id
             .unwrap_or_else(agenter_core::CommandId::new),
-        idempotency_key: request.idempotency_key.unwrap_or_else(|| {
-            format!("legacy:send_message:{session_id}:{}", uuid::Uuid::new_v4())
-        }),
+        idempotency_key: request
+            .idempotency_key
+            .unwrap_or_else(|| format!("uap:send_message:{session_id}:{}", uuid::Uuid::new_v4())),
         session_id: Some(session_id),
         turn_id: None,
         command: agenter_core::UniversalCommand::StartTurn {
@@ -571,12 +619,7 @@ pub(super) async fn send_session_message(
         author_user_id: Some(user.user_id),
         content: content.to_owned(),
     };
-    state
-        .publish_event(
-            session_id,
-            agenter_core::AppEvent::UserMessage(user_message.clone()),
-        )
-        .await;
+    publish_user_message(&state, &user_message).await;
     super::publish_session_status_event(
         &state,
         session_id,
@@ -858,10 +901,7 @@ pub(super) async fn update_session_settings(
             .command_id
             .unwrap_or_else(agenter_core::CommandId::new),
         idempotency_key: request.idempotency_key.unwrap_or_else(|| {
-            format!(
-                "legacy:update_settings:{session_id}:{}",
-                uuid::Uuid::new_v4()
-            )
+            format!("uap:update_settings:{session_id}:{}", uuid::Uuid::new_v4())
         }),
         session_id: Some(session_id),
         turn_id: None,

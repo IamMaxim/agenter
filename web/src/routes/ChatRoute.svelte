@@ -274,11 +274,7 @@
             universalState = applyUniversalClientMessage(universalState, message);
             chatState = universalState.chat;
             if (message.type === 'session_snapshot' && message.has_more) {
-              connectionState = 'Snapshot replay incomplete';
-              pushToast({ severity: 'error', message: 'Session replay is incomplete. Refresh later after the event log catches up.' });
-              suppressNextReconnect = true;
-              socket?.close();
-              return;
+              connectionState = 'Loaded snapshot';
             }
             if (universalState.snapshot?.info) {
               session = universalState.snapshot.info;
@@ -1196,9 +1192,9 @@
     {/if}
     {#if turnActive}
       <div class="working-row" aria-live="polite">
-        <span class="working-dot"></span>
-        <span>{turnActivity?.label ?? 'Working'}</span>
-        <span class="working-shimmer"></span>
+        <!-- <span class="working-dot"></span> -->
+        <span class="working-shimmer-text">{turnActivity?.label ?? 'Working'}</span>
+        <!-- <span class="working-shimmer"></span> -->
       </div>
     {/if}
   </div>

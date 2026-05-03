@@ -7,11 +7,11 @@ use std::{
 
 use crate::agents::approval_state::PendingProviderApproval;
 use agenter_core::{
-    AgentCapabilities, AgentErrorEvent, AgentMessageDeltaEvent, AgentProviderId, AppEvent,
-    ApprovalDecision, ApprovalId, ApprovalKind, ApprovalRequestEvent, CommandCompletedEvent,
-    CommandEvent, CommandOutputEvent, CommandOutputStream, FileChangeEvent, FileChangeKind,
-    MessageCompletedEvent, PlanEntry, PlanEntryStatus, PlanEvent, ProviderEvent, SessionId,
-    SessionStatus, SessionStatusChangedEvent, ToolEvent,
+    AgentCapabilities, AgentErrorEvent, AgentMessageDeltaEvent, AgentProviderId, ApprovalDecision,
+    ApprovalId, ApprovalKind, ApprovalRequestEvent, CommandCompletedEvent, CommandEvent,
+    CommandOutputEvent, CommandOutputStream, FileChangeEvent, FileChangeKind,
+    MessageCompletedEvent, NativeNotification, NormalizedEvent, PlanEntry, PlanEntryStatus,
+    PlanEvent, SessionId, SessionStatus, SessionStatusChangedEvent, ToolEvent,
 };
 use anyhow::{anyhow, Context};
 use serde_json::{json, Value};
@@ -367,7 +367,7 @@ impl AcpRunnerRuntime {
         &self,
         request: AcpTurnRequest,
         profile: AcpProviderProfile,
-        event_sender: mpsc::UnboundedSender<AppEvent>,
+        event_sender: mpsc::UnboundedSender<NormalizedEvent>,
         pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingAcpApproval>>>,
     ) -> anyhow::Result<()> {
         let mut session = {
@@ -407,11 +407,13 @@ impl AcpRunnerRuntime {
                     ))
                     .ok();
                 event_sender
-                    .send(AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
-                        session_id: request.session_id,
-                        status: SessionStatus::Idle,
-                        reason: Some(format!("{} prompt completed.", session.profile.title)),
-                    }))
+                    .send(NormalizedEvent::SessionStatusChanged(
+                        SessionStatusChangedEvent {
+                            session_id: request.session_id,
+                            status: SessionStatus::Idle,
+                            reason: Some(format!("{} prompt completed.", session.profile.title)),
+                        },
+                    ))
                     .ok();
                 self.sessions
                     .lock()
@@ -450,7 +452,7 @@ impl AcpRunnerRuntime {
         session_id: SessionId,
         provider_id: AgentProviderId,
         message: &Value,
-        event_sender: mpsc::UnboundedSender<AppEvent>,
+        event_sender: mpsc::UnboundedSender<NormalizedEvent>,
         pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingAcpApproval>>>,
     ) -> anyhow::Result<Value> {
         match jsonrpc_method(message).unwrap_or_default() {
@@ -464,11 +466,13 @@ impl AcpRunnerRuntime {
                     .await
                     .insert(approval_id, PendingAcpApproval::new(session_id, sender));
                 event_sender
-                    .send(AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
-                        session_id,
-                        status: SessionStatus::WaitingForApproval,
-                        reason: Some("ACP provider is waiting for approval.".to_owned()),
-                    }))
+                    .send(NormalizedEvent::SessionStatusChanged(
+                        SessionStatusChangedEvent {
+                            session_id,
+                            status: SessionStatus::WaitingForApproval,
+                            reason: Some("ACP provider is waiting for approval.".to_owned()),
+                        },
+                    ))
                     .ok();
                 event_sender.send(event).ok();
                 let answer = receiver
@@ -477,11 +481,13 @@ impl AcpRunnerRuntime {
                 let response = acp_permission_response(message, answer.decision);
                 answer.acknowledged.send(Ok(())).ok();
                 event_sender
-                    .send(AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
-                        session_id,
-                        status: SessionStatus::Running,
-                        reason: Some("Approval answered.".to_owned()),
-                    }))
+                    .send(NormalizedEvent::SessionStatusChanged(
+                        SessionStatusChangedEvent {
+                            session_id,
+                            status: SessionStatus::Running,
+                            reason: Some("Approval answered.".to_owned()),
+                        },
+                    ))
                     .ok();
                 Ok(response)
             }
@@ -496,7 +502,7 @@ impl AcpRunnerRuntime {
                     .write_text_file(message)
                     .await?;
                 event_sender
-                    .send(AppEvent::FileChangeApplied(FileChangeEvent {
+                    .send(NormalizedEvent::FileChangeApplied(FileChangeEvent {
                         session_id,
                         path,
                         change_kind: FileChangeKind::Modify,
@@ -718,7 +724,7 @@ pub fn normalize_acp_message(
     session_id: SessionId,
     provider_id: AgentProviderId,
     message: &Value,
-) -> Vec<AppEvent> {
+) -> Vec<NormalizedEvent> {
     if jsonrpc_method(message) != Some("session/update") {
         return Vec::new();
     }
@@ -728,7 +734,7 @@ pub fn normalize_acp_message(
             let Some(delta) = acp_content_text(message) else {
                 return Vec::new();
             };
-            vec![AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {
+            vec![NormalizedEvent::AgentMessageDelta(AgentMessageDeltaEvent {
                 session_id,
                 message_id: message_id(message),
                 delta: delta.to_owned(),
@@ -736,14 +742,16 @@ pub fn normalize_acp_message(
             })]
         }
         "agent_message" | "agent_message_complete" | "complete" | "done" => {
-            vec![AppEvent::AgentMessageCompleted(MessageCompletedEvent {
-                session_id,
-                message_id: message_id(message),
-                content: acp_content_text(message).map(str::to_owned),
-                provider_payload: Some(message.clone()),
-            })]
+            vec![NormalizedEvent::AgentMessageCompleted(
+                MessageCompletedEvent {
+                    session_id,
+                    message_id: message_id(message),
+                    content: acp_content_text(message).map(str::to_owned),
+                    provider_payload: Some(message.clone()),
+                },
+            )]
         }
-        "plan" | "plan_update" => vec![AppEvent::PlanUpdated(PlanEvent {
+        "plan" | "plan_update" => vec![NormalizedEvent::PlanUpdated(PlanEvent {
             session_id,
             plan_id: string_at(message, &["/params/update/planId", "/params/update/id"])
                 .map(str::to_owned),
@@ -758,9 +766,13 @@ pub fn normalize_acp_message(
             .unwrap_or(false),
             provider_payload: Some(message.clone()),
         })],
-        "tool_call" => vec![AppEvent::ToolStarted(tool_event(session_id, message))],
-        "tool_call_update" => vec![AppEvent::ToolUpdated(tool_event(session_id, message))],
-        "error" => vec![AppEvent::Error(AgentErrorEvent {
+        "tool_call" => vec![NormalizedEvent::ToolStarted(tool_event(
+            session_id, message,
+        ))],
+        "tool_call_update" => vec![NormalizedEvent::ToolUpdated(tool_event(
+            session_id, message,
+        ))],
+        "error" => vec![NormalizedEvent::Error(AgentErrorEvent {
             session_id: Some(session_id),
             code: string_at(message, &["/params/update/code", "/params/code"]).map(str::to_owned),
             message: string_at(message, &["/params/update/message", "/params/message"])
@@ -768,7 +780,7 @@ pub fn normalize_acp_message(
                 .to_owned(),
             provider_payload: Some(message.clone()),
         })],
-        _ => vec![AppEvent::ProviderEvent(provider_event(
+        _ => vec![NormalizedEvent::NativeNotification(native_notification(
             session_id,
             provider_id,
             message,
@@ -797,7 +809,7 @@ pub mod acp_reducer {
     use uuid::Uuid;
 
     use crate::agents::adapter::{
-        legacy_events_to_adapter_events, AdapterEvent, AdapterUniversalEvent,
+        normalized_events_to_adapter_events, AdapterEvent, AdapterUniversalEvent,
     };
 
     #[derive(Clone, Debug)]
@@ -848,7 +860,6 @@ pub mod acp_reducer {
                         },
                     },
                 },
-                legacy: None,
             }
         }
 
@@ -882,7 +893,6 @@ pub mod acp_reducer {
                         },
                     },
                 },
-                legacy: None,
             })
         }
 
@@ -918,7 +928,7 @@ pub mod acp_reducer {
         message: &Value,
     ) -> Vec<AdapterEvent> {
         let method = super::acp_codec::method(message);
-        legacy_events_to_adapter_events(
+        normalized_events_to_adapter_events(
             provider_id.clone(),
             "acp-stdio",
             method,
@@ -931,8 +941,8 @@ fn normalize_acp_prompt_response(
     session_id: SessionId,
     _provider_id: AgentProviderId,
     message: &Value,
-) -> AppEvent {
-    AppEvent::AgentMessageCompleted(MessageCompletedEvent {
+) -> NormalizedEvent {
+    NormalizedEvent::AgentMessageCompleted(MessageCompletedEvent {
         session_id,
         message_id: string_at(
             message,
@@ -952,18 +962,18 @@ fn normalize_acp_prompt_response(
     })
 }
 
-fn provider_event(
+fn native_notification(
     session_id: SessionId,
     provider_id: AgentProviderId,
     message: &Value,
     category: &str,
-) -> ProviderEvent {
-    ProviderEvent {
+) -> NativeNotification {
+    NativeNotification {
         session_id,
         provider_id,
         event_id: string_at(message, &["/params/update/id", "/id"]).map(str::to_owned),
         method: jsonrpc_method(message)
-            .unwrap_or("provider_event")
+            .unwrap_or("native_notification")
             .to_owned(),
         category: category.to_owned(),
         title: string_at(
@@ -986,7 +996,7 @@ fn normalize_acp_permission_request(
     session_id: SessionId,
     provider_id: AgentProviderId,
     message: &Value,
-) -> Option<(ApprovalId, AppEvent)> {
+) -> Option<(ApprovalId, NormalizedEvent)> {
     if jsonrpc_method(message) != Some("session/request_permission") {
         return None;
     }
@@ -1014,7 +1024,7 @@ fn normalize_acp_permission_request(
     .or_else(|| serde_json::to_string(message.get("params").unwrap_or(&Value::Null)).ok());
     Some((
         approval_id,
-        AppEvent::ApprovalRequested(ApprovalRequestEvent {
+        NormalizedEvent::ApprovalRequested(ApprovalRequestEvent {
             session_id,
             approval_id,
             kind: ApprovalKind::ProviderSpecific,
@@ -1147,7 +1157,7 @@ impl AcpTerminalService {
         &self,
         session_id: SessionId,
         message: &Value,
-        event_sender: mpsc::UnboundedSender<AppEvent>,
+        event_sender: mpsc::UnboundedSender<NormalizedEvent>,
     ) -> anyhow::Result<Value> {
         let command = string_at(message, &["/params/command", "/params/cmd"])
             .ok_or_else(|| anyhow!("ACP terminal/create missing command"))?
@@ -1162,7 +1172,7 @@ impl AcpTerminalService {
             },
         );
         event_sender
-            .send(AppEvent::CommandStarted(CommandEvent {
+            .send(NormalizedEvent::CommandStarted(CommandEvent {
                 session_id,
                 command_id: terminal_id.clone(),
                 command: command.clone(),
@@ -1205,7 +1215,7 @@ impl AcpTerminalService {
             };
             if !text.is_empty() {
                 event_sender
-                    .send(AppEvent::CommandOutputDelta(CommandOutputEvent {
+                    .send(NormalizedEvent::CommandOutputDelta(CommandOutputEvent {
                         session_id,
                         command_id: terminal_id_for_task.clone(),
                         stream: CommandOutputStream::Stdout,
@@ -1215,7 +1225,7 @@ impl AcpTerminalService {
                     .ok();
             }
             event_sender
-                .send(AppEvent::CommandCompleted(CommandCompletedEvent {
+                .send(NormalizedEvent::CommandCompleted(CommandCompletedEvent {
                     session_id,
                     command_id: terminal_id_for_task,
                     exit_code: Some(exit_code),
@@ -1556,7 +1566,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_acp_session_update_becomes_provider_event() {
+    fn unknown_acp_session_update_becomes_native_notification() {
         let message = json!({
             "jsonrpc": "2.0",
             "method": "session/update",
@@ -1576,8 +1586,8 @@ mod tests {
         );
 
         assert_eq!(events.len(), 1);
-        let agenter_core::AppEvent::ProviderEvent(event) = &events[0] else {
-            panic!("expected provider event fallback");
+        let agenter_core::NormalizedEvent::NativeNotification(event) = &events[0] else {
+            panic!("expected native notification fallback");
         };
         assert_eq!(event.provider_id.as_str(), "opencode");
         assert_eq!(event.method, "session/update");
@@ -1586,7 +1596,7 @@ mod tests {
     }
 
     #[test]
-    fn acp_semantic_reducer_preserves_legacy_projection() {
+    fn acp_semantic_reducer_emits_universal_projection() {
         let session_id = SessionId::nil();
         let provider_id = AgentProviderId::from(AgentProviderId::QWEN);
         let message = json!({
@@ -1602,11 +1612,10 @@ mod tests {
             }
         });
 
-        let legacy = normalize_acp_message(session_id, provider_id.clone(), &message);
+        let source = normalize_acp_message(session_id, provider_id.clone(), &message);
         let semantic = super::acp_reducer::reduce_native_message(session_id, provider_id, &message);
 
-        assert_eq!(semantic.len(), legacy.len());
-        assert_eq!(semantic[0].legacy_projection(), Some(&legacy[0]));
+        assert_eq!(semantic.len(), source.len());
         assert_eq!(semantic[0].universal.session_id, Some(session_id));
         let native = semantic[0].universal.native.as_ref().expect("native ref");
         assert_eq!(native.protocol, "acp-stdio");
@@ -1701,14 +1710,14 @@ mod tests {
                 "options": [{"optionId": "allow_once", "kind": "allow_once"}]
             }
         });
-        let (_approval_id, legacy) =
+        let (_approval_id, source) =
             normalize_acp_permission_request(session_id, provider_id.clone(), &permission)
                 .expect("permission");
-        let approval = crate::agents::adapter::AdapterEvent::from_legacy(
+        let approval = crate::agents::adapter::AdapterEvent::from_normalized_event(
             provider_id,
             "acp-stdio",
             Some("session/request_permission"),
-            legacy,
+            source,
         )
         .with_turn_id(turn_id);
         assert!(matches!(
@@ -1767,14 +1776,14 @@ mod tests {
                 .iter()
                 .find(|message| jsonrpc_method(message) == Some("session/request_permission"))
                 .expect("permission request");
-            let (_approval_id, legacy) =
+            let (_approval_id, source) =
                 normalize_acp_permission_request(session_id, provider_id.clone(), permission)
                     .expect("permission should normalize");
-            let approval = crate::agents::adapter::AdapterEvent::from_legacy(
+            let approval = crate::agents::adapter::AdapterEvent::from_normalized_event(
                 provider_id,
                 "acp-stdio",
                 Some("session/request_permission"),
-                legacy,
+                source,
             )
             .with_turn_id(turn_id);
             let agenter_core::UniversalEventKind::ApprovalRequested { approval } =
@@ -1840,7 +1849,7 @@ mod tests {
         else {
             panic!("expected unknown native event");
         };
-        assert_eq!(summary.as_deref(), Some("provider event"));
+        assert_eq!(summary.as_deref(), Some("native notification"));
         assert_eq!(
             semantic[0]
                 .universal

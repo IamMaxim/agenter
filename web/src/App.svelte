@@ -2,15 +2,23 @@
   import { onMount } from 'svelte';
   import { getCurrentUser, logout } from './api/auth';
   import { ApiError } from './api/http';
-  import type { AuthenticatedUser } from './api/types';
+  import type { AuthenticatedUser, SessionInfo } from './api/types';
   import SessionTabsBar from './components/SessionTabsBar.svelte';
   import SessionTreeSidebar from './components/SessionTreeSidebar.svelte';
   import ToastHost from './components/ToastHost.svelte';
   import { parseRoute, routeHref, type AppRoute } from './lib/router';
-  import { MAX_OPEN_TABS, parseSavedTabs, serializeTabs, TAB_STORAGE_KEY, type PersistedSessionTab } from './lib/sessionTabs';
+  import {
+    FALLBACK_TAB_TITLE,
+    MAX_OPEN_TABS,
+    parseSavedTabs,
+    serializeTabs,
+    TAB_STORAGE_KEY,
+    type PersistedSessionTab
+  } from './lib/sessionTabs';
   import { pushToast } from './lib/toasts';
   import ChatRoute from './routes/ChatRoute.svelte';
   import LoginRoute from './routes/LoginRoute.svelte';
+  import { listSessions } from './api/sessions';
 
   let route: AppRoute = parseRoute(window.location.hash);
   let user: AuthenticatedUser | null = null;
@@ -55,6 +63,50 @@
     activeSessionId = sessionId;
   }
 
+  function normalizeTabTitle(raw: string | null | undefined): string {
+    const trimmed = raw?.trim();
+    return trimmed?.length ? trimmed : FALLBACK_TAB_TITLE;
+  }
+
+  async function refreshOpenTabTitles() {
+    if (!user) {
+      return;
+    }
+
+    let sessions: SessionInfo[] = [];
+    try {
+      sessions = await listSessions();
+    } catch {
+      return;
+    }
+
+    if (!user || tabs.length === 0) {
+      return;
+    }
+
+    const byId = new Map(sessions.map((session) => [session.session_id, session.title ?? null]));
+    let changed = false;
+    const next = tabs.map((tab) => {
+      if (!byId.has(tab.sessionId)) {
+        return tab;
+      }
+      const nextTitle = normalizeTabTitle(byId.get(tab.sessionId));
+      if (tab.title === nextTitle) {
+        return tab;
+      }
+      changed = true;
+      return {
+        ...tab,
+        title: nextTitle
+      };
+    });
+
+    if (changed) {
+      tabs = next;
+      persistTabs();
+    }
+  }
+
   function ensureTab(sessionId: string) {
     if (!sessionId) {
       return;
@@ -65,7 +117,7 @@
       if (tabs.length >= MAX_OPEN_TABS) {
         tabs = tabs.slice(tabs.length - (MAX_OPEN_TABS - 1));
       }
-      tabs = [...tabs, { sessionId, title: sessionId }];
+      tabs = [...tabs, { sessionId, title: FALLBACK_TAB_TITLE }];
       persistTabs();
     }
     touchTab(sessionId);
@@ -75,6 +127,7 @@
     route = parseRoute(window.location.hash);
     if (route.name === 'chat') {
       ensureTab(route.sessionId);
+      void refreshOpenTabTitles();
       return;
     }
     activeSessionId = '';
@@ -130,7 +183,7 @@
     if (index === -1) {
       return;
     }
-    const normalizedTitle = detail.title?.trim() || detail.sessionId;
+    const normalizedTitle = normalizeTabTitle(detail.title);
     const next: PersistedSessionTab = {
       ...tabs[index],
       title: normalizedTitle
@@ -166,6 +219,10 @@
     };
     window.addEventListener('error', showRuntimeError);
     window.addEventListener('unhandledrejection', showUnhandledRejection);
+    const syncTabTitles = () => {
+      void refreshOpenTabTitles();
+    };
+    window.addEventListener('agenter:sessions-changed', syncTabTitles);
 
     loadTabs();
     syncRoute();
@@ -176,6 +233,7 @@
         if (route.name === 'login') {
           window.location.hash = '#/';
         }
+        void refreshOpenTabTitles();
       })
       .catch((err) => {
         if (!(err instanceof ApiError && err.status === 401)) {
@@ -192,6 +250,7 @@
 
     return () => {
       window.removeEventListener('hashchange', syncRoute);
+      window.removeEventListener('agenter:sessions-changed', syncTabTitles);
       window.removeEventListener('error', showRuntimeError);
       window.removeEventListener('unhandledrejection', showUnhandledRejection);
     };

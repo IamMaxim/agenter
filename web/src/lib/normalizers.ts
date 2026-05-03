@@ -12,8 +12,6 @@ import type {
   AgentQuestionAnswer,
   AgentQuestionField,
   AgentTurnSettings,
-  AppEventType,
-  BrowserEventEnvelope,
   BrowserSessionSnapshot,
   CapabilitySet,
   ContentBlock,
@@ -78,35 +76,6 @@ const sessionStatuses = new Set<SessionStatus>([
   'degraded',
   'failed',
   'archived'
-]);
-
-const appEventTypes = new Set<AppEventType>([
-  'session_started',
-  'session_status_changed',
-  'user_message',
-  'agent_message_delta',
-  'agent_message_completed',
-  'plan_updated',
-  'tool_started',
-  'tool_updated',
-  'tool_completed',
-  'command_started',
-  'command_output_delta',
-  'command_completed',
-  'file_change_proposed',
-  'file_change_applied',
-  'file_change_rejected',
-  'approval_requested',
-  'approval_resolved',
-  'question_requested',
-  'question_answered',
-  'turn_diff_updated',
-  'item_reasoning',
-  'server_request_resolved',
-  'mcp_tool_call_progress',
-  'thread_realtime_event',
-  'provider_event',
-  'error'
 ]);
 
 export function normalizeAgentOptions(value: unknown): AgentOptions {
@@ -186,19 +155,6 @@ export function normalizeBrowserServerMessage(value: unknown): BrowserServerMess
     };
   }
   throw new Error(`Unsupported browser server message type: ${String(record.type ?? 'unknown')}`);
-}
-
-export function normalizeBrowserEventEnvelope(value: unknown): BrowserEventEnvelope {
-  const record = objectRecord(value);
-  const eventRecord = objectRecord(record.event);
-  return {
-    type: 'app_event',
-    ...(typeof record.event_id === 'string' ? { event_id: record.event_id } : {}),
-    event: {
-      type: isAppEventType(eventRecord.type) ? eventRecord.type : 'error',
-      payload: objectRecord(eventRecord.payload)
-    }
-  };
 }
 
 export function normalizeBrowserSessionSnapshot(value: unknown): BrowserSessionSnapshot {
@@ -748,10 +704,6 @@ function isReasoningEffort(value: unknown): value is AgentReasoningEffort {
 
 function isSessionStatus(value: unknown): value is SessionStatus {
   return typeof value === 'string' && sessionStatuses.has(value as SessionStatus);
-}
-
-function isAppEventType(value: unknown): value is AppEventType {
-  return typeof value === 'string' && appEventTypes.has(value as AppEventType);
 }
 
 function isString(value: unknown): value is string {

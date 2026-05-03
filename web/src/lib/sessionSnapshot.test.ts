@@ -283,6 +283,156 @@ describe('universal session snapshot client reducer', () => {
     expect(state.items.map((item) => ('title' in item ? item.title : ''))).not.toContain('Tool activity');
   });
 
+  test('materializes universal_projection terminal items without tool projection as command rows', () => {
+    const state = materializeSnapshotChatState(
+      snapshot({
+        items: {
+          cmd1: {
+            item_id: 'cmd1',
+            session_id: 's1',
+            role: 'tool',
+            status: 'completed',
+            content: [
+              { block_id: 'cmd1-call', kind: 'tool_call', text: 'cargo test' },
+              { block_id: 'cmd1-stdout', kind: 'command_output', text: 'ok\n' }
+            ],
+            native: {
+              protocol: 'agenter.native_projection',
+              method: 'command_started'
+            }
+          }
+        }
+      })
+    );
+
+    expect(state.items).toMatchObject([
+      {
+        id: 'event:item:cmd1',
+        kind: 'inlineEvent',
+        eventKind: 'command',
+        title: 'cargo test',
+        detail: undefined,
+        output: 'ok\n',
+        status: 'completed',
+        source: 'agenter.native_projection'
+      }
+    ]);
+  });
+
+  test('materializes universal_projection fileChange items as file rows with inline diff', () => {
+    const state = materializeSnapshotChatState(
+      snapshot({
+        items: {
+          fc1: {
+            item_id: 'fc1',
+            session_id: 's1',
+            role: 'tool',
+            status: 'streaming',
+            content: [
+              { block_id: 'fc1-call', kind: 'tool_call', text: '' },
+              {
+                block_id: 'fc1-diff',
+                kind: 'file_diff',
+                text: '@@ -1,2 +1,2 @@\n-line 1\n+line 2\n'
+              }
+            ],
+            native: {
+              protocol: 'agenter.native_projection',
+              method: 'file_change_proposed'
+            }
+          }
+        }
+      })
+    );
+
+    expect(state.items).toMatchObject([
+      {
+        id: 'event:item:fc1',
+        kind: 'inlineEvent',
+        eventKind: 'file',
+        title: 'File change proposed',
+        detail: '@@ -1,2 +1,2 @@\n-line 1\n+line 2\n',
+        status: 'streaming',
+        source: 'agenter.native_projection'
+      }
+    ]);
+  });
+
+  test('materializes universal_projection fileChange rows for broader command-change method families', () => {
+    const state = materializeSnapshotChatState(
+      snapshot({
+        items: {
+          fc1: {
+            item_id: 'fc1',
+            session_id: 's1',
+            role: 'tool',
+            status: 'completed',
+            content: [
+              { block_id: 'fc1-call', kind: 'tool_call', text: '' },
+              {
+                block_id: 'fc1-diff',
+                kind: 'file_diff',
+                text: '@@ -1,1 +1,1 @@\n-old\n+new\n'
+              }
+            ],
+            native: {
+              protocol: 'agenter.native_projection',
+              method: 'file_change'
+            }
+          }
+        }
+      })
+    );
+
+    expect(state.items).toMatchObject([
+      {
+        id: 'event:item:fc1',
+        kind: 'inlineEvent',
+        eventKind: 'file',
+        title: 'File change',
+        detail: '@@ -1,1 +1,1 @@\n-old\n+new\n',
+        status: 'completed',
+        source: 'agenter.native_projection'
+      }
+    ]);
+  });
+
+  test('materializes universal_projection command rows for broader command method families', () => {
+    const state = materializeSnapshotChatState(
+      snapshot({
+        items: {
+          cmd1: {
+            item_id: 'cmd1',
+            session_id: 's1',
+            role: 'tool',
+            status: 'completed',
+            content: [
+              { block_id: 'cmd1-call', kind: 'tool_call', text: 'cargo test' },
+              { block_id: 'cmd1-stdout', kind: 'command_output', text: 'ok\n' }
+            ],
+            native: {
+              protocol: 'agenter.native_projection',
+              method: 'command_completed'
+            }
+          }
+        }
+      })
+    );
+
+    expect(state.items).toMatchObject([
+      {
+        id: 'event:item:cmd1',
+        kind: 'inlineEvent',
+        eventKind: 'command',
+        title: 'cargo test',
+        detail: undefined,
+        output: 'ok\n',
+        status: 'completed',
+        source: 'agenter.native_projection'
+      }
+    ]);
+  });
+
   test('applies snapshot first and only replays events after the snapshot cursor', () => {
     let state = createUniversalClientState();
     const message: BrowserServerMessage = {
@@ -355,32 +505,31 @@ describe('universal session snapshot client reducer', () => {
     expect(state.chat.items).toEqual([]);
   });
 
-  test('does not advance latest seq when snapshot replay is incomplete', () => {
+  test('applies snapshot checkpoint when replay page is truncated', () => {
     const state = applyUniversalClientMessage(createUniversalClientState(), {
       type: 'session_snapshot',
-      snapshot: snapshot({ latest_seq: '5' }),
+      snapshot: snapshot({
+        latest_seq: '5',
+        items: {
+          a1: {
+            item_id: 'a1',
+            session_id: 's1',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ block_id: 'assistant-block', kind: 'text', text: 'Snapshot text' }]
+          }
+        }
+      }),
       latest_seq: '9',
       has_more: true,
       events: [universalEvent('9')]
     });
 
-    expect(state.latestSeq).toBeUndefined();
+    expect(state.latestSeq).toBe('5');
     expect(state.snapshotIncomplete).toBe(true);
-    expect(state.chat.items).toEqual([]);
-  });
-
-  test.skip('legacy fallback path for app_event messages was removed', () => {
-    const state = applyUniversalClientMessage(createUniversalClientState(), {
-      type: 'app_event',
-      event_id: 'legacy-1',
-      event: {
-        type: 'user_message',
-        payload: { session_id: 's1', message_id: 'm1', content: 'legacy hello' }
-      }
-    });
-
-    expect(state.usingUniversal).toBe(false);
-    expect(state.chat.items).toMatchObject([{ id: 'user:m1', content: 'legacy hello' }]);
+    expect(state.chat.items).toMatchObject([
+      { id: 'agent:a1', kind: 'assistant', content: 'Snapshot text' }
+    ]);
   });
 
   test('detects real capability data before feature gating existing controls', () => {
@@ -651,203 +800,47 @@ describe('universal session snapshot client reducer', () => {
     ]);
   });
 
-  test.skip('dual-delivered live question app events were removed', () => {
-    let state = createUniversalClientState();
-    state = applyUniversalClientMessage(state, {
-      type: 'session_snapshot',
-      snapshot: snapshot({ latest_seq: '5' }),
-      latest_seq: '5',
-      has_more: false,
-      events: []
-    });
-    state = applyUniversalClientMessage(state, {
-      type: 'app_event',
-      event_id: 'question-live',
-      event: {
-        type: 'question_requested',
-        payload: {
-          session_id: 's1',
-          question_id: 'q1',
-          title: 'Need input',
-          fields: [
-            {
-              id: 'target',
-              label: 'Target',
-              kind: 'single_select',
-              required: true,
-              secret: false,
-              choices: [{ value: 'web', label: 'Web' }],
-              default_answers: []
-            }
-          ]
-        }
-      }
-    });
-
-    expect(state.chat.items).toMatchObject([
-      { id: 'question:q1', kind: 'question', questionId: 'q1', answered: false }
-    ]);
-  });
-
-  test.skip('legacy question rows were replaced by universal question state', () => {
-    let state = createUniversalClientState();
-    state = applyUniversalClientMessage(state, {
-      type: 'session_snapshot',
-      snapshot: snapshot({ latest_seq: '5' }),
-      latest_seq: '5',
-      has_more: false,
-      events: []
-    });
-    state = applyUniversalClientMessage(state, {
-      type: 'app_event',
-      event_id: 'question-live',
-      event: {
-        type: 'question_requested',
-        payload: {
-          session_id: 's1',
-          question_id: 'q1',
-          title: 'Need input',
-          fields: [
-            {
-              id: 'target',
-              label: 'Target',
-              kind: 'single_select',
-              required: true,
-              secret: false,
-              choices: [{ value: 'web', label: 'Web' }],
-              default_answers: []
-            }
-          ]
-        }
-      }
-    });
-    state = applyUniversalClientMessage(state, {
-      type: 'universal_event',
-      event_id: '11111111-1111-4111-8111-111111111111',
-      seq: '6',
-      session_id: 's1',
-      ts: '2026-05-03T12:01:00Z',
-      source: 'runner',
-      event: {
-        type: 'content.delta',
-        data: { block_id: 'assistant-block', kind: 'text', delta: 'after question' }
-      }
-    });
-
-    expect(state.chat.items.map((item) => item.id)).toEqual([
-      'agent:assistant-block',
-      'question:q1'
-    ]);
-  });
-
-  test.skip('legacy approval resolution patching was replaced by universal approval state', () => {
+  test('places snapshot-only rows before replayed rows when synthetic ordering is needed', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
       snapshot: snapshot({
-        latest_seq: '5',
-        approvals: {
-          ap1: {
-            approval_id: 'ap1',
+        latest_seq: '3',
+        plans: {
+          p1: {
+            plan_id: 'p1',
             session_id: 's1',
-            kind: 'command',
-            title: 'Run command',
-            options: [{ option_id: 'approve_once', kind: 'approve_once', label: 'Approve once' }],
-            status: 'pending'
+            turn_id: 't1',
+            status: 'implementing',
+            title: 'Implementation plan',
+            content: 'Use this plan',
+            entries: [],
+            artifact_refs: [],
+            source: 'native_structured',
+            partial: false
           }
         }
       }),
       latest_seq: '5',
       has_more: false,
-      events: []
-    });
-
-    state = applyUniversalClientMessage(state, {
-      type: 'app_event',
-      event_id: 'approval-resolved',
-      event: {
-        type: 'approval_resolved',
-        payload: {
-          session_id: 's1',
-          approval_id: 'ap1',
-          decision: { decision: 'accept' }
+      events: [
+        {
+          ...universalEvent('5', 'evt-assistant'),
+          item_id: 'assistant-item',
+          event: {
+            type: 'content.delta',
+            data: { block_id: 'assistant-block', kind: 'text', delta: 'hello' }
+          }
         }
-      }
-    });
-
-    expect(state.chat.items).toMatchObject([
-      {
-        id: 'approval:ap1',
-        kind: 'approval',
-        resolvedDecision: 'accept',
-        resolutionState: undefined
-      }
-    ]);
-    const approval = state.chat.items[0];
-    expect(approval.kind).toBe('approval');
-    if (approval.kind === 'approval') {
-      expect(approval.options).toEqual([]);
-    }
-  });
-
-  test.skip('legacy question answer patching was replaced by universal question state', () => {
-    let state = createUniversalClientState();
-    state = applyUniversalClientMessage(state, {
-      type: 'app_event',
-      event_id: 'question-live',
-      event: {
-        type: 'question_requested',
-        payload: {
-          session_id: 's1',
-          question_id: 'q1',
-          title: 'Need input',
-          fields: [
-            {
-              id: 'target',
-              label: 'Target',
-              kind: 'single_select',
-              required: true,
-              secret: false,
-              choices: [{ value: 'web', label: 'Web' }],
-              default_answers: []
-            }
-          ]
-        }
-      }
-    });
-    state = applyUniversalClientMessage(state, {
-      type: 'app_event',
-      event_id: 'question-answered',
-      event: {
-        type: 'question_answered',
-        payload: {
-          session_id: 's1',
-          question_id: 'q1',
-          answer: { question_id: 'q1', answers: { target: ['web'] } }
-        }
-      }
-    });
-    state = applyUniversalClientMessage(state, {
-      type: 'universal_event',
-      event_id: '22222222-2222-4222-8222-222222222222',
-      seq: '6',
-      session_id: 's1',
-      ts: '2026-05-03T12:01:00Z',
-      source: 'runner',
-      event: {
-        type: 'content.delta',
-        data: { block_id: 'assistant-block', kind: 'text', delta: 'after answer' }
-      }
+      ]
     });
 
     expect(state.chat.items.map((item) => item.id)).toEqual([
-      'agent:assistant-block',
-      'question:q1'
+      'plan:p1',
+      'agent:assistant-item'
     ]);
-    expect(state.chat.items[1]).toMatchObject({
-      id: 'question:q1',
-      kind: 'question',
-      answered: true
-    });
+    expect(state.rowOrder.get('plan:p1')?.seq).toBe('4');
+    expect(state.rowOrder.get('agent:assistant-item')?.seq).toBe('5');
   });
+
 });

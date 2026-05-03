@@ -8,7 +8,7 @@ describe('router', () => {
     expect(parseRoute('#/')).toEqual({ name: 'home' });
   });
 
-  it('maps legacy list paths to home', () => {
+  it('maps list alias paths to home', () => {
     expect(parseRoute('#/sessions')).toEqual({ name: 'home' });
     expect(parseRoute('#/workspaces')).toEqual({ name: 'home' });
   });

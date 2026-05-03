@@ -5,12 +5,13 @@ use std::{
 };
 
 use agenter_core::{
-    AgentProviderId, AgentQuestionAnswer, AgentTurnSettings, AppEvent, ApprovalDecision,
-    ApprovalId, ApprovalKind, ApprovalOption, ApprovalRequest, ApprovalResolutionState,
+    AgentProviderId, AgentQuestionAnswer, AgentTurnSettings, ApprovalDecision, ApprovalId,
+    ApprovalKind, ApprovalOption, ApprovalRequest, ApprovalResolutionState,
     ApprovalStatus as UniversalApprovalStatus, CommandAction, CommandOutputStream, ContentBlock,
-    ContentBlockKind, ItemRole, ItemState, ItemStatus, NativeRef, ProviderEvent, QuestionId,
-    QuestionState, QuestionStatus, RunnerId, SessionId, SessionInfo, SessionSnapshot,
-    SessionStatus, SessionUsageContext, SessionUsageSnapshot, SessionUsageWindow, TurnStatus,
+    ContentBlockKind, ItemRole, ItemState, ItemStatus, NativeNotification, NativeRef,
+    NormalizedEvent, QuestionId, QuestionState, QuestionStatus, RunnerId, SessionId, SessionInfo,
+    SessionSnapshot, SessionStatus, SessionUsageContext, SessionUsageSnapshot, SessionUsageWindow,
+    ToolActionProjection, ToolCommandProjection, ToolProjection, ToolProjectionKind, TurnStatus,
     UniversalCommandEnvelope, UniversalEventEnvelope, UniversalEventKind, UniversalEventSource,
     UniversalSeq, UserId, WorkspaceId, WorkspaceRef,
 };
@@ -92,14 +93,14 @@ pub struct RegisteredQuestion {
 /// `approval_requested` envelope so reconnects still render cards after cache eviction.
 #[derive(Clone, Debug)]
 enum ApprovalStatus {
-    Pending(Box<AppEventEnvelope>),
-    Presented(Box<AppEventEnvelope>),
+    Pending(Box<CachedEventEnvelope>),
+    Presented(Box<CachedEventEnvelope>),
     Resolving {
-        request: Box<AppEventEnvelope>,
+        request: Box<CachedEventEnvelope>,
         decision: ApprovalDecision,
     },
-    Resolved(Box<AppEventEnvelope>),
-    Orphaned(Box<AppEventEnvelope>),
+    Resolved(Box<CachedEventEnvelope>),
+    Orphaned(Box<CachedEventEnvelope>),
 }
 
 #[derive(Debug)]
@@ -120,21 +121,24 @@ enum RunnerCommandOperationStatus {
     TimedOut,
 }
 
-fn envelope_references_approval_id(envelope: &AppEventEnvelope, approval_id: ApprovalId) -> bool {
+fn envelope_references_approval_id(
+    envelope: &CachedEventEnvelope,
+    approval_id: ApprovalId,
+) -> bool {
     match &envelope.event {
-        AppEvent::ApprovalRequested(req) => req.approval_id == approval_id,
-        AppEvent::ApprovalResolved(res) => res.approval_id == approval_id,
+        NormalizedEvent::ApprovalRequested(req) => req.approval_id == approval_id,
+        NormalizedEvent::ApprovalResolved(res) => res.approval_id == approval_id,
         _ => false,
     }
 }
 
 fn approval_request_envelope_with_state(
-    envelope: &AppEventEnvelope,
+    envelope: &CachedEventEnvelope,
     state: ApprovalResolutionState,
     decision: Option<ApprovalDecision>,
-) -> AppEventEnvelope {
+) -> CachedEventEnvelope {
     let mut envelope = envelope.clone();
-    if let AppEvent::ApprovalRequested(request) = &mut envelope.event {
+    if let NormalizedEvent::ApprovalRequested(request) = &mut envelope.event {
         request.resolution_state = Some(state);
         request.resolving_decision = decision;
     }
@@ -148,8 +152,8 @@ fn session_status_orphans_approvals(status: &SessionStatus) -> bool {
     )
 }
 
-fn enrich_approval_event(event: &mut AppEvent) {
-    let AppEvent::ApprovalRequested(request) = event else {
+fn enrich_approval_event(event: &mut NormalizedEvent) {
+    let NormalizedEvent::ApprovalRequested(request) = event else {
         return;
     };
     if request.status.is_none() {
@@ -181,9 +185,9 @@ fn enrich_approval_event(event: &mut AppEvent) {
 
 fn merge_pending_approval_envelopes_for_session(
     session_id: SessionId,
-    mut envelopes: Vec<AppEventEnvelope>,
+    mut envelopes: Vec<CachedEventEnvelope>,
     registry: &Registry,
-) -> Vec<AppEventEnvelope> {
+) -> Vec<CachedEventEnvelope> {
     for (&approval_id, approval) in &registry.approvals {
         if approval.session_id != session_id {
             continue;
@@ -209,7 +213,10 @@ fn merge_pending_approval_envelopes_for_session(
             .position(|e| envelope_references_approval_id(e, approval_id))
         {
             Some(index) => {
-                if matches!(envelopes[index].event, AppEvent::ApprovalRequested(_)) {
+                if matches!(
+                    envelopes[index].event,
+                    NormalizedEvent::ApprovalRequested(_)
+                ) {
                     envelopes[index] = replacement;
                 }
             }
@@ -222,8 +229,8 @@ fn merge_pending_approval_envelopes_for_session(
 #[derive(Clone, Debug)]
 pub enum ApprovalResolutionStart {
     Missing,
-    InProgress { envelope: Box<AppEventEnvelope> },
-    AlreadyResolved { envelope: Box<AppEventEnvelope> },
+    InProgress { envelope: Box<CachedEventEnvelope> },
+    AlreadyResolved { envelope: Box<CachedEventEnvelope> },
     Started,
 }
 
@@ -235,11 +242,11 @@ pub enum ApprovalResolutionLookup {
     },
     InProgress {
         session_id: SessionId,
-        envelope: Box<AppEventEnvelope>,
+        envelope: Box<CachedEventEnvelope>,
     },
     AlreadyResolved {
         session_id: SessionId,
-        envelope: Box<AppEventEnvelope>,
+        envelope: Box<CachedEventEnvelope>,
     },
 }
 
@@ -295,22 +302,22 @@ impl RegisteredSession {
 #[derive(Debug)]
 struct SessionEvents {
     sender: broadcast::Sender<SessionBroadcastEvent>,
-    cache: Vec<AppEventEnvelope>,
+    cache: Vec<CachedEventEnvelope>,
     universal_cache: Vec<UniversalEventEnvelope>,
     snapshot: SessionSnapshot,
     next_seq: i64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct AppEventEnvelope {
+pub struct CachedEventEnvelope {
     pub event_id: Option<agenter_protocol::EventId>,
-    pub event: AppEvent,
+    pub event: NormalizedEvent,
 }
 
 #[derive(Clone, Debug)]
 pub struct SessionBroadcastEvent {
     #[cfg(test)]
-    pub app_event: AppEventEnvelope,
+    pub normalized_event: CachedEventEnvelope,
     pub universal_event: Option<UniversalEventEnvelope>,
 }
 
@@ -360,7 +367,7 @@ pub struct UniversalCommandPersistenceError {
 #[derive(Debug)]
 pub struct SessionSubscription {
     #[cfg(test)]
-    pub cached_events: Vec<AppEventEnvelope>,
+    pub cached_events: Vec<CachedEventEnvelope>,
     pub snapshot: Option<BrowserSessionSnapshot>,
     pub receiver: broadcast::Receiver<SessionBroadcastEvent>,
 }
@@ -1730,7 +1737,7 @@ impl AppState {
         &self,
         user_id: UserId,
         session_id: SessionId,
-    ) -> Option<Vec<AppEventEnvelope>> {
+    ) -> Option<Vec<CachedEventEnvelope>> {
         if !self.can_access_session(user_id, session_id).await {
             return None;
         }
@@ -1756,7 +1763,7 @@ impl AppState {
     pub async fn pending_approval_request_envelopes(
         &self,
         session_id: SessionId,
-    ) -> Vec<AppEventEnvelope> {
+    ) -> Vec<CachedEventEnvelope> {
         let mut to_persist = Vec::new();
         let mut registry = self.inner.registry.lock().await;
         let mut out = Vec::new();
@@ -1771,7 +1778,7 @@ impl AppState {
                         ApprovalResolutionState::Pending,
                         None,
                     );
-                    if let AppEvent::ApprovalRequested(request) = &mut presented.event {
+                    if let NormalizedEvent::ApprovalRequested(request) = &mut presented.event {
                         request.status = Some(UniversalApprovalStatus::Presented);
                     }
                     approval.status = ApprovalStatus::Presented(Box::new(presented.clone()));
@@ -1849,16 +1856,16 @@ impl AppState {
     pub async fn publish_event(
         &self,
         session_id: SessionId,
-        mut event: AppEvent,
-    ) -> AppEventEnvelope {
+        mut event: NormalizedEvent,
+    ) -> CachedEventEnvelope {
         enrich_approval_event(&mut event);
-        let envelope = AppEventEnvelope {
+        let envelope = CachedEventEnvelope {
             event_id: Some(Uuid::new_v4().to_string().into()),
             event,
         };
         let mut orphan_session = None;
         match &envelope.event {
-            AppEvent::ApprovalRequested(request) => {
+            NormalizedEvent::ApprovalRequested(request) => {
                 tracing::info!(
                     approval_id = %request.approval_id,
                     %session_id,
@@ -1873,7 +1880,7 @@ impl AppState {
                     },
                 );
             }
-            AppEvent::ApprovalResolved(resolved) => {
+            NormalizedEvent::ApprovalResolved(resolved) => {
                 tracing::info!(
                     approval_id = %resolved.approval_id,
                     %session_id,
@@ -1901,7 +1908,7 @@ impl AppState {
                     }
                 }
             }
-            AppEvent::QuestionRequested(request) => {
+            NormalizedEvent::QuestionRequested(request) => {
                 tracing::info!(
                     question_id = %request.question_id,
                     %session_id,
@@ -1915,27 +1922,27 @@ impl AppState {
                     },
                 );
             }
-            AppEvent::QuestionAnswered(answered) => {
+            NormalizedEvent::QuestionAnswered(answered) => {
                 let mut registry = self.inner.registry.lock().await;
                 if let Some(question) = registry.questions.get_mut(&answered.question_id) {
                     question.resolved = true;
                 }
             }
-            AppEvent::SessionStatusChanged(status) => {
+            NormalizedEvent::SessionStatusChanged(status) => {
                 self.apply_session_status(status.session_id, status.status.clone())
                     .await;
                 if session_status_orphans_approvals(&status.status) {
                     orphan_session = Some(status.session_id);
                 }
             }
-            AppEvent::ProviderEvent(provider_event)
-            | AppEvent::TurnDiffUpdated(provider_event)
-            | AppEvent::ItemReasoning(provider_event)
-            | AppEvent::ServerRequestResolved(provider_event)
-            | AppEvent::McpToolCallProgress(provider_event)
-            | AppEvent::ThreadRealtimeEvent(provider_event) => {
+            NormalizedEvent::NativeNotification(native_notification)
+            | NormalizedEvent::TurnDiffUpdated(native_notification)
+            | NormalizedEvent::ItemReasoning(native_notification)
+            | NormalizedEvent::ServerRequestResolved(native_notification)
+            | NormalizedEvent::McpToolCallProgress(native_notification)
+            | NormalizedEvent::ThreadRealtimeEvent(native_notification) => {
                 if let Some(usage) = self
-                    .apply_provider_usage_event(session_id, provider_event)
+                    .apply_provider_usage_event(session_id, native_notification)
                     .await
                 {
                     if let Some(pool) = &self.inner.db_pool {
@@ -1978,6 +1985,33 @@ impl AppState {
         Ok(stored)
     }
 
+    pub async fn publish_universal_event(
+        &self,
+        session_id: SessionId,
+        turn_id: Option<agenter_core::TurnId>,
+        item_id: Option<agenter_core::ItemId>,
+        event: UniversalEventKind,
+    ) -> anyhow::Result<UniversalEventEnvelope> {
+        let stored = self
+            .store_universal_event_with_acceptance(
+                session_id,
+                AgentUniversalEvent {
+                    session_id,
+                    event_id: None,
+                    turn_id,
+                    item_id,
+                    ts: None,
+                    source: UniversalEventSource::ControlPlane,
+                    native: None,
+                    event,
+                },
+                false,
+            )
+            .await?;
+        self.apply_accepted_universal_event(&stored).await;
+        Ok(stored)
+    }
+
     async fn apply_accepted_universal_event(&self, envelope: &UniversalEventEnvelope) {
         match &envelope.event {
             UniversalEventKind::ApprovalRequested { approval } => {
@@ -1985,10 +2019,10 @@ impl AppState {
                     approval.approval_id,
                     RegisteredApproval {
                         session_id: envelope.session_id,
-                        status: ApprovalStatus::Pending(Box::new(AppEventEnvelope {
+                        status: ApprovalStatus::Pending(Box::new(CachedEventEnvelope {
                             event_id: Some(envelope.event_id.clone().into()),
-                            event: AppEvent::ApprovalRequested(
-                                legacy_approval_request_event_from_universal(approval),
+                            event: NormalizedEvent::ApprovalRequested(
+                                source_approval_request_event_from_universal(approval),
                             ),
                         })),
                     },
@@ -2012,6 +2046,17 @@ impl AppState {
             UniversalEventKind::SessionCreated { session } => {
                 self.apply_session_status(session.session_id, session.status.clone())
                     .await;
+            }
+            UniversalEventKind::SessionStatusChanged { status, .. } => {
+                self.apply_session_status(envelope.session_id, status.clone())
+                    .await;
+                if session_status_orphans_approvals(status) {
+                    self.orphan_pending_approvals_for_session(
+                        envelope.session_id,
+                        "runner reported native session ownership ended",
+                    )
+                    .await;
+                }
             }
             UniversalEventKind::UsageUpdated { usage } => {
                 if let Some(pool) = &self.inner.db_pool {
@@ -2055,9 +2100,9 @@ impl AppState {
     async fn apply_provider_usage_event(
         &self,
         session_id: SessionId,
-        event: &ProviderEvent,
+        event: &NativeNotification,
     ) -> Option<SessionUsageSnapshot> {
-        let usage_update = usage_snapshot_from_provider_event(event)?;
+        let usage_update = usage_snapshot_from_native_notification(event)?;
         let mut registry = self.inner.registry.lock().await;
         let session = registry.sessions.get_mut(&session_id)?;
         let mut usage = session.usage.clone().unwrap_or_default();
@@ -2086,7 +2131,7 @@ impl AppState {
                         ApprovalResolutionState::Resolving,
                         Some(decision.clone()),
                     );
-                    if let AppEvent::ApprovalRequested(request) = &mut resolving.event {
+                    if let NormalizedEvent::ApprovalRequested(request) = &mut resolving.event {
                         request.status = Some(UniversalApprovalStatus::Resolving);
                     }
                     transition = Some((approval.session_id, resolving));
@@ -2176,9 +2221,9 @@ impl AppState {
         &self,
         approval_id: ApprovalId,
         session_id: SessionId,
-        event: AppEvent,
-    ) -> Option<AppEventEnvelope> {
-        let envelope = AppEventEnvelope {
+        event: NormalizedEvent,
+    ) -> Option<CachedEventEnvelope> {
+        let envelope = CachedEventEnvelope {
             event_id: Some(Uuid::new_v4().to_string().into()),
             event,
         };
@@ -2218,8 +2263,8 @@ impl AppState {
         &self,
         session_id: SessionId,
         answer: AgentQuestionAnswer,
-    ) -> AppEventEnvelope {
-        let event = AppEvent::QuestionAnswered(agenter_core::QuestionAnsweredEvent {
+    ) -> CachedEventEnvelope {
+        let event = NormalizedEvent::QuestionAnswered(agenter_core::QuestionAnsweredEvent {
             session_id,
             question_id: answer.question_id,
             answer,
@@ -2244,7 +2289,7 @@ impl AppState {
                     ApprovalStatus::Resolved(_) | ApprovalStatus::Orphaned(_) => continue,
                 };
                 let mut envelope = request.as_ref().clone();
-                if let AppEvent::ApprovalRequested(request) = &mut envelope.event {
+                if let NormalizedEvent::ApprovalRequested(request) = &mut envelope.event {
                     request.status = Some(UniversalApprovalStatus::Orphaned);
                     request.resolution_state = None;
                     request.resolving_decision = None;
@@ -2265,15 +2310,15 @@ impl AppState {
     async fn store_event(
         &self,
         session_id: SessionId,
-        envelope: AppEventEnvelope,
-    ) -> AppEventEnvelope {
+        envelope: CachedEventEnvelope,
+    ) -> CachedEventEnvelope {
         self.store_event_with_acceptance(session_id, envelope, false)
             .await
             .unwrap_or_else(|error| {
                 tracing::warn!(%session_id, %error, "event storage failed");
-                AppEventEnvelope {
+                CachedEventEnvelope {
                     event_id: Some(Uuid::new_v4().to_string().into()),
-                    event: AppEvent::Error(agenter_core::AgentErrorEvent {
+                    event: NormalizedEvent::Error(agenter_core::AgentErrorEvent {
                         session_id: Some(session_id),
                         code: Some("event_storage_failed".to_owned()),
                         message: error.to_string(),
@@ -2286,9 +2331,9 @@ impl AppState {
     async fn store_event_with_acceptance(
         &self,
         session_id: SessionId,
-        envelope: AppEventEnvelope,
+        envelope: CachedEventEnvelope,
         strict_db: bool,
-    ) -> anyhow::Result<AppEventEnvelope> {
+    ) -> anyhow::Result<CachedEventEnvelope> {
         self.store_event_with_universal_acceptance(session_id, envelope, None, strict_db)
             .await
     }
@@ -2355,9 +2400,9 @@ impl AppState {
 
         let _ = sender.send(SessionBroadcastEvent {
             #[cfg(test)]
-            app_event: AppEventEnvelope {
+            normalized_event: CachedEventEnvelope {
                 event_id: Some(envelope.event_id.clone().into()),
-                event: AppEvent::ProviderEvent(ProviderEvent {
+                event: NormalizedEvent::NativeNotification(NativeNotification {
                     session_id,
                     provider_id: AgentProviderId::from("universal"),
                     event_id: Some(envelope.event_id.clone()),
@@ -2377,10 +2422,10 @@ impl AppState {
     async fn store_event_with_universal_acceptance(
         &self,
         session_id: SessionId,
-        mut envelope: AppEventEnvelope,
+        mut envelope: CachedEventEnvelope,
         universal_event: Option<AgentUniversalEvent>,
         strict_db: bool,
-    ) -> anyhow::Result<AppEventEnvelope> {
+    ) -> anyhow::Result<CachedEventEnvelope> {
         let mut broadcast_universal_event = None;
         if let Some(pool) = &self.inner.db_pool {
             if let Some(workspace_id) = self.workspace_id_for_session(session_id).await {
@@ -2395,7 +2440,7 @@ impl AppState {
                         runner_universal_event_envelope(session_id, &event_id, universal)
                     })
                     .unwrap_or_else(|| {
-                        compatibility_universal_event(session_id, event_id, &envelope.event)
+                        universal_projection_universal_event(session_id, event_id, &envelope.event)
                     });
                 match agenter_db::append_universal_event_reducing_snapshot(
                     pool,
@@ -2419,7 +2464,7 @@ impl AppState {
                         tracing::warn!(
                             %session_id,
                             %error,
-                            "failed to persist universal app event; continuing with in-memory universal broadcast"
+                            "failed to persist universal normalized event; continuing with in-memory universal broadcast"
                         );
                     }
                 }
@@ -2431,7 +2476,7 @@ impl AppState {
                 }
                 tracing::warn!(
                     %session_id,
-                    "failed to persist universal app event without a registered workspace; continuing with in-memory universal broadcast"
+                    "failed to persist universal normalized event without a registered workspace; continuing with in-memory universal broadcast"
                 );
             }
         }
@@ -2453,7 +2498,7 @@ impl AppState {
                         runner_universal_event_envelope(session_id, &event_id, universal)
                     })
                     .unwrap_or_else(|| {
-                        compatibility_universal_event(session_id, event_id, &envelope.event)
+                        universal_projection_universal_event(session_id, event_id, &envelope.event)
                     });
                 universal.seq = UniversalSeq::new(events.next_seq);
                 apply_universal_event_to_snapshot(&mut events.snapshot, &universal);
@@ -2474,14 +2519,14 @@ impl AppState {
 
         let _ = sender.send(SessionBroadcastEvent {
             #[cfg(test)]
-            app_event: envelope.clone(),
+            normalized_event: envelope.clone(),
             universal_event: broadcast_universal_event,
         });
         tracing::debug!(
             %session_id,
             event_id = envelope.event_id.as_ref().map(ToString::to_string).as_deref(),
-            event_type = app_event_name(&envelope.event),
-            "stored and broadcast app event"
+            event_type = normalized_event_name(&envelope.event),
+            "stored and broadcast normalized event"
         );
         Ok(envelope)
     }
@@ -2678,7 +2723,11 @@ impl AppState {
                             .iter()
                             .map(|event| {
                                 let event_id = Uuid::new_v4().to_string();
-                                compatibility_universal_event(session.session_id, event_id, event)
+                                universal_projection_universal_event(
+                                    session.session_id,
+                                    event_id,
+                                    event,
+                                )
                             })
                             .collect::<Vec<_>>();
                         match agenter_db::replace_session_event_projection(
@@ -2744,7 +2793,7 @@ impl AppState {
                 for event in discovered_events {
                     self.store_event(
                         session.session_id,
-                        AppEventEnvelope {
+                        CachedEventEnvelope {
                             event_id: Some(Uuid::new_v4().to_string().into()),
                             event,
                         },
@@ -2932,6 +2981,11 @@ pub fn apply_universal_event_to_snapshot(
         UniversalEventKind::SessionCreated { session } => {
             snapshot.info = Some((**session).clone());
         }
+        UniversalEventKind::SessionStatusChanged { status, .. } => {
+            if let Some(info) = &mut snapshot.info {
+                info.status = status.clone();
+            }
+        }
         UniversalEventKind::TurnStarted { turn }
         | UniversalEventKind::TurnStatusChanged { turn }
         | UniversalEventKind::TurnCompleted { turn }
@@ -3065,6 +3119,7 @@ pub fn apply_universal_event_to_snapshot(
                 info.usage = Some(usage.clone());
             }
         }
+        UniversalEventKind::ErrorReported { .. } => {}
         UniversalEventKind::NativeUnknown { .. } => {}
     }
 }
@@ -3224,15 +3279,17 @@ fn materialize_plan_item(
         if let Some(item_id) = envelope.item_id {
             snapshot.items.remove(&item_id);
         }
-        snapshot.items.remove(&compatibility_item_id(&format!(
-            "plan:item:{}",
-            plan.plan_id
-        )));
+        snapshot
+            .items
+            .remove(&universal_projection_item_id(&format!(
+                "plan:item:{}",
+                plan.plan_id
+            )));
         return;
     }
     let item_id = envelope
         .item_id
-        .unwrap_or_else(|| compatibility_item_id(&format!("plan:item:{}", plan.plan_id)));
+        .unwrap_or_else(|| universal_projection_item_id(&format!("plan:item:{}", plan.plan_id)));
     let mut text = plan.content.clone().unwrap_or_default();
     if !plan.entries.is_empty() {
         if !text.is_empty() {
@@ -3272,22 +3329,22 @@ fn materialize_plan_item(
     );
 }
 
-fn compatibility_universal_event(
+fn universal_projection_universal_event(
     session_id: SessionId,
     event_id: String,
-    event: &AppEvent,
+    event: &NormalizedEvent,
 ) -> UniversalEventEnvelope {
     let ts = Utc::now();
     let mut turn_id = None;
     let mut item_id = None;
     let universal_event = match event {
-        AppEvent::SessionStarted(info) => UniversalEventKind::SessionCreated {
+        NormalizedEvent::SessionStarted(info) => UniversalEventKind::SessionCreated {
             session: Box::new(info.clone()),
         },
-        AppEvent::AgentMessageDelta(message) => {
-            turn_id = compatibility_turn_id_from_payload(message.provider_payload.as_ref())
-                .or_else(|| Some(compatibility_turn_id(&message.message_id)));
-            item_id = Some(compatibility_item_id(&format!(
+        NormalizedEvent::AgentMessageDelta(message) => {
+            turn_id = universal_projection_turn_id_from_payload(message.provider_payload.as_ref())
+                .or_else(|| Some(universal_projection_turn_id(&message.message_id)));
+            item_id = Some(universal_projection_item_id(&format!(
                 "assistant:{}:{}",
                 message.session_id, message.message_id
             )));
@@ -3297,24 +3354,24 @@ fn compatibility_universal_event(
                 delta: message.delta.clone(),
             }
         }
-        AppEvent::AgentMessageCompleted(message) => {
-            turn_id = compatibility_turn_id_from_payload(message.provider_payload.as_ref())
-                .or_else(|| Some(compatibility_turn_id(&message.message_id)));
-            if compatibility_payload_method(message.provider_payload.as_ref())
+        NormalizedEvent::AgentMessageCompleted(message) => {
+            turn_id = universal_projection_turn_id_from_payload(message.provider_payload.as_ref())
+                .or_else(|| Some(universal_projection_turn_id(&message.message_id)));
+            if universal_projection_payload_method(message.provider_payload.as_ref())
                 == Some("turn/completed")
             {
                 let completed_turn_id =
-                    turn_id.unwrap_or_else(|| compatibility_turn_id(&message.message_id));
+                    turn_id.unwrap_or_else(|| universal_projection_turn_id(&message.message_id));
                 turn_id = Some(completed_turn_id);
                 UniversalEventKind::TurnCompleted {
-                    turn: compatibility_turn_state(
+                    turn: universal_projection_turn_state(
                         message.session_id,
                         completed_turn_id,
                         TurnStatus::Completed,
                     ),
                 }
             } else {
-                item_id = Some(compatibility_item_id(&format!(
+                item_id = Some(universal_projection_item_id(&format!(
                     "assistant:{}:{}",
                     message.session_id, message.message_id
                 )));
@@ -3325,22 +3382,24 @@ fn compatibility_universal_event(
                 }
             }
         }
-        AppEvent::PlanUpdated(plan) => {
+        NormalizedEvent::PlanUpdated(plan) => {
             turn_id = plan
                 .plan_id
                 .as_deref()
-                .map(compatibility_turn_id)
-                .or_else(|| compatibility_turn_id_from_payload(plan.provider_payload.as_ref()));
+                .map(universal_projection_turn_id)
+                .or_else(|| {
+                    universal_projection_turn_id_from_payload(plan.provider_payload.as_ref())
+                });
             UniversalEventKind::PlanUpdated {
                 plan: agenter_core::PlanState {
-                    plan_id: agenter_core::PlanId::from_uuid(compatibility_uuid(&format!(
+                    plan_id: agenter_core::PlanId::from_uuid(universal_projection_uuid(&format!(
                         "plan:{}:{}",
                         plan.session_id,
                         plan.plan_id.as_deref().unwrap_or("default")
                     ))),
                     session_id: plan.session_id,
                     turn_id,
-                    status: compatibility_plan_status(plan),
+                    status: universal_projection_plan_status(plan),
                     title: plan.title.clone(),
                     content: plan.content.clone(),
                     entries: plan
@@ -3360,9 +3419,9 @@ fn compatibility_universal_event(
                 },
             }
         }
-        AppEvent::CommandStarted(command) => {
-            turn_id = compatibility_turn_id_from_payload(command.provider_payload.as_ref());
-            let command_item_id = compatibility_item_id(&format!(
+        NormalizedEvent::CommandStarted(command) => {
+            turn_id = universal_projection_turn_id_from_payload(command.provider_payload.as_ref());
+            let command_item_id = universal_projection_item_id(&format!(
                 "command:{}:{}",
                 command.session_id, command.command_id
             ));
@@ -3381,14 +3440,14 @@ fn compatibility_universal_event(
                         mime_type: None,
                         artifact_id: None,
                     }],
-                    tool: None,
+                    tool: Some(universal_projection_command_tool_projection(command)),
                     native: None,
                 }),
             }
         }
-        AppEvent::CommandOutputDelta(output) => {
-            turn_id = compatibility_turn_id_from_payload(output.provider_payload.as_ref());
-            item_id = Some(compatibility_item_id(&format!(
+        NormalizedEvent::CommandOutputDelta(output) => {
+            turn_id = universal_projection_turn_id_from_payload(output.provider_payload.as_ref());
+            item_id = Some(universal_projection_item_id(&format!(
                 "command:{}:{}",
                 output.session_id, output.command_id
             )));
@@ -3402,9 +3461,9 @@ fn compatibility_universal_event(
                 delta: output.delta.clone(),
             }
         }
-        AppEvent::CommandCompleted(command) => {
-            turn_id = compatibility_turn_id_from_payload(command.provider_payload.as_ref());
-            item_id = Some(compatibility_item_id(&format!(
+        NormalizedEvent::CommandCompleted(command) => {
+            turn_id = universal_projection_turn_id_from_payload(command.provider_payload.as_ref());
+            item_id = Some(universal_projection_item_id(&format!(
                 "command:{}:{}",
                 command.session_id, command.command_id
             )));
@@ -3418,13 +3477,13 @@ fn compatibility_universal_event(
                 }),
             }
         }
-        AppEvent::FileChangeProposed(change)
-        | AppEvent::FileChangeApplied(change)
-        | AppEvent::FileChangeRejected(change) => {
-            turn_id = compatibility_turn_id_from_payload(change.provider_payload.as_ref());
+        NormalizedEvent::FileChangeProposed(change)
+        | NormalizedEvent::FileChangeApplied(change)
+        | NormalizedEvent::FileChangeRejected(change) => {
+            turn_id = universal_projection_turn_id_from_payload(change.provider_payload.as_ref());
             UniversalEventKind::DiffUpdated {
                 diff: agenter_core::DiffState {
-                    diff_id: agenter_core::DiffId::from_uuid(compatibility_uuid(&format!(
+                    diff_id: agenter_core::DiffId::from_uuid(universal_projection_uuid(&format!(
                         "file:{}:{}",
                         change.session_id, change.path
                     ))),
@@ -3440,71 +3499,78 @@ fn compatibility_universal_event(
                 },
             }
         }
-        AppEvent::ApprovalRequested(request) => UniversalEventKind::ApprovalRequested {
-            approval: Box::new(legacy_approval_request(request, ts)),
+        NormalizedEvent::ApprovalRequested(request) => UniversalEventKind::ApprovalRequested {
+            approval: Box::new(source_approval_request(request, ts)),
         },
-        AppEvent::ApprovalResolved(resolved) => UniversalEventKind::ApprovalRequested {
-            approval: Box::new(legacy_resolved_approval_request(resolved)),
+        NormalizedEvent::ApprovalResolved(resolved) => UniversalEventKind::ApprovalRequested {
+            approval: Box::new(source_resolved_approval_request(resolved)),
         },
-        AppEvent::ProviderEvent(provider_event)
-        | AppEvent::TurnDiffUpdated(provider_event)
-        | AppEvent::ItemReasoning(provider_event)
-        | AppEvent::ServerRequestResolved(provider_event)
-        | AppEvent::McpToolCallProgress(provider_event)
-        | AppEvent::ThreadRealtimeEvent(provider_event) => {
-            if let Some(usage) = usage_snapshot_from_provider_event(provider_event) {
+        NormalizedEvent::NativeNotification(native_notification)
+        | NormalizedEvent::TurnDiffUpdated(native_notification)
+        | NormalizedEvent::ItemReasoning(native_notification)
+        | NormalizedEvent::ServerRequestResolved(native_notification)
+        | NormalizedEvent::McpToolCallProgress(native_notification)
+        | NormalizedEvent::ThreadRealtimeEvent(native_notification) => {
+            if let Some(usage) = usage_snapshot_from_native_notification(native_notification) {
                 UniversalEventKind::UsageUpdated {
                     usage: Box::new(usage),
                 }
-            } else if provider_event.method == "turn/started" {
-                let started_turn_id = provider_event
+            } else if native_notification.method == "turn/started" {
+                let started_turn_id = native_notification
                     .event_id
                     .as_deref()
-                    .map(compatibility_turn_id)
+                    .map(universal_projection_turn_id)
                     .unwrap_or_else(|| {
-                        compatibility_turn_id(&format!("{}:turn", provider_event.session_id))
+                        universal_projection_turn_id(&format!(
+                            "{}:turn",
+                            native_notification.session_id
+                        ))
                     });
                 turn_id = Some(started_turn_id);
                 UniversalEventKind::TurnStarted {
-                    turn: compatibility_turn_state(
-                        provider_event.session_id,
+                    turn: universal_projection_turn_state(
+                        native_notification.session_id,
                         started_turn_id,
                         TurnStatus::Running,
                     ),
                 }
-            } else if matches!(event, AppEvent::TurnDiffUpdated(_)) {
-                turn_id = provider_event
+            } else if matches!(event, NormalizedEvent::TurnDiffUpdated(_)) {
+                turn_id = native_notification
                     .event_id
                     .as_deref()
-                    .map(compatibility_turn_id)
+                    .map(universal_projection_turn_id)
                     .or_else(|| {
-                        compatibility_turn_id_from_payload(provider_event.provider_payload.as_ref())
+                        universal_projection_turn_id_from_payload(
+                            native_notification.provider_payload.as_ref(),
+                        )
                     });
                 UniversalEventKind::DiffUpdated {
                     diff: agenter_core::DiffState {
-                        diff_id: agenter_core::DiffId::from_uuid(compatibility_uuid(&format!(
-                            "provider:{}:{}",
-                            provider_event.session_id,
-                            provider_event
-                                .event_id
-                                .as_deref()
-                                .unwrap_or(&provider_event.method)
-                        ))),
-                        session_id: provider_event.session_id,
+                        diff_id: agenter_core::DiffId::from_uuid(universal_projection_uuid(
+                            &format!(
+                                "provider:{}:{}",
+                                native_notification.session_id,
+                                native_notification
+                                    .event_id
+                                    .as_deref()
+                                    .unwrap_or(&native_notification.method)
+                            ),
+                        )),
+                        session_id: native_notification.session_id,
                         turn_id,
-                        title: Some(provider_event.title.clone()),
+                        title: Some(native_notification.title.clone()),
                         files: Vec::new(),
                         updated_at: None,
                     },
                 }
             } else {
                 UniversalEventKind::NativeUnknown {
-                    summary: Some(app_event_name(event).to_owned()),
+                    summary: Some(normalized_event_name(event).to_owned()),
                 }
             }
         }
         _ => UniversalEventKind::NativeUnknown {
-            summary: Some(app_event_name(event).to_owned()),
+            summary: Some(normalized_event_name(event).to_owned()),
         },
     };
 
@@ -3517,11 +3583,11 @@ fn compatibility_universal_event(
         ts,
         source: UniversalEventSource::ControlPlane,
         native: Some(NativeRef {
-            protocol: "agenter.app_event".to_owned(),
-            method: Some(app_event_name(event).to_owned()),
-            kind: Some("compatibility".to_owned()),
+            protocol: "uap.universal_projection".to_owned(),
+            method: Some(normalized_event_name(event).to_owned()),
+            kind: Some("universal_projection".to_owned()),
             native_id: None,
-            summary: Some("Compatibility projection from legacy AppEvent".to_owned()),
+            summary: Some("universal_projection from source NormalizedEvent".to_owned()),
             hash: None,
             pointer: None,
         }),
@@ -3550,7 +3616,7 @@ fn runner_universal_event_envelope(
     }
 }
 
-fn legacy_resolved_approval_request(
+fn source_resolved_approval_request(
     resolved: &agenter_core::ApprovalResolvedEvent,
 ) -> ApprovalRequest {
     ApprovalRequest {
@@ -3569,9 +3635,9 @@ fn legacy_resolved_approval_request(
         native_blocking: true,
         policy: None,
         native: Some(NativeRef {
-            protocol: "agenter.app_event".to_owned(),
+            protocol: "uap.universal_projection".to_owned(),
             method: Some("approval_resolved".to_owned()),
-            kind: Some("compatibility".to_owned()),
+            kind: Some("universal_projection".to_owned()),
             native_id: safe_native_request_id(resolved.provider_payload.as_ref()),
             summary: Some("Approval resolved".to_owned()),
             hash: None,
@@ -3582,7 +3648,68 @@ fn legacy_resolved_approval_request(
     }
 }
 
-fn compatibility_turn_state(
+fn universal_projection_command_tool_projection(
+    event: &agenter_core::CommandEvent,
+) -> ToolProjection {
+    ToolProjection {
+        kind: ToolProjectionKind::Command,
+        name: "command".to_owned(),
+        title: event.command.clone(),
+        status: ItemStatus::Streaming,
+        detail: command_projection_detail(event),
+        input_summary: None,
+        output_summary: None,
+        command: Some(ToolCommandProjection {
+            command: event.command.clone(),
+            cwd: event.cwd.clone(),
+            source: event.source.clone(),
+            process_id: event.process_id.clone(),
+            actions: event
+                .actions
+                .iter()
+                .map(universal_projection_command_action_projection)
+                .collect(),
+            exit_code: None,
+            duration_ms: None,
+            success: None,
+        }),
+        subagent: None,
+        mcp: None,
+    }
+}
+
+fn command_projection_detail(event: &agenter_core::CommandEvent) -> Option<String> {
+    let parts = [
+        event.cwd.clone(),
+        event.source.clone(),
+        event.process_id.clone().map(|pid| format!("pid {pid}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    (!parts.is_empty()).then_some(parts.join(" · "))
+}
+
+fn universal_projection_command_action_projection(action: &CommandAction) -> ToolActionProjection {
+    ToolActionProjection {
+        kind: action.kind.clone(),
+        label: action
+            .name
+            .clone()
+            .or_else(|| action.command.clone())
+            .or_else(|| action.path.clone())
+            .or_else(|| action.query.clone())
+            .unwrap_or_else(|| action.kind.clone()),
+        detail: action
+            .path
+            .clone()
+            .or_else(|| action.query.clone())
+            .or_else(|| action.command.clone()),
+        path: action.path.clone(),
+    }
+}
+
+fn universal_projection_turn_state(
     session_id: SessionId,
     turn_id: agenter_core::TurnId,
     status: TurnStatus,
@@ -3598,7 +3725,7 @@ fn compatibility_turn_state(
     }
 }
 
-fn compatibility_plan_status(plan: &agenter_core::PlanEvent) -> agenter_core::PlanStatus {
+fn universal_projection_plan_status(plan: &agenter_core::PlanEvent) -> agenter_core::PlanStatus {
     plan.provider_payload
         .as_ref()
         .and_then(|payload| {
@@ -3640,15 +3767,15 @@ fn compatibility_plan_status(plan: &agenter_core::PlanEvent) -> agenter_core::Pl
         .unwrap_or(agenter_core::PlanStatus::Draft)
 }
 
-fn compatibility_turn_id(value: &str) -> agenter_core::TurnId {
-    agenter_core::TurnId::from_uuid(compatibility_uuid(&format!("turn:{value}")))
+fn universal_projection_turn_id(value: &str) -> agenter_core::TurnId {
+    agenter_core::TurnId::from_uuid(universal_projection_uuid(&format!("turn:{value}")))
 }
 
-fn compatibility_item_id(value: &str) -> agenter_core::ItemId {
-    agenter_core::ItemId::from_uuid(compatibility_uuid(&format!("item:{value}")))
+fn universal_projection_item_id(value: &str) -> agenter_core::ItemId {
+    agenter_core::ItemId::from_uuid(universal_projection_uuid(&format!("item:{value}")))
 }
 
-fn compatibility_uuid(value: &str) -> Uuid {
+fn universal_projection_uuid(value: &str) -> Uuid {
     if let Ok(uuid) = Uuid::parse_str(value) {
         return uuid;
     }
@@ -3658,7 +3785,9 @@ fn compatibility_uuid(value: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-fn compatibility_turn_id_from_payload(payload: Option<&Value>) -> Option<agenter_core::TurnId> {
+fn universal_projection_turn_id_from_payload(
+    payload: Option<&Value>,
+) -> Option<agenter_core::TurnId> {
     let payload = payload?;
     string_at_value(
         payload,
@@ -3672,10 +3801,10 @@ fn compatibility_turn_id_from_payload(payload: Option<&Value>) -> Option<agenter
             "/turnId",
         ],
     )
-    .map(compatibility_turn_id)
+    .map(universal_projection_turn_id)
 }
 
-fn compatibility_payload_method(payload: Option<&Value>) -> Option<&str> {
+fn universal_projection_payload_method(payload: Option<&Value>) -> Option<&str> {
     payload.and_then(|payload| payload.get("method"))?.as_str()
 }
 
@@ -3685,7 +3814,7 @@ fn string_at_value<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a str> {
         .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
 }
 
-fn legacy_approval_request_event_from_universal(
+fn source_approval_request_event_from_universal(
     approval: &ApprovalRequest,
 ) -> agenter_core::ApprovalRequestEvent {
     agenter_core::ApprovalRequestEvent {
@@ -3714,7 +3843,7 @@ fn legacy_approval_request_event_from_universal(
     }
 }
 
-fn legacy_approval_request(
+fn source_approval_request(
     request: &agenter_core::ApprovalRequestEvent,
     requested_at: DateTime<Utc>,
 ) -> ApprovalRequest {
@@ -3747,7 +3876,7 @@ fn legacy_approval_request(
         native_blocking: request.native_blocking,
         policy: request.policy.clone(),
         native: Some(NativeRef {
-            protocol: "agenter.app_event".to_owned(),
+            protocol: "uap.universal_projection".to_owned(),
             method: Some("approval_requested".to_owned()),
             kind: Some(format!("{:?}", request.kind)),
             native_id,
@@ -3801,23 +3930,25 @@ fn discovered_history_events(
     session_id: SessionId,
     owner_user_id: UserId,
     history: &[DiscoveredSessionHistoryItem],
-) -> Vec<AppEvent> {
+) -> Vec<NormalizedEvent> {
     history
         .iter()
         .flat_map(|item| match item {
             DiscoveredSessionHistoryItem::UserMessage {
                 message_id,
                 content,
-            } => vec![AppEvent::UserMessage(agenter_core::UserMessageEvent {
-                session_id,
-                message_id: message_id.clone(),
-                author_user_id: Some(owner_user_id),
-                content: content.clone(),
-            })],
+            } => vec![NormalizedEvent::UserMessage(
+                agenter_core::UserMessageEvent {
+                    session_id,
+                    message_id: message_id.clone(),
+                    author_user_id: Some(owner_user_id),
+                    content: content.clone(),
+                },
+            )],
             DiscoveredSessionHistoryItem::AgentMessage {
                 message_id,
                 content,
-            } => vec![AppEvent::AgentMessageCompleted(
+            } => vec![NormalizedEvent::AgentMessageCompleted(
                 agenter_core::MessageCompletedEvent {
                     session_id,
                     message_id: message_id.clone(),
@@ -3830,7 +3961,7 @@ fn discovered_history_events(
                 title,
                 content,
                 provider_payload,
-            } => vec![AppEvent::PlanUpdated(agenter_core::PlanEvent {
+            } => vec![NormalizedEvent::PlanUpdated(agenter_core::PlanEvent {
                 session_id,
                 plan_id: Some(plan_id.clone()),
                 title: title.clone(),
@@ -3859,9 +3990,9 @@ fn discovered_history_events(
                 };
                 match status {
                     DiscoveredToolStatus::Completed | DiscoveredToolStatus::Failed => {
-                        vec![AppEvent::ToolCompleted(event)]
+                        vec![NormalizedEvent::ToolCompleted(event)]
                     }
-                    DiscoveredToolStatus::Running => vec![AppEvent::ToolStarted(event)],
+                    DiscoveredToolStatus::Running => vec![NormalizedEvent::ToolStarted(event)],
                 }
             }
             DiscoveredSessionHistoryItem::Command {
@@ -3877,29 +4008,31 @@ fn discovered_history_events(
                 success,
                 provider_payload,
             } => {
-                let mut events = vec![AppEvent::CommandStarted(agenter_core::CommandEvent {
-                    session_id,
-                    command_id: command_id.clone(),
-                    command: command.clone(),
-                    cwd: cwd.clone(),
-                    source: source.clone(),
-                    process_id: process_id.clone(),
-                    actions: actions
-                        .iter()
-                        .map(|action| CommandAction {
-                            kind: action.kind.clone(),
-                            command: action.command.clone(),
-                            path: action.path.clone(),
-                            name: action.name.clone(),
-                            query: action.query.clone(),
-                            provider_payload: action.provider_payload.clone(),
-                        })
-                        .collect(),
-                    provider_payload: provider_payload.clone(),
-                })];
+                let mut events = vec![NormalizedEvent::CommandStarted(
+                    agenter_core::CommandEvent {
+                        session_id,
+                        command_id: command_id.clone(),
+                        command: command.clone(),
+                        cwd: cwd.clone(),
+                        source: source.clone(),
+                        process_id: process_id.clone(),
+                        actions: actions
+                            .iter()
+                            .map(|action| CommandAction {
+                                kind: action.kind.clone(),
+                                command: action.command.clone(),
+                                path: action.path.clone(),
+                                name: action.name.clone(),
+                                query: action.query.clone(),
+                                provider_payload: action.provider_payload.clone(),
+                            })
+                            .collect(),
+                        provider_payload: provider_payload.clone(),
+                    },
+                )];
                 if let Some(output) = output {
                     if !output.is_empty() {
-                        events.push(AppEvent::CommandOutputDelta(
+                        events.push(NormalizedEvent::CommandOutputDelta(
                             agenter_core::CommandOutputEvent {
                                 session_id,
                                 command_id: command_id.clone(),
@@ -3910,7 +4043,7 @@ fn discovered_history_events(
                         ));
                     }
                 }
-                events.push(AppEvent::CommandCompleted(
+                events.push(NormalizedEvent::CommandCompleted(
                     agenter_core::CommandCompletedEvent {
                         session_id,
                         command_id: command_id.clone(),
@@ -3938,65 +4071,69 @@ fn discovered_history_events(
                     provider_payload: provider_payload.clone(),
                 };
                 match status {
-                    DiscoveredFileChangeStatus::Applied => vec![AppEvent::FileChangeApplied(event)],
+                    DiscoveredFileChangeStatus::Applied => {
+                        vec![NormalizedEvent::FileChangeApplied(event)]
+                    }
                     DiscoveredFileChangeStatus::Rejected => {
-                        vec![AppEvent::FileChangeRejected(event)]
+                        vec![NormalizedEvent::FileChangeRejected(event)]
                     }
                     DiscoveredFileChangeStatus::Proposed => {
-                        vec![AppEvent::FileChangeProposed(event)]
+                        vec![NormalizedEvent::FileChangeProposed(event)]
                     }
                 }
             }
-            DiscoveredSessionHistoryItem::ProviderEvent {
+            DiscoveredSessionHistoryItem::NativeNotification {
                 event_id,
                 category,
                 title,
                 detail,
                 status,
                 provider_payload,
-            } => vec![AppEvent::ProviderEvent(agenter_core::ProviderEvent {
-                session_id,
-                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
-                method: category.clone(),
-                event_id: event_id.clone(),
-                category: category.clone(),
-                title: title.clone(),
-                detail: detail.clone(),
-                status: status.clone(),
-                provider_payload: provider_payload.clone(),
-            })],
+            } => vec![NormalizedEvent::NativeNotification(
+                agenter_core::NativeNotification {
+                    session_id,
+                    provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                    method: category.clone(),
+                    event_id: event_id.clone(),
+                    category: category.clone(),
+                    title: title.clone(),
+                    detail: detail.clone(),
+                    status: status.clone(),
+                    provider_payload: provider_payload.clone(),
+                },
+            )],
         })
         .collect()
 }
 
-fn app_event_name(event: &AppEvent) -> &'static str {
+fn normalized_event_name(event: &NormalizedEvent) -> &'static str {
     match event {
-        AppEvent::SessionStarted(_) => "session_started",
-        AppEvent::SessionStatusChanged(_) => "session_status_changed",
-        AppEvent::UserMessage(_) => "user_message",
-        AppEvent::AgentMessageDelta(_) => "agent_message_delta",
-        AppEvent::AgentMessageCompleted(_) => "agent_message_completed",
-        AppEvent::PlanUpdated(_) => "plan_updated",
-        AppEvent::ToolStarted(_) => "tool_started",
-        AppEvent::ToolUpdated(_) => "tool_updated",
-        AppEvent::ToolCompleted(_) => "tool_completed",
-        AppEvent::CommandStarted(_) => "command_started",
-        AppEvent::CommandOutputDelta(_) => "command_output_delta",
-        AppEvent::CommandCompleted(_) => "command_completed",
-        AppEvent::FileChangeProposed(_) => "file_change_proposed",
-        AppEvent::FileChangeApplied(_) => "file_change_applied",
-        AppEvent::FileChangeRejected(_) => "file_change_rejected",
-        AppEvent::ApprovalRequested(_) => "approval_requested",
-        AppEvent::ApprovalResolved(_) => "approval_resolved",
-        AppEvent::QuestionRequested(_) => "question_requested",
-        AppEvent::QuestionAnswered(_) => "question_answered",
-        AppEvent::TurnDiffUpdated(_) => "turn_diff_updated",
-        AppEvent::ItemReasoning(_) => "item_reasoning",
-        AppEvent::ServerRequestResolved(_) => "server_request_resolved",
-        AppEvent::McpToolCallProgress(_) => "mcp_tool_call_progress",
-        AppEvent::ThreadRealtimeEvent(_) => "thread_realtime_event",
-        AppEvent::ProviderEvent(_) => "provider_event",
-        AppEvent::Error(_) => "error",
+        NormalizedEvent::SessionStarted(_) => "session_started",
+        NormalizedEvent::SessionStatusChanged(_) => "session_status_changed",
+        NormalizedEvent::UserMessage(_) => "user_message",
+        NormalizedEvent::AgentMessageDelta(_) => "agent_message_delta",
+        NormalizedEvent::AgentMessageCompleted(_) => "agent_message_completed",
+        NormalizedEvent::PlanUpdated(_) => "plan_updated",
+        NormalizedEvent::ToolStarted(_) => "tool_started",
+        NormalizedEvent::ToolUpdated(_) => "tool_updated",
+        NormalizedEvent::ToolCompleted(_) => "tool_completed",
+        NormalizedEvent::CommandStarted(_) => "command_started",
+        NormalizedEvent::CommandOutputDelta(_) => "command_output_delta",
+        NormalizedEvent::CommandCompleted(_) => "command_completed",
+        NormalizedEvent::FileChangeProposed(_) => "file_change_proposed",
+        NormalizedEvent::FileChangeApplied(_) => "file_change_applied",
+        NormalizedEvent::FileChangeRejected(_) => "file_change_rejected",
+        NormalizedEvent::ApprovalRequested(_) => "approval_requested",
+        NormalizedEvent::ApprovalResolved(_) => "approval_resolved",
+        NormalizedEvent::QuestionRequested(_) => "question_requested",
+        NormalizedEvent::QuestionAnswered(_) => "question_answered",
+        NormalizedEvent::TurnDiffUpdated(_) => "turn_diff_updated",
+        NormalizedEvent::ItemReasoning(_) => "item_reasoning",
+        NormalizedEvent::ServerRequestResolved(_) => "server_request_resolved",
+        NormalizedEvent::McpToolCallProgress(_) => "mcp_tool_call_progress",
+        NormalizedEvent::ThreadRealtimeEvent(_) => "thread_realtime_event",
+        NormalizedEvent::NativeNotification(_) => "native_notification",
+        NormalizedEvent::Error(_) => "error",
     }
 }
 
@@ -4145,7 +4282,9 @@ fn merge_usage_snapshot(target: &mut SessionUsageSnapshot, update: SessionUsageS
     }
 }
 
-fn usage_snapshot_from_provider_event(event: &ProviderEvent) -> Option<SessionUsageSnapshot> {
+fn usage_snapshot_from_native_notification(
+    event: &NativeNotification,
+) -> Option<SessionUsageSnapshot> {
     match event.category.as_str() {
         "token_usage" => usage_snapshot_from_token_usage(event.provider_payload.as_ref()),
         "rate_limits" => usage_snapshot_from_rate_limits(event.provider_payload.as_ref()),
@@ -4340,10 +4479,10 @@ fn sort_session_infos(sessions: &mut [SessionInfo]) {
 #[cfg(test)]
 mod tests {
     use agenter_core::{
-        AgentMessageDeltaEvent, AgentProviderId, AppEvent, ApprovalDecision, ApprovalId,
-        ApprovalKind, ApprovalRequestEvent, ApprovalStatus as UniversalApprovalStatus,
-        CommandCompletedEvent, CommandEvent, CommandOutputEvent, ContentBlockKind, ItemId,
-        ItemRole, ItemState, ItemStatus, MessageCompletedEvent, RunnerId, SessionId, SessionInfo,
+        AgentMessageDeltaEvent, AgentProviderId, ApprovalDecision, ApprovalId, ApprovalKind,
+        ApprovalRequestEvent, ApprovalStatus as UniversalApprovalStatus, CommandCompletedEvent,
+        CommandEvent, CommandOutputEvent, ContentBlockKind, ItemId, ItemRole, ItemState,
+        ItemStatus, MessageCompletedEvent, NormalizedEvent, RunnerId, SessionId, SessionInfo,
         TurnId, TurnState, TurnStatus, UniversalEventEnvelope, UniversalEventKind,
         UniversalEventSource, UniversalSeq, UserId, UserMessageEvent, WorkspaceId, WorkspaceRef,
     };
@@ -4486,16 +4625,16 @@ mod tests {
     }
 
     #[test]
-    fn universal_reducer_materializes_compatibility_message_content_in_snapshot() {
+    fn universal_reducer_materializes_universal_projection_message_content_in_snapshot() {
         let session_id = SessionId::new();
         let mut snapshot = SessionSnapshot {
             session_id,
             ..SessionSnapshot::default()
         };
-        let delta = compatibility_universal_event(
+        let delta = universal_projection_universal_event(
             session_id,
             "event-1".to_owned(),
-            &AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {
+            &NormalizedEvent::AgentMessageDelta(AgentMessageDeltaEvent {
                 session_id,
                 message_id: "msg-1".to_owned(),
                 delta: "hello ".to_owned(),
@@ -4505,10 +4644,10 @@ mod tests {
                 })),
             }),
         );
-        let completed = compatibility_universal_event(
+        let completed = universal_projection_universal_event(
             session_id,
             "event-2".to_owned(),
-            &AppEvent::AgentMessageCompleted(MessageCompletedEvent {
+            &NormalizedEvent::AgentMessageCompleted(MessageCompletedEvent {
                 session_id,
                 message_id: "msg-1".to_owned(),
                 content: Some("hello world".to_owned()),
@@ -4537,10 +4676,10 @@ mod tests {
             ..SessionSnapshot::default()
         };
         let events = [
-            compatibility_universal_event(
+            universal_projection_universal_event(
                 session_id,
                 "event-1".to_owned(),
-                &AppEvent::CommandStarted(CommandEvent {
+                &NormalizedEvent::CommandStarted(CommandEvent {
                     session_id,
                     command_id: "cmd-1".to_owned(),
                     command: "cargo test".to_owned(),
@@ -4554,10 +4693,10 @@ mod tests {
                     })),
                 }),
             ),
-            compatibility_universal_event(
+            universal_projection_universal_event(
                 session_id,
                 "event-2".to_owned(),
-                &AppEvent::CommandOutputDelta(CommandOutputEvent {
+                &NormalizedEvent::CommandOutputDelta(CommandOutputEvent {
                     session_id,
                     command_id: "cmd-1".to_owned(),
                     stream: CommandOutputStream::Stdout,
@@ -4568,10 +4707,10 @@ mod tests {
                     })),
                 }),
             ),
-            compatibility_universal_event(
+            universal_projection_universal_event(
                 session_id,
                 "event-3".to_owned(),
-                &AppEvent::CommandCompleted(CommandCompletedEvent {
+                &NormalizedEvent::CommandCompleted(CommandCompletedEvent {
                     session_id,
                     command_id: "cmd-1".to_owned(),
                     exit_code: Some(0),
@@ -4591,6 +4730,13 @@ mod tests {
 
         let item = snapshot.items.values().next().expect("command item");
         assert_eq!(item.status, ItemStatus::Completed);
+        let tool = item
+            .tool
+            .as_ref()
+            .expect("universal_projection command projection");
+        assert_eq!(tool.kind, ToolProjectionKind::Command);
+        assert_eq!(tool.name, "command");
+        assert_eq!(tool.title, "cargo test");
         let invocation = item
             .content
             .iter()
@@ -5062,10 +5208,10 @@ mod tests {
             session_id,
             ..SessionSnapshot::default()
         };
-        let requested = compatibility_universal_event(
+        let requested = universal_projection_universal_event(
             session_id,
             Uuid::new_v4().to_string(),
-            &AppEvent::ApprovalRequested(ApprovalRequestEvent {
+            &NormalizedEvent::ApprovalRequested(ApprovalRequestEvent {
                 session_id,
                 approval_id,
                 kind: ApprovalKind::Command,
@@ -5087,10 +5233,10 @@ mod tests {
                 provider_payload: Some(serde_json::json!({ "request_id": "native-1" })),
             }),
         );
-        let resolved = compatibility_universal_event(
+        let resolved = universal_projection_universal_event(
             session_id,
             Uuid::new_v4().to_string(),
-            &AppEvent::ApprovalResolved(agenter_core::ApprovalResolvedEvent {
+            &NormalizedEvent::ApprovalResolved(agenter_core::ApprovalResolvedEvent {
                 session_id,
                 approval_id,
                 decision: ApprovalDecision::Accept,
@@ -5118,10 +5264,10 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_projection_does_not_persist_raw_approval_payload() {
+    fn universal_projection_projection_does_not_persist_raw_approval_payload() {
         let session_id = SessionId::new();
         let approval_id = ApprovalId::new();
-        let event = AppEvent::ApprovalRequested(ApprovalRequestEvent {
+        let event = NormalizedEvent::ApprovalRequested(ApprovalRequestEvent {
             session_id,
             approval_id,
             kind: ApprovalKind::Command,
@@ -5147,7 +5293,7 @@ mod tests {
         });
 
         let universal =
-            compatibility_universal_event(session_id, Uuid::new_v4().to_string(), &event);
+            universal_projection_universal_event(session_id, Uuid::new_v4().to_string(), &event);
         let UniversalEventKind::ApprovalRequested { approval } = universal.event else {
             panic!("approval event should materialize");
         };
@@ -5162,7 +5308,7 @@ mod tests {
         let approval_json = serde_json::to_value(&approval).expect("approval json");
         assert!(
             !approval_json.to_string().contains("must-not-copy"),
-            "compatibility universal approval must keep only safe native references"
+            "universal_projection universal approval must keep only safe native references"
         );
     }
 
@@ -5176,7 +5322,7 @@ mod tests {
         state
             .publish_event(
                 session_id,
-                AppEvent::UserMessage(UserMessageEvent {
+                NormalizedEvent::UserMessage(UserMessageEvent {
                     session_id,
                     message_id: Some("user-1".to_owned()),
                     author_user_id: None,
@@ -5190,8 +5336,8 @@ mod tests {
             .recv()
             .await
             .expect("event is broadcast");
-        let received = received.app_event;
-        assert!(matches!(received.event, AppEvent::UserMessage(_)));
+        let received = received.normalized_event;
+        assert!(matches!(received.event, NormalizedEvent::UserMessage(_)));
         assert!(received.event_id.is_some());
     }
 
@@ -5239,7 +5385,7 @@ mod tests {
         state
             .publish_event(
                 session.session_id,
-                AppEvent::ProviderEvent(agenter_core::ProviderEvent {
+                NormalizedEvent::NativeNotification(agenter_core::NativeNotification {
                     session_id: session.session_id,
                     provider_id: AgentProviderId::from(AgentProviderId::CODEX),
                     event_id: None,
@@ -5262,7 +5408,7 @@ mod tests {
         state
             .publish_event(
                 session.session_id,
-                AppEvent::ProviderEvent(agenter_core::ProviderEvent {
+                NormalizedEvent::NativeNotification(agenter_core::NativeNotification {
                     session_id: session.session_id,
                     provider_id: AgentProviderId::from(AgentProviderId::CODEX),
                     event_id: None,
@@ -5341,7 +5487,7 @@ mod tests {
         state
             .publish_event(
                 session.session_id,
-                AppEvent::SessionStatusChanged(agenter_core::SessionStatusChangedEvent {
+                NormalizedEvent::SessionStatusChanged(agenter_core::SessionStatusChangedEvent {
                     session_id: session.session_id,
                     status: SessionStatus::WaitingForApproval,
                     reason: Some("waiting".to_owned()),
@@ -5393,7 +5539,7 @@ mod tests {
         state
             .publish_event(
                 session.session_id,
-                AppEvent::ApprovalRequested(ApprovalRequestEvent {
+                NormalizedEvent::ApprovalRequested(ApprovalRequestEvent {
                     session_id: session.session_id,
                     approval_id,
                     kind: ApprovalKind::Command,
@@ -5420,7 +5566,7 @@ mod tests {
         state
             .publish_event(
                 session.session_id,
-                AppEvent::SessionStatusChanged(agenter_core::SessionStatusChangedEvent {
+                NormalizedEvent::SessionStatusChanged(agenter_core::SessionStatusChangedEvent {
                     session_id: session.session_id,
                     status: SessionStatus::Stopped,
                     reason: Some("provider exited".to_owned()),
@@ -5435,7 +5581,9 @@ mod tests {
         let orphaned = history
             .iter()
             .filter_map(|envelope| match &envelope.event {
-                AppEvent::ApprovalRequested(request) if request.approval_id == approval_id => {
+                NormalizedEvent::ApprovalRequested(request)
+                    if request.approval_id == approval_id =>
+                {
                     request.status.clone()
                 }
                 _ => None,
@@ -5488,7 +5636,7 @@ mod tests {
         state
             .publish_event(
                 active.session_id,
-                AppEvent::SessionStatusChanged(agenter_core::SessionStatusChangedEvent {
+                NormalizedEvent::SessionStatusChanged(agenter_core::SessionStatusChangedEvent {
                     session_id: active.session_id,
                     status: SessionStatus::Running,
                     reason: None,
@@ -5498,7 +5646,7 @@ mod tests {
         state
             .publish_event(
                 failed.session_id,
-                AppEvent::SessionStatusChanged(agenter_core::SessionStatusChangedEvent {
+                NormalizedEvent::SessionStatusChanged(agenter_core::SessionStatusChangedEvent {
                     session_id: failed.session_id,
                     status: SessionStatus::Failed,
                     reason: None,
@@ -5555,7 +5703,7 @@ mod tests {
         state
             .publish_event(
                 sid,
-                AppEvent::ApprovalRequested(ApprovalRequestEvent {
+                NormalizedEvent::ApprovalRequested(ApprovalRequestEvent {
                     session_id: sid,
                     approval_id,
                     kind: ApprovalKind::FileChange,
@@ -5583,7 +5731,7 @@ mod tests {
             state
                 .publish_event(
                     sid,
-                    AppEvent::UserMessage(UserMessageEvent {
+                    NormalizedEvent::UserMessage(UserMessageEvent {
                         session_id: sid,
                         message_id: Some(format!("filler-{i}")),
                         author_user_id: None,
@@ -5606,13 +5754,13 @@ mod tests {
             !state.inner.sessions.lock().await[&sid]
                 .cache
                 .iter()
-                .any(|e| matches!(e.event, AppEvent::ApprovalRequested(_))),
+                .any(|e| matches!(e.event, NormalizedEvent::ApprovalRequested(_))),
             "oldest approval_requested should be evicted from ring buffer"
         );
 
         let history = state.session_history(owner, sid).await.expect("history");
         let found = history.iter().find_map(|env| match &env.event {
-            AppEvent::ApprovalRequested(req) if req.approval_id == approval_id => Some(()),
+            NormalizedEvent::ApprovalRequested(req) if req.approval_id == approval_id => Some(()),
             _ => None,
         });
         assert!(
@@ -5622,7 +5770,10 @@ mod tests {
 
         let pending = state.pending_approval_request_envelopes(sid).await;
         assert_eq!(pending.len(), 1);
-        assert!(matches!(pending[0].event, AppEvent::ApprovalRequested(_)));
+        assert!(matches!(
+            pending[0].event,
+            NormalizedEvent::ApprovalRequested(_)
+        ));
     }
 
     #[tokio::test]
@@ -5656,7 +5807,7 @@ mod tests {
         state
             .publish_event(
                 sid,
-                AppEvent::ApprovalRequested(ApprovalRequestEvent {
+                NormalizedEvent::ApprovalRequested(ApprovalRequestEvent {
                     session_id: sid,
                     approval_id,
                     kind: ApprovalKind::FileChange,
@@ -5689,7 +5840,9 @@ mod tests {
         let approval = history
             .iter()
             .find_map(|env| match &env.event {
-                AppEvent::ApprovalRequested(req) if req.approval_id == approval_id => Some(req),
+                NormalizedEvent::ApprovalRequested(req) if req.approval_id == approval_id => {
+                    Some(req)
+                }
                 _ => None,
             })
             .expect("replayed approval");
@@ -5706,7 +5859,7 @@ mod tests {
     async fn subscribe_snapshots_cached_events_and_live_receiver_atomically() {
         let state = AppState::new("dev-token".to_owned(), CookieSecurity::DevelopmentInsecure);
         let session_id = SessionId::new();
-        let event = AppEvent::UserMessage(UserMessageEvent {
+        let event = NormalizedEvent::UserMessage(UserMessageEvent {
             session_id,
             message_id: Some("cached".to_owned()),
             author_user_id: None,
@@ -5718,13 +5871,13 @@ mod tests {
         assert_eq!(subscription.cached_events.len(), 1);
         assert!(matches!(
             subscription.cached_events[0].event,
-            AppEvent::UserMessage(_)
+            NormalizedEvent::UserMessage(_)
         ));
 
         state
             .publish_event(
                 session_id,
-                AppEvent::UserMessage(UserMessageEvent {
+                NormalizedEvent::UserMessage(UserMessageEvent {
                     session_id,
                     message_id: Some("live".to_owned()),
                     author_user_id: None,
@@ -5738,20 +5891,20 @@ mod tests {
                 .recv()
                 .await
                 .expect("live event")
-                .app_event
+                .normalized_event
                 .event,
-            AppEvent::UserMessage(_)
+            NormalizedEvent::UserMessage(_)
         ));
     }
 
     #[tokio::test]
-    async fn subscribe_snapshot_replays_universal_events_after_legacy_cache_miss() {
+    async fn subscribe_snapshot_replays_universal_events_after_source_cache_miss() {
         let state = AppState::new("dev-token".to_owned(), CookieSecurity::DevelopmentInsecure);
         let session_id = SessionId::new();
         state
             .publish_event(
                 session_id,
-                AppEvent::UserMessage(UserMessageEvent {
+                NormalizedEvent::UserMessage(UserMessageEvent {
                     session_id,
                     message_id: Some("first".to_owned()),
                     author_user_id: None,
@@ -5763,7 +5916,7 @@ mod tests {
             state
                 .publish_event(
                     session_id,
-                    AppEvent::UserMessage(UserMessageEvent {
+                    NormalizedEvent::UserMessage(UserMessageEvent {
                         session_id,
                         message_id: Some(format!("filler-{i}")),
                         author_user_id: None,
@@ -5780,7 +5933,7 @@ mod tests {
         assert!(!subscription.cached_events.iter().any(|event| {
             matches!(
                 &event.event,
-                AppEvent::UserMessage(message) if message.message_id.as_deref() == Some("first")
+                NormalizedEvent::UserMessage(message) if message.message_id.as_deref() == Some("first")
             )
         }));
         let snapshot = subscription.snapshot.expect("snapshot replay");
@@ -5800,7 +5953,7 @@ mod tests {
             state
                 .publish_event(
                     session_id,
-                    AppEvent::UserMessage(UserMessageEvent {
+                    NormalizedEvent::UserMessage(UserMessageEvent {
                         session_id,
                         message_id: Some(message_id.to_owned()),
                         author_user_id: None,
@@ -5835,7 +5988,7 @@ mod tests {
             state
                 .publish_event(
                     session_id,
-                    AppEvent::UserMessage(UserMessageEvent {
+                    NormalizedEvent::UserMessage(UserMessageEvent {
                         session_id,
                         message_id: Some(format!("event-{i}")),
                         author_user_id: None,
@@ -5894,7 +6047,7 @@ mod tests {
         state
             .publish_event(
                 session.session_id,
-                AppEvent::UserMessage(UserMessageEvent {
+                NormalizedEvent::UserMessage(UserMessageEvent {
                     session_id: session.session_id,
                     message_id: Some("old".to_owned()),
                     author_user_id: Some(owner_user_id),
@@ -5939,7 +6092,7 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert!(matches!(
             history[0].event,
-            AppEvent::AgentMessageCompleted(_)
+            NormalizedEvent::AgentMessageCompleted(_)
         ));
     }
 
@@ -5982,7 +6135,7 @@ mod tests {
         state
             .publish_event(
                 session.session_id,
-                AppEvent::UserMessage(UserMessageEvent {
+                NormalizedEvent::UserMessage(UserMessageEvent {
                     session_id: session.session_id,
                     message_id: Some("old".to_owned()),
                     author_user_id: Some(owner_user_id),
@@ -6025,10 +6178,10 @@ mod tests {
             }
         );
         assert_eq!(history.len(), 2);
-        assert!(matches!(history[0].event, AppEvent::UserMessage(_)));
+        assert!(matches!(history[0].event, NormalizedEvent::UserMessage(_)));
         assert!(matches!(
             history[1].event,
-            AppEvent::AgentMessageCompleted(_)
+            NormalizedEvent::AgentMessageCompleted(_)
         ));
     }
 
@@ -6071,7 +6224,7 @@ mod tests {
         state
             .publish_event(
                 session.session_id,
-                AppEvent::UserMessage(UserMessageEvent {
+                NormalizedEvent::UserMessage(UserMessageEvent {
                     session_id: session.session_id,
                     message_id: Some("old".to_owned()),
                     author_user_id: Some(owner_user_id),
@@ -6113,7 +6266,7 @@ mod tests {
             }
         );
         assert_eq!(history.len(), 1);
-        assert!(matches!(history[0].event, AppEvent::UserMessage(_)));
+        assert!(matches!(history[0].event, NormalizedEvent::UserMessage(_)));
     }
 
     #[tokio::test]
@@ -6233,7 +6386,7 @@ mod tests {
                     content: "1. Test".to_owned(),
                     provider_payload: None,
                 },
-                DiscoveredSessionHistoryItem::ProviderEvent {
+                DiscoveredSessionHistoryItem::NativeNotification {
                     event_id: Some("compact-1".to_owned()),
                     category: "compaction".to_owned(),
                     title: "Context compacted".to_owned(),
@@ -6244,25 +6397,28 @@ mod tests {
             ],
         );
 
-        assert!(matches!(events[0], AppEvent::UserMessage(_)));
-        assert!(matches!(events[1], AppEvent::AgentMessageCompleted(_)));
-        assert!(matches!(events[2], AppEvent::CommandStarted(_)));
-        assert!(matches!(events[3], AppEvent::CommandOutputDelta(_)));
-        assert!(matches!(events[4], AppEvent::CommandCompleted(_)));
-        assert!(matches!(events[5], AppEvent::ToolCompleted(_)));
-        assert!(matches!(events[6], AppEvent::FileChangeApplied(_)));
-        assert!(matches!(events[7], AppEvent::PlanUpdated(_)));
-        assert!(matches!(events[8], AppEvent::ProviderEvent(_)));
+        assert!(matches!(events[0], NormalizedEvent::UserMessage(_)));
+        assert!(matches!(
+            events[1],
+            NormalizedEvent::AgentMessageCompleted(_)
+        ));
+        assert!(matches!(events[2], NormalizedEvent::CommandStarted(_)));
+        assert!(matches!(events[3], NormalizedEvent::CommandOutputDelta(_)));
+        assert!(matches!(events[4], NormalizedEvent::CommandCompleted(_)));
+        assert!(matches!(events[5], NormalizedEvent::ToolCompleted(_)));
+        assert!(matches!(events[6], NormalizedEvent::FileChangeApplied(_)));
+        assert!(matches!(events[7], NormalizedEvent::PlanUpdated(_)));
+        assert!(matches!(events[8], NormalizedEvent::NativeNotification(_)));
     }
 
     #[test]
-    fn discovered_history_codex_thread_item_maps_to_provider_app_event() {
+    fn discovered_history_codex_thread_item_maps_to_provider_normalized_event() {
         let session_id = SessionId::nil();
         let owner_user_id = UserId::nil();
         let events = discovered_history_events(
             session_id,
             owner_user_id,
-            &[DiscoveredSessionHistoryItem::ProviderEvent {
+            &[DiscoveredSessionHistoryItem::NativeNotification {
                 event_id: Some("og-1".to_owned()),
                 category: "codex_thread_item".to_owned(),
                 title: "orphanGadget".to_owned(),
@@ -6273,8 +6429,8 @@ mod tests {
         );
 
         assert_eq!(events.len(), 1);
-        let AppEvent::ProviderEvent(pe) = &events[0] else {
-            panic!("expected ProviderEvent app event");
+        let NormalizedEvent::NativeNotification(pe) = &events[0] else {
+            panic!("expected NativeNotification normalized event");
         };
         assert_eq!(pe.session_id, session_id);
         assert_eq!(pe.method.as_str(), "codex_thread_item");

@@ -36,6 +36,7 @@ Do not store large transcripts here. Link to specs, plans, decisions, and runboo
 
 ## Recent Notes
 
+- 2026-05-04: Clarified `docs/plans/2026-05-03-universal-agent-protocol.md` replay behavior: truncated `session_snapshot` replay with `include_snapshot=true` is non-fatal, the browser uses the materialized snapshot as its live checkpoint, and replay-only subscriptions still close on incomplete replay to avoid advancing past a gap.
 - 2026-05-03: Implemented `docs/plans/2026-05-03-nonblocking-session-refresh.md`: workspace/provider refresh now returns a background `refresh_id`, runner discovery runs off the connection path, Codex startup discovery is metadata-only, DB-backed forced imports use a history fingerprint to skip unchanged projection rewrites, and runner refresh progress is exposed as an operation state machine with sidebar progress/log UI.
 - 2026-05-03: Accepted `docs/decisions/2026-05-03-runner-local-codex-wire-logs.md` and implemented `docs/plans/2026-05-03-codex-runner-observability.md`: Codex raw JSON-RPC/stdout/stderr wire logs are runner-local and opt-in via `AGENTER_CODEX_RAW_LOG=1`, with operator usage in `docs/runbooks/codex-wire-logging.md`.
 - 2026-05-03: Accepted `docs/decisions/2026-05-03-persistent-browser-auth-sessions.md`: Postgres-backed browser auth now persists SHA-256 cookie token hashes for 30 days in `browser_auth_sessions`; without `DATABASE_URL`, browser sessions remain in-memory development state.

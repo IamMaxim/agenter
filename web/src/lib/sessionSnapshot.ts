@@ -1,6 +1,5 @@
 import type {
   ApprovalRequest,
-  BrowserEventEnvelope,
   BrowserServerMessage,
   CapabilitySet,
   ContentBlock,
@@ -50,7 +49,7 @@ export function createUniversalClientState(): UniversalClientState {
 
 export function applyUniversalClientMessage(
   state: UniversalClientState,
-  message: BrowserServerMessage | BrowserEventEnvelope
+  message: BrowserServerMessage
 ): UniversalClientState {
   if (message.type === 'session_snapshot') {
     return applySessionSnapshotMessage(state, message);
@@ -92,6 +91,8 @@ export function materializeSnapshotChatState(
     items.push(materializeArtifact(artifact));
   }
 
+  ensureSnapshotRowOrder(items, rowOrder, snapshot.latest_seq);
+
   const sortedItems = sortByUniversalOrder(items, rowOrder);
   const latestPlan = [...sortedItems].reverse().find((item) => item.kind === 'plan');
   return {
@@ -119,14 +120,20 @@ function applySessionSnapshotMessage(
   state: UniversalClientState,
   message: Extract<BrowserServerMessage, { type: 'session_snapshot' }>
 ): UniversalClientState {
+  let snapshot = cloneSnapshot(message.snapshot);
   if (message.has_more) {
+    const rowOrder = new Map(state.rowOrder);
     return {
-      ...state,
-      snapshotIncomplete: true
+      chat: materializeSnapshotChatState(snapshot, rowOrder),
+      snapshot,
+      latestSeq: snapshot.latest_seq ?? undefined,
+      usingUniversal: true,
+      snapshotIncomplete: true,
+      seenUniversalEvents: new Set(state.seenUniversalEvents),
+      rowOrder
     };
   }
 
-  let snapshot = cloneSnapshot(message.snapshot);
   let latestSeq = snapshot.latest_seq ?? undefined;
   const seenUniversalEvents = new Set(state.seenUniversalEvents);
   const rowOrder = new Map(state.rowOrder);
@@ -248,6 +255,14 @@ function materializeItem(item: ItemState): ChatItem | undefined {
     return materializeToolItem(item, content);
   }
   const first = item.content[0];
+  const nativeMethod = item.native?.method;
+  const isNativeCommand =
+    isNativeCommandMethod(nativeMethod) ||
+    (first?.kind === 'tool_call' &&
+      item.content.some((block) => block.block_id.startsWith('command-')));
+  const isNativeFileChange =
+    isFileChangeMethod(nativeMethod) ||
+    item.content.some((block) => isFileDiffBlock(block.kind));
   if (first?.kind === 'command_output') {
     return {
       id: `event:item:${item.item_id}`,
@@ -260,10 +275,36 @@ function materializeItem(item: ItemState): ChatItem | undefined {
       source: item.native?.protocol ?? undefined
     };
   }
+  if (isNativeCommand) {
+    return {
+      id: `event:item:${item.item_id}`,
+      kind: 'inlineEvent',
+      eventKind: 'command',
+      title: first?.text?.trim() || 'Command',
+      detail: undefined,
+      output: commandOutputText(item.content),
+      status: item.status,
+      source: item.native?.protocol ?? undefined
+    };
+  }
+  if (isNativeFileChange) {
+    return {
+      id: `event:item:${item.item_id}`,
+      kind: 'inlineEvent',
+      eventKind: 'file',
+      title:
+        methodFileChangeTitle(item.native?.method) ??
+        item.native?.summary ??
+        (first?.text?.trim() || 'File change'),
+      detail: fileChangeDetail(item.content) || content || undefined,
+      status: item.status,
+      source: item.native?.protocol ?? undefined
+    };
+  }
   return {
     id: `event:item:${item.item_id}`,
     kind: 'inlineEvent',
-    eventKind: first?.kind === 'file_diff' ? 'file' : 'tool',
+    eventKind: 'tool',
     title: item.native?.summary ?? item.native?.method ?? first?.kind ?? 'Tool activity',
     detail: content || undefined,
     status: item.status,
@@ -273,6 +314,25 @@ function materializeItem(item: ItemState): ChatItem | undefined {
 
 function materializeToolItem(item: ItemState, content: string): ChatItem {
   const tool = item.tool!;
+  const isToolFileChange =
+    isFileChangeMethod(item.native?.method) ||
+    item.content.some((block) => isFileDiffBlock(block.kind));
+  if (isToolFileChange) {
+    return {
+      id: `event:item:${item.item_id}`,
+      kind: 'inlineEvent',
+      eventKind: 'file',
+      title:
+        methodFileChangeTitle(item.native?.method) ??
+        tool.title ??
+        item.native?.summary ??
+        tool.name ??
+        'File change',
+      detail: fileChangeDetail(item.content) || content || undefined,
+      status: tool.status ?? item.status,
+      source: item.native?.protocol ?? undefined
+    };
+  }
   if (tool.kind === 'subagent' && tool.subagent) {
     return {
       id: `subagent:${item.item_id}`,
@@ -336,6 +396,22 @@ function materializeToolItem(item: ItemState, content: string): ChatItem {
     status: tool.status ?? item.status,
     source: item.native?.protocol ?? undefined
   };
+}
+
+function methodFileChangeTitle(method: string | null | undefined): string | undefined {
+  if (!method?.startsWith('file_change_')) {
+    return undefined;
+  }
+  return `File change ${method.replace(/^file_change_/, '').replace(/_/g, ' ')}`.trim();
+}
+
+function fileChangeDetail(blocks: ContentBlock[]): string | undefined {
+  const text = blocks
+    .filter((block) => isFileDiffBlock(block.kind))
+    .map((block) => block.text ?? '')
+    .filter(Boolean)
+    .join('');
+  return text.length > 0 ? text : undefined;
 }
 
 function commandProjectionDetail(command: NonNullable<ItemState['tool']>['command']): string | undefined {
@@ -469,6 +545,48 @@ function snapshotActivity(snapshot: SessionSnapshot): ChatActivity | undefined {
     };
   }
   return undefined;
+}
+
+function ensureSnapshotRowOrder(
+  items: ChatItem[],
+  rowOrder: Map<string, RowOrder>,
+  latestSeq?: string | null
+) {
+  const snapshotSeq = fallbackRowOrderSeq(latestSeq);
+  for (const item of items) {
+    if (rowOrder.has(item.id)) {
+      continue;
+    }
+    rowOrder.set(item.id, {
+      seq: snapshotSeq,
+      ts: '0001-01-01T00:00:00.000Z',
+      index: rowOrder.size
+    });
+  }
+}
+
+function fallbackRowOrderSeq(latestSeq?: string | null): string {
+  if (!latestSeq) {
+    return '0';
+  }
+  try {
+    const value = BigInt(latestSeq);
+    return value > 0n ? String(value - 1n) : '0';
+  } catch {
+    return '0';
+  }
+}
+
+function isNativeCommandMethod(method: string | null | undefined): boolean {
+  return !!method && (method === 'command_started' || method.startsWith('command_'));
+}
+
+function isFileChangeMethod(method: string | null | undefined): boolean {
+  return !!method && method.startsWith('file_change');
+}
+
+function isFileDiffBlock(kind: string): boolean {
+  return kind === 'file_diff' || kind.startsWith('file_diff');
 }
 
 function sortByUniversalOrder(items: ChatItem[], rowOrder: Map<string, RowOrder>): ChatItem[] {

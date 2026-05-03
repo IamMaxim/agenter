@@ -21,18 +21,6 @@ describe('browser websocket events', () => {
     expect(error).toHaveBeenCalledWith(expect.any(Error));
   });
 
-  test('rejects legacy app_event websocket messages', () => {
-    expect(() =>
-      parseBrowserServerMessage(
-        JSON.stringify({
-          type: 'app_event',
-          event_id: 10,
-          event: { type: 'error', payload: null }
-        })
-      )
-    ).toThrow(/Unsupported browser server message type: app_event/);
-  });
-
   test('subscribes with snapshot replay cursor options', () => {
     const socket = new FakeWebSocket();
     vi.stubGlobal('WebSocket', vi.fn(() => socket));

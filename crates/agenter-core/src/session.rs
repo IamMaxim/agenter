@@ -499,7 +499,7 @@ mod tests {
     use crate::{AgentCapabilities, CapabilitySet};
 
     #[test]
-    fn converts_legacy_agent_capabilities_to_nested_capability_set() {
+    fn converts_source_agent_capabilities_to_nested_capability_set() {
         let capabilities = CapabilitySet::from(AgentCapabilities {
             streaming: true,
             session_resume: true,
