@@ -79,3 +79,25 @@ Align the browser workbench with the checked-in mockups: sidebar/navigation from
   - `npm run test`
   - `npm run build`
   - Manual: open a real mobile viewport, go to list first, open a session, return via back button, and confirm list returns; verify manifest presence in DevTools.
+
+## 2026-05-03 Transcript Verbosity
+
+- Added inline event metadata tagging in `web/src/lib/chatEvents.ts`:
+  - `displayLevel: 'thinking'` for `provider_event` with `category: 'reasoning'` and `item_reasoning`.
+  - `displayLevel: 'raw'` for `turn_diff_updated`, `server_request_resolved`, `mcp_tool_call_progress`, and `thread_realtime_event`.
+  - `displayLevel` omitted for normal events.
+- Added composer transcript verbosity selector in `web/src/routes/ChatRoute.svelte` with values:
+  - `compact` (raw hidden),
+  - `normal` (raw hidden, thinking rows collapsed by default),
+  - `detailed` (raw hidden, thinking rows expanded),
+  - `debug` (all inline rows shown).
+- Added local persistence (`agenter.chat.verbosity.v1`) for the selected level.
+- Updated inline row expansion behavior in `web/src/components/InlineEventRow.svelte` to respect default expansion state while preserving user toggles.
+- Added/updated tests in `web/src/lib/chatEvents.test.ts`:
+  - thinking/raw tagging assertions for high-value provider event variants,
+  - preserved existing behavior for provider row rendering with explicit display levels.
+- Verification in this task:
+  - `cd web && npm run check`
+  - `cd web && npm run lint`
+  - `cd web && npm run test`
+  - `cd web && npm run build`

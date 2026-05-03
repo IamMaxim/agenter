@@ -18,6 +18,7 @@ export type ChatItem =
       id: string;
       kind: 'inlineEvent';
       eventKind: 'command';
+      displayLevel?: InlineEventDisplayLevel;
       title: string;
       detail?: string;
       output: string;
@@ -33,6 +34,7 @@ export type ChatItem =
       id: string;
       kind: 'inlineEvent';
       eventKind: 'tool' | 'file' | 'event';
+      displayLevel?: InlineEventDisplayLevel;
       title: string;
       detail?: string;
       output?: never;
@@ -109,6 +111,8 @@ export interface ChatActivity {
   active: boolean;
   label: string;
 }
+
+export type InlineEventDisplayLevel = 'normal' | 'thinking' | 'raw';
 
 export interface ChatState {
   seenEventIds: Set<string>;
@@ -204,6 +208,7 @@ function applyPlanTracking(
 
 function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): ChatItem[] {
   const payload = event.payload;
+  const displayLevel = inlineEventDisplayLevel(event.type, payload);
   switch (event.type) {
     case 'user_message':
       return upsert(items, {
@@ -217,6 +222,7 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
       return upsert(items, {
         id: `status:${eventId ?? stringField(payload, 'status') ?? fallbackId(event)}`,
         kind: 'inlineEvent',
+        ...(displayLevel === 'normal' ? {} : { displayLevel }),
         eventKind: 'event',
         title: statusLabel(stringField(payload, 'status')),
         detail: stringField(payload, 'reason'),
@@ -266,6 +272,7 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
         id: `event:command:${stringField(payload, 'command_id') ?? fallbackId(event)}`,
         kind: 'inlineEvent',
         eventKind: 'command',
+        ...(displayLevel === 'normal' ? {} : { displayLevel }),
         title: stringField(payload, 'command') ?? 'Command',
         detail: commandDetail(payload),
         output: '',
@@ -290,6 +297,7 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
         id: `event:tool:${stringField(payload, 'tool_call_id') ?? fallbackId(event)}`,
         kind: 'inlineEvent',
         eventKind: 'tool',
+        ...(displayLevel === 'normal' ? {} : { displayLevel }),
         title: toolTitle(payload),
         detail: toolDetail(payload),
         status: event.type === 'tool_completed' ? 'completed' : 'running'
@@ -302,6 +310,7 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
         id: `event:file:${stringField(payload, 'path') ?? fallbackId(event)}`,
         kind: 'inlineEvent',
         eventKind: 'file',
+        ...(displayLevel === 'normal' ? {} : { displayLevel }),
         title: stringField(payload, 'path') ?? 'File change',
         detail: stringField(payload, 'diff'),
         status:
@@ -346,6 +355,7 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
         id: `event:provider:${stringField(payload, 'event_id') ?? eventId ?? fallbackId(event)}`,
         kind: 'inlineEvent',
         eventKind: 'event',
+        ...(displayLevel === 'normal' ? {} : { displayLevel }),
         title: stringField(payload, 'title') ?? providerEventTitle(payload),
         detail: stringField(payload, 'detail') ?? providerEventDetail(payload),
         status: stringField(payload, 'status') ?? 'received'
@@ -379,6 +389,7 @@ function applyAppEvent(items: ChatItem[], event: AppEvent, eventId?: string): Ch
           id: `event:generic:${event.type}:${items.length}`,
           kind: 'inlineEvent',
           eventKind: 'event',
+          ...(displayLevel === 'normal' ? {} : { displayLevel }),
           title: event.type,
           status: 'received',
           detail: JSON.stringify(payload, null, 2)
@@ -393,6 +404,27 @@ function errorDetail(payload: Record<string, unknown>): string | undefined {
     providerPayloadDetail(payload)
   ].filter(Boolean);
   return parts.length > 0 ? parts.join('\n\n') : undefined;
+}
+
+function inlineEventDisplayLevel(
+  eventType: AppEvent['type'],
+  payload: Record<string, unknown>
+): InlineEventDisplayLevel | 'normal' {
+  if (eventType === 'provider_event' && stringField(payload, 'category') === 'reasoning') {
+    return 'thinking';
+  }
+  if (eventType === 'item_reasoning') {
+    return 'thinking';
+  }
+  switch (eventType) {
+    case 'turn_diff_updated':
+    case 'server_request_resolved':
+    case 'mcp_tool_call_progress':
+    case 'thread_realtime_event':
+      return 'raw';
+    default:
+      return 'normal';
+  }
 }
 
 function providerPayloadDetail(payload: Record<string, unknown>): string | undefined {
@@ -421,6 +453,11 @@ function updateCommandOutput(items: ChatItem[], payload: Record<string, unknown>
   return upsert(items, {
     id,
     kind: 'inlineEvent',
+    ...(existing?.kind === 'inlineEvent' && existing.eventKind === 'command'
+      ? existing.displayLevel === undefined
+        ? {}
+        : { displayLevel: existing.displayLevel }
+      : {}),
     eventKind: 'command',
     title:
       existing?.kind === 'inlineEvent' && existing.eventKind === 'command'
@@ -466,6 +503,11 @@ function updateCommandCompleted(items: ChatItem[], payload: Record<string, unkno
   return upsert(items, {
     id,
     kind: 'inlineEvent',
+    ...(existing?.kind === 'inlineEvent' && existing.eventKind === 'command' && existing.displayLevel === undefined
+      ? {}
+      : existing?.kind === 'inlineEvent' && existing.eventKind === 'command'
+        ? { displayLevel: existing.displayLevel }
+        : {}),
     eventKind: 'command',
     title: existing?.kind === 'inlineEvent' ? existing.title : 'Command',
     detail: existing?.kind === 'inlineEvent' ? existing.detail : undefined,

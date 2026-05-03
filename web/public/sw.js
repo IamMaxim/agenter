@@ -51,16 +51,19 @@ self.addEventListener('fetch', (event) => {
 
   event.respondWith(
     caches.match(request).then((cached) => {
-      const networkRequest = fetch(request)
+      if (cached) {
+        return cached;
+      }
+
+      return fetch(request)
         .then((response) => {
-          if (response.ok) {
-            void caches.open(CACHE_NAME).then((cache) => cache.put(request, response.clone()));
+          if (response.ok && !response.bodyUsed) {
+            const responseToCache = response.clone();
+            void caches.open(CACHE_NAME).then((cache) => cache.put(request, responseToCache));
           }
           return response;
         })
-        .catch(() => cached);
-
-      return cached || networkRequest;
+        .catch(() => Response.error());
     })
   );
 });

@@ -1008,11 +1008,12 @@ describe('chat event state', () => {
       });
     }
 
-    expect(state.items).toEqual([
+    expect(state.items).toMatchObject([
       {
         id: 'event:provider:turn-diff-1',
         kind: 'inlineEvent',
         eventKind: 'event',
+        displayLevel: 'raw',
         title: 'Turn diff updated',
         detail: 'turn diff details',
         status: 'updated'
@@ -1021,6 +1022,7 @@ describe('chat event state', () => {
         id: 'event:provider:reasoning-1',
         kind: 'inlineEvent',
         eventKind: 'event',
+        displayLevel: 'thinking',
         title: 'Reasoning update',
         detail: 'reasoning delta',
         status: 'updated'
@@ -1029,6 +1031,7 @@ describe('chat event state', () => {
         id: 'event:provider:server-1',
         kind: 'inlineEvent',
         eventKind: 'event',
+        displayLevel: 'raw',
         title: 'Server request resolved',
         detail: 'server resolved',
         status: 'resolved'
@@ -1037,6 +1040,7 @@ describe('chat event state', () => {
         id: 'event:provider:mcp-1',
         kind: 'inlineEvent',
         eventKind: 'event',
+        displayLevel: 'raw',
         title: 'MCP progress',
         detail: 'mcp step',
         status: 'running'
@@ -1045,9 +1049,77 @@ describe('chat event state', () => {
         id: 'event:provider:realtime-1',
         kind: 'inlineEvent',
         eventKind: 'event',
+        displayLevel: 'raw',
         title: 'Thread realtime event',
         detail: 'realtime update',
         status: 'updated'
+      }
+    ]);
+  });
+
+  test('marks thinking and raw inline events with explicit verbosity levels', () => {
+    let state = createChatState();
+
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-provider-reasoning',
+      event: {
+        type: 'provider_event',
+        payload: {
+          session_id: 's1',
+          provider_id: 'codex',
+          event_id: 'reasoning-2',
+          category: 'reasoning',
+          title: 'Reasoning update',
+          detail: 'reasoning details'
+        }
+      }
+    });
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-item-reasoning',
+      event: {
+        type: 'item_reasoning',
+        payload: {
+          session_id: 's1',
+          event_id: 'item-reasoning-1',
+          title: 'Reasoning delta',
+          detail: 'reasoning delta'
+        }
+      }
+    });
+    state = applyChatEnvelope(state, {
+      type: 'app_event',
+      event_id: 'evt-turn-diff',
+      event: {
+        type: 'turn_diff_updated',
+        payload: {
+          session_id: 's1',
+          event_id: 'turn-diff-1',
+          title: 'Turn diff updated',
+          detail: 'turn diff details'
+        }
+      }
+    });
+
+    expect(state.items).toMatchObject([
+      {
+        id: 'event:provider:reasoning-2',
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        displayLevel: 'thinking'
+      },
+      {
+        id: 'event:provider:item-reasoning-1',
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        displayLevel: 'thinking'
+      },
+      {
+        id: 'event:provider:turn-diff-1',
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        displayLevel: 'raw'
       }
     ]);
   });

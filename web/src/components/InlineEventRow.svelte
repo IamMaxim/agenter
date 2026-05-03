@@ -18,8 +18,14 @@
     | 'generic';
 
   export let item: Extract<ChatItem, { kind: 'inlineEvent' }>;
+  export let expandedByDefault = false;
 
-  let expanded = false;
+  let expanded = expandedByDefault;
+  let userExpanded = false;
+
+  $: if (!userExpanded) {
+    expanded = expandedByDefault;
+  }
 
   $: commandActions = item.eventKind === 'command' ? (item.actions ?? []) : [];
   $: hasCommandMeta =
@@ -35,6 +41,7 @@
 
   function toggle() {
     if (hasDetail) {
+      userExpanded = true;
       expanded = !expanded;
     }
   }

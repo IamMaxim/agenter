@@ -2185,7 +2185,8 @@ fn sort_session_infos(sessions: &mut [SessionInfo]) {
 mod tests {
     use agenter_core::{
         AgentProviderId, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind,
-        ApprovalRequestEvent, RunnerId, SessionId, UserMessageEvent, WorkspaceId, WorkspaceRef,
+        ApprovalRequestEvent, RunnerId, SessionId, UserId, UserMessageEvent, WorkspaceId,
+        WorkspaceRef,
     };
     use agenter_protocol::runner::{RunnerHeartbeatAck, RunnerServerMessage};
 
@@ -2962,6 +2963,34 @@ mod tests {
         assert!(matches!(events[6], AppEvent::FileChangeApplied(_)));
         assert!(matches!(events[7], AppEvent::PlanUpdated(_)));
         assert!(matches!(events[8], AppEvent::ProviderEvent(_)));
+    }
+
+    #[test]
+    fn discovered_history_codex_thread_item_maps_to_provider_app_event() {
+        let session_id = SessionId::nil();
+        let owner_user_id = UserId::nil();
+        let events = discovered_history_events(
+            session_id,
+            owner_user_id,
+            &[DiscoveredSessionHistoryItem::ProviderEvent {
+                event_id: Some("og-1".to_owned()),
+                category: "codex_thread_item".to_owned(),
+                title: "orphanGadget".to_owned(),
+                detail: Some("experimental row".to_owned()),
+                status: Some("done".to_owned()),
+                provider_payload: None,
+            }],
+        );
+
+        assert_eq!(events.len(), 1);
+        let AppEvent::ProviderEvent(pe) = &events[0] else {
+            panic!("expected ProviderEvent app event");
+        };
+        assert_eq!(pe.session_id, session_id);
+        assert_eq!(pe.method.as_str(), "codex_thread_item");
+        assert_eq!(pe.category.as_str(), "codex_thread_item");
+        assert_eq!(pe.title.as_str(), "orphanGadget");
+        assert_eq!(pe.detail.as_deref(), Some("experimental row"));
     }
 
     #[test]

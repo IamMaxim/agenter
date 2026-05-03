@@ -87,7 +87,12 @@
   let pendingDangerCommand:
     | { command: SlashCommandDefinition; request: SlashCommandRequest }
     | undefined;
-  let openComposerMenu: 'mode' | 'model' | 'reasoning' | null = null;
+  let openComposerMenu: 'mode' | 'model' | 'reasoning' | 'verbosity' | null = null;
+  type VerbosityMode = 'compact' | 'normal' | 'detailed' | 'debug';
+  const VERBOSITY_OPTIONS: VerbosityMode[] = ['compact', 'normal', 'detailed', 'debug'];
+  const DEFAULT_VERBOSITY: VerbosityMode = 'debug';
+  const VERBOSITY_STORAGE_KEY = 'agenter.chat.verbosity.v1';
+  let verbosity: VerbosityMode = DEFAULT_VERBOSITY;
   let dismissedPlanIds: Set<string> = new Set();
   let eventStream: HTMLDivElement | undefined;
   const EVENT_STREAM_BOTTOM_EPSILON_PX = 8;
@@ -110,6 +115,8 @@
   $: items = chatState.items;
   $: turnActivity = chatState.activity;
   $: turnActive = turnActivity?.active ?? false;
+  $: visibleItems = items.filter((item) => shouldShowItem(item, verbosity));
+  $: shouldExpandThinkingByDefault = verbosity === 'detailed' || verbosity === 'debug';
   $: sendBusy = submitting || turnActive;
   $: slashSuggestions = filterSlashCommands(draft, slashCommands);
   $: parsedSlash = parseSlashCommand(draft, slashCommands);
@@ -142,6 +149,7 @@
   onMount(() => {
     mounted = true;
     activeSessionId = sessionId;
+    verbosity = readVerbosityFromStorage();
     window.addEventListener('pointerdown', closeComposerMenuOnOutsideClick);
     window.addEventListener('keydown', closeComposerMenuOnEscape);
     void reloadAndConnect();
@@ -336,6 +344,47 @@
       event.preventDefault();
       closeComposerMenu();
     }
+  }
+
+  function readVerbosityFromStorage(): VerbosityMode {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return DEFAULT_VERBOSITY;
+    }
+    const raw = localStorage.getItem(VERBOSITY_STORAGE_KEY);
+    return raw === 'compact' || raw === 'normal' || raw === 'detailed' || raw === 'debug'
+      ? raw
+      : DEFAULT_VERBOSITY;
+  }
+
+  function writeVerbosityToStorage(next: VerbosityMode) {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return;
+    }
+    localStorage.setItem(VERBOSITY_STORAGE_KEY, next);
+  }
+
+  function isThinkingItem(item: ChatItem): boolean {
+    return item.kind === 'inlineEvent' && item.displayLevel === 'thinking';
+  }
+
+  function shouldShowItem(item: ChatItem, level: VerbosityMode): boolean {
+    if (item.kind !== 'inlineEvent') {
+      return true;
+    }
+    if (item.displayLevel === 'raw' && level !== 'debug') {
+      return false;
+    }
+    return true;
+  }
+
+  function shouldExpandInlineEvent(item: ChatItem): boolean {
+    return shouldShowItem(item, verbosity) && isThinkingItem(item) && shouldExpandThinkingByDefault;
+  }
+
+  function setVerbosity(level: VerbosityMode) {
+    openComposerMenu = null;
+    verbosity = level;
+    writeVerbosityToStorage(level);
   }
 
   async function submitSlashCommand(confirmed = false) {
@@ -577,7 +626,7 @@
     });
   }
 
-  function toggleComposerMenu(menu: 'mode' | 'model' | 'reasoning') {
+  function toggleComposerMenu(menu: 'mode' | 'model' | 'reasoning' | 'verbosity') {
     openComposerMenu = openComposerMenu === menu ? null : menu;
   }
 
@@ -927,13 +976,13 @@
   </header>
 
   <div class="event-stream" bind:this={eventStream}>
-    {#if items.length === 0}
+    {#if visibleItems.length === 0}
       <div class="empty-state">
         <strong>No events yet</strong>
         <span>Send a message or wait for the connected runner to stream normalized events.</span>
       </div>
     {:else}
-      {#each items as item (item.id)}
+      {#each visibleItems as item (item.id)}
         {#if item.kind === 'user'}
           <article class="message-row user-message">
             <!-- <span>You</span> -->
@@ -945,7 +994,7 @@
             <MarkdownBlock content={item.content} />
           </article>
         {:else if item.kind === 'inlineEvent'}
-          <InlineEventRow {item} />
+          <InlineEventRow expandedByDefault={shouldExpandInlineEvent(item)} {item} />
         {:else if item.kind === 'subagent'}
           <SubagentEventRow {item} />
         {:else if item.kind === 'plan'}
@@ -1244,6 +1293,28 @@
                 on:click={() => chooseReasoning(effort)}
               >
                 {effort}
+              </button>
+            {/each}
+          </span>
+        {/if}
+      </span>
+      <span class="composer-dot" aria-hidden="true">·</span>
+      <span class="composer-chip-wrap">
+        <button
+          aria-expanded={openComposerMenu === 'verbosity'}
+          aria-label="Transcript verbosity"
+          class="composer-chip"
+          type="button"
+          on:click={() => toggleComposerMenu('verbosity')}
+        >
+          {verbosity}
+          <AgenterIcon name="chevron" size={14} />
+        </button>
+        {#if openComposerMenu === 'verbosity'}
+          <span class="composer-chip-menu">
+            {#each VERBOSITY_OPTIONS as option}
+              <button class:active={verbosity === option} type="button" on:click={() => setVerbosity(option)}>
+                {option}
               </button>
             {/each}
           </span>

@@ -2830,17 +2830,84 @@ fn collect_codex_history_items(value: &Value, items: &mut Vec<DiscoveredSessionH
     }
 }
 
+fn codex_history_message_has_fallback_content(value: &Value) -> bool {
+    match value.get("content") {
+        Some(Value::Array(parts)) => !parts.is_empty(),
+        Some(Value::Object(_)) => true,
+        _ => false,
+    }
+}
+
+fn codex_history_plan_text_content(value: &Value) -> Option<String> {
+    codex_text_content(value).or_else(|| {
+        string_at(value, &["/text"])
+            .map(str::to_owned)
+            .filter(|s| !s.is_empty())
+    })
+}
+
+fn codex_history_command_line(value: &Value) -> Option<String> {
+    string_at(
+        value,
+        &[
+            "/command",
+            "/cmdLine",
+            "/cmd",
+            "/executable",
+            "/shellCommand",
+        ],
+    )
+    .map(str::to_owned)
+    .or_else(|| {
+        value
+            .pointer("/argv")
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        Value::String(s) => Some(s.as_str()),
+                        _ => part.as_str(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+    })
+    .filter(|line| !line.is_empty())
+}
+
+fn codex_history_thread_item_provider_event(
+    value: &Value,
+    wire_type: &str,
+) -> DiscoveredSessionHistoryItem {
+    let detail = string_at(value, &["/summary", "/prompt", "/message"]).map(str::to_owned);
+    DiscoveredSessionHistoryItem::ProviderEvent {
+        event_id: string_at(value, &["/id", "/messageId"]).map(str::to_owned),
+        category: "codex_thread_item".to_owned(),
+        title: wire_type.to_owned(),
+        detail,
+        status: string_at(value, &["/status"]).map(str::to_owned),
+        provider_payload: Some(value.clone()),
+    }
+}
+
 fn collect_codex_history_item(value: &Value, items: &mut Vec<DiscoveredSessionHistoryItem>) {
-    match value.get("type").and_then(Value::as_str) {
-        Some("userMessage") => {
+    let Some(wire_type) = value.get("type").and_then(Value::as_str) else {
+        return;
+    };
+
+    match wire_type {
+        "userMessage" => {
             if let Some(content) = codex_text_content(value) {
                 items.push(DiscoveredSessionHistoryItem::UserMessage {
                     message_id: string_at(value, &["/id", "/messageId"]).map(str::to_owned),
                     content,
                 });
+            } else if codex_history_message_has_fallback_content(value) {
+                items.push(codex_history_thread_item_provider_event(value, wire_type));
             }
         }
-        Some("agentMessage") => {
+        "agentMessage" => {
             if let Some(content) = codex_text_content(value) {
                 items.push(DiscoveredSessionHistoryItem::AgentMessage {
                     message_id: string_at(value, &["/id", "/messageId"])
@@ -2848,12 +2915,14 @@ fn collect_codex_history_item(value: &Value, items: &mut Vec<DiscoveredSessionHi
                         .to_owned(),
                     content,
                 });
+            } else if codex_history_message_has_fallback_content(value) {
+                items.push(codex_history_thread_item_provider_event(value, wire_type));
             }
         }
-        Some("commandExecution") => {
-            if let Some(command) = string_at(value, &["/command"]) {
+        "commandExecution" => {
+            if let Some(command) = codex_history_command_line(value) {
                 let status = string_at(value, &["/status"]);
-                let exit_code = integer_at(value, &["/exitCode"]).map(|value| value as i32);
+                let exit_code = integer_at(value, &["/exitCode"]).map(|code| code as i32);
                 let success = exit_code
                     .map(|code| code == 0)
                     .unwrap_or(status != Some("failed"));
@@ -2861,26 +2930,30 @@ fn collect_codex_history_item(value: &Value, items: &mut Vec<DiscoveredSessionHi
                     command_id: string_at(value, &["/id"])
                         .unwrap_or("codex-command")
                         .to_owned(),
-                    command: command.to_owned(),
+                    command,
                     cwd: string_at(value, &["/cwd"]).map(str::to_owned),
                     source: string_at(value, &["/source"]).map(str::to_owned),
                     process_id: string_at(value, &["/processId"]).map(str::to_owned),
                     duration_ms: integer_at(value, &["/durationMs"])
-                        .and_then(|value| value.try_into().ok()),
+                        .and_then(|dur| dur.try_into().ok()),
                     actions: codex_history_command_actions(value),
                     output: string_at(value, &["/aggregatedOutput"]).map(str::to_owned),
                     exit_code,
                     success,
                     provider_payload: Some(value.clone()),
                 });
+            } else {
+                items.push(codex_history_thread_item_provider_event(value, wire_type));
             }
         }
-        Some("fileChange") => {
+        "fileChange" => {
+            let mut pushed = false;
             if let Some(changes) = value.get("changes").and_then(Value::as_array) {
                 for (index, change) in changes.iter().enumerate() {
                     let Some(path) = string_at(change, &["/path"]) else {
                         continue;
                     };
+                    pushed = true;
                     let change_id = format!(
                         "{}:{index}",
                         string_at(value, &["/id"]).unwrap_or("codex-file-change")
@@ -2895,8 +2968,11 @@ fn collect_codex_history_item(value: &Value, items: &mut Vec<DiscoveredSessionHi
                     });
                 }
             }
+            if !pushed {
+                items.push(codex_history_thread_item_provider_event(value, wire_type));
+            }
         }
-        Some("collabAgentToolCall") => {
+        "collabAgentToolCall" => {
             let status = codex_history_tool_status(value);
             items.push(DiscoveredSessionHistoryItem::Tool {
                 tool_call_id: string_at(value, &["/id"])
@@ -2912,19 +2988,44 @@ fn collect_codex_history_item(value: &Value, items: &mut Vec<DiscoveredSessionHi
                 provider_payload: Some(value.clone()),
             });
         }
-        Some("plan") => {
-            if let Some(content) = string_at(value, &["/text", "/content"]) {
+        "mcpToolCall" => {
+            let status = codex_history_tool_status(value);
+            let server_name = value
+                .get("serverInfo")
+                .and_then(|info| string_at(info, &["/name"]));
+            let name = string_at(value, &["/tool", "/name"])
+                .or(server_name)
+                .unwrap_or("mcp_tool");
+            items.push(DiscoveredSessionHistoryItem::Tool {
+                tool_call_id: string_at(value, &["/id"])
+                    .unwrap_or("codex-mcp-tool")
+                    .to_owned(),
+                name: name.to_owned(),
+                title: Some(name.to_owned()),
+                status,
+                input: Some(value.clone()),
+                output: value
+                    .get("output")
+                    .cloned()
+                    .or_else(|| value.get("result").cloned()),
+                provider_payload: Some(value.clone()),
+            });
+        }
+        "plan" => {
+            if let Some(content) = codex_history_plan_text_content(value) {
                 items.push(DiscoveredSessionHistoryItem::Plan {
                     plan_id: string_at(value, &["/id"])
                         .unwrap_or("codex-plan")
                         .to_owned(),
                     title: Some("Implementation plan".to_owned()),
-                    content: content.to_owned(),
+                    content,
                     provider_payload: Some(value.clone()),
                 });
+            } else {
+                items.push(codex_history_thread_item_provider_event(value, wire_type));
             }
         }
-        Some("contextCompaction") => {
+        "contextCompaction" => {
             items.push(DiscoveredSessionHistoryItem::ProviderEvent {
                 event_id: string_at(value, &["/id"]).map(str::to_owned),
                 category: "compaction".to_owned(),
@@ -2934,7 +3035,9 @@ fn collect_codex_history_item(value: &Value, items: &mut Vec<DiscoveredSessionHi
                 provider_payload: Some(value.clone()),
             });
         }
-        _ => {}
+        _ => {
+            items.push(codex_history_thread_item_provider_event(value, wire_type));
+        }
     }
 }
 
@@ -4202,6 +4305,143 @@ mod tests {
                     })),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn codex_history_preserves_argv_commands_mcp_tools_and_unknown_types() {
+        let read_response = json!({
+            "id": 6,
+            "result": {
+                "thread": {
+                    "turns": [
+                        {
+                            "items": [
+                                {
+                                    "type": "commandExecution",
+                                    "id": "argv-cmd",
+                                    "argv": ["git", "status"],
+                                    "cwd": "/repo",
+                                    "status": "completed",
+                                    "exitCode": 0,
+                                    "aggregatedOutput": "clean"
+                                },
+                                {
+                                    "type": "mcpToolCall",
+                                    "id": "mcp-1",
+                                    "name": "read_file",
+                                    "status": "completed",
+                                    "arguments": {"path": "README.md"}
+                                },
+                                {
+                                    "type": "orphanGadget",
+                                    "id": "og-1",
+                                    "status": "done",
+                                    "summary": "experimental row"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(
+            codex_history_from_thread_read_response(&read_response),
+            vec![
+                DiscoveredSessionHistoryItem::Command {
+                    command_id: "argv-cmd".to_owned(),
+                    command: "git status".to_owned(),
+                    cwd: Some("/repo".to_owned()),
+                    source: None,
+                    process_id: None,
+                    duration_ms: None,
+                    actions: vec![],
+                    output: Some("clean".to_owned()),
+                    exit_code: Some(0),
+                    success: true,
+                    provider_payload: Some(json!({
+                        "type": "commandExecution",
+                        "id": "argv-cmd",
+                        "argv": ["git", "status"],
+                        "cwd": "/repo",
+                        "status": "completed",
+                        "exitCode": 0,
+                        "aggregatedOutput": "clean"
+                    })),
+                },
+                DiscoveredSessionHistoryItem::Tool {
+                    tool_call_id: "mcp-1".to_owned(),
+                    name: "read_file".to_owned(),
+                    title: Some("read_file".to_owned()),
+                    status: DiscoveredToolStatus::Completed,
+                    input: Some(json!({
+                        "type": "mcpToolCall",
+                        "id": "mcp-1",
+                        "name": "read_file",
+                        "status": "completed",
+                        "arguments": {"path": "README.md"}
+                    })),
+                    output: None,
+                    provider_payload: Some(json!({
+                        "type": "mcpToolCall",
+                        "id": "mcp-1",
+                        "name": "read_file",
+                        "status": "completed",
+                        "arguments": {"path": "README.md"}
+                    })),
+                },
+                DiscoveredSessionHistoryItem::ProviderEvent {
+                    event_id: Some("og-1".to_owned()),
+                    category: "codex_thread_item".to_owned(),
+                    title: "orphanGadget".to_owned(),
+                    detail: Some("experimental row".to_owned()),
+                    status: Some("done".to_owned()),
+                    provider_payload: Some(json!({
+                        "type": "orphanGadget",
+                        "id": "og-1",
+                        "status": "done",
+                        "summary": "experimental row"
+                    })),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_history_user_message_multimodal_falls_back_to_provider_event() {
+        let read_response = json!({
+            "result": {
+                "thread": {
+                    "turns": [
+                        {
+                            "items": [
+                                {
+                                    "type": "userMessage",
+                                    "id": "u-img",
+                                    "content": [{"type": "input_image", "imageId": "img-9"}]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(
+            codex_history_from_thread_read_response(&read_response),
+            vec![DiscoveredSessionHistoryItem::ProviderEvent {
+                event_id: Some("u-img".to_owned()),
+                category: "codex_thread_item".to_owned(),
+                title: "userMessage".to_owned(),
+                detail: None,
+                status: None,
+                provider_payload: Some(json!({
+                    "type": "userMessage",
+                    "id": "u-img",
+                    "content": [{"type": "input_image", "imageId": "img-9"}]
+                })),
+            },]
         );
     }
 
