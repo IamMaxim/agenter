@@ -2,18 +2,46 @@ import type {
   AgentCollaborationMode,
   AgentModelOption,
   AgentOptions,
+  ApprovalKind,
+  ApprovalOption,
+  ApprovalOptionKind,
+  ApprovalRequest,
+  ArtifactKind,
+  ArtifactState,
   AgentReasoningEffort,
   AgentTurnSettings,
   AppEventType,
+  BrowserSessionSnapshot,
   BrowserEventEnvelope,
+  CapabilitySet,
+  ContentBlock,
+  ContentBlockKind,
+  DiffFile,
+  DiffState,
+  FileChangeKind,
+  ItemRole,
+  ItemState,
+  ItemStatus,
+  NativeRef,
+  PlanEntryStatus,
+  PlanSource,
+  PlanState,
+  PlanStatus,
   BrowserServerMessage,
   RunnerInfo,
   RunnerStatus,
   SessionInfo,
+  SessionSnapshot,
   SessionStatus,
   SessionUsageContext,
   SessionUsageSnapshot,
   SessionUsageWindow,
+  TurnState,
+  TurnStatus,
+  UniversalEventEnvelope,
+  UniversalEventKind,
+  UniversalEventSource,
+  UniversalPlanEntry,
   WorkspaceRef
 } from '../api/types';
 
@@ -143,6 +171,15 @@ export function normalizeBrowserEventEnvelope(value: unknown): BrowserEventEnvel
 
 export function normalizeBrowserServerMessage(value: unknown): BrowserServerMessage {
   const record = objectRecord(value);
+  if (record.type === 'session_snapshot') {
+    return normalizeBrowserSessionSnapshot(record);
+  }
+  if (record.type === 'universal_event') {
+    return {
+      type: 'universal_event',
+      ...normalizeUniversalEventEnvelope(record)
+    };
+  }
   if (record.type === 'ack') {
     return {
       type: 'ack',
@@ -158,6 +195,282 @@ export function normalizeBrowserServerMessage(value: unknown): BrowserServerMess
     };
   }
   return normalizeBrowserEventEnvelope(value);
+}
+
+export function normalizeBrowserSessionSnapshot(value: unknown): BrowserSessionSnapshot {
+  const record = objectRecord(value);
+  return {
+    type: 'session_snapshot',
+    ...(typeof record.request_id === 'string' ? { request_id: record.request_id } : {}),
+    snapshot: normalizeSessionSnapshot(record.snapshot),
+    events: arrayValue(record.events).map(normalizeUniversalEventEnvelope),
+    latest_seq: normalizeSeq(record.latest_seq),
+    has_more: record.has_more === true
+  };
+}
+
+export function normalizeSessionSnapshot(value: unknown): SessionSnapshot {
+  const record = objectRecord(value);
+  const sessionId = typeof record.session_id === 'string' ? record.session_id : '';
+  return {
+    session_id: sessionId,
+    latest_seq: normalizeSeq(record.latest_seq),
+    info: normalizeSessionInfo(record.info) ?? null,
+    capabilities: normalizeCapabilitySet(record.capabilities),
+    turns: normalizeRecord(record.turns, normalizeTurnState),
+    items: normalizeRecord(record.items, normalizeItemState),
+    approvals: normalizeRecord(record.approvals, normalizeApprovalRequest),
+    plans: normalizeRecord(record.plans, normalizePlanState),
+    diffs: normalizeRecord(record.diffs, normalizeDiffState),
+    artifacts: normalizeRecord(record.artifacts, normalizeArtifactState),
+    active_turns: arrayValue(record.active_turns).filter(isString)
+  };
+}
+
+export function normalizeUniversalEventEnvelope(value: unknown): UniversalEventEnvelope {
+  const record = objectRecord(value);
+  const seq = normalizeSeq(record.seq);
+  if (!seq) {
+    throw new Error('Universal event is missing a valid universal seq.');
+  }
+  if (typeof record.event_id !== 'string' || record.event_id.length === 0) {
+    throw new Error('Universal event is missing event_id.');
+  }
+  if (!isUuid(record.event_id)) {
+    throw new Error('Universal event event_id must be UUID-shaped.');
+  }
+  return {
+    event_id: record.event_id,
+    seq,
+    session_id: typeof record.session_id === 'string' ? record.session_id : '',
+    turn_id: typeof record.turn_id === 'string' ? record.turn_id : null,
+    item_id: typeof record.item_id === 'string' ? record.item_id : null,
+    ts: typeof record.ts === 'string' ? record.ts : '',
+    source: typeof record.source === 'string' ? (record.source as UniversalEventSource) : 'control_plane',
+    native: normalizeNativeRef(record.native),
+    event: normalizeUniversalEventKind(record.event)
+  };
+}
+
+function normalizeUniversalEventKind(value: unknown): UniversalEventKind {
+  const record = objectRecord(value);
+  const type = typeof record.type === 'string' ? record.type : 'native.unknown';
+  const data = objectRecord(record.data);
+  switch (type) {
+    case 'session.created':
+      return { type, data: { session: normalizeSessionInfo(data.session) ?? minimalSessionInfo() } };
+    case 'turn.started':
+    case 'turn.status_changed':
+    case 'turn.completed':
+    case 'turn.failed':
+    case 'turn.cancelled':
+    case 'turn.interrupted':
+    case 'turn.detached':
+      return { type, data: { turn: normalizeTurnState(data.turn) } };
+    case 'item.created':
+      return { type, data: { item: normalizeItemState(data.item) } };
+    case 'content.delta':
+      return {
+        type,
+        data: {
+          block_id: stringOr(data.block_id, ''),
+          kind: normalizeContentBlockKind(data.kind),
+          delta: stringOr(data.delta, '')
+        }
+      };
+    case 'content.completed':
+      return {
+        type,
+        data: {
+          block_id: stringOr(data.block_id, ''),
+          kind: normalizeContentBlockKind(data.kind),
+          text: typeof data.text === 'string' ? data.text : null
+        }
+      };
+    case 'approval.requested':
+      return { type, data: { approval: normalizeApprovalRequest(data.approval) } };
+    case 'plan.updated':
+      return { type, data: { plan: normalizePlanState(data.plan) } };
+    case 'diff.updated':
+      return { type, data: { diff: normalizeDiffState(data.diff) } };
+    case 'artifact.created':
+      return { type, data: { artifact: normalizeArtifactState(data.artifact) } };
+    case 'usage.updated':
+      return { type, data: { usage: normalizeSessionUsage(data.usage) ?? {} } };
+    case 'native.unknown':
+      return { type, data: { summary: typeof data.summary === 'string' ? data.summary : null } };
+    default:
+      return { type: 'native.unknown', data: { summary: type } };
+  }
+}
+
+function normalizeCapabilitySet(value: unknown): CapabilitySet | undefined {
+  const record = objectRecord(value);
+  if (Object.keys(record).length === 0) {
+    return undefined;
+  }
+  return {
+    protocol: boolGroup(record.protocol),
+    content: boolGroup(record.content),
+    tools: boolGroup(record.tools),
+    approvals: boolGroup(record.approvals),
+    plan: boolGroup(record.plan),
+    modes: boolGroup(record.modes),
+    integration: boolGroup(record.integration)
+  };
+}
+
+function normalizeTurnState(value: unknown): TurnState {
+  const record = objectRecord(value);
+  return {
+    turn_id: stringOr(record.turn_id, ''),
+    session_id: stringOr(record.session_id, ''),
+    status: stringOr(record.status, 'running') as TurnStatus,
+    started_at: typeof record.started_at === 'string' ? record.started_at : null,
+    completed_at: typeof record.completed_at === 'string' ? record.completed_at : null,
+    model: typeof record.model === 'string' ? record.model : null,
+    mode: typeof record.mode === 'string' ? record.mode : null
+  };
+}
+
+function normalizeItemState(value: unknown): ItemState {
+  const record = objectRecord(value);
+  return {
+    item_id: stringOr(record.item_id, ''),
+    session_id: stringOr(record.session_id, ''),
+    turn_id: typeof record.turn_id === 'string' ? record.turn_id : null,
+    role: stringOr(record.role, 'system') as ItemRole,
+    status: stringOr(record.status, 'created') as ItemStatus,
+    content: arrayValue(record.content).map(normalizeContentBlock),
+    native: normalizeNativeRef(record.native)
+  };
+}
+
+function normalizeContentBlock(value: unknown): ContentBlock {
+  const record = objectRecord(value);
+  return {
+    block_id: stringOr(record.block_id, ''),
+    kind: normalizeContentBlockKind(record.kind),
+    text: typeof record.text === 'string' ? record.text : null,
+    mime_type: typeof record.mime_type === 'string' ? record.mime_type : null,
+    artifact_id: typeof record.artifact_id === 'string' ? record.artifact_id : null
+  };
+}
+
+function normalizeContentBlockKind(value: unknown): ContentBlockKind {
+  return stringOr(value, 'text') as ContentBlockKind;
+}
+
+function normalizeApprovalRequest(value: unknown): ApprovalRequest {
+  const record = objectRecord(value);
+  return {
+    approval_id: stringOr(record.approval_id, ''),
+    session_id: stringOr(record.session_id, ''),
+    turn_id: typeof record.turn_id === 'string' ? record.turn_id : null,
+    item_id: typeof record.item_id === 'string' ? record.item_id : null,
+    kind: stringOr(record.kind, 'provider_specific') as ApprovalKind,
+    title: stringOr(record.title, 'Approval requested'),
+    details: typeof record.details === 'string' ? record.details : null,
+    options: arrayValue(record.options).map(normalizeApprovalOption),
+    status: stringOr(record.status, 'pending'),
+    risk: typeof record.risk === 'string' ? record.risk : null,
+    subject: typeof record.subject === 'string' ? record.subject : null,
+    native_request_id: typeof record.native_request_id === 'string' ? record.native_request_id : null,
+    native_blocking: record.native_blocking === true,
+    policy: objectOrNull(record.policy),
+    native: normalizeNativeRef(record.native),
+    requested_at: typeof record.requested_at === 'string' ? record.requested_at : null,
+    resolved_at: typeof record.resolved_at === 'string' ? record.resolved_at : null
+  };
+}
+
+function normalizeApprovalOption(value: unknown): ApprovalOption {
+  const record = objectRecord(value);
+  return {
+    option_id: stringOr(record.option_id, ''),
+    kind: stringOr(record.kind, 'provider_specific') as ApprovalOptionKind,
+    label: stringOr(record.label, stringOr(record.option_id, 'Option')),
+    description: typeof record.description === 'string' ? record.description : null,
+    scope: typeof record.scope === 'string' ? record.scope : null,
+    native_option_id: typeof record.native_option_id === 'string' ? record.native_option_id : null
+  };
+}
+
+function normalizePlanState(value: unknown): PlanState {
+  const record = objectRecord(value);
+  return {
+    plan_id: stringOr(record.plan_id, ''),
+    session_id: stringOr(record.session_id, ''),
+    turn_id: typeof record.turn_id === 'string' ? record.turn_id : null,
+    status: stringOr(record.status, 'none') as PlanStatus,
+    title: typeof record.title === 'string' ? record.title : null,
+    content: typeof record.content === 'string' ? record.content : null,
+    entries: arrayValue(record.entries).map(normalizePlanEntry),
+    artifact_refs: arrayValue(record.artifact_refs).filter(isString),
+    source: stringOr(record.source, 'native_structured') as PlanSource,
+    partial: record.partial === true,
+    updated_at: typeof record.updated_at === 'string' ? record.updated_at : null
+  };
+}
+
+function normalizePlanEntry(value: unknown): UniversalPlanEntry {
+  const record = objectRecord(value);
+  return {
+    entry_id: stringOr(record.entry_id, ''),
+    label: stringOr(record.label, ''),
+    status: stringOr(record.status, 'pending') as PlanEntryStatus
+  };
+}
+
+function normalizeDiffState(value: unknown): DiffState {
+  const record = objectRecord(value);
+  return {
+    diff_id: stringOr(record.diff_id, ''),
+    session_id: stringOr(record.session_id, ''),
+    turn_id: typeof record.turn_id === 'string' ? record.turn_id : null,
+    title: typeof record.title === 'string' ? record.title : null,
+    files: arrayValue(record.files).map(normalizeDiffFile),
+    updated_at: typeof record.updated_at === 'string' ? record.updated_at : null
+  };
+}
+
+function normalizeDiffFile(value: unknown): DiffFile {
+  const record = objectRecord(value);
+  return {
+    path: stringOr(record.path, '(unknown)'),
+    status: stringOr(record.status, 'modified') as FileChangeKind,
+    diff: typeof record.diff === 'string' ? record.diff : null
+  };
+}
+
+function normalizeArtifactState(value: unknown): ArtifactState {
+  const record = objectRecord(value);
+  return {
+    artifact_id: stringOr(record.artifact_id, ''),
+    session_id: stringOr(record.session_id, ''),
+    turn_id: typeof record.turn_id === 'string' ? record.turn_id : null,
+    kind: stringOr(record.kind, 'native') as ArtifactKind,
+    title: stringOr(record.title, 'Artifact'),
+    uri: typeof record.uri === 'string' ? record.uri : null,
+    mime_type: typeof record.mime_type === 'string' ? record.mime_type : null,
+    created_at: typeof record.created_at === 'string' ? record.created_at : null
+  };
+}
+
+function normalizeNativeRef(value: unknown): NativeRef | null {
+  const record = objectRecord(value);
+  if (typeof record.protocol !== 'string') {
+    return null;
+  }
+  return {
+    protocol: record.protocol,
+    method: typeof record.method === 'string' ? record.method : null,
+    type: typeof record.type === 'string' ? record.type : null,
+    native_id: typeof record.native_id === 'string' ? record.native_id : null,
+    summary: typeof record.summary === 'string' ? record.summary : null,
+    hash: typeof record.hash === 'string' ? record.hash : null,
+    pointer: typeof record.pointer === 'string' ? record.pointer : null
+  };
 }
 
 function normalizeAgentModelOption(value: unknown): AgentModelOption | undefined {
@@ -294,6 +607,58 @@ function objectRecord(value: unknown): Record<string, unknown> {
 
 function arrayValue(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
+}
+
+function normalizeRecord<T>(
+  value: unknown,
+  normalize: (entry: unknown) => T
+): Record<string, T> {
+  const record = objectRecord(value);
+  return Object.fromEntries(Object.entries(record).map(([key, entry]) => [key, normalize(entry)]));
+}
+
+function boolGroup(value: unknown): Record<string, boolean> {
+  const record = objectRecord(value);
+  return Object.fromEntries(Object.entries(record).map(([key, entry]) => [key, entry === true]));
+}
+
+function stringOr(value: unknown, fallback: string): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+function normalizeSeq(value: unknown): string | undefined {
+  if (typeof value === 'string' && /^\d+$/.test(value)) {
+    return value;
+  }
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) {
+    return String(value);
+  }
+  return undefined;
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function objectOrNull(value: unknown): Record<string, unknown> | null {
+  const record = objectRecord(value);
+  return Object.keys(record).length > 0 ? record : null;
+}
+
+function minimalSessionInfo(): SessionInfo {
+  return {
+    session_id: '',
+    owner_user_id: '',
+    runner_id: '',
+    workspace_id: '',
+    provider_id: 'unknown',
+    status: 'degraded',
+    external_session_id: null,
+    title: null,
+    created_at: null,
+    updated_at: null,
+    usage: null
+  };
 }
 
 function numberOrNull(value: unknown): number | null {

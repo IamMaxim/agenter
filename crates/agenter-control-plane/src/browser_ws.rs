@@ -85,14 +85,59 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: UserId) {
         return;
     }
 
-    let (cached_events, mut events) = state.subscribe_session(subscription.session_id).await;
+    let universal_subscription = subscription.include_snapshot || subscription.after_seq.is_some();
+    let mut session_subscription = state
+        .subscribe_session(
+            subscription.session_id,
+            subscription.after_seq,
+            subscription.include_snapshot,
+        )
+        .await;
+    let mut sent_universal_events = std::collections::HashSet::new();
+    if let Some(mut snapshot) = session_subscription.snapshot.take() {
+        snapshot.request_id = subscription.request_id.clone();
+        let replay_incomplete = snapshot.has_more;
+        let latest_seq = snapshot.latest_seq;
+        for event in &snapshot.events {
+            sent_universal_events.insert((event.seq, event.event_id.clone()));
+        }
+        if send_server_message(&mut sender, BrowserServerMessage::SessionSnapshot(snapshot))
+            .await
+            .is_err()
+        {
+            tracing::warn!(%user_id, session_id = %subscription.session_id, "browser websocket failed to send session snapshot");
+            return;
+        }
+        if universal_subscription && replay_incomplete {
+            let _ = send_server_message(
+                &mut sender,
+                BrowserServerMessage::Error(BrowserError {
+                    request_id: subscription.request_id.clone(),
+                    code: "snapshot_replay_incomplete".to_owned(),
+                    message: format!(
+                        "universal event replay is incomplete; resubscribe/page from snapshot.latest_seq {latest_seq:?} before consuming live events"
+                    ),
+                }),
+            )
+            .await;
+            tracing::info!(
+                %user_id,
+                session_id = %subscription.session_id,
+                "browser websocket closed universal subscription after incomplete replay"
+            );
+            return;
+        }
+    }
     tracing::info!(
         %user_id,
         session_id = %subscription.session_id,
-        cached_event_count = cached_events.len(),
+        cached_event_count = session_subscription.cached_events.len(),
         "browser websocket subscribed"
     );
-    for event in cached_events {
+    for event in session_subscription.cached_events {
+        if universal_subscription {
+            continue;
+        }
         if send_server_message(&mut sender, BrowserServerMessage::Event(event))
             .await
             .is_err()
@@ -126,10 +171,42 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: UserId) {
                     }
                 }
             }
-            event = events.recv() => {
+            event = session_subscription.receiver.recv() => {
                 match event {
                     Ok(event) => {
-                        if send_server_message(&mut sender, BrowserServerMessage::Event(event))
+                        if universal_subscription {
+                            if let Some(universal_event) = event.universal_event {
+                                if !sent_universal_events
+                                    .insert((universal_event.seq, universal_event.event_id.clone()))
+                                {
+                                    continue;
+                                }
+                                if send_server_message(
+                                    &mut sender,
+                                    BrowserServerMessage::UniversalEvent(universal_event),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    tracing::warn!(%user_id, session_id = %subscription.session_id, "browser websocket send universal event failed");
+                                    return;
+                                }
+                            }
+                            if is_question_app_event(&event.app_event.event)
+                                && send_server_message(
+                                    &mut sender,
+                                    BrowserServerMessage::Event(event.app_event),
+                                )
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(%user_id, session_id = %subscription.session_id, "browser websocket send dual-delivered question event failed");
+                                return;
+                            }
+                        } else if send_server_message(
+                            &mut sender,
+                            BrowserServerMessage::Event(event.app_event),
+                        )
                         .await
                         .is_err()
                         {
@@ -160,6 +237,13 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: UserId) {
             }
         }
     }
+}
+
+fn is_question_app_event(event: &agenter_core::AppEvent) -> bool {
+    matches!(
+        event,
+        agenter_core::AppEvent::QuestionRequested(_) | agenter_core::AppEvent::QuestionAnswered(_)
+    )
 }
 
 async fn send_server_message(

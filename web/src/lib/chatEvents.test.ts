@@ -111,7 +111,7 @@ describe('chat event state', () => {
     expect(fileChangeApprovalFiles(row.presentation)).toEqual([
       { path: 'a.ts', changeKind: 'update', diff: '@@ stub' }
     ]);
-    expect(approvalUiChoices(row)).toEqual([
+    expect(approvalUiChoices(row).map((choice) => choice.decision)).toEqual([
       'accept',
       'accept_for_session',
       'decline',
@@ -201,7 +201,7 @@ describe('chat event state', () => {
         available_decisions: ['accept', 'acceptForSession']
       }
     };
-    expect(approvalUiChoices(item)).toEqual(['accept', 'accept_for_session']);
+    expect(approvalUiChoices(item).map((choice) => choice.decision)).toEqual(['accept', 'accept_for_session']);
   });
 
   test('maps multi-select question requests and answered events', () => {

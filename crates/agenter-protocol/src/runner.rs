@@ -1,8 +1,10 @@
 use agenter_core::{
     AgentCapabilities, AgentOptions, AgentProviderId, AgentQuestionAnswer, AgentTurnSettings,
-    AppEvent, ApprovalDecision, ApprovalId, FileChangeKind, SessionId, SlashCommandDefinition,
-    SlashCommandRequest, SlashCommandResult, UserMessageEvent, WorkspaceRef,
+    AppEvent, ApprovalDecision, ApprovalId, FileChangeKind, ItemId, NativeRef, SessionId,
+    SlashCommandDefinition, SlashCommandRequest, SlashCommandResult, TurnId, UniversalEventKind,
+    UniversalEventSource, UserMessageEvent, WorkspaceRef,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -20,7 +22,7 @@ pub enum RunnerClientMessage {
     #[serde(rename = "runner_response")]
     Response(RunnerResponseEnvelope),
     #[serde(rename = "runner_event")]
-    Event(RunnerEventEnvelope),
+    Event(Box<RunnerEventEnvelope>),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -30,6 +32,8 @@ pub enum RunnerServerMessage {
     Command(Box<RunnerCommandEnvelope>),
     #[serde(rename = "runner_heartbeat_ack")]
     HeartbeatAck(RunnerHeartbeatAck),
+    #[serde(rename = "runner_event_ack")]
+    EventAck(RunnerEventAck),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -38,6 +42,10 @@ pub struct RunnerHello {
     pub protocol_version: String,
     pub token: String,
     pub capabilities: RunnerCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acked_runner_event_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_from_runner_event_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspaces: Vec<WorkspaceRef>,
 }
@@ -67,6 +75,11 @@ pub struct RunnerHeartbeat {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunnerHeartbeatAck {
     pub sequence: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RunnerEventAck {
+    pub runner_event_seq: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -219,13 +232,17 @@ pub struct RunnerError {
 pub struct RunnerEventEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<RequestId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_event_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acked_runner_event_seq: Option<u64>,
     pub event: RunnerEvent,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunnerEvent {
-    AgentEvent(AgentEvent),
+    AgentEvent(Box<AgentEvent>),
     HealthChanged(RunnerHealthChanged),
     SessionsDiscovered(DiscoveredSessions),
     Error(RunnerError),
@@ -235,6 +252,24 @@ pub enum RunnerEvent {
 pub struct AgentEvent {
     pub session_id: SessionId,
     pub event: AppEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub universal_event: Option<AgentUniversalEvent>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AgentUniversalEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<ItemId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts: Option<DateTime<Utc>>,
+    pub source: UniversalEventSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeRef>,
+    pub event: UniversalEventKind,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -419,6 +454,8 @@ mod tests {
                 transports: vec!["stdio".to_owned()],
                 workspace_discovery: false,
             },
+            acked_runner_event_seq: Some(40),
+            replay_from_runner_event_seq: Some(41),
             workspaces: vec![WorkspaceRef {
                 workspace_id: WorkspaceId::nil(),
                 runner_id: RunnerId::nil(),
@@ -434,6 +471,8 @@ mod tests {
         assert_eq!(json["type"], "runner_hello");
         assert_eq!(json["runner_id"], RunnerId::nil().to_string());
         assert_eq!(json["protocol_version"], PROTOCOL_VERSION);
+        assert_eq!(json["acked_runner_event_seq"], 40);
+        assert_eq!(json["replay_from_runner_event_seq"], 41);
         assert_eq!(
             json["capabilities"]["agent_providers"][0]["provider_id"],
             "codex"
@@ -541,6 +580,8 @@ mod tests {
                 provider_id: AgentProviderId::from(AgentProviderId::CODEX),
                 command: agenter_core::SlashCommandRequest {
                     command_id: "codex.compact".to_owned(),
+                    universal_command_id: None,
+                    idempotency_key: None,
                     arguments: serde_json::json!({}),
                     raw_input: "/compact".to_owned(),
                     confirmed: false,
@@ -574,9 +615,11 @@ mod tests {
 
     #[test]
     fn round_trips_agent_event() {
-        let message = RunnerClientMessage::Event(RunnerEventEnvelope {
+        let message = RunnerClientMessage::Event(Box::new(RunnerEventEnvelope {
             request_id: Some(RequestId::from("event-1")),
-            event: RunnerEvent::AgentEvent(AgentEvent {
+            runner_event_seq: Some(123),
+            acked_runner_event_seq: Some(122),
+            event: RunnerEvent::AgentEvent(Box::new(AgentEvent {
                 session_id: SessionId::nil(),
                 event: AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {
                     session_id: SessionId::nil(),
@@ -584,8 +627,27 @@ mod tests {
                     delta: "hello".to_owned(),
                     provider_payload: None,
                 }),
-            }),
-        });
+                universal_event: Some(AgentUniversalEvent {
+                    event_id: Some("11111111-1111-1111-1111-111111111111".to_owned()),
+                    turn_id: None,
+                    item_id: None,
+                    ts: None,
+                    source: UniversalEventSource::Native,
+                    native: Some(NativeRef {
+                        protocol: "codex-app-server".to_owned(),
+                        method: Some("thread/item".to_owned()),
+                        kind: Some("codex".to_owned()),
+                        native_id: Some("native-msg-1".to_owned()),
+                        summary: Some("native message".to_owned()),
+                        hash: None,
+                        pointer: None,
+                    }),
+                    event: UniversalEventKind::NativeUnknown {
+                        summary: Some("native message".to_owned()),
+                    },
+                }),
+            })),
+        }));
 
         let json = serde_json::to_value(&message).expect("serialize event");
         let decoded: RunnerClientMessage =
@@ -593,9 +655,66 @@ mod tests {
 
         assert_eq!(json["type"], "runner_event");
         assert_eq!(json["request_id"], "event-1");
+        assert_eq!(json["runner_event_seq"], 123);
+        assert_eq!(json["acked_runner_event_seq"], 122);
         assert_eq!(json["event"]["type"], "agent_event");
         assert_eq!(json["event"]["event"]["type"], "agent_message_delta");
+        assert_eq!(
+            json["event"]["universal_event"]["native"]["protocol"],
+            "codex-app-server"
+        );
+        assert_eq!(
+            json["event"]["universal_event"]["event"]["type"],
+            "native.unknown"
+        );
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn round_trips_runner_event_ack() {
+        let message = RunnerServerMessage::EventAck(RunnerEventAck {
+            runner_event_seq: 123,
+        });
+
+        let json = serde_json::to_value(&message).expect("serialize ack");
+        let decoded: RunnerServerMessage =
+            serde_json::from_value(json.clone()).expect("deserialize ack");
+
+        assert_eq!(json["type"], "runner_event_ack");
+        assert_eq!(json["runner_event_seq"], 123);
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn decodes_legacy_runner_event_without_universal_ack_fields() {
+        let json = serde_json::json!({
+            "type": "runner_event",
+            "request_id": "legacy-event-1",
+            "event": {
+                "type": "agent_event",
+                "session_id": SessionId::nil(),
+                "event": {
+                    "type": "user_message",
+                    "payload": {
+                        "session_id": SessionId::nil(),
+                        "message_id": "msg-1",
+                        "content": "hello"
+                    }
+                }
+            }
+        });
+
+        let decoded: RunnerClientMessage =
+            serde_json::from_value(json).expect("deserialize legacy runner event");
+
+        match decoded {
+            RunnerClientMessage::Event(envelope) => {
+                assert_eq!(envelope.request_id, Some(RequestId::from("legacy-event-1")));
+                assert_eq!(envelope.runner_event_seq, None);
+                assert_eq!(envelope.acked_runner_event_seq, None);
+            }
+            other => panic!("unexpected message {other:?}"),
+        }
     }
 
     #[test]
@@ -606,8 +725,10 @@ mod tests {
             path: "/work/agenter".to_owned(),
             display_name: Some("agenter".to_owned()),
         };
-        let message = RunnerClientMessage::Event(RunnerEventEnvelope {
+        let message = RunnerClientMessage::Event(Box::new(RunnerEventEnvelope {
             request_id: None,
+            runner_event_seq: None,
+            acked_runner_event_seq: None,
             event: RunnerEvent::SessionsDiscovered(DiscoveredSessions {
                 workspace: workspace.clone(),
                 provider_id: AgentProviderId::from(AgentProviderId::CODEX),
@@ -628,7 +749,7 @@ mod tests {
                     ],
                 }],
             }),
-        });
+        }));
 
         let json = serde_json::to_value(&message).expect("serialize discovered sessions");
         let decoded: RunnerClientMessage =
@@ -657,8 +778,10 @@ mod tests {
             path: "/work/agenter".to_owned(),
             display_name: None,
         };
-        let message = RunnerClientMessage::Event(RunnerEventEnvelope {
+        let message = RunnerClientMessage::Event(Box::new(RunnerEventEnvelope {
             request_id: Some(RequestId::from("refresh-1")),
+            runner_event_seq: None,
+            acked_runner_event_seq: None,
             event: RunnerEvent::SessionsDiscovered(DiscoveredSessions {
                 workspace,
                 provider_id: AgentProviderId::from(AgentProviderId::CODEX),
@@ -672,7 +795,7 @@ mod tests {
                     history: Vec::new(),
                 }],
             }),
-        });
+        }));
 
         let json = serde_json::to_value(&message).expect("serialize discovered sessions");
         let decoded: RunnerClientMessage =

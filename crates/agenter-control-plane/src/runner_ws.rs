@@ -1,7 +1,8 @@
 use agenter_core::{AppEvent, SessionId};
 use agenter_protocol::runner::{
-    AgentEvent, RunnerClientMessage, RunnerCommand, RunnerEvent, RunnerHeartbeat,
-    RunnerResponseEnvelope, RunnerServerMessage, PROTOCOL_VERSION,
+    AgentEvent, RunnerClientMessage, RunnerCommand, RunnerEvent, RunnerEventAck,
+    RunnerEventEnvelope, RunnerHeartbeat, RunnerResponseEnvelope, RunnerServerMessage,
+    PROTOCOL_VERSION,
 };
 use agenter_protocol::{
     chunk_message, reassemble_message, RunnerTransportChunkFrame, RunnerTransportChunkReassembler,
@@ -89,6 +90,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let connection_id = state
         .connect_runner(runner.runner_id, outbound_sender)
         .await;
+    state
+        .seed_runner_event_ack(runner.runner_id, hello.acked_runner_event_seq)
+        .await;
 
     loop {
         tokio::select! {
@@ -97,32 +101,85 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     Some(Ok(Message::Text(text))) => {
                         match classify_runner_client_text(&mut runner_message_reassembler, &text) {
                             Ok(Some(RunnerClientFrame::Event(envelope))) => {
-                                match envelope.event {
-                                    RunnerEvent::AgentEvent(AgentEvent { session_id, event }) => {
-                                    if app_event_session_id(&event) != Some(session_id) {
-                                        tracing::warn!(
-                                            %session_id,
-                                            "runner event envelope session_id did not match embedded event"
-                                        );
-                                        continue;
-                                    }
-                                    state.publish_event(session_id, event).await;
-                                    }
-                                    RunnerEvent::SessionsDiscovered(discovered) => {
-                                        let request_id = envelope.request_id.clone();
-                                        let import_mode = if request_id.is_some() {
-                                            crate::state::SessionImportMode::Forced
-                                        } else {
-                                            crate::state::SessionImportMode::Automatic
-                                        };
-                                        let summary = state
-                                            .import_discovered_sessions(runner.runner_id, discovered, import_mode)
-                                            .await;
-                                        if let Some(request_id) = request_id {
-                                            state.record_refresh_summary(request_id, summary).await;
+                                let runner_event_seq = envelope.runner_event_seq;
+                                let duplicate = state
+                                    .runner_event_already_accepted(
+                                        runner.runner_id,
+                                        runner_event_seq,
+                                    )
+                                    .await;
+                                let mut accepted = duplicate;
+                                if !duplicate {
+                                    match envelope.event {
+                                        RunnerEvent::AgentEvent(agent_event) => {
+                                            let AgentEvent {
+                                                session_id,
+                                                event,
+                                                universal_event,
+                                            } = *agent_event;
+                                            if app_event_session_id(&event) != Some(session_id) {
+                                                tracing::warn!(
+                                                    %session_id,
+                                                    "runner event envelope session_id did not match embedded event"
+                                                );
+                                                continue;
+                                            }
+                                            match state.accept_runner_agent_event(session_id, event, universal_event).await {
+                                                Ok(_) => {
+                                                    accepted = true;
+                                                }
+                                                Err(error) => {
+                                                    tracing::warn!(
+                                                        runner_id = %runner.runner_id,
+                                                        runner_event_seq = ?runner_event_seq,
+                                                        %error,
+                                                        "runner app event was not accepted; withholding ack"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        RunnerEvent::SessionsDiscovered(discovered) => {
+                                            let db_backed = state.db_pool().is_some();
+                                            accepted = state
+                                                .process_runner_discovered_sessions(
+                                                    runner.runner_id,
+                                                    envelope.request_id.clone(),
+                                                    discovered,
+                                                )
+                                                .await;
+                                            if db_backed && !accepted {
+                                                tracing::warn!(
+                                                    runner_id = %runner.runner_id,
+                                                    runner_event_seq = ?runner_event_seq,
+                                                    "processed discovered sessions but withholding ack because import did not complete successfully"
+                                                );
+                                            }
+                                        }
+                                        RunnerEvent::HealthChanged(_) | RunnerEvent::Error(_) => {
+                                            accepted = true;
                                         }
                                     }
-                                    RunnerEvent::HealthChanged(_) | RunnerEvent::Error(_) => {}
+                                }
+                                if accepted {
+                                if let Some(seq) = runner_event_seq {
+                                    state.mark_runner_event_accepted(runner.runner_id, seq).await;
+                                    if let Err(error) = send_server_message(
+                                        &mut sender,
+                                        RunnerServerMessage::EventAck(RunnerEventAck {
+                                            runner_event_seq: seq,
+                                        }),
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            runner_id = %runner.runner_id,
+                                            runner_event_seq = seq,
+                                            %error,
+                                            "runner event ack send failed"
+                                        );
+                                        break;
+                                    }
+                                }
                                 }
                             }
                                 Ok(Some(RunnerClientFrame::Response(response))) => {
@@ -238,6 +295,7 @@ fn runner_server_message_type(message: &RunnerServerMessage) -> &'static str {
     match message {
         RunnerServerMessage::Command(_) => "runner_command",
         RunnerServerMessage::HeartbeatAck(_) => "runner_heartbeat_ack",
+        RunnerServerMessage::EventAck(_) => "runner_event_ack",
     }
 }
 
@@ -258,7 +316,7 @@ enum RunnerClientFrame {
     Hello,
     Heartbeat(RunnerHeartbeat),
     Response(RunnerResponseEnvelope),
-    Event(agenter_protocol::runner::RunnerEventEnvelope),
+    Event(RunnerEventEnvelope),
 }
 
 fn classify_runner_client_text(
@@ -274,7 +332,7 @@ fn classify_runner_client_text(
             Ok(Some(RunnerClientFrame::Heartbeat(heartbeat)))
         }
         RunnerClientMessage::Response(response) => Ok(Some(RunnerClientFrame::Response(response))),
-        RunnerClientMessage::Event(event) => Ok(Some(RunnerClientFrame::Event(event))),
+        RunnerClientMessage::Event(event) => Ok(Some(RunnerClientFrame::Event(*event))),
     }
 }
 

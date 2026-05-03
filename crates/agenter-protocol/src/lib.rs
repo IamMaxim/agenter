@@ -6,7 +6,10 @@ pub mod runner_transport;
 
 use serde::{Deserialize, Serialize};
 
-pub use browser::{BrowserClientMessage, BrowserEventEnvelope, BrowserServerMessage};
+pub use browser::{
+    BrowserClientMessage, BrowserEventEnvelope, BrowserServerMessage, BrowserSessionSnapshot,
+    SubscribeSession,
+};
 pub use runner::{
     AgentEvent, AgentInput, AgentInputCommand, AgentProviderAdvertisement, ApprovalAnswerCommand,
     CreateSessionCommand, DiscoveredCommandAction, DiscoveredFileChangeStatus, DiscoveredSession,
@@ -84,8 +87,10 @@ mod runner_transport_tests {
     };
 
     fn oversized_discovered_sessions_message(bytes: usize) -> RunnerClientMessage {
-        RunnerClientMessage::Event(RunnerEventEnvelope {
+        RunnerClientMessage::Event(Box::new(RunnerEventEnvelope {
             request_id: None,
+            runner_event_seq: None,
+            acked_runner_event_seq: None,
             event: RunnerEvent::SessionsDiscovered(DiscoveredSessions {
                 workspace: WorkspaceRef {
                     workspace_id: WorkspaceId::nil(),
@@ -111,7 +116,7 @@ mod runner_transport_tests {
                     }],
                 }],
             }),
-        })
+        }))
     }
 
     fn frame_json_len(frame: &RunnerTransportOutboundFrame) -> usize {

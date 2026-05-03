@@ -25,6 +25,16 @@
   </div>
   <strong>{item.title}</strong>
   <MarkdownBlock content={item.content} />
+  {#if item.entries && item.entries.length > 0}
+    <ol class="plan-entry-list">
+      {#each item.entries as entry}
+        <li class:done={entry.status === 'completed'} class:active={entry.status === 'in_progress' || entry.status === 'implementing'} class:error={entry.status === 'failed' || entry.status === 'cancelled'}>
+          <span>{entry.label}</span>
+          <code>{entry.status}</code>
+        </li>
+      {/each}
+    </ol>
+  {/if}
   {#if pendingHandoff}
     <div class="plan-handoff" role="group" aria-label="Implement this plan?">
       <span class="plan-handoff-title">Implement this plan?</span>
@@ -78,5 +88,38 @@
     display: flex;
     flex-wrap: wrap;
     gap: 0.5rem;
+  }
+
+  .plan-entry-list {
+    display: grid;
+    gap: 0.35rem;
+    margin: 0.75rem 0 0;
+    padding-left: 1.25rem;
+  }
+
+  .plan-entry-list li {
+    padding-left: 0.25rem;
+  }
+
+  .plan-entry-list li::marker {
+    color: var(--text-muted, rgba(255, 255, 255, 0.55));
+  }
+
+  .plan-entry-list li.done span {
+    text-decoration: line-through;
+    opacity: 0.75;
+  }
+
+  .plan-entry-list li.active span {
+    font-weight: 600;
+  }
+
+  .plan-entry-list li.error span {
+    color: var(--danger, #ff8a8a);
+  }
+
+  .plan-entry-list code {
+    margin-left: 0.4rem;
+    opacity: 0.7;
   }
 </style>

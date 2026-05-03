@@ -1,14 +1,19 @@
 use agenter_core::{
     AgentProviderId, AgentTurnSettings, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind,
-    RunnerId, SessionId, SessionStatus, SessionUsageSnapshot, UserId, WorkspaceId,
+    ApprovalRequest, ApprovalStatus as UniversalApprovalStatus, CommandId, ItemId, RunnerId,
+    SessionId, SessionSnapshot, SessionStatus, SessionUsageSnapshot, TurnId,
+    UniversalEventEnvelope, UniversalEventKind, UniversalEventSource, UniversalSeq, UserId,
+    WorkspaceId,
 };
 use chrono::{DateTime, Utc};
-use sqlx::{postgres::PgRow, PgPool, Result, Row};
+use sqlx::{postgres::PgRow, PgPool, Postgres, Result, Row, Transaction};
 use uuid::Uuid;
 
 use crate::models::{
-    AgentSession, AgentSessionWithWorkspace, BrowserAuthSession, CachedEvent, ConnectorAccount,
-    ConnectorLinkCode, OidcLoginState, OidcProvider, PendingApproval, Runner, User, Workspace,
+    AgentEvent, AgentSession, AgentSessionWithWorkspace, BrowserAuthSession, CachedEvent,
+    CommandIdempotencyRecord, CommandIdempotencyStatus, ConnectorAccount, ConnectorLinkCode,
+    OidcLoginState, OidcProvider, PendingApproval, Runner, StoredSessionSnapshot,
+    UniversalAppendOutcome, User, Workspace,
 };
 
 #[derive(Clone, Debug)]
@@ -900,6 +905,38 @@ pub async fn clear_event_cache(pool: &PgPool, session_id: SessionId) -> Result<(
     Ok(())
 }
 
+/// Clears Agenter's compatibility projection for a session before rewriting history
+/// from native-agent discovery. Native harness history remains the source of truth.
+pub async fn clear_session_event_projection(pool: &PgPool, session_id: SessionId) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("select 1 from agent_sessions where session_id = $1 for update")
+        .bind(session_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+    sqlx::query("delete from event_cache where session_id = $1")
+        .bind(session_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from event_cache_cursors where session_id = $1")
+        .bind(session_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from recent_turn_caches where session_id = $1")
+        .bind(session_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from session_snapshots where session_id = $1")
+        .bind(session_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from agent_events where session_id = $1")
+        .bind(session_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn append_event_cache(
     pool: &PgPool,
     session_id: SessionId,
@@ -938,6 +975,222 @@ pub async fn append_event_cache(
     cached_event_from_row(&row)
 }
 
+pub async fn append_universal_event(
+    pool: &PgPool,
+    workspace_id: WorkspaceId,
+    envelope: UniversalEventEnvelope,
+    command_id: Option<CommandId>,
+) -> Result<AgentEvent> {
+    let mut tx = pool.begin().await?;
+    let event = insert_universal_event_tx(&mut tx, workspace_id, &envelope, command_id).await?;
+    tx.commit().await?;
+    Ok(event)
+}
+
+pub async fn append_universal_event_reducing_snapshot<F>(
+    pool: &PgPool,
+    workspace_id: WorkspaceId,
+    envelope: UniversalEventEnvelope,
+    command_id: Option<CommandId>,
+    legacy_event: Option<&AppEvent>,
+    reduce: F,
+) -> Result<UniversalAppendOutcome>
+where
+    F: FnOnce(&mut SessionSnapshot, &UniversalEventEnvelope) + Send,
+{
+    let mut tx = pool.begin().await?;
+    lock_session_for_projection_tx(&mut tx, envelope.session_id).await?;
+    let event = insert_universal_event_tx(&mut tx, workspace_id, &envelope, command_id).await?;
+    if let UniversalEventKind::ApprovalRequested { approval } = &event.event {
+        if is_resolved_universal_approval_status(&approval.status) {
+            resolve_pending_approval_from_universal_tx(&mut tx, approval).await?;
+        } else {
+            materialize_pending_approval_tx(&mut tx, approval).await?;
+        }
+    }
+    let mut snapshot = load_session_snapshot_for_update_tx(&mut tx, event.session_id).await?;
+    reduce(&mut snapshot, &event.envelope());
+    snapshot.latest_seq = Some(event.seq);
+    let snapshot = store_session_snapshot_tx(&mut tx, &snapshot).await?;
+    let cached_event = if let Some(legacy_event) = legacy_event {
+        Some(insert_event_cache_tx(&mut tx, event.event_id, event.session_id, legacy_event).await?)
+    } else {
+        None
+    };
+    tx.commit().await?;
+    Ok(UniversalAppendOutcome {
+        event,
+        snapshot,
+        cached_event,
+    })
+}
+
+pub async fn list_universal_events_after(
+    pool: &PgPool,
+    session_id: SessionId,
+    after_seq: Option<UniversalSeq>,
+    limit: usize,
+) -> Result<Vec<AgentEvent>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let after_seq = after_seq.unwrap_or_else(UniversalSeq::zero);
+    let rows = sqlx::query(
+        "select seq, event_id, workspace_id, session_id, turn_id, item_id,
+                event_type, event_json, native_json, source, command_id, created_at
+         from agent_events
+         where session_id = $1 and seq > $2
+         order by seq asc
+         limit $3",
+    )
+    .bind(session_id.as_uuid())
+    .bind(after_seq.as_i64())
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    rows.iter()
+        .map(agent_event_from_row)
+        .collect::<Result<Vec<_>>>()
+}
+
+pub async fn load_stored_session_snapshot(
+    pool: &PgPool,
+    session_id: SessionId,
+) -> Result<Option<StoredSessionSnapshot>> {
+    let row = sqlx::query(
+        "select session_id, latest_seq, snapshot_json, updated_at
+         from session_snapshots
+         where session_id = $1",
+    )
+    .bind(session_id.as_uuid())
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref()
+        .map(stored_session_snapshot_from_row)
+        .transpose()
+}
+
+pub async fn load_session_snapshot(
+    pool: &PgPool,
+    session_id: SessionId,
+) -> Result<Option<SessionSnapshot>> {
+    Ok(load_stored_session_snapshot(pool, session_id)
+        .await?
+        .map(|snapshot| snapshot.snapshot))
+}
+
+pub async fn store_session_snapshot(
+    pool: &PgPool,
+    snapshot: &SessionSnapshot,
+) -> Result<StoredSessionSnapshot> {
+    let mut tx = pool.begin().await?;
+    let stored = store_session_snapshot_tx(&mut tx, snapshot).await?;
+    tx.commit().await?;
+    Ok(stored)
+}
+
+pub async fn begin_command_idempotency(
+    pool: &PgPool,
+    idempotency_key: &str,
+    command_id: CommandId,
+    session_id: Option<SessionId>,
+    command_json: serde_json::Value,
+) -> Result<(CommandIdempotencyRecord, bool)> {
+    let response_json = serde_json::json!({
+        "command": command_json,
+        "response": null,
+    });
+    let row = sqlx::query(
+        "insert into agent_event_idempotency (
+            idempotency_key,
+            command_id,
+            session_id,
+            status,
+            response_json
+         )
+         values ($1, $2, $3, 'pending', $4)
+         on conflict (idempotency_key) do nothing
+         returning idempotency_key, command_id, session_id, status, response_json, created_at, updated_at",
+    )
+    .bind(idempotency_key)
+    .bind(command_id.as_uuid())
+    .bind(session_id.map(SessionId::as_uuid))
+    .bind(response_json)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(row) = row {
+        return command_idempotency_from_row(&row).map(|record| (record, true));
+    }
+
+    load_command_idempotency(pool, idempotency_key)
+        .await?
+        .map(|record| (record, false))
+        .ok_or_else(|| sqlx::Error::RowNotFound)
+}
+
+pub async fn load_command_idempotency(
+    pool: &PgPool,
+    idempotency_key: &str,
+) -> Result<Option<CommandIdempotencyRecord>> {
+    let row = sqlx::query(
+        "select idempotency_key, command_id, session_id, status, response_json, created_at, updated_at
+         from agent_event_idempotency
+         where idempotency_key = $1",
+    )
+    .bind(idempotency_key)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(command_idempotency_from_row).transpose()
+}
+
+pub async fn finish_command_idempotency(
+    pool: &PgPool,
+    idempotency_key: &str,
+    status: CommandIdempotencyStatus,
+    command_json: serde_json::Value,
+    response_json: serde_json::Value,
+) -> Result<CommandIdempotencyRecord> {
+    let response_json = serde_json::json!({
+        "command": command_json,
+        "response": response_json,
+    });
+    let row = sqlx::query(
+        "update agent_event_idempotency
+         set status = $2,
+             response_json = $3,
+             updated_at = now()
+         where idempotency_key = $1
+         returning idempotency_key, command_id, session_id, status, response_json, created_at, updated_at",
+    )
+    .bind(idempotency_key)
+    .bind(command_idempotency_status_to_db(&status))
+    .bind(response_json)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Err(sqlx::Error::RowNotFound);
+    };
+
+    command_idempotency_from_row(&row)
+}
+
+pub async fn delete_command_idempotency(pool: &PgPool, idempotency_key: &str) -> Result<()> {
+    sqlx::query(
+        "delete from agent_event_idempotency
+         where idempotency_key = $1",
+    )
+    .bind(idempotency_key)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn create_approval(
     pool: &PgPool,
     session_id: SessionId,
@@ -958,6 +1211,8 @@ pub async fn create_approval(
          )
          values ($1, $2, $3, $4, $5, $6)
          returning approval_id, session_id, kind, title, details, provider_payload,
+             universal_status, native_request_id, canonical_options, risk, subject,
+             native_summary, native_json,
              expires_at, resolved_decision, resolved_by_user_id, resolved_at, created_at, updated_at",
     )
     .bind(session_id.as_uuid())
@@ -978,6 +1233,7 @@ pub async fn resolve_approval(
     decision: ApprovalDecision,
     resolved_by_user_id: Option<UserId>,
 ) -> Result<Option<PendingApproval>> {
+    let universal_status = decision_universal_status(&decision);
     let decision = serde_json::to_value(decision).map_err(sqlx::Error::decode)?;
     let resolved_by_user_id = resolved_by_user_id.map(UserId::as_uuid);
     let row = sqlx::query(
@@ -985,14 +1241,18 @@ pub async fn resolve_approval(
          set resolved_decision = $2,
              resolved_by_user_id = $3,
              resolved_at = now(),
+             universal_status = $4,
              updated_at = now()
          where approval_id = $1 and resolved_at is null
          returning approval_id, session_id, kind, title, details, provider_payload,
+             universal_status, native_request_id, canonical_options, risk, subject,
+             native_summary, native_json,
              expires_at, resolved_decision, resolved_by_user_id, resolved_at, created_at, updated_at",
     )
     .bind(approval_id.as_uuid())
     .bind(decision)
     .bind(resolved_by_user_id)
+    .bind(universal_approval_status_to_db(&universal_status))
     .fetch_optional(pool)
     .await?;
 
@@ -1124,6 +1384,309 @@ pub async fn consume_connector_link_code(
     Ok(Some(account))
 }
 
+async fn insert_universal_event_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: WorkspaceId,
+    envelope: &UniversalEventEnvelope,
+    command_id: Option<CommandId>,
+) -> Result<AgentEvent> {
+    let event_id = parse_control_plane_event_id(&envelope.event_id)?;
+    let event_json = serde_json::to_value(&envelope.event).map_err(sqlx::Error::decode)?;
+    let native_json = envelope
+        .native
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(sqlx::Error::decode)?;
+    let row = sqlx::query(
+        "insert into agent_events (
+            event_id,
+            workspace_id,
+            session_id,
+            turn_id,
+            item_id,
+            event_type,
+            event_json,
+            native_json,
+            source,
+            command_id,
+            created_at
+         )
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         returning seq, event_id, workspace_id, session_id, turn_id, item_id,
+             event_type, event_json, native_json, source, command_id, created_at",
+    )
+    .bind(event_id)
+    .bind(workspace_id.as_uuid())
+    .bind(envelope.session_id.as_uuid())
+    .bind(envelope.turn_id.map(TurnId::as_uuid))
+    .bind(envelope.item_id.map(ItemId::as_uuid))
+    .bind(universal_event_type(&envelope.event))
+    .bind(event_json)
+    .bind(native_json)
+    .bind(universal_event_source_to_db(&envelope.source))
+    .bind(command_id.map(CommandId::as_uuid))
+    .bind(envelope.ts)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    agent_event_from_row(&row)
+}
+
+async fn lock_session_for_projection_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: SessionId,
+) -> Result<()> {
+    sqlx::query("select 1 from agent_sessions where session_id = $1 for update")
+        .bind(session_id.as_uuid())
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn load_session_snapshot_for_update_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: SessionId,
+) -> Result<SessionSnapshot> {
+    let row = sqlx::query(
+        "select session_id, latest_seq, snapshot_json, updated_at
+         from session_snapshots
+         where session_id = $1
+         for update",
+    )
+    .bind(session_id.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    if let Some(row) = row {
+        return stored_session_snapshot_from_row(&row).map(|stored| stored.snapshot);
+    }
+
+    Ok(SessionSnapshot {
+        session_id,
+        ..SessionSnapshot::default()
+    })
+}
+
+async fn store_session_snapshot_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    snapshot: &SessionSnapshot,
+) -> Result<StoredSessionSnapshot> {
+    let latest_seq = snapshot.latest_seq.unwrap_or_else(UniversalSeq::zero);
+    let snapshot_json = serde_json::to_value(snapshot).map_err(sqlx::Error::decode)?;
+    let row = sqlx::query(
+        "insert into session_snapshots (session_id, latest_seq, snapshot_json)
+         values ($1, $2, $3)
+         on conflict (session_id)
+         do update set latest_seq = excluded.latest_seq,
+                       snapshot_json = excluded.snapshot_json,
+                       updated_at = now()
+         where session_snapshots.latest_seq <= excluded.latest_seq
+         returning session_id, latest_seq, snapshot_json, updated_at",
+    )
+    .bind(snapshot.session_id.as_uuid())
+    .bind(latest_seq.as_i64())
+    .bind(snapshot_json)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let Some(row) = row else {
+        return Err(sqlx::Error::ColumnDecode {
+            index: "latest_seq".to_owned(),
+            source: format!(
+                "session snapshot latest_seq regression for session {}",
+                snapshot.session_id
+            )
+            .into(),
+        });
+    };
+
+    stored_session_snapshot_from_row(&row)
+}
+
+async fn insert_event_cache_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    event_id: Uuid,
+    session_id: SessionId,
+    event: &AppEvent,
+) -> Result<CachedEvent> {
+    let payload = serde_json::to_value(event).map_err(sqlx::Error::decode)?;
+    let event_type = payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let event_index: i64 = sqlx::query_scalar(
+        "insert into event_cache_cursors (session_id, next_event_index)
+         values ($1, 2)
+         on conflict (session_id)
+         do update set next_event_index = event_cache_cursors.next_event_index + 1
+         returning next_event_index - 1",
+    )
+    .bind(session_id.as_uuid())
+    .fetch_one(&mut **tx)
+    .await?;
+    let row = sqlx::query(
+        "insert into event_cache (event_id, session_id, event_index, event_type, payload)
+         values ($1, $2, $3, $4, $5)
+         returning event_id, session_id, event_index, event_type, payload, created_at",
+    )
+    .bind(event_id)
+    .bind(session_id.as_uuid())
+    .bind(event_index)
+    .bind(&event_type)
+    .bind(payload)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    cached_event_from_row(&row)
+}
+
+async fn materialize_pending_approval_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    approval: &ApprovalRequest,
+) -> Result<()> {
+    let canonical_options = serde_json::to_value(&approval.options).map_err(sqlx::Error::decode)?;
+    let native_json = approval
+        .native
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(sqlx::Error::decode)?;
+    let native_request_id = approval.native_request_id.as_deref().or_else(|| {
+        approval
+            .native
+            .as_ref()
+            .and_then(|native| native.native_id.as_deref())
+    });
+    let native_summary = approval
+        .native
+        .as_ref()
+        .and_then(|native| native.summary.as_deref());
+    sqlx::query(
+        "insert into pending_approvals (
+            approval_id,
+            session_id,
+            kind,
+            title,
+            details,
+            provider_payload,
+            universal_status,
+            native_request_id,
+            canonical_options,
+            risk,
+            subject,
+            native_summary,
+            native_json,
+            resolved_at
+         )
+         values ($1, $2, $3, $4, $5, null, $6, $7, $8, $9, $10, $11, $12, $13)
+         on conflict (approval_id)
+         do update set kind = excluded.kind,
+                       title = excluded.title,
+                       details = excluded.details,
+                       universal_status = case
+                           when pending_approvals.resolved_at is not null then pending_approvals.universal_status
+                           else excluded.universal_status
+                       end,
+                       native_request_id = excluded.native_request_id,
+                       canonical_options = excluded.canonical_options,
+                       risk = excluded.risk,
+                       subject = excluded.subject,
+                       native_summary = excluded.native_summary,
+                       native_json = excluded.native_json,
+                       resolved_at = coalesce(excluded.resolved_at, pending_approvals.resolved_at),
+                       updated_at = now()",
+    )
+    .bind(approval.approval_id.as_uuid())
+    .bind(approval.session_id.as_uuid())
+    .bind(approval_kind_to_db(&approval.kind))
+    .bind(&approval.title)
+    .bind(&approval.details)
+    .bind(universal_approval_status_to_db(&approval.status))
+    .bind(native_request_id)
+    .bind(canonical_options)
+    .bind(&approval.risk)
+    .bind(&approval.subject)
+    .bind(native_summary)
+    .bind(native_json)
+    .bind(approval.resolved_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn resolve_pending_approval_from_universal_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    approval: &ApprovalRequest,
+) -> Result<()> {
+    let canonical_options = serde_json::to_value(&approval.options).map_err(sqlx::Error::decode)?;
+    let native_json = approval
+        .native
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(sqlx::Error::decode)?;
+    let native_request_id = approval.native_request_id.as_deref().or_else(|| {
+        approval
+            .native
+            .as_ref()
+            .and_then(|native| native.native_id.as_deref())
+    });
+    let native_summary = approval
+        .native
+        .as_ref()
+        .and_then(|native| native.summary.as_deref());
+    sqlx::query(
+        "insert into pending_approvals (
+            approval_id,
+            session_id,
+            kind,
+            title,
+            details,
+            provider_payload,
+            universal_status,
+            native_request_id,
+            canonical_options,
+            risk,
+            subject,
+            native_summary,
+            native_json,
+            resolved_at
+         )
+         values ($1, $2, $3, $4, $5, null, $6, $7, $8, $9, $10, $11, $12, $13)
+         on conflict (approval_id)
+         do update set universal_status = excluded.universal_status,
+                       native_request_id = coalesce(excluded.native_request_id, pending_approvals.native_request_id),
+                       canonical_options = case
+                           when excluded.canonical_options = '[]'::jsonb then pending_approvals.canonical_options
+                           else excluded.canonical_options
+                       end,
+                       risk = coalesce(excluded.risk, pending_approvals.risk),
+                       subject = coalesce(excluded.subject, pending_approvals.subject),
+                       native_summary = coalesce(excluded.native_summary, pending_approvals.native_summary),
+                       native_json = coalesce(excluded.native_json, pending_approvals.native_json),
+                       resolved_at = coalesce(excluded.resolved_at, pending_approvals.resolved_at, now()),
+                       updated_at = now()",
+    )
+    .bind(approval.approval_id.as_uuid())
+    .bind(approval.session_id.as_uuid())
+    .bind(approval_kind_to_db(&approval.kind))
+    .bind(&approval.title)
+    .bind(&approval.details)
+    .bind(universal_approval_status_to_db(&approval.status))
+    .bind(native_request_id)
+    .bind(canonical_options)
+    .bind(&approval.risk)
+    .bind(&approval.subject)
+    .bind(native_summary)
+    .bind(native_json)
+    .bind(approval.resolved_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 fn user_from_row(row: &PgRow) -> Result<User> {
     Ok(User {
         user_id: UserId::from_uuid(row.try_get("user_id")?),
@@ -1188,6 +1751,56 @@ fn cached_event_from_row(row: &PgRow) -> Result<CachedEvent> {
     })
 }
 
+fn agent_event_from_row(row: &PgRow) -> Result<AgentEvent> {
+    let turn_id: Option<Uuid> = row.try_get("turn_id")?;
+    let item_id: Option<Uuid> = row.try_get("item_id")?;
+    let command_id: Option<Uuid> = row.try_get("command_id")?;
+    let source: String = row.try_get("source")?;
+    let event_json: serde_json::Value = row.try_get("event_json")?;
+    let native_json: Option<serde_json::Value> = row.try_get("native_json")?;
+    Ok(AgentEvent {
+        seq: UniversalSeq::new(row.try_get("seq")?),
+        event_id: row.try_get("event_id")?,
+        workspace_id: WorkspaceId::from_uuid(row.try_get("workspace_id")?),
+        session_id: SessionId::from_uuid(row.try_get("session_id")?),
+        turn_id: turn_id.map(TurnId::from_uuid),
+        item_id: item_id.map(ItemId::from_uuid),
+        event_type: row.try_get("event_type")?,
+        event: serde_json::from_value(event_json).map_err(sqlx::Error::decode)?,
+        native: native_json
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(sqlx::Error::decode)?,
+        source: universal_event_source_from_db(&source)?,
+        command_id: command_id.map(CommandId::from_uuid),
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn stored_session_snapshot_from_row(row: &PgRow) -> Result<StoredSessionSnapshot> {
+    let snapshot_json: serde_json::Value = row.try_get("snapshot_json")?;
+    Ok(StoredSessionSnapshot {
+        session_id: SessionId::from_uuid(row.try_get("session_id")?),
+        latest_seq: UniversalSeq::new(row.try_get("latest_seq")?),
+        snapshot: serde_json::from_value(snapshot_json).map_err(sqlx::Error::decode)?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn command_idempotency_from_row(row: &PgRow) -> Result<CommandIdempotencyRecord> {
+    let status: String = row.try_get("status")?;
+    let session_id: Option<Uuid> = row.try_get("session_id")?;
+    Ok(CommandIdempotencyRecord {
+        idempotency_key: row.try_get("idempotency_key")?,
+        command_id: CommandId::from_uuid(row.try_get("command_id")?),
+        session_id: session_id.map(SessionId::from_uuid),
+        status: command_idempotency_status_from_db(&status)?,
+        response_json: row.try_get("response_json")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 fn session_with_workspace_from_row(row: &PgRow) -> Result<AgentSessionWithWorkspace> {
     let status: String = row.try_get("status")?;
     let provider_id: String = row.try_get("provider_id")?;
@@ -1221,6 +1834,9 @@ fn session_with_workspace_from_row(row: &PgRow) -> Result<AgentSessionWithWorksp
 
 fn approval_from_row(row: &PgRow) -> Result<PendingApproval> {
     let kind: String = row.try_get("kind")?;
+    let universal_status: String = row.try_get("universal_status")?;
+    let canonical_options: serde_json::Value = row.try_get("canonical_options")?;
+    let native_json: Option<serde_json::Value> = row.try_get("native_json")?;
     let resolved_decision: Option<serde_json::Value> = row.try_get("resolved_decision")?;
     let resolved_by_user_id: Option<Uuid> = row.try_get("resolved_by_user_id")?;
     Ok(PendingApproval {
@@ -1230,6 +1846,17 @@ fn approval_from_row(row: &PgRow) -> Result<PendingApproval> {
         title: row.try_get("title")?,
         details: row.try_get("details")?,
         provider_payload: row.try_get("provider_payload")?,
+        universal_status: universal_approval_status_from_db(&universal_status)?,
+        native_request_id: row.try_get("native_request_id")?,
+        canonical_options: serde_json::from_value(canonical_options)
+            .map_err(sqlx::Error::decode)?,
+        risk: row.try_get("risk")?,
+        subject: row.try_get("subject")?,
+        native_summary: row.try_get("native_summary")?,
+        native: native_json
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(sqlx::Error::decode)?,
         expires_at: row.try_get("expires_at")?,
         resolved_decision: resolved_decision
             .map(serde_json::from_value)
@@ -1365,14 +1992,200 @@ fn approval_kind_from_db(value: &str) -> Result<ApprovalKind> {
     }
 }
 
+fn parse_control_plane_event_id(value: &str) -> Result<Uuid> {
+    Uuid::parse_str(value).map_err(|error| sqlx::Error::ColumnDecode {
+        index: "event_id".to_owned(),
+        source: format!(
+            "universal event_id must be a control-plane UUID; native stable IDs belong in NativeRef: {error}"
+        )
+        .into(),
+    })
+}
+
+fn universal_event_type(event: &UniversalEventKind) -> &'static str {
+    match event {
+        UniversalEventKind::SessionCreated { .. } => "session.created",
+        UniversalEventKind::TurnStarted { .. } => "turn.started",
+        UniversalEventKind::TurnStatusChanged { .. } => "turn.status_changed",
+        UniversalEventKind::TurnCompleted { .. } => "turn.completed",
+        UniversalEventKind::TurnFailed { .. } => "turn.failed",
+        UniversalEventKind::TurnCancelled { .. } => "turn.cancelled",
+        UniversalEventKind::TurnInterrupted { .. } => "turn.interrupted",
+        UniversalEventKind::TurnDetached { .. } => "turn.detached",
+        UniversalEventKind::ItemCreated { .. } => "item.created",
+        UniversalEventKind::ContentDelta { .. } => "content.delta",
+        UniversalEventKind::ContentCompleted { .. } => "content.completed",
+        UniversalEventKind::ApprovalRequested { .. } => "approval.requested",
+        UniversalEventKind::PlanUpdated { .. } => "plan.updated",
+        UniversalEventKind::DiffUpdated { .. } => "diff.updated",
+        UniversalEventKind::ArtifactCreated { .. } => "artifact.created",
+        UniversalEventKind::UsageUpdated { .. } => "usage.updated",
+        UniversalEventKind::NativeUnknown { .. } => "native.unknown",
+    }
+}
+
+fn universal_event_source_to_db(source: &UniversalEventSource) -> &'static str {
+    match source {
+        UniversalEventSource::ControlPlane => "control_plane",
+        UniversalEventSource::Runner => "runner",
+        UniversalEventSource::Browser => "browser",
+        UniversalEventSource::Connector => "connector",
+        UniversalEventSource::Native => "native",
+    }
+}
+
+fn universal_event_source_from_db(value: &str) -> Result<UniversalEventSource> {
+    match value {
+        "control_plane" => Ok(UniversalEventSource::ControlPlane),
+        "runner" => Ok(UniversalEventSource::Runner),
+        "browser" => Ok(UniversalEventSource::Browser),
+        "connector" => Ok(UniversalEventSource::Connector),
+        "native" => Ok(UniversalEventSource::Native),
+        _ => Err(sqlx::Error::ColumnDecode {
+            index: "source".to_owned(),
+            source: format!("unknown universal event source {value:?}").into(),
+        }),
+    }
+}
+
+fn decision_universal_status(decision: &ApprovalDecision) -> UniversalApprovalStatus {
+    match decision {
+        ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => {
+            UniversalApprovalStatus::Approved
+        }
+        ApprovalDecision::Cancel => UniversalApprovalStatus::Cancelled,
+        ApprovalDecision::Decline => UniversalApprovalStatus::Denied,
+        ApprovalDecision::ProviderSpecific { payload } => {
+            provider_specific_decision_status(payload).unwrap_or(UniversalApprovalStatus::Denied)
+        }
+    }
+}
+
+fn provider_specific_decision_status(
+    payload: &serde_json::Value,
+) -> Option<UniversalApprovalStatus> {
+    let value = payload
+        .pointer("/decision")
+        .or_else(|| payload.pointer("/status"))
+        .or_else(|| payload.pointer("/kind"))?
+        .as_str()?;
+    match value {
+        "accept" | "approve" | "approved" | "allow" | "allowed" => {
+            Some(UniversalApprovalStatus::Approved)
+        }
+        "cancel" | "cancelled" | "canceled" => Some(UniversalApprovalStatus::Cancelled),
+        "decline" | "deny" | "denied" | "reject" | "rejected" => {
+            Some(UniversalApprovalStatus::Denied)
+        }
+        _ => None,
+    }
+}
+
+fn is_resolved_universal_approval_status(status: &UniversalApprovalStatus) -> bool {
+    matches!(
+        status,
+        UniversalApprovalStatus::Approved
+            | UniversalApprovalStatus::Denied
+            | UniversalApprovalStatus::Cancelled
+            | UniversalApprovalStatus::Expired
+            | UniversalApprovalStatus::Orphaned
+    )
+}
+
+fn universal_approval_status_to_db(status: &UniversalApprovalStatus) -> &'static str {
+    match status {
+        UniversalApprovalStatus::Pending => "pending",
+        UniversalApprovalStatus::Presented => "presented",
+        UniversalApprovalStatus::Resolving => "resolving",
+        UniversalApprovalStatus::Approved => "approved",
+        UniversalApprovalStatus::Denied => "denied",
+        UniversalApprovalStatus::Cancelled => "cancelled",
+        UniversalApprovalStatus::Expired => "expired",
+        UniversalApprovalStatus::Orphaned => "orphaned",
+    }
+}
+
+fn universal_approval_status_from_db(value: &str) -> Result<UniversalApprovalStatus> {
+    match value {
+        "pending" => Ok(UniversalApprovalStatus::Pending),
+        "presented" => Ok(UniversalApprovalStatus::Presented),
+        "resolving" => Ok(UniversalApprovalStatus::Resolving),
+        "approved" => Ok(UniversalApprovalStatus::Approved),
+        "denied" => Ok(UniversalApprovalStatus::Denied),
+        "cancelled" => Ok(UniversalApprovalStatus::Cancelled),
+        "expired" => Ok(UniversalApprovalStatus::Expired),
+        "orphaned" => Ok(UniversalApprovalStatus::Orphaned),
+        _ => Err(sqlx::Error::ColumnDecode {
+            index: "universal_status".to_owned(),
+            source: format!("unknown universal approval status {value:?}").into(),
+        }),
+    }
+}
+
+fn command_idempotency_status_to_db(status: &CommandIdempotencyStatus) -> &'static str {
+    match status {
+        CommandIdempotencyStatus::Pending => "pending",
+        CommandIdempotencyStatus::Succeeded => "succeeded",
+        CommandIdempotencyStatus::Failed => "failed",
+        CommandIdempotencyStatus::Conflict => "conflict",
+    }
+}
+
+fn command_idempotency_status_from_db(value: &str) -> Result<CommandIdempotencyStatus> {
+    match value {
+        "pending" => Ok(CommandIdempotencyStatus::Pending),
+        "succeeded" => Ok(CommandIdempotencyStatus::Succeeded),
+        "failed" => Ok(CommandIdempotencyStatus::Failed),
+        "conflict" => Ok(CommandIdempotencyStatus::Conflict),
+        _ => Err(sqlx::Error::ColumnDecode {
+            index: "status".to_owned(),
+            source: format!("unknown command idempotency status {value:?}").into(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use agenter_core::{
-        AgentProviderId, AppEvent, ApprovalDecision, ApprovalKind, SessionStatus, UserMessageEvent,
+        AgentProviderId, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind, ApprovalRequest,
+        ApprovalStatus as UniversalApprovalStatus, NativeRef, SessionInfo, SessionSnapshot,
+        SessionStatus, UniversalEventEnvelope, UniversalEventKind, UniversalEventSource,
+        UniversalSeq, UserMessageEvent,
     };
-    use sqlx::{Executor, PgPool};
+    use sqlx::{Executor, PgPool, Row};
 
     use super::*;
+
+    #[test]
+    fn rejects_non_uuid_universal_event_ids_with_clear_error() {
+        let error = parse_control_plane_event_id("native-event-1").expect_err("must reject");
+        let message = error.to_string();
+
+        assert!(message.contains("universal event_id must be a control-plane UUID"));
+        assert!(message.contains("native stable IDs belong in NativeRef"));
+    }
+
+    #[test]
+    fn maps_approval_decisions_to_universal_statuses() {
+        assert_eq!(
+            decision_universal_status(&ApprovalDecision::Accept),
+            UniversalApprovalStatus::Approved
+        );
+        assert_eq!(
+            decision_universal_status(&ApprovalDecision::Cancel),
+            UniversalApprovalStatus::Cancelled
+        );
+        assert_eq!(
+            decision_universal_status(&ApprovalDecision::Decline),
+            UniversalApprovalStatus::Denied
+        );
+        assert_eq!(
+            decision_universal_status(&ApprovalDecision::ProviderSpecific {
+                payload: serde_json::json!({ "status": "approved" }),
+            }),
+            UniversalApprovalStatus::Approved
+        );
+    }
 
     async fn test_pool() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
@@ -1386,6 +2199,23 @@ mod tests {
             .await
             .expect("run migrations");
         pool
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
+    async fn finish_command_idempotency_missing_row_returns_row_not_found() {
+        let pool = test_pool().await;
+        let error = finish_command_idempotency(
+            &pool,
+            &format!("missing-command-{}", uuid::Uuid::new_v4()),
+            CommandIdempotencyStatus::Failed,
+            serde_json::json!({ "type": "close_session" }),
+            serde_json::json!({ "status": 404 }),
+        )
+        .await
+        .expect_err("missing command row must fail closed");
+
+        assert!(matches!(error, sqlx::Error::RowNotFound));
     }
 
     #[tokio::test]
@@ -1470,6 +2300,227 @@ mod tests {
         assert_eq!(first_event.event_index, 1);
         assert_eq!(first_event.event_type, "user_message");
         assert_eq!(second_event.event_index, 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
+    async fn universal_event_log_sequences_replays_snapshots_approvals_and_legacy_cache() {
+        let pool = test_pool().await;
+
+        let suffix = uuid::Uuid::new_v4();
+        let user = create_user(
+            &pool,
+            &format!("universal-user-{suffix}@example.test"),
+            Some("Universal User"),
+        )
+        .await
+        .expect("create user");
+        let runner = register_runner(&pool, &format!("universal-runner-{suffix}"), Some("test"))
+            .await
+            .expect("register runner");
+        let workspace = upsert_workspace(
+            &pool,
+            runner.runner_id,
+            &format!("/tmp/agenter-universal-test-{suffix}"),
+            Some("Universal Workspace"),
+        )
+        .await
+        .expect("upsert workspace");
+        let session = create_session(
+            &pool,
+            user.user_id,
+            runner.runner_id,
+            workspace.workspace_id,
+            AgentProviderId::from(AgentProviderId::CODEX),
+            None,
+            Some("Universal Session"),
+        )
+        .await
+        .expect("create session");
+
+        let session_event = UniversalEventEnvelope {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            seq: UniversalSeq::zero(),
+            session_id: session.session_id,
+            turn_id: None,
+            item_id: None,
+            ts: Utc::now(),
+            source: UniversalEventSource::ControlPlane,
+            native: None,
+            event: UniversalEventKind::SessionCreated {
+                session: Box::new(SessionInfo {
+                    session_id: session.session_id,
+                    owner_user_id: user.user_id,
+                    runner_id: runner.runner_id,
+                    workspace_id: workspace.workspace_id,
+                    provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                    status: SessionStatus::Running,
+                    external_session_id: None,
+                    title: Some("Universal Session".to_owned()),
+                    created_at: None,
+                    updated_at: None,
+                    usage: None,
+                }),
+            },
+        };
+        let first = append_universal_event_reducing_snapshot(
+            &pool,
+            workspace.workspace_id,
+            session_event,
+            None,
+            None,
+            |snapshot: &mut SessionSnapshot, event| {
+                snapshot.session_id = event.session_id;
+                snapshot.latest_seq = Some(event.seq);
+                if let UniversalEventKind::SessionCreated { session } = &event.event {
+                    snapshot.info = Some((**session).clone());
+                }
+            },
+        )
+        .await
+        .expect("append universal session event");
+
+        let approval_id = ApprovalId::new();
+        let approval_event = UniversalEventEnvelope {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            seq: UniversalSeq::zero(),
+            session_id: session.session_id,
+            turn_id: None,
+            item_id: None,
+            ts: Utc::now(),
+            source: UniversalEventSource::Runner,
+            native: None,
+            event: UniversalEventKind::ApprovalRequested {
+                approval: Box::new(ApprovalRequest {
+                    approval_id,
+                    session_id: session.session_id,
+                    turn_id: None,
+                    item_id: None,
+                    kind: ApprovalKind::Command,
+                    title: "Run command".to_owned(),
+                    details: Some("cargo test".to_owned()),
+                    options: Vec::new(),
+                    status: UniversalApprovalStatus::Pending,
+                    risk: Some("writes".to_owned()),
+                    subject: Some("cargo test".to_owned()),
+                    native_request_id: Some("canonical-native-approval-1".to_owned()),
+                    native_blocking: true,
+                    policy: None,
+                    native: Some(NativeRef {
+                        protocol: "codex.app_server".to_owned(),
+                        method: Some("approval/requested".to_owned()),
+                        kind: Some("command".to_owned()),
+                        native_id: Some("native-approval-1".to_owned()),
+                        summary: Some("Run command".to_owned()),
+                        hash: None,
+                        pointer: None,
+                    }),
+                    requested_at: Some(Utc::now()),
+                    resolved_at: None,
+                }),
+            },
+        };
+        let legacy_event = AppEvent::UserMessage(UserMessageEvent {
+            session_id: session.session_id,
+            message_id: Some("legacy-user-1".to_owned()),
+            author_user_id: Some(user.user_id),
+            content: "legacy cache still exists".to_owned(),
+        });
+        let second = append_universal_event_reducing_snapshot(
+            &pool,
+            workspace.workspace_id,
+            approval_event,
+            None,
+            Some(&legacy_event),
+            |snapshot: &mut SessionSnapshot, event| {
+                snapshot.session_id = event.session_id;
+                snapshot.latest_seq = Some(event.seq);
+                if let UniversalEventKind::ApprovalRequested { approval } = &event.event {
+                    snapshot
+                        .approvals
+                        .insert(approval.approval_id, (**approval).clone());
+                }
+            },
+        )
+        .await
+        .expect("append universal approval event");
+
+        assert!(second.event.seq > first.event.seq);
+        assert!(second.cached_event.is_some());
+
+        let replay =
+            list_universal_events_after(&pool, session.session_id, Some(first.event.seq), 10)
+                .await
+                .expect("list events after first seq");
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].seq, second.event.seq);
+        assert_eq!(replay[0].event_type, "approval.requested");
+
+        let snapshot = load_session_snapshot(&pool, session.session_id)
+            .await
+            .expect("load snapshot")
+            .expect("snapshot exists");
+        assert_eq!(snapshot.latest_seq, Some(second.event.seq));
+        assert!(snapshot.approvals.contains_key(&approval_id));
+
+        let approval_row = sqlx::query(
+            "select universal_status, native_request_id, native_json
+             from pending_approvals
+             where approval_id = $1",
+        )
+        .bind(approval_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("load materialized approval");
+        let universal_status: String = approval_row
+            .try_get("universal_status")
+            .expect("approval status");
+        let native_request_id: Option<String> = approval_row
+            .try_get("native_request_id")
+            .expect("native request id");
+        let native_json: serde_json::Value = approval_row.try_get("native_json").expect("native");
+        assert_eq!(universal_status, "pending");
+        assert_eq!(
+            native_request_id.as_deref(),
+            Some("canonical-native-approval-1")
+        );
+        assert!(!native_json.to_string().contains("provider_payload"));
+
+        let resolved = resolve_approval(
+            &pool,
+            approval_id,
+            ApprovalDecision::Accept,
+            Some(user.user_id),
+        )
+        .await
+        .expect("resolve approval")
+        .expect("approval resolved");
+        assert_eq!(resolved.universal_status, UniversalApprovalStatus::Approved);
+
+        let legacy_cache = list_event_cache(&pool, session.session_id)
+            .await
+            .expect("list legacy cache");
+        assert_eq!(legacy_cache.len(), 1);
+        assert_eq!(legacy_cache[0].event_type, "user_message");
+        assert_eq!(legacy_cache[0].event_id, second.event.event_id);
+
+        clear_session_event_projection(&pool, session.session_id)
+            .await
+            .expect("clear compatibility projection");
+        assert!(
+            list_universal_events_after(&pool, session.session_id, None, 10)
+                .await
+                .expect("list cleared universal events")
+                .is_empty()
+        );
+        assert!(load_session_snapshot(&pool, session.session_id)
+            .await
+            .expect("load cleared snapshot")
+            .is_none());
+        assert!(list_event_cache(&pool, session.session_id)
+            .await
+            .expect("list cleared legacy cache")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1899,6 +2950,10 @@ mod tests {
             "browser_auth_sessions",
             "pending_approvals",
             "event_cache",
+            "agent_events",
+            "agent_event_idempotency",
+            "session_snapshots",
+            "recent_turn_caches",
             "connector_deliveries",
         ] {
             let exists: bool = sqlx::query_scalar(

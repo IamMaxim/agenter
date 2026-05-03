@@ -1,4 +1,4 @@
-use crate::state::{ApprovalResolutionStart, RunnerCommandWaitError};
+use crate::state::{ApprovalResolutionLookup, ApprovalResolutionStart, RunnerCommandWaitError};
 use agenter_core::SessionId;
 use axum::{
     extract::{Path, Query, State},
@@ -8,12 +8,23 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct ListApprovalsQuery {
     pub session_id: SessionId,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct ApprovalDecisionRequest {
+    #[serde(flatten)]
+    pub decision: agenter_core::ApprovalDecision,
+    #[serde(default)]
+    pub option_id: Option<String>,
+    #[serde(default)]
+    pub feedback: Option<String>,
 }
 
 pub(super) fn router() -> Router<crate::state::AppState> {
@@ -53,48 +64,101 @@ pub(super) async fn decide_approval(
     state: State<crate::state::AppState>,
     headers: HeaderMap,
     Path(approval_id): Path<agenter_core::ApprovalId>,
-    decision: Json<agenter_core::ApprovalDecision>,
+    decision: Json<ApprovalDecisionRequest>,
 ) -> Response {
     let state = state.0;
-    let decision = decision.0;
+    let decision_request = decision.0;
+    let decision = decision_request.decision.clone();
     let Some(user) = super::authenticated_user_from_headers(&state, &headers).await else {
         tracing::debug!(%approval_id, "approval decision rejected missing or invalid session");
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let session_id = match state
-        .begin_approval_resolution(approval_id, decision.clone())
-        .await
-    {
-        ApprovalResolutionStart::Started { session_id } => session_id,
-        ApprovalResolutionStart::AlreadyResolved {
-            session_id,
-            envelope,
-        } => {
-            if state.session(user.user_id, session_id).await.is_none() {
-                return StatusCode::NOT_FOUND.into_response();
+    let lookup = state.lookup_approval_resolution(approval_id).await;
+    let session_id = match &lookup {
+        ApprovalResolutionLookup::Missing => {
+            tracing::warn!(%approval_id, "approval decision rejected missing approval");
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        ApprovalResolutionLookup::Pending { session_id }
+        | ApprovalResolutionLookup::InProgress { session_id, .. }
+        | ApprovalResolutionLookup::AlreadyResolved { session_id, .. } => *session_id,
+    };
+    let Some(session) = state.session(user.user_id, session_id).await else {
+        tracing::warn!(user_id = %user.user_id, %approval_id, %session_id, "approval decision rejected session not found");
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let universal_command = approval_command_envelope(
+        user.user_id,
+        session_id,
+        approval_id,
+        &decision,
+        decision_request.option_id.as_deref(),
+        decision_request.feedback.clone(),
+    );
+
+    match lookup {
+        ApprovalResolutionLookup::AlreadyResolved { envelope, .. } => {
+            if !approval_envelope_matches_decision(&envelope.event, &decision) {
+                return super::command_conflict_response(approval_decision_conflict())
+                    .into_response();
             }
             return Json(*envelope).into_response();
         }
-        ApprovalResolutionStart::InProgress {
-            session_id,
-            envelope,
-        } => {
-            if state.session(user.user_id, session_id).await.is_none() {
-                return StatusCode::NOT_FOUND.into_response();
+        ApprovalResolutionLookup::InProgress { envelope, .. } => {
+            if !approval_envelope_matches_decision(&envelope.event, &decision) {
+                return super::command_conflict_response(approval_decision_conflict())
+                    .into_response();
             }
             tracing::debug!(%approval_id, "approval decision already resolving");
             return Json(*envelope).into_response();
         }
+        ApprovalResolutionLookup::Pending { .. } => {
+            let command_start = state.begin_universal_command(&universal_command).await;
+            if let Some(response) = super::command_replay_response(command_start) {
+                return response;
+            }
+        }
+        ApprovalResolutionLookup::Missing => unreachable!("handled before session lookup"),
+    }
+
+    match state
+        .begin_approval_resolution(approval_id, decision.clone())
+        .await
+    {
+        ApprovalResolutionStart::Started => {}
+        ApprovalResolutionStart::AlreadyResolved { envelope, .. } => {
+            let body = serde_json::to_value(&*envelope).ok();
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Succeeded,
+                super::command_response(StatusCode::OK, body),
+            )
+            .await
+            {
+                return response;
+            }
+            return Json(*envelope).into_response();
+        }
+        ApprovalResolutionStart::InProgress { envelope, .. } => {
+            return Json(*envelope).into_response();
+        }
         ApprovalResolutionStart::Missing => {
-            tracing::warn!(%approval_id, "approval decision rejected missing approval");
+            let response = super::command_response(StatusCode::NOT_FOUND, None);
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Failed,
+                response,
+            )
+            .await
+            {
+                return response;
+            }
             return StatusCode::NOT_FOUND.into_response();
         }
-    };
-    let Some(session) = state.session(user.user_id, session_id).await else {
-        state.cancel_approval_resolution(approval_id).await;
-        tracing::warn!(user_id = %user.user_id, %approval_id, %session_id, "approval decision rejected session not found");
-        return StatusCode::NOT_FOUND.into_response();
-    };
+    }
 
     let request_id = agenter_protocol::RequestId::from(Uuid::new_v4().to_string());
     let command = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
@@ -120,6 +184,7 @@ pub(super) async fn decide_approval(
     let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
     let state_for_resolution = state.clone();
     let decision_for_resolution = decision.clone();
+    let command_for_resolution = universal_command.clone();
     let user_id = user.user_id;
     tokio::spawn(async move {
         let outcome = operation
@@ -131,6 +196,7 @@ pub(super) async fn decide_approval(
             session_id,
             decision_for_resolution,
             Some(user_id),
+            command_for_resolution,
             outcome,
         )
         .await;
@@ -146,12 +212,80 @@ pub(super) async fn decide_approval(
     }
 }
 
+fn approval_envelope_matches_decision(
+    event: &agenter_core::AppEvent,
+    incoming: &agenter_core::ApprovalDecision,
+) -> bool {
+    match event {
+        agenter_core::AppEvent::ApprovalResolved(resolved) => resolved.decision == *incoming,
+        agenter_core::AppEvent::ApprovalRequested(request) => {
+            request.resolving_decision.as_ref() == Some(incoming)
+        }
+        _ => false,
+    }
+}
+
+fn approval_decision_conflict() -> crate::state::UniversalCommandConflict {
+    crate::state::UniversalCommandConflict {
+        code: "approval_decision_conflict".to_owned(),
+        message: "Approval already has a different decision in progress or resolved.".to_owned(),
+    }
+}
+
+fn approval_command_envelope(
+    user_id: agenter_core::UserId,
+    session_id: SessionId,
+    approval_id: agenter_core::ApprovalId,
+    decision: &agenter_core::ApprovalDecision,
+    option_id: Option<&str>,
+    feedback: Option<String>,
+) -> agenter_core::UniversalCommandEnvelope {
+    let effective_option_id = option_id
+        .filter(|option_id| !option_id.is_empty())
+        .unwrap_or_else(|| approval_option_id(decision))
+        .to_owned();
+    let effective_feedback = feedback.or_else(|| approval_feedback(decision));
+    agenter_core::UniversalCommandEnvelope {
+        command_id: agenter_core::CommandId::new(),
+        idempotency_key: format!("legacy:approval:{user_id}:{approval_id}:{effective_option_id}"),
+        session_id: Some(session_id),
+        turn_id: None,
+        command: agenter_core::UniversalCommand::ResolveApproval {
+            approval_id,
+            option_id: effective_option_id,
+            feedback: effective_feedback,
+        },
+    }
+}
+
+fn approval_option_id(decision: &agenter_core::ApprovalDecision) -> &'static str {
+    decision.canonical_option_id()
+}
+
+fn approval_feedback(decision: &agenter_core::ApprovalDecision) -> Option<String> {
+    match decision {
+        agenter_core::ApprovalDecision::ProviderSpecific { payload } => {
+            let payload_bytes = serde_json::to_vec(payload).unwrap_or_default();
+            let hash = Sha256::digest(&payload_bytes);
+            let fingerprint = format!("provider_specific_sha256:{hash:x}");
+            payload
+                .get("feedback")
+                .and_then(serde_json::Value::as_str)
+                .filter(|feedback| !feedback.is_empty())
+                .map(|feedback| format!("{feedback}\n{fingerprint}"))
+                .or(Some(fingerprint))
+        }
+        _ => None,
+    }
+}
+
 async fn finish_approval_operation(
     state: crate::state::AppState,
     approval_id: agenter_core::ApprovalId,
     session_id: SessionId,
     decision: agenter_core::ApprovalDecision,
     resolved_by_user_id: Option<agenter_core::UserId>,
+    command: agenter_core::UniversalCommandEnvelope,
     outcome: Result<
         agenter_protocol::runner::RunnerResponseOutcome,
         crate::state::RunnerCommandWaitError,
@@ -177,6 +311,17 @@ async fn finish_approval_operation(
                 tracing::warn!(%approval_id, %session_id, "approval decision could not finish resolution");
                 return Err(StatusCode::CONFLICT);
             };
+            if state
+                .finish_universal_command(
+                    &command,
+                    crate::state::UniversalCommandIdempotencyStatus::Succeeded,
+                    super::command_response(StatusCode::OK, serde_json::to_value(&envelope).ok()),
+                )
+                .await
+                .is_err()
+            {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
             tracing::info!(%approval_id, %session_id, "approval decision resolved after runner acknowledgement");
             Ok(envelope)
         }
@@ -192,6 +337,20 @@ async fn finish_approval_operation(
                 ),
             )
             .await;
+            if state
+                .finish_universal_command(
+                    &command,
+                    crate::state::UniversalCommandIdempotencyStatus::Failed,
+                    super::command_response(
+                        StatusCode::BAD_GATEWAY,
+                        serde_json::to_value(&error).ok(),
+                    ),
+                )
+                .await
+                .is_err()
+            {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
             Err(StatusCode::BAD_GATEWAY)
         }
         Ok(other) => {
@@ -203,6 +362,17 @@ async fn finish_approval_operation(
                 format!("Approval decision received an unexpected runner response: {other:?}"),
             )
             .await;
+            if state
+                .finish_universal_command(
+                    &command,
+                    crate::state::UniversalCommandIdempotencyStatus::Failed,
+                    super::command_response(StatusCode::BAD_GATEWAY, None),
+                )
+                .await
+                .is_err()
+            {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
             Err(StatusCode::BAD_GATEWAY)
         }
         Err(error) => {
@@ -214,7 +384,11 @@ async fn finish_approval_operation(
                 format!("Approval decision could not reach the runner: {error:?}"),
             )
             .await;
-            Err(super::runner_wait_error_status(error))
+            let status = super::runner_wait_error_status(error);
+            if state.clear_universal_command(&command).await.is_err() {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            Err(status)
         }
     }
 }
@@ -263,12 +437,47 @@ pub(super) async fn answer_question(
     };
     let mut answer = answer.0;
     answer.question_id = question_id;
+    let universal_command = agenter_core::UniversalCommandEnvelope {
+        command_id: agenter_core::CommandId::new(),
+        idempotency_key: format!("legacy:question:{}:{question_id}", user.user_id),
+        session_id: None,
+        turn_id: None,
+        command: agenter_core::UniversalCommand::AnswerQuestion {
+            question_id,
+            answer: answer.clone(),
+        },
+    };
+    if let Some(response) =
+        super::command_replay_response(state.begin_universal_command(&universal_command).await)
+    {
+        return response;
+    }
     let Some(session_id) = state.question_session(question_id).await else {
         tracing::warn!(%question_id, "question answer rejected missing question");
+        if let Some(response) = super::finish_command_or_error_response(
+            &state,
+            &universal_command,
+            crate::state::UniversalCommandIdempotencyStatus::Failed,
+            super::command_response(StatusCode::NOT_FOUND, None),
+        )
+        .await
+        {
+            return response;
+        }
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(session) = state.session(user.user_id, session_id).await else {
         tracing::warn!(user_id = %user.user_id, %question_id, %session_id, "question answer rejected session not found");
+        if let Some(response) = super::finish_command_or_error_response(
+            &state,
+            &universal_command,
+            crate::state::UniversalCommandIdempotencyStatus::Failed,
+            super::command_response(StatusCode::NOT_FOUND, None),
+        )
+        .await
+        {
+            return response;
+        }
         return StatusCode::NOT_FOUND.into_response();
     };
     let request_id = agenter_protocol::RequestId::from(Uuid::new_v4().to_string());
@@ -297,6 +506,16 @@ pub(super) async fn answer_question(
             result: agenter_protocol::runner::RunnerCommandResult::Accepted,
         }) => {
             let envelope = state.finish_question_answer(session_id, answer).await;
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Succeeded,
+                super::command_response(StatusCode::OK, serde_json::to_value(&envelope).ok()),
+            )
+            .await
+            {
+                return response;
+            }
             Json(envelope).into_response()
         }
         Ok(agenter_protocol::runner::RunnerResponseOutcome::Error { error }) => {
@@ -307,15 +526,46 @@ pub(super) async fn answer_question(
                 message = %error.message,
                 "question answer rejected by runner"
             );
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Failed,
+                super::command_response(StatusCode::BAD_GATEWAY, serde_json::to_value(&error).ok()),
+            )
+            .await
+            {
+                return response;
+            }
             StatusCode::BAD_GATEWAY.into_response()
         }
         Ok(other) => {
             tracing::warn!(user_id = %user.user_id, %question_id, ?other, "question answer received unexpected runner response");
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Failed,
+                super::command_response(StatusCode::BAD_GATEWAY, None),
+            )
+            .await
+            {
+                return response;
+            }
             StatusCode::BAD_GATEWAY.into_response()
         }
         Err(error) => {
             tracing::warn!(user_id = %user.user_id, %question_id, ?error, "question answer failed because runner is unavailable");
-            super::runner_wait_error_status(error).into_response()
+            let status = super::runner_wait_error_status(error);
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Failed,
+                super::command_response(status, None),
+            )
+            .await
+            {
+                return response;
+            }
+            status.into_response()
         }
     }
 }

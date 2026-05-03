@@ -1,4 +1,4 @@
-use agenter_core::ApprovalDecision;
+use agenter_core::{ApprovalDecision, SessionId};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 
@@ -15,6 +15,7 @@ pub struct PendingProviderApproval {
 
 #[derive(Debug)]
 struct PendingProviderApprovalState {
+    session_id: SessionId,
     provider_response: Option<oneshot::Sender<ProviderApprovalDecision>>,
     in_flight: Option<InFlightApprovalDecision>,
     completed: Option<CompletedApprovalDecision>,
@@ -42,14 +43,28 @@ pub enum PendingApprovalSubmitError {
 
 impl PendingProviderApproval {
     #[must_use]
-    pub fn new(provider_response: oneshot::Sender<ProviderApprovalDecision>) -> Self {
+    pub fn new(
+        session_id: SessionId,
+        provider_response: oneshot::Sender<ProviderApprovalDecision>,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(PendingProviderApprovalState {
+                session_id,
                 provider_response: Some(provider_response),
                 in_flight: None,
                 completed: None,
             })),
         }
+    }
+
+    pub async fn session_id(&self) -> SessionId {
+        self.inner.lock().await.session_id
+    }
+
+    pub async fn is_live(&self) -> bool {
+        let state = self.inner.lock().await;
+        state.completed.is_none()
+            && (state.provider_response.is_some() || state.in_flight.is_some())
     }
 
     pub async fn submit(
@@ -135,7 +150,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_same_decision_joins_in_flight_delivery() {
         let (provider_sender, provider_receiver) = oneshot::channel();
-        let pending = PendingProviderApproval::new(provider_sender);
+        let pending = PendingProviderApproval::new(SessionId::nil(), provider_sender);
 
         let first = tokio::spawn({
             let pending = pending.clone();
@@ -164,7 +179,7 @@ mod tests {
     #[tokio::test]
     async fn conflicting_duplicate_decision_is_rejected_without_second_delivery() {
         let (provider_sender, provider_receiver) = oneshot::channel();
-        let pending = PendingProviderApproval::new(provider_sender);
+        let pending = PendingProviderApproval::new(SessionId::nil(), provider_sender);
 
         let first = tokio::spawn({
             let pending = pending.clone();
@@ -191,7 +206,7 @@ mod tests {
     #[tokio::test]
     async fn completed_decision_is_replayed_for_late_duplicate() {
         let (provider_sender, provider_receiver) = oneshot::channel();
-        let pending = PendingProviderApproval::new(provider_sender);
+        let pending = PendingProviderApproval::new(SessionId::nil(), provider_sender);
 
         let first = tokio::spawn({
             let pending = pending.clone();

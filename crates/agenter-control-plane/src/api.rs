@@ -2,15 +2,19 @@ use std::{env, net::SocketAddr, time::Duration as StdDuration};
 
 use axum::{
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use tower_http::trace::TraceLayer;
 
 use crate::{
     auth::{session_token_from_headers, AuthenticatedUser, CookieSecurity},
     runner_ws,
-    state::{AppState, RunnerCommandWaitError},
+    state::{
+        AppState, RunnerCommandWaitError, UniversalCommandConflict,
+        UniversalCommandPersistenceError, UniversalCommandResponse, UniversalCommandStart,
+    },
 };
 
 pub mod approvals;
@@ -135,6 +139,105 @@ fn runner_wait_error_message(error: RunnerCommandWaitError) -> &'static str {
     }
 }
 
+fn command_replay_response(
+    start: Result<UniversalCommandStart, UniversalCommandPersistenceError>,
+) -> Option<Response> {
+    match start {
+        Err(error) => Some(command_persistence_error_response(error)),
+        Ok(start) => command_start_response(start),
+    }
+}
+
+fn command_start_response(start: UniversalCommandStart) -> Option<Response> {
+    match start {
+        UniversalCommandStart::Started => None,
+        UniversalCommandStart::Duplicate {
+            response: Some(response),
+            ..
+        } => Some(stored_command_response(response)),
+        UniversalCommandStart::Duplicate { .. } => Some(
+            (
+                StatusCode::ACCEPTED,
+                Json(agenter_protocol::runner::RunnerError {
+                    code: "command_pending".to_owned(),
+                    message: "Command with this idempotency key is already in progress.".to_owned(),
+                }),
+            )
+                .into_response(),
+        ),
+        UniversalCommandStart::Conflict(conflict) => Some(command_conflict_response(conflict)),
+    }
+}
+
+fn command_persistence_error_response(error: UniversalCommandPersistenceError) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(agenter_protocol::runner::RunnerError {
+            code: error.code,
+            message: error.message,
+        }),
+    )
+        .into_response()
+}
+
+fn command_finish_error_response(error: UniversalCommandPersistenceError) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(agenter_protocol::runner::RunnerError {
+            code: error.code,
+            message: format!(
+                "{} The command side effect may already have completed; refresh before retrying.",
+                error.message
+            ),
+        }),
+    )
+        .into_response()
+}
+
+async fn finish_command_or_error_response(
+    state: &AppState,
+    command: &agenter_core::UniversalCommandEnvelope,
+    status: crate::state::UniversalCommandIdempotencyStatus,
+    response: UniversalCommandResponse,
+) -> Option<Response> {
+    match state
+        .finish_universal_command(command, status, response)
+        .await
+    {
+        Ok(()) => None,
+        Err(error) => Some(command_finish_error_response(error)),
+    }
+}
+
+fn command_conflict_response(conflict: UniversalCommandConflict) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(agenter_protocol::runner::RunnerError {
+            code: conflict.code,
+            message: conflict.message,
+        }),
+    )
+        .into_response()
+}
+
+fn stored_command_response(response: UniversalCommandResponse) -> Response {
+    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::OK);
+    match response.body {
+        Some(body) => (status, Json(body)).into_response(),
+        None => status.into_response(),
+    }
+}
+
+fn command_response(
+    status: StatusCode,
+    body: Option<serde_json::Value>,
+) -> UniversalCommandResponse {
+    UniversalCommandResponse {
+        status: status.as_u16(),
+        body,
+    }
+}
+
 async fn publish_runner_error_event(
     state: &AppState,
     session_id: agenter_core::SessionId,
@@ -192,7 +295,7 @@ mod tests {
     use agenter_core::{
         AgentCapabilities, AgentMessageDeltaEvent, AgentProviderId, AppEvent, ApprovalDecision,
         ApprovalId, ApprovalKind, ApprovalRequestEvent, FileChangeKind, RunnerId, SessionId,
-        SessionInfo, WorkspaceId,
+        SessionInfo, UserMessageEvent, WorkspaceId,
     };
     use agenter_protocol::{
         browser::{
@@ -259,6 +362,84 @@ mod tests {
                 .is_err(),
             "runner should not receive an unsolicited command"
         );
+    }
+
+    async fn user_message_count(
+        state: &AppState,
+        user_id: agenter_core::UserId,
+        session_id: SessionId,
+        content: &str,
+    ) -> usize {
+        state
+            .session_history(user_id, session_id)
+            .await
+            .expect("session history")
+            .into_iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.event,
+                    AppEvent::UserMessage(message) if message.content == content
+                )
+            })
+            .count()
+    }
+
+    fn approval_request_event(
+        session_id: SessionId,
+        approval_id: ApprovalId,
+    ) -> ApprovalRequestEvent {
+        ApprovalRequestEvent {
+            session_id,
+            approval_id,
+            kind: ApprovalKind::Command,
+            title: "Run tests".to_owned(),
+            details: Some("cargo test".to_owned()),
+            expires_at: None,
+            presentation: None,
+            resolution_state: None,
+            resolving_decision: None,
+            status: None,
+            turn_id: None,
+            item_id: None,
+            options: Vec::new(),
+            risk: None,
+            subject: None,
+            native_request_id: None,
+            native_blocking: true,
+            policy: None,
+            provider_payload: None,
+        }
+    }
+
+    fn approval_test_command(
+        user_id: agenter_core::UserId,
+        session_id: SessionId,
+        approval_id: ApprovalId,
+        option_id: &str,
+        feedback: Option<String>,
+    ) -> agenter_core::UniversalCommandEnvelope {
+        agenter_core::UniversalCommandEnvelope {
+            command_id: agenter_core::CommandId::new(),
+            idempotency_key: format!("legacy:approval:{user_id}:{approval_id}:{option_id}"),
+            session_id: Some(session_id),
+            turn_id: None,
+            command: agenter_core::UniversalCommand::ResolveApproval {
+                approval_id,
+                option_id: option_id.to_owned(),
+                feedback,
+            },
+        }
+    }
+
+    fn approval_feedback_for_test(decision: &ApprovalDecision) -> Option<String> {
+        match decision {
+            ApprovalDecision::ProviderSpecific { payload } => {
+                use sha2::{Digest, Sha256};
+                let hash = Sha256::digest(serde_json::to_vec(payload).expect("serialize payload"));
+                Some(format!("provider_specific_sha256:{hash:x}"))
+            }
+            _ => None,
+        }
     }
 
     async fn send_runner_response(
@@ -773,8 +954,10 @@ mod tests {
         assert_eq!(command.provider_id.as_str(), AgentProviderId::CODEX);
         runner_sender
             .send(Message::Text(
-                serde_json::to_string(&RunnerClientMessage::Event(RunnerEventEnvelope {
+                serde_json::to_string(&RunnerClientMessage::Event(Box::new(RunnerEventEnvelope {
                     request_id: Some(refresh_command.request_id.clone()),
+                    runner_event_seq: None,
+                    acked_runner_event_seq: None,
                     event: RunnerEvent::SessionsDiscovered(agenter_protocol::runner::DiscoveredSessions {
                         workspace: workspace.clone(),
                         provider_id: AgentProviderId::from(AgentProviderId::CODEX),
@@ -789,7 +972,7 @@ mod tests {
                             }],
                         }],
                     }),
-                }))
+                })))
                 .expect("serialize discovered event")
                 .into(),
             ))
@@ -844,10 +1027,16 @@ mod tests {
     ) {
         sender
             .send(Message::Text(
-                serde_json::to_string(&RunnerClientMessage::Event(RunnerEventEnvelope {
+                serde_json::to_string(&RunnerClientMessage::Event(Box::new(RunnerEventEnvelope {
                     request_id,
-                    event: RunnerEvent::AgentEvent(AgentEvent { session_id, event }),
-                }))
+                    runner_event_seq: None,
+                    acked_runner_event_seq: None,
+                    event: RunnerEvent::AgentEvent(Box::new(AgentEvent {
+                        session_id,
+                        event,
+                        universal_event: None,
+                    })),
+                })))
                 .expect("serialize runner event")
                 .into(),
             ))
@@ -875,9 +1064,32 @@ mod tests {
                 .expect("decode browser message")
             {
                 BrowserServerMessage::Event(event) => return event,
+                BrowserServerMessage::UniversalEvent(_) => continue,
                 BrowserServerMessage::Ack(_) => continue,
+                BrowserServerMessage::SessionSnapshot(_) => continue,
                 BrowserServerMessage::Error(error) => panic!("unexpected browser error: {error:?}"),
             }
+        }
+    }
+
+    async fn next_browser_message(
+        receiver: &mut futures_util::stream::SplitStream<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        >,
+    ) -> BrowserServerMessage {
+        loop {
+            let frame = timeout(Duration::from_secs(2), receiver.next())
+                .await
+                .expect("browser message timeout")
+                .expect("browser message frame")
+                .expect("browser message websocket result");
+            let Message::Text(text) = frame else {
+                continue;
+            };
+            return serde_json::from_str::<BrowserServerMessage>(&text)
+                .expect("decode browser message");
         }
     }
 
@@ -944,6 +1156,8 @@ mod tests {
                 serde_json::to_string(&BrowserClientMessage::SubscribeSession(SubscribeSession {
                     request_id: Some(RequestId::from("sub-1")),
                     session_id: session.session_id,
+                    after_seq: None,
+                    include_snapshot: false,
                 }))
                 .expect("serialize subscribe")
                 .into(),
@@ -963,9 +1177,11 @@ mod tests {
 
         runner_sender
             .send(Message::Text(
-                serde_json::to_string(&RunnerClientMessage::Event(RunnerEventEnvelope {
+                serde_json::to_string(&RunnerClientMessage::Event(Box::new(RunnerEventEnvelope {
                     request_id: Some(RequestId::from("event-1")),
-                    event: RunnerEvent::AgentEvent(AgentEvent {
+                    runner_event_seq: None,
+                    acked_runner_event_seq: None,
+                    event: RunnerEvent::AgentEvent(Box::new(AgentEvent {
                         session_id: session.session_id,
                         event: AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {
                             session_id: session.session_id,
@@ -973,8 +1189,9 @@ mod tests {
                             delta: "hello browser".to_owned(),
                             provider_payload: None,
                         }),
-                    }),
-                }))
+                        universal_event: None,
+                    })),
+                })))
                 .expect("serialize runner event")
                 .into(),
             ))
@@ -998,6 +1215,137 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn subscribe_truncated_universal_snapshot_stops_before_live_events() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let user_id = state.bootstrap_user_id().expect("bootstrap user");
+        let runner = fake_hello();
+        let workspace = runner.workspaces[0].clone();
+        state
+            .register_runner(
+                runner.runner_id,
+                runner.capabilities.clone(),
+                runner.workspaces.clone(),
+            )
+            .await;
+        let session = state
+            .create_session(
+                SessionId::new(),
+                user_id,
+                runner.runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        for i in 0..1026 {
+            state
+                .publish_event(
+                    session.session_id,
+                    AppEvent::UserMessage(UserMessageEvent {
+                        session_id: session.session_id,
+                        message_id: Some(format!("replay-{i}")),
+                        author_user_id: None,
+                        content: "replay".to_owned(),
+                    }),
+                )
+                .await;
+        }
+
+        let browser_session_token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let server_state = state.clone();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("read listener address");
+        tokio::spawn(async move {
+            axum::serve(listener, app(server_state))
+                .await
+                .expect("serve app");
+        });
+
+        let mut browser_request = format!("ws://{addr}/api/browser/ws")
+            .into_client_request()
+            .expect("build browser websocket request");
+        browser_request.headers_mut().insert(
+            header::COOKIE,
+            format!("{}={browser_session_token}", SESSION_COOKIE_NAME)
+                .parse()
+                .expect("cookie header"),
+        );
+        let (browser_socket, _) = connect_async(browser_request)
+            .await
+            .expect("connect browser");
+        let (mut browser_sender, mut browser_receiver) = browser_socket.split();
+        browser_sender
+            .send(Message::Text(
+                serde_json::to_string(&BrowserClientMessage::SubscribeSession(SubscribeSession {
+                    request_id: Some(RequestId::from("sub-truncated")),
+                    session_id: session.session_id,
+                    after_seq: Some(agenter_core::UniversalSeq::zero()),
+                    include_snapshot: true,
+                }))
+                .expect("serialize subscribe")
+                .into(),
+            ))
+            .await
+            .expect("send browser subscription");
+
+        assert!(matches!(
+            next_browser_message(&mut browser_receiver).await,
+            BrowserServerMessage::Ack(_)
+        ));
+        let BrowserServerMessage::SessionSnapshot(snapshot) =
+            next_browser_message(&mut browser_receiver).await
+        else {
+            panic!("expected session snapshot");
+        };
+        assert!(snapshot.has_more);
+        let safe_latest_seq = snapshot.latest_seq;
+        state
+            .publish_event(
+                session.session_id,
+                AppEvent::UserMessage(UserMessageEvent {
+                    session_id: session.session_id,
+                    message_id: Some("live-after-truncated-snapshot".to_owned()),
+                    author_user_id: None,
+                    content: "live".to_owned(),
+                }),
+            )
+            .await;
+        let BrowserServerMessage::Error(error) = next_browser_message(&mut browser_receiver).await
+        else {
+            panic!("expected replay incomplete error");
+        };
+        assert_eq!(error.code, "snapshot_replay_incomplete");
+        assert!(
+            error.message.contains("snapshot.latest_seq"),
+            "error should instruct clients to resume from the snapshot cursor: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains(&format!("{safe_latest_seq:?}")),
+            "error should not point at a later live cursor: {}",
+            error.message
+        );
+
+        let next = timeout(Duration::from_millis(250), browser_receiver.next())
+            .await
+            .expect("subscription should close instead of waiting for live universal events");
+        assert!(
+            matches!(next, None | Some(Ok(Message::Close(_))) | Some(Err(_))),
+            "truncated universal subscription must not deliver live events: {next:?}"
+        );
     }
 
     #[tokio::test]
@@ -1246,6 +1594,1125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idempotent_send_session_message_replays_legacy_rest_response() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let user_id = state.bootstrap_user_id().expect("bootstrap user");
+        let runner = fake_hello();
+        let workspace = runner.workspaces[0].clone();
+        state
+            .register_runner(
+                runner.runner_id,
+                runner.capabilities.clone(),
+                runner.workspaces.clone(),
+            )
+            .await;
+        let (runner_sender, mut runner_receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.connect_runner(runner.runner_id, runner_sender).await;
+        let session = state
+            .create_session(
+                SessionId::new(),
+                user_id,
+                runner.runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let browser_session_token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let app = app(state.clone());
+        let request_body = serde_json::json!({
+            "content": "from browser",
+            "idempotency_key": "send-message-idempotency-1"
+        })
+        .to_string();
+
+        let first = tokio::spawn({
+            let app = app.clone();
+            let request_body = request_body.clone();
+            let browser_session_token = browser_session_token.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/sessions/{}/messages", session.session_id))
+                        .header(
+                            header::COOKIE,
+                            format!("{}={browser_session_token}", SESSION_COOKIE_NAME),
+                        )
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(request_body))
+                        .expect("build send request"),
+                )
+                .await
+                .expect("route send request")
+            }
+        });
+        let outbound = runner_receiver.recv().await.expect("runner command");
+        let RunnerServerMessage::Command(command) = outbound.message else {
+            panic!("expected runner command");
+        };
+        outbound
+            .delivered
+            .send(Ok(()))
+            .expect("report runner delivery");
+        state
+            .finish_runner_response(
+                runner.runner_id,
+                command.request_id,
+                agenter_protocol::runner::RunnerResponseOutcome::Ok {
+                    result: agenter_protocol::runner::RunnerCommandResult::Accepted,
+                },
+            )
+            .await;
+        let first = first.await.expect("join first send");
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+        let duplicate = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{}/messages", session.session_id))
+                    .header(
+                        header::COOKIE,
+                        format!("{}={browser_session_token}", SESSION_COOKIE_NAME),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body))
+                    .expect("build duplicate send request"),
+            )
+            .await
+            .expect("route duplicate send request");
+        assert_eq!(duplicate.status(), StatusCode::ACCEPTED);
+        assert!(
+            runner_receiver.try_recv().is_err(),
+            "duplicate same-key send must not dispatch another runner command"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_send_message_conflicts_when_settings_override_changes() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let user_id = state.bootstrap_user_id().expect("bootstrap user");
+        let runner = fake_hello();
+        let workspace = runner.workspaces[0].clone();
+        state
+            .register_runner(
+                runner.runner_id,
+                runner.capabilities.clone(),
+                runner.workspaces.clone(),
+            )
+            .await;
+        let (runner_sender, mut runner_receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.connect_runner(runner.runner_id, runner_sender).await;
+        let session = state
+            .create_session(
+                SessionId::new(),
+                user_id,
+                runner.runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let browser_session_token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let app = app(state.clone());
+        let first_body = serde_json::json!({
+            "content": "same text",
+            "idempotency_key": "send-message-settings-key",
+            "settings_override": { "collaboration_mode": "plan" }
+        })
+        .to_string();
+
+        let first = tokio::spawn({
+            let app = app.clone();
+            let token = browser_session_token.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/sessions/{}/messages", session.session_id))
+                        .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(first_body))
+                        .expect("build first send"),
+                )
+                .await
+                .expect("route first send")
+            }
+        });
+        let outbound = runner_receiver.recv().await.expect("runner command");
+        let RunnerServerMessage::Command(command) = outbound.message else {
+            panic!("expected runner command");
+        };
+        outbound.delivered.send(Ok(())).expect("runner delivered");
+        state
+            .finish_runner_response(
+                runner.runner_id,
+                command.request_id,
+                agenter_protocol::runner::RunnerResponseOutcome::Ok {
+                    result: agenter_protocol::runner::RunnerCommandResult::Accepted,
+                },
+            )
+            .await;
+        assert_eq!(
+            first.await.expect("join first").status(),
+            StatusCode::ACCEPTED
+        );
+
+        let conflict = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{}/messages", session.session_id))
+                    .header(
+                        header::COOKIE,
+                        format!("{}={browser_session_token}", SESSION_COOKIE_NAME),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "content": "same text",
+                            "idempotency_key": "send-message-settings-key",
+                            "settings_override": { "collaboration_mode": "default" }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build conflicting send"),
+            )
+            .await
+            .expect("route conflicting send");
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert!(runner_receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn idempotent_question_answer_replays_after_question_is_resolved_and_conflicts() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let user_id = state.bootstrap_user_id().expect("bootstrap user");
+        let runner = fake_hello();
+        let workspace = runner.workspaces[0].clone();
+        state
+            .register_runner(
+                runner.runner_id,
+                runner.capabilities.clone(),
+                runner.workspaces.clone(),
+            )
+            .await;
+        let (runner_sender, mut runner_receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.connect_runner(runner.runner_id, runner_sender).await;
+        let session = state
+            .create_session(
+                SessionId::new(),
+                user_id,
+                runner.runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let question_id = agenter_core::QuestionId::new();
+        state
+            .publish_event(
+                session.session_id,
+                AppEvent::QuestionRequested(agenter_core::QuestionRequestedEvent {
+                    session_id: session.session_id,
+                    question_id,
+                    title: "Pick target".to_owned(),
+                    description: None,
+                    fields: Vec::new(),
+                    provider_payload: None,
+                }),
+            )
+            .await;
+        let token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let app = app(state.clone());
+        let answer = serde_json::json!({
+            "question_id": question_id,
+            "answers": { "target": ["browser"] }
+        })
+        .to_string();
+
+        let first = tokio::spawn({
+            let app = app.clone();
+            let token = token.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/questions/{question_id}/answer"))
+                        .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(answer))
+                        .expect("build answer"),
+                )
+                .await
+                .expect("route answer")
+            }
+        });
+        let outbound = runner_receiver.recv().await.expect("runner command");
+        let RunnerServerMessage::Command(command) = outbound.message else {
+            panic!("expected runner command");
+        };
+        outbound.delivered.send(Ok(())).expect("runner delivered");
+        state
+            .finish_runner_response(
+                runner.runner_id,
+                command.request_id,
+                agenter_protocol::runner::RunnerResponseOutcome::Ok {
+                    result: agenter_protocol::runner::RunnerCommandResult::Accepted,
+                },
+            )
+            .await;
+        let first = first.await.expect("join answer");
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = to_bytes(first.into_body(), usize::MAX)
+            .await
+            .expect("read first answer body");
+        let first_envelope: BrowserEventEnvelope =
+            serde_json::from_slice(&first_body).expect("answer envelope");
+
+        let duplicate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/questions/{question_id}/answer"))
+                    .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "question_id": question_id,
+                            "answers": { "target": ["browser"] }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build duplicate answer"),
+            )
+            .await
+            .expect("route duplicate answer");
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        let duplicate_body = to_bytes(duplicate.into_body(), usize::MAX)
+            .await
+            .expect("read duplicate answer body");
+        let duplicate_envelope: BrowserEventEnvelope =
+            serde_json::from_slice(&duplicate_body).expect("duplicate envelope");
+        assert_eq!(duplicate_envelope.event_id, first_envelope.event_id);
+        assert!(runner_receiver.try_recv().is_err());
+
+        let conflict = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/questions/{question_id}/answer"))
+                    .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "question_id": question_id,
+                            "answers": { "target": ["runner"] }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build conflicting answer"),
+            )
+            .await
+            .expect("route conflicting answer");
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert!(runner_receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn idempotent_slash_interrupt_replays_and_conflicts() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let user_id = state.bootstrap_user_id().expect("bootstrap user");
+        let runner = fake_hello();
+        let workspace = runner.workspaces[0].clone();
+        state
+            .register_runner(
+                runner.runner_id,
+                runner.capabilities.clone(),
+                runner.workspaces.clone(),
+            )
+            .await;
+        let (runner_sender, mut runner_receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.connect_runner(runner.runner_id, runner_sender).await;
+        let session = state
+            .create_session(
+                SessionId::new(),
+                user_id,
+                runner.runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let app = app(state.clone());
+        let body = serde_json::json!({
+            "command_id": "runner.interrupt",
+            "raw_input": "/interrupt",
+            "arguments": {},
+            "confirmed": true,
+            "idempotency_key": "slash-interrupt-key"
+        })
+        .to_string();
+
+        let first = tokio::spawn({
+            let app = app.clone();
+            let token = token.clone();
+            let body = body.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/api/sessions/{}/slash-commands",
+                            session.session_id
+                        ))
+                        .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .expect("build interrupt"),
+                )
+                .await
+                .expect("route interrupt")
+            }
+        });
+        let outbound = runner_receiver.recv().await.expect("runner command");
+        let RunnerServerMessage::Command(command) = outbound.message else {
+            panic!("expected runner command");
+        };
+        assert!(matches!(
+            command.command,
+            agenter_protocol::runner::RunnerCommand::InterruptSession { .. }
+        ));
+        outbound.delivered.send(Ok(())).expect("runner delivered");
+        state
+            .finish_runner_response(
+                runner.runner_id,
+                command.request_id,
+                agenter_protocol::runner::RunnerResponseOutcome::Ok {
+                    result: agenter_protocol::runner::RunnerCommandResult::Accepted,
+                },
+            )
+            .await;
+        assert_eq!(
+            first.await.expect("join interrupt").status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            user_message_count(&state, user_id, session.session_id, "/interrupt").await,
+            1
+        );
+
+        let duplicate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/sessions/{}/slash-commands",
+                        session.session_id
+                    ))
+                    .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("build duplicate interrupt"),
+            )
+            .await
+            .expect("route duplicate interrupt");
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        assert!(runner_receiver.try_recv().is_err());
+        assert_eq!(
+            user_message_count(&state, user_id, session.session_id, "/interrupt").await,
+            1
+        );
+
+        let conflict = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/sessions/{}/slash-commands",
+                        session.session_id
+                    ))
+                    .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command_id": "runner.interrupt",
+                            "raw_input": "/interrupt please",
+                            "arguments": {},
+                            "confirmed": true,
+                            "idempotency_key": "slash-interrupt-key"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build conflicting interrupt"),
+            )
+            .await
+            .expect("route conflicting interrupt");
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert!(runner_receiver.try_recv().is_err());
+        assert_eq!(
+            user_message_count(&state, user_id, session.session_id, "/interrupt").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_provider_slash_command_replays_and_conflicts() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let user_id = state.bootstrap_user_id().expect("bootstrap user");
+        let runner = fake_hello();
+        let workspace = runner.workspaces[0].clone();
+        state
+            .register_runner(
+                runner.runner_id,
+                runner.capabilities.clone(),
+                runner.workspaces.clone(),
+            )
+            .await;
+        let (runner_sender, mut runner_receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.connect_runner(runner.runner_id, runner_sender).await;
+        let session = state
+            .create_session(
+                SessionId::new(),
+                user_id,
+                runner.runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let app = app(state.clone());
+        let body = serde_json::json!({
+            "command_id": "codex.compact",
+            "raw_input": "/compact",
+            "arguments": {},
+            "confirmed": false,
+            "idempotency_key": "provider-slash-key"
+        })
+        .to_string();
+
+        let first = tokio::spawn({
+            let app = app.clone();
+            let token = token.clone();
+            let body = body.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/api/sessions/{}/slash-commands",
+                            session.session_id
+                        ))
+                        .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .expect("build provider command"),
+                )
+                .await
+                .expect("route provider command")
+            }
+        });
+        let outbound = runner_receiver.recv().await.expect("runner command");
+        let RunnerServerMessage::Command(command) = outbound.message else {
+            panic!("expected runner command");
+        };
+        assert!(matches!(
+            command.command,
+            agenter_protocol::runner::RunnerCommand::ExecuteProviderCommand(_)
+        ));
+        outbound.delivered.send(Ok(())).expect("runner delivered");
+        state
+            .finish_runner_response(
+                runner.runner_id,
+                command.request_id,
+                agenter_protocol::runner::RunnerResponseOutcome::Ok {
+                    result:
+                        agenter_protocol::runner::RunnerCommandResult::ProviderCommandExecuted {
+                            result: agenter_core::SlashCommandResult {
+                                accepted: true,
+                                message: "Compacted.".to_owned(),
+                                session: None,
+                                provider_payload: None,
+                            },
+                        },
+                },
+            )
+            .await;
+        assert_eq!(
+            first.await.expect("join provider command").status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            user_message_count(&state, user_id, session.session_id, "/compact").await,
+            1
+        );
+
+        let duplicate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/sessions/{}/slash-commands",
+                        session.session_id
+                    ))
+                    .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("build duplicate provider command"),
+            )
+            .await
+            .expect("route duplicate provider command");
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        assert!(runner_receiver.try_recv().is_err());
+        assert_eq!(
+            user_message_count(&state, user_id, session.session_id, "/compact").await,
+            1
+        );
+
+        let conflict = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/sessions/{}/slash-commands",
+                        session.session_id
+                    ))
+                    .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command_id": "codex.compact",
+                            "raw_input": "/compact now",
+                            "arguments": {},
+                            "confirmed": false,
+                            "idempotency_key": "provider-slash-key"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build conflicting provider command"),
+            )
+            .await
+            .expect("route conflicting provider command");
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert!(runner_receiver.try_recv().is_err());
+        assert_eq!(
+            user_message_count(&state, user_id, session.session_id, "/compact").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_legacy_slash_without_key_executes_repeated_invocations() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let user_id = state.bootstrap_user_id().expect("bootstrap user");
+        let runner = fake_hello();
+        let workspace = runner.workspaces[0].clone();
+        state
+            .register_runner(
+                runner.runner_id,
+                runner.capabilities.clone(),
+                runner.workspaces.clone(),
+            )
+            .await;
+        let (runner_sender, mut runner_receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.connect_runner(runner.runner_id, runner_sender).await;
+        let session = state
+            .create_session(
+                SessionId::new(),
+                user_id,
+                runner.runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let app = app(state.clone());
+        let body = serde_json::json!({
+            "command_id": "codex.compact",
+            "raw_input": "/compact",
+            "arguments": {},
+            "confirmed": false
+        })
+        .to_string();
+
+        for expected_message in ["Compacted once.", "Compacted twice."] {
+            let response_task = tokio::spawn({
+                let app = app.clone();
+                let token = token.clone();
+                let body = body.clone();
+                let session_id = session.session_id;
+                async move {
+                    app.oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(format!("/api/sessions/{session_id}/slash-commands"))
+                            .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body))
+                            .expect("build provider command"),
+                    )
+                    .await
+                    .expect("route provider command")
+                }
+            });
+            let outbound = runner_receiver.recv().await.expect("runner command");
+            let RunnerServerMessage::Command(command) = outbound.message else {
+                panic!("expected runner command");
+            };
+            assert!(matches!(
+                command.command,
+                agenter_protocol::runner::RunnerCommand::ExecuteProviderCommand(_)
+            ));
+            outbound.delivered.send(Ok(())).expect("runner delivered");
+            state
+                .finish_runner_response(
+                    runner.runner_id,
+                    command.request_id,
+                    agenter_protocol::runner::RunnerResponseOutcome::Ok {
+                        result:
+                            agenter_protocol::runner::RunnerCommandResult::ProviderCommandExecuted {
+                                result: agenter_core::SlashCommandResult {
+                                    accepted: true,
+                                    message: expected_message.to_owned(),
+                                    session: None,
+                                    provider_payload: None,
+                                },
+                            },
+                    },
+                )
+                .await;
+            assert_eq!(
+                response_task.await.expect("join provider command").status(),
+                StatusCode::OK
+            );
+        }
+
+        assert!(runner_receiver.try_recv().is_err());
+        assert_eq!(
+            user_message_count(&state, user_id, session.session_id, "/compact").await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_local_new_slash_replays_created_session() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let user_id = state.bootstrap_user_id().expect("bootstrap user");
+        let runner = fake_hello();
+        let workspace = runner.workspaces[0].clone();
+        state
+            .register_runner(
+                runner.runner_id,
+                runner.capabilities.clone(),
+                runner.workspaces.clone(),
+            )
+            .await;
+        let (runner_sender, mut runner_receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.connect_runner(runner.runner_id, runner_sender).await;
+        let source_session = state
+            .create_session(
+                SessionId::new(),
+                user_id,
+                runner.runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let app = app(state.clone());
+        let body = serde_json::json!({
+            "command_id": "local.new",
+            "raw_input": "/new follow-up",
+            "arguments": { "title": "follow-up" },
+            "confirmed": false,
+            "idempotency_key": "local-new-key"
+        })
+        .to_string();
+
+        let first = tokio::spawn({
+            let app = app.clone();
+            let token = token.clone();
+            let body = body.clone();
+            let source_session_id = source_session.session_id;
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/sessions/{source_session_id}/slash-commands"))
+                        .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .expect("build local new"),
+                )
+                .await
+                .expect("route local new")
+            }
+        });
+        let outbound = runner_receiver.recv().await.expect("runner command");
+        let RunnerServerMessage::Command(command) = outbound.message else {
+            panic!("expected runner command");
+        };
+        let agenter_protocol::runner::RunnerCommand::CreateSession(create_command) =
+            &command.command
+        else {
+            panic!("expected create-session command");
+        };
+        let created_session_id = create_command.session_id;
+        outbound.delivered.send(Ok(())).expect("runner delivered");
+        state
+            .finish_runner_response(
+                runner.runner_id,
+                command.request_id,
+                agenter_protocol::runner::RunnerResponseOutcome::Ok {
+                    result: agenter_protocol::runner::RunnerCommandResult::SessionCreated {
+                        session_id: created_session_id,
+                        external_session_id: "codex-local-new".to_owned(),
+                    },
+                },
+            )
+            .await;
+        let first = first.await.expect("join local new");
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = to_bytes(first.into_body(), usize::MAX)
+            .await
+            .expect("read local new body");
+        let first_result: agenter_core::SlashCommandResult =
+            serde_json::from_slice(&first_body).expect("local new result");
+        assert_eq!(
+            first_result.session.expect("created session").session_id,
+            created_session_id
+        );
+
+        let duplicate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/sessions/{}/slash-commands",
+                        source_session.session_id
+                    ))
+                    .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("build duplicate local new"),
+            )
+            .await
+            .expect("route duplicate local new");
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        let duplicate_body = to_bytes(duplicate.into_body(), usize::MAX)
+            .await
+            .expect("read duplicate local new body");
+        let duplicate_result: agenter_core::SlashCommandResult =
+            serde_json::from_slice(&duplicate_body).expect("duplicate local new result");
+        assert_eq!(
+            duplicate_result
+                .session
+                .expect("created session")
+                .session_id,
+            created_session_id
+        );
+        assert!(runner_receiver.try_recv().is_err());
+
+        let conflict = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/sessions/{}/slash-commands",
+                        source_session.session_id
+                    ))
+                    .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command_id": "local.new",
+                            "raw_input": "/new other",
+                            "arguments": { "title": "other" },
+                            "confirmed": false,
+                            "idempotency_key": "local-new-key"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build conflicting local new"),
+            )
+            .await
+            .expect("route conflicting local new");
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert!(runner_receiver.try_recv().is_err());
+        assert_eq!(
+            user_message_count(&state, user_id, source_session.session_id, "/new follow-up").await,
+            1
+        );
+        assert_eq!(
+            user_message_count(&state, user_id, source_session.session_id, "/new other").await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_local_refresh_replays_unavailable_workspace_failure() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let user_id = state.bootstrap_user_id().expect("bootstrap user");
+        let runner = fake_hello();
+        let workspace = runner.workspaces[0].clone();
+        let session = state
+            .create_session(
+                SessionId::new(),
+                user_id,
+                runner.runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let app = app(state.clone());
+        let body = serde_json::json!({
+            "command_id": "local.refresh",
+            "raw_input": "/refresh",
+            "arguments": {},
+            "confirmed": false,
+            "idempotency_key": "local-refresh-missing-workspace"
+        })
+        .to_string();
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/sessions/{}/slash-commands",
+                        session.session_id
+                    ))
+                    .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .expect("build local refresh"),
+            )
+            .await
+            .expect("route local refresh");
+        assert_eq!(first.status(), StatusCode::NOT_FOUND);
+        let first_body = to_bytes(first.into_body(), usize::MAX)
+            .await
+            .expect("read local refresh body");
+        let first_result: agenter_core::SlashCommandResult =
+            serde_json::from_slice(&first_body).expect("local refresh result");
+        assert!(!first_result.accepted);
+
+        let duplicate = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/sessions/{}/slash-commands",
+                        session.session_id
+                    ))
+                    .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("build duplicate local refresh"),
+            )
+            .await
+            .expect("route duplicate local refresh");
+        assert_eq!(duplicate.status(), StatusCode::NOT_FOUND);
+        let duplicate_body = to_bytes(duplicate.into_body(), usize::MAX)
+            .await
+            .expect("read duplicate local refresh body");
+        let duplicate_result: agenter_core::SlashCommandResult =
+            serde_json::from_slice(&duplicate_body).expect("duplicate local refresh result");
+        assert_eq!(duplicate_result.message, first_result.message);
+        assert_eq!(
+            user_message_count(&state, user_id, session.session_id, "/refresh").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_local_model_slash_replays_and_conflicts() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let user_id = state.bootstrap_user_id().expect("bootstrap user");
+        let runner = fake_hello();
+        let workspace = runner.workspaces[0].clone();
+        state
+            .register_runner(
+                runner.runner_id,
+                runner.capabilities.clone(),
+                runner.workspaces.clone(),
+            )
+            .await;
+        let session = state
+            .create_session(
+                SessionId::new(),
+                user_id,
+                runner.runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let app = app(state.clone());
+        let body = serde_json::json!({
+            "command_id": "local.model",
+            "raw_input": "/model gpt-5",
+            "arguments": { "model": "gpt-5" },
+            "confirmed": false,
+            "idempotency_key": "local-model-key"
+        })
+        .to_string();
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/sessions/{}/slash-commands",
+                        session.session_id
+                    ))
+                    .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .expect("build local model"),
+            )
+            .await
+            .expect("route local model");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let duplicate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/sessions/{}/slash-commands",
+                        session.session_id
+                    ))
+                    .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("build duplicate local model"),
+            )
+            .await
+            .expect("route duplicate local model");
+        assert_eq!(duplicate.status(), StatusCode::OK);
+
+        let conflict = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/sessions/{}/slash-commands",
+                        session.session_id
+                    ))
+                    .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command_id": "local.model",
+                            "raw_input": "/model gpt-5.1",
+                            "arguments": { "model": "gpt-5.1" },
+                            "confirmed": false,
+                            "idempotency_key": "local-model-key"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build conflicting local model"),
+            )
+            .await
+            .expect("route conflicting local model");
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+        let settings = state
+            .session_turn_settings(user_id, session.session_id)
+            .await
+            .expect("settings");
+        assert_eq!(settings.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[tokio::test]
     async fn full_browser_fake_runner_pipeline_routes_messages_events_history_and_approvals() {
         let state = AppState::new_with_bootstrap_admin(
             "dev-token".to_owned(),
@@ -1326,6 +2793,8 @@ mod tests {
                 serde_json::to_string(&BrowserClientMessage::SubscribeSession(SubscribeSession {
                     request_id: Some(RequestId::from("sub-full")),
                     session_id: session.session_id,
+                    after_seq: None,
+                    include_snapshot: false,
                 }))
                 .expect("serialize subscribe")
                 .into(),
@@ -1395,6 +2864,15 @@ mod tests {
                 presentation: None,
                 resolution_state: None,
                 resolving_decision: None,
+                status: None,
+                turn_id: None,
+                item_id: None,
+                options: Vec::new(),
+                risk: None,
+                subject: None,
+                native_request_id: None,
+                native_blocking: true,
+                policy: None,
                 provider_payload: None,
             }),
         )
@@ -1545,6 +3023,15 @@ mod tests {
                     presentation: None,
                     resolution_state: None,
                     resolving_decision: None,
+                    status: None,
+                    turn_id: None,
+                    item_id: None,
+                    options: Vec::new(),
+                    risk: None,
+                    subject: None,
+                    native_request_id: None,
+                    native_blocking: true,
+                    policy: None,
                     provider_payload: None,
                 }),
             )
@@ -1632,6 +3119,7 @@ mod tests {
         assert!(matches!(envelope.event, AppEvent::ApprovalResolved(_)));
 
         let duplicate_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1660,6 +3148,449 @@ mod tests {
             observed_receiver.try_recv().is_err(),
             "duplicate decisions must not send another runner command"
         );
+
+        let conflicting_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/approvals/{approval_id}/decision"))
+                    .header(
+                        header::COOKIE,
+                        format!("{}={browser_session_token}", SESSION_COOKIE_NAME),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&ApprovalDecision::Decline)
+                            .expect("serialize conflicting decision"),
+                    ))
+                    .expect("build conflicting approval decision request"),
+            )
+            .await
+            .expect("route conflicting approval decision");
+        assert_eq!(conflicting_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn approval_decision_retry_after_transient_runner_failure_is_not_poisoned() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let user_id = state.bootstrap_user_id().expect("bootstrap user");
+        let session_id = smoke_session_id();
+        let runner = fake_hello();
+        let workspace = runner.workspaces[0].clone();
+        state
+            .register_runner(
+                runner.runner_id,
+                runner.capabilities.clone(),
+                runner.workspaces.clone(),
+            )
+            .await;
+        state
+            .create_session(
+                session_id,
+                user_id,
+                runner.runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let approval_id = ApprovalId::new();
+        state
+            .publish_event(
+                session_id,
+                AppEvent::ApprovalRequested(ApprovalRequestEvent {
+                    session_id,
+                    approval_id,
+                    kind: ApprovalKind::Command,
+                    title: "Run tests".to_owned(),
+                    details: Some("cargo test".to_owned()),
+                    expires_at: None,
+                    presentation: None,
+                    resolution_state: None,
+                    resolving_decision: None,
+                    status: None,
+                    turn_id: None,
+                    item_id: None,
+                    options: vec![agenter_core::ApprovalOption::approve_once()],
+                    risk: None,
+                    subject: None,
+                    native_request_id: None,
+                    native_blocking: true,
+                    policy: None,
+                    provider_payload: None,
+                }),
+            )
+            .await;
+        let browser_session_token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let app = app(state.clone());
+
+        let first_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/approvals/{approval_id}/decision"))
+                    .header(
+                        header::COOKIE,
+                        format!("{}={browser_session_token}", SESSION_COOKIE_NAME),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "decision": "accept",
+                            "option_id": "approve_once"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build transient approval decision request"),
+            )
+            .await
+            .expect("route transient approval decision");
+        assert_eq!(first_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let (runner_sender, mut runner_receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.connect_runner(runner.runner_id, runner_sender).await;
+        let retry_task = tokio::spawn(
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/approvals/{approval_id}/decision"))
+                    .header(
+                        header::COOKIE,
+                        format!("{}={browser_session_token}", SESSION_COOKIE_NAME),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "decision": "accept",
+                            "option_id": "approve_once"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("build retry approval decision request"),
+            ),
+        );
+
+        let outbound = runner_receiver
+            .recv()
+            .await
+            .expect("retry sends runner command");
+        outbound
+            .delivered
+            .send(Ok(()))
+            .expect("report runner delivery");
+        let RunnerServerMessage::Command(command) = outbound.message else {
+            panic!("expected runner command");
+        };
+        state
+            .finish_runner_response(
+                runner.runner_id,
+                command.request_id,
+                agenter_protocol::runner::RunnerResponseOutcome::Ok {
+                    result: agenter_protocol::runner::RunnerCommandResult::Accepted,
+                },
+            )
+            .await;
+
+        let retry_response = retry_task
+            .await
+            .expect("join retry approval decision")
+            .expect("route retry approval decision");
+        assert_eq!(retry_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_approval_decision_does_not_mark_resolving() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let owner = state.bootstrap_user_id().expect("bootstrap user");
+        let runner = fake_hello();
+        let session_id = smoke_session_id();
+        state
+            .create_session(
+                session_id,
+                owner,
+                runner.runner_id,
+                runner.workspaces[0].clone(),
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let approval_id = ApprovalId::new();
+        state
+            .publish_event(
+                session_id,
+                AppEvent::ApprovalRequested(approval_request_event(session_id, approval_id)),
+            )
+            .await;
+        let other_token = state
+            .create_authenticated_session(AuthenticatedUser {
+                user_id: agenter_core::UserId::new(),
+                email: "other@example.test".to_owned(),
+                display_name: None,
+            })
+            .await;
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/approvals/{approval_id}/decision"))
+                    .header(
+                        header::COOKIE,
+                        format!("{}={other_token}", SESSION_COOKIE_NAME),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&ApprovalDecision::Accept)
+                            .expect("serialize decision"),
+                    ))
+                    .expect("build approval request"),
+            )
+            .await
+            .expect("route approval request");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(!state.approval_is_resolving(approval_id).await);
+        let history = state
+            .session_history(owner, session_id)
+            .await
+            .expect("history");
+        assert!(
+            history.iter().all(|entry| {
+                !matches!(
+                    &entry.event,
+                    AppEvent::ApprovalRequested(request)
+                        if request.approval_id == approval_id
+                            && request.resolution_state
+                                == Some(agenter_core::ApprovalResolutionState::Resolving)
+                )
+            }),
+            "unauthorized decision must not emit resolving transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_conflict_does_not_mark_approval_resolving() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let owner = state.bootstrap_user_id().expect("bootstrap user");
+        let runner = fake_hello();
+        let session_id = smoke_session_id();
+        state
+            .create_session(
+                session_id,
+                owner,
+                runner.runner_id,
+                runner.workspaces[0].clone(),
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let approval_id = ApprovalId::new();
+        state
+            .publish_event(
+                session_id,
+                AppEvent::ApprovalRequested(approval_request_event(session_id, approval_id)),
+            )
+            .await;
+        let token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+        let mut conflicting_command =
+            approval_test_command(owner, session_id, approval_id, "approve_once", None);
+        if let agenter_core::UniversalCommand::ResolveApproval { option_id, .. } =
+            &mut conflicting_command.command
+        {
+            *option_id = "deny".to_owned();
+        }
+        assert!(matches!(
+            state.begin_universal_command(&conflicting_command).await,
+            Ok(crate::state::UniversalCommandStart::Started)
+        ));
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/approvals/{approval_id}/decision"))
+                    .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&ApprovalDecision::Accept)
+                            .expect("serialize decision"),
+                    ))
+                    .expect("build approval request"),
+            )
+            .await
+            .expect("route approval request");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(!state.approval_is_resolving(approval_id).await);
+    }
+
+    #[tokio::test]
+    async fn resolved_approval_with_pending_idempotency_replays_and_finishes() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let owner = state.bootstrap_user_id().expect("bootstrap user");
+        let runner = fake_hello();
+        let session_id = smoke_session_id();
+        state
+            .create_session(
+                session_id,
+                owner,
+                runner.runner_id,
+                runner.workspaces[0].clone(),
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let approval_id = ApprovalId::new();
+        state
+            .publish_event(
+                session_id,
+                AppEvent::ApprovalRequested(approval_request_event(session_id, approval_id)),
+            )
+            .await;
+        state
+            .publish_event(
+                session_id,
+                AppEvent::ApprovalResolved(agenter_core::ApprovalResolvedEvent {
+                    session_id,
+                    approval_id,
+                    decision: ApprovalDecision::Accept,
+                    resolved_by_user_id: Some(owner),
+                    resolved_at: Utc::now(),
+                    provider_payload: None,
+                }),
+            )
+            .await;
+        let pending_command =
+            approval_test_command(owner, session_id, approval_id, "approve_once", None);
+        assert!(matches!(
+            state.begin_universal_command(&pending_command).await,
+            Ok(crate::state::UniversalCommandStart::Started)
+        ));
+        let token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+
+        for _ in 0..2 {
+            let response = app(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/approvals/{approval_id}/decision"))
+                        .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_string(&ApprovalDecision::Accept)
+                                .expect("serialize decision"),
+                        ))
+                        .expect("build approval request"),
+                )
+                .await
+                .expect("route approval request");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read approval body");
+            let envelope: BrowserEventEnvelope =
+                serde_json::from_slice(&body).expect("approval envelope");
+            assert!(matches!(envelope.event, AppEvent::ApprovalResolved(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_specific_approval_payload_changes_conflict_by_hash() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let owner = state.bootstrap_user_id().expect("bootstrap user");
+        let runner = fake_hello();
+        let session_id = smoke_session_id();
+        state
+            .create_session(
+                session_id,
+                owner,
+                runner.runner_id,
+                runner.workspaces[0].clone(),
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let approval_id = ApprovalId::new();
+        state
+            .publish_event(
+                session_id,
+                AppEvent::ApprovalRequested(approval_request_event(session_id, approval_id)),
+            )
+            .await;
+        let first_decision = ApprovalDecision::ProviderSpecific {
+            payload: serde_json::json!({"decision": "allow", "nonce": 1}),
+        };
+        let first_command = approval_test_command(
+            owner,
+            session_id,
+            approval_id,
+            "provider_specific",
+            approval_feedback_for_test(&first_decision),
+        );
+        assert!(matches!(
+            state.begin_universal_command(&first_command).await,
+            Ok(crate::state::UniversalCommandStart::Started)
+        ));
+        let token = state
+            .login_password("admin@example.test", "correct horse battery staple")
+            .await
+            .expect("login bootstrap admin");
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/approvals/{approval_id}/decision"))
+                    .header(header::COOKIE, format!("{}={token}", SESSION_COOKIE_NAME))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&ApprovalDecision::ProviderSpecific {
+                            payload: serde_json::json!({"decision": "allow", "nonce": 2}),
+                        })
+                        .expect("serialize decision"),
+                    ))
+                    .expect("build approval request"),
+            )
+            .await
+            .expect("route approval request");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(!state.approval_is_resolving(approval_id).await);
     }
 
     #[tokio::test]
@@ -1757,11 +3688,20 @@ mod tests {
                     presentation: None,
                     resolution_state: None,
                     resolving_decision: None,
+                    status: None,
+                    turn_id: None,
+                    item_id: None,
+                    options: Vec::new(),
+                    risk: None,
+                    subject: None,
+                    native_request_id: None,
+                    native_blocking: true,
+                    policy: None,
                     provider_payload: None,
                 }),
             )
             .await;
-        let resolved = state
+        state
             .publish_event(
                 session_id,
                 AppEvent::ApprovalResolved(agenter_core::ApprovalResolvedEvent {
@@ -1797,13 +3737,7 @@ mod tests {
             .await
             .expect("route stale approval decision");
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read stale approval response");
-        let envelope: BrowserEventEnvelope =
-            serde_json::from_slice(&body).expect("stale approval response json");
-        assert_eq!(envelope.event_id, resolved.event_id);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         assert!(
             runner_receiver.try_recv().is_err(),
             "stale browser decisions must not send runner commands"
@@ -2039,6 +3973,8 @@ mod tests {
                 serde_json::to_string(&BrowserClientMessage::SubscribeSession(SubscribeSession {
                     request_id: Some(RequestId::from("sub-forbidden")),
                     session_id: SessionId::new(),
+                    after_seq: None,
+                    include_snapshot: false,
                 }))
                 .expect("serialize subscribe")
                 .into(),
@@ -2099,8 +4035,10 @@ mod tests {
 
         let huge_diff = "x".repeat(17 * 1024 * 1024);
         let huge_payload = "y".repeat(17 * 1024 * 1024);
-        let message = RunnerClientMessage::Event(RunnerEventEnvelope {
+        let message = RunnerClientMessage::Event(Box::new(RunnerEventEnvelope {
             request_id: None,
+            runner_event_seq: None,
+            acked_runner_event_seq: None,
             event: RunnerEvent::SessionsDiscovered(agenter_protocol::runner::DiscoveredSessions {
                 workspace,
                 provider_id: AgentProviderId::from(AgentProviderId::CODEX),
@@ -2124,7 +4062,7 @@ mod tests {
                     ],
                 }],
             }),
-        });
+        }));
 
         let frames = chunk_message(&message, 1024 * 1024).expect("chunk large runner message");
         assert!(frames.len() > 3);
@@ -2177,6 +4115,8 @@ mod tests {
                 transports: vec!["fake".to_owned()],
                 workspace_discovery: false,
             },
+            acked_runner_event_seq: None,
+            replay_from_runner_event_seq: None,
             workspaces: vec![agenter_core::WorkspaceRef {
                 workspace_id: WorkspaceId::nil(),
                 runner_id,

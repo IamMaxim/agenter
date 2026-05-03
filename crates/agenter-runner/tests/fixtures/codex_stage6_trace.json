@@ -1,0 +1,55 @@
+[
+  {
+    "method": "turn/started",
+    "params": {
+      "turnId": "turn-1",
+      "turn": { "id": "turn-1", "status": "running" }
+    }
+  },
+  {
+    "method": "turn/plan/updated",
+    "params": {
+      "turnId": "turn-1",
+      "explanation": "Implement in phases",
+      "plan": [
+        { "step": "Map events", "status": "completed" },
+        { "step": "Verify reducers", "status": "inProgress" }
+      ]
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "turnId": "turn-1",
+      "itemId": "cmd-1",
+      "command": "cargo test"
+    }
+  },
+  {
+    "method": "item/commandExecution/outputDelta",
+    "params": {
+      "turnId": "turn-1",
+      "itemId": "cmd-1",
+      "stream": "stdout",
+      "delta": "running tests\n"
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "turnId": "turn-1",
+      "item": {
+        "id": "cmd-1",
+        "command": "cargo test",
+        "success": true
+      }
+    }
+  },
+  {
+    "method": "turn/diff/updated",
+    "params": {
+      "turnId": "turn-1",
+      "id": "diff-1"
+    }
+  }
+]

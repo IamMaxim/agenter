@@ -64,6 +64,54 @@ Protocol and connector work should include focused integration checks:
 - Telegram test proves login linking, session selection, message routing, and approval decision.
 - Mattermost test proves login linking, thread binding, message routing, and approval decision.
 
+## Universal Protocol Smoke Phase
+
+Run `docs/runbooks/universal-protocol-smoke.md` after changes to universal events, snapshots, replay, runner WAL/ack behavior, provider reducers, approval/question/cancel state, or frontend snapshot consumption.
+
+Environment prerequisites:
+
+- Rust toolchain and Node dependencies are installed.
+- Docker Compose is available for the DB-backed path.
+- `DATABASE_URL` points at the local Postgres database for DB spot checks.
+- `websocat` is optional but useful for raw browser WebSocket inspection.
+- Live provider checks require locally installed and authenticated `codex`, `qwen`, `gemini`, and/or `opencode` CLIs. Provider authentication remains a local prerequisite; do not treat auth/setup failure as universal protocol failure without a direct provider spike.
+
+Focused automated smoke:
+
+```sh
+cargo test -p agenter-runner codex_stage10_conformance_trace_preserves_expected_milestones
+cargo test -p agenter-runner acp_stage10_provider_traces_share_prompt_plan_permission_shape
+cargo test -p agenter-control-plane subscribe_snapshot_replays_after_seq_in_strict_order
+cargo test -p agenter-control-plane runner_event_ack_state_dedupes_replayed_sequences
+cargo test -p agenter-control-plane seeded_runner_ack_marks_old_replay_as_duplicate
+cargo test -p agenter-runner interrupt_cancels_blocked_approval_for_same_session
+cargo test -p agenter-runner interrupt_does_not_count_completed_approval_cancel_replay_as_new_cancel
+```
+
+Full universal protocol gate, when feasible:
+
+```sh
+cargo fmt --all -- --check
+cargo check --workspace
+cargo clippy --workspace -- -D warnings
+cargo test --workspace
+cd web
+npm run check
+npm run lint
+npm run test
+npm run build
+git diff --check
+```
+
+Manual provider smoke should record:
+
+- provider command and version;
+- workspace path;
+- prompt used;
+- whether plan, approval/question, command/tool, diff/artifact, cancel, and terminal state were observed;
+- expected final state: replayed, resolving, detached, cancelled, failed, or orphaned;
+- exact setup limitation if the provider could not run.
+
 ## Completion Rule
 
 When verification cannot run, record:

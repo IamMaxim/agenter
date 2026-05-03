@@ -1,6 +1,7 @@
 import type {
   AgentQuestionField,
   AppEvent,
+  ApprovalOption,
   ApprovalDecisionName,
   BrowserEventEnvelope
 } from '../api/types';
@@ -51,6 +52,9 @@ export type ChatItem =
       kind: 'plan';
       title: string;
       content: string;
+      status?: string;
+      entries?: PlanEntryView[];
+      source?: string;
     }
   | {
       id: string;
@@ -73,6 +77,10 @@ export type ChatItem =
       detail?: string;
       /** Serialized shapes from runners (Codex-correlated today). See runner `presentation` on `approval_requested`. */
       presentation?: Record<string, unknown>;
+      options?: ApprovalUiChoice[];
+      status?: string;
+      risk?: string;
+      subject?: string;
       resolutionState?: 'pending' | 'resolving';
       resolvingDecision?: string;
       resolvedDecision?: string;
@@ -98,6 +106,20 @@ export interface CommandActionView {
   label: string;
   detail?: string;
   path?: string;
+}
+
+export interface PlanEntryView {
+  id: string;
+  label: string;
+  status: string;
+}
+
+export interface ApprovalUiChoice {
+  optionId: string;
+  decision: ApprovalDecisionName;
+  label: string;
+  description?: string;
+  scope?: string;
 }
 
 export interface SubagentStateView {
@@ -687,7 +709,10 @@ function dedupeStable<T extends string>(items: T[]): T[] {
 }
 
 /** Maps Codex `available_decisions` (when present) to API `ApprovalDecision` names; otherwise all four Codex-supported outcomes. */
-export function approvalUiChoices(item: Extract<ChatItem, { kind: 'approval' }>): ApprovalDecisionName[] {
+export function approvalUiChoices(item: Extract<ChatItem, { kind: 'approval' }>): ApprovalUiChoice[] {
+  if (item.options && item.options.length > 0) {
+    return item.options;
+  }
   const p = item.presentation;
   const variant = p && typeof p.variant === 'string' ? p.variant : '';
   if (variant === 'codex_command' && p && Array.isArray(p.available_decisions)) {
@@ -696,10 +721,10 @@ export function approvalUiChoices(item: Extract<ChatItem, { kind: 'approval' }>)
       .map(mapCodexDecisionLabel)
       .filter((x): x is ApprovalDecisionName => Boolean(x));
     if (mapped.length > 0) {
-      return dedupeStable(mapped);
+      return dedupeStable(mapped).map(choiceFromLegacyDecision);
     }
   }
-  return [...DEFAULT_APPROVAL_ACTIONS];
+  return DEFAULT_APPROVAL_ACTIONS.map(choiceFromLegacyDecision);
 }
 
 export function approvalUiButtonLabel(decision: ApprovalDecisionName): string {
@@ -714,6 +739,59 @@ export function approvalUiButtonLabel(decision: ApprovalDecisionName): string {
       return 'Cancel';
     default:
       return decision;
+  }
+}
+
+export function approvalChoiceFromOption(option: ApprovalOption): ApprovalUiChoice | undefined {
+  const decision = approvalDecisionFromOption(option);
+  if (!decision) {
+    return undefined;
+  }
+  return {
+    optionId: option.option_id,
+    decision,
+    label: option.label || approvalUiButtonLabel(decision),
+    description: option.description ?? undefined,
+    scope: option.scope ?? undefined
+  };
+}
+
+function choiceFromLegacyDecision(decision: ApprovalDecisionName): ApprovalUiChoice {
+  return {
+    optionId: legacyOptionId(decision),
+    decision,
+    label: approvalUiButtonLabel(decision)
+  };
+}
+
+function legacyOptionId(decision: ApprovalDecisionName): string {
+  switch (decision) {
+    case 'accept':
+      return 'approve_once';
+    case 'accept_for_session':
+      return 'approve_always';
+    case 'decline':
+      return 'deny';
+    case 'cancel':
+      return 'cancel_turn';
+    default:
+      return decision;
+  }
+}
+
+function approvalDecisionFromOption(option: ApprovalOption): ApprovalDecisionName | undefined {
+  switch (option.option_id) {
+    case 'approve_once':
+      return 'accept';
+    case 'approve_always':
+      return 'accept_for_session';
+    case 'deny':
+    case 'deny_with_feedback':
+      return 'decline';
+    case 'cancel_turn':
+      return 'cancel';
+    default:
+      return mapCodexDecisionLabel(option.native_option_id ?? option.kind);
   }
 }
 

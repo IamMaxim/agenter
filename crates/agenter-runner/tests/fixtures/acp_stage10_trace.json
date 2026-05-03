@@ -1,0 +1,142 @@
+{
+  "qwen": [
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "qwen-native-stage10",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "id": "qwen-msg-1",
+          "content": "I will inspect first."
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "qwen-native-stage10",
+        "update": {
+          "sessionUpdate": "plan_update",
+          "planId": "qwen-plan-stage10",
+          "title": "Plan",
+          "entries": [
+            { "label": "Inspect repo", "status": "completed" },
+            { "label": "Ask before edits", "status": "in_progress" }
+          ]
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": "qwen-permission-1",
+      "method": "session/request_permission",
+      "params": {
+        "toolCall": {
+          "toolCallId": "qwen-tool-1",
+          "name": "write_file",
+          "title": "Write runbook"
+        },
+        "options": [
+          { "optionId": "allow_once", "kind": "allow_once" },
+          { "optionId": "reject_once", "kind": "reject_once" }
+        ]
+      }
+    }
+  ],
+  "gemini": [
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "gemini-native-stage10",
+        "update": {
+          "sessionUpdate": "plan_update",
+          "planId": "gemini-plan-stage10",
+          "title": "Plan mode",
+          "content": "Confirm the plan before implementation.",
+          "entries": [
+            { "label": "Draft plan", "status": "completed" },
+            { "label": "Wait for approval", "status": "in_progress" }
+          ]
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "gemini-native-stage10",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "id": "gemini-msg-1",
+          "content": "Please confirm the approach."
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": "gemini-permission-1",
+      "method": "session/request_permission",
+      "params": {
+        "toolCall": {
+          "toolCallId": "gemini-question-1",
+          "name": "question",
+          "title": "Confirm plan"
+        },
+        "options": [
+          { "optionId": "continue", "kind": "allow_once" },
+          { "optionId": "cancel", "kind": "reject_once" }
+        ]
+      }
+    }
+  ],
+  "opencode": [
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "opencode-native-stage10",
+        "update": {
+          "sessionUpdate": "tool_call",
+          "toolCallId": "opencode-tool-1",
+          "name": "todowrite",
+          "title": "Update todos"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "opencode-native-stage10",
+        "update": {
+          "sessionUpdate": "plan_update",
+          "planId": "opencode-plan-stage10",
+          "title": "Todos",
+          "entries": [
+            { "label": "Add fixtures", "status": "completed" },
+            { "label": "Run smoke", "status": "in_progress" }
+          ]
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": "opencode-permission-1",
+      "method": "session/request_permission",
+      "params": {
+        "toolCall": {
+          "toolCallId": "opencode-bash-1",
+          "name": "bash",
+          "title": "Run tests"
+        },
+        "options": [
+          { "optionId": "allow_once", "kind": "allow_once" },
+          { "optionId": "reject_once", "kind": "reject_once" }
+        ]
+      }
+    }
+  ]
+}

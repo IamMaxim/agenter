@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount, tick } from 'svelte';
+  import { createEventDispatcher, onDestroy, onMount, tick } from 'svelte';
   import AgenterIcon from '../components/AgenterIcon.svelte';
   import InlineEventRow from '../components/InlineEventRow.svelte';
   import MarkdownBlock from '../components/MarkdownBlock.svelte';
@@ -30,6 +30,7 @@
     AgentTurnSettings,
     BrowserServerMessage,
     ApprovalDecisionName,
+    ApprovalDecision,
     SessionInfo,
     SessionUsageWindow,
     SlashCommandDefinition,
@@ -51,6 +52,12 @@
     type ChatState
   } from '../lib/chatEvents';
   import {
+    applyUniversalClientMessage,
+    createUniversalClientState,
+    hasCapabilitySignal,
+    type UniversalClientState
+  } from '../lib/sessionSnapshot';
+  import {
     filterSlashCommands,
     isSlashDraft,
     needsSlashConfirmation,
@@ -60,6 +67,14 @@
   } from '../lib/slashCommands';
 
   export let sessionId: string;
+  type SessionMetaEvent = {
+    sessionId: string;
+    title: string;
+    status?: string;
+    workspaceId?: string;
+    providerId?: string;
+  };
+  const dispatch = createEventDispatcher<{ sessionMeta: SessionMetaEvent }>();
 
   let socket: BrowserEventSocket | undefined;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -68,6 +83,8 @@
   let activeSessionId = '';
   let connectionGeneration = 0;
   let chatState: ChatState = createChatState();
+  let universalState: UniversalClientState = createUniversalClientState();
+  let forceLegacyStream = false;
   let session: SessionInfo | undefined;
   let connectionState = 'Connecting';
   let draft = '';
@@ -96,6 +113,26 @@
   let dismissedPlanIds: Set<string> = new Set();
   let eventStream: HTMLDivElement | undefined;
   const EVENT_STREAM_BOTTOM_EPSILON_PX = 8;
+  let sessionMetaSignature = '';
+
+  function emitSessionMeta() {
+    if (!session) {
+      return;
+    }
+    const title = session.title?.trim() || 'New session';
+    const signature = `${session.session_id}|${title}|${session.status}|${session.workspace_id}|${session.provider_id}`;
+    if (signature === sessionMetaSignature) {
+      return;
+    }
+    sessionMetaSignature = signature;
+    dispatch('sessionMeta', {
+      sessionId: session.session_id,
+      title,
+      status: session.status,
+      workspaceId: session.workspace_id,
+      providerId: session.provider_id
+    });
+  }
 
   function exitSession() {
     window.location.hash = '#/';
@@ -124,6 +161,16 @@
   $: usage = session?.usage ?? null;
   $: defaultModeId = resolveDefaultModeId(agentOptions.collaboration_modes);
   $: defaultModeAvailable = defaultModeId !== null;
+  $: universalCapabilities = universalState.snapshot?.capabilities;
+  $: capabilitySignal = hasCapabilitySignal(universalCapabilities);
+  $: modeControlEnabled =
+    !capabilitySignal || universalCapabilities?.modes.collaboration_modes === true;
+  $: modelControlEnabled =
+    !capabilitySignal || universalCapabilities?.modes.model_selection === true;
+  $: reasoningControlEnabled =
+    !capabilitySignal || universalCapabilities?.modes.reasoning_effort === true;
+  $: approvalControlEnabled =
+    !capabilitySignal || universalCapabilities?.approvals.enabled === true;
   $: modeValue =
     turnSettings.collaboration_mode ?? usage?.mode_label ?? defaultModeId ?? '';
   $: latestPlanId = chatState.latestPlanId;
@@ -141,7 +188,10 @@
   $: if (slashSelectionIndex >= slashSuggestions.length) {
     slashSelectionIndex = 0;
   }
+  $: emitSessionMeta();
   $: if (mounted && sessionId !== activeSessionId) {
+    universalState = createUniversalClientState();
+    forceLegacyStream = false;
     activeSessionId = sessionId;
     void reloadAndConnect();
   }
@@ -167,6 +217,8 @@
 
   async function reloadAndConnect() {
     const generation = ++connectionGeneration;
+    const useUniversalStream = !forceLegacyStream;
+    const replayCursor = useUniversalStream ? universalState.latestSeq : undefined;
     openComposerMenu = null;
     socket?.close();
     if (reconnectTimer) {
@@ -174,6 +226,10 @@
       reconnectTimer = undefined;
     }
     chatState = createChatState();
+    universalState = {
+      ...createUniversalClientState(),
+      latestSeq: replayCursor
+    };
     dismissedPlanIds = new Set();
     session = undefined;
     sendError = '';
@@ -202,6 +258,11 @@
         }
       }
       chatState = nextState;
+      universalState = {
+        ...createUniversalClientState(),
+        chat: nextState,
+        latestSeq: replayCursor
+      };
       await tick();
       scrollEventStreamToBottom();
     } catch {
@@ -215,6 +276,9 @@
 
     connectionState = 'Connecting';
     socket = connectSessionEvents(sessionId, {
+      afterSeq: useUniversalStream ? universalState.latestSeq : undefined,
+      includeSnapshot: useUniversalStream
+    }, {
       onOpen: () => {
         if (generation !== connectionGeneration) {
           return;
@@ -226,15 +290,27 @@
         if (generation !== connectionGeneration) {
           return;
         }
-        if (message.type === 'app_event') {
+        if (message.type === 'app_event' || message.type === 'session_snapshot' || message.type === 'universal_event') {
           try {
-            chatState = applyChatEnvelope(chatState, message);
+            universalState = applyUniversalClientMessage(universalState, message);
+            chatState = universalState.chat;
+            if (message.type === 'session_snapshot' && message.has_more) {
+              forceLegacyStream = true;
+              connectionState = 'Falling back to legacy stream';
+              socket?.close();
+              return;
+            }
+            if (universalState.snapshot?.info) {
+              session = universalState.snapshot.info;
+              titleDraft = session.title ?? '';
+            }
             void tick().then(() => {
               if (shouldScrollToBottom) {
                 scrollEventStreamToBottom();
               }
             });
             if (
+              message.type === 'app_event' &&
               message.event.type === 'provider_event' &&
               ['token_usage', 'rate_limits'].includes(String(message.event.payload.category ?? ''))
             ) {
@@ -246,6 +322,10 @@
         }
         if (message.type === 'error') {
           connectionState = message.message;
+          if (message.code === 'snapshot_replay_incomplete') {
+            forceLegacyStream = true;
+            socket?.close();
+          }
           pushToast({ severity: 'error', message: message.message });
         }
       },
@@ -555,15 +635,20 @@
     messageTextarea.style.overflowY = messageTextarea.scrollHeight > maxHeight ? 'auto' : 'hidden';
   }
 
-  async function resolveApproval(item: ChatItem, decision: ApprovalDecisionName) {
+  async function resolveApproval(item: ChatItem, decision: ApprovalDecisionName, optionId?: string) {
     if (item.kind !== 'approval' || item.resolvedDecision) {
       return;
     }
 
     decisionError = '';
     try {
-      const envelope = await decideApproval(item.approvalId, { decision });
-      chatState = applyChatEnvelope(chatState, envelope);
+      const request: ApprovalDecision = {
+        decision,
+        ...(optionId ? { option_id: optionId } : {})
+      };
+      const envelope = await decideApproval(item.approvalId, request);
+      universalState = applyUniversalClientMessage(universalState, envelope);
+      chatState = universalState.chat;
     } catch {
       decisionError = 'Could not resolve approval.';
       pushToast({ severity: 'error', message: decisionError });
@@ -926,7 +1011,8 @@
     decisionError = '';
     try {
       const envelope = await answerQuestion(item.questionId, answers);
-      chatState = applyChatEnvelope(chatState, envelope);
+      universalState = applyUniversalClientMessage(universalState, envelope);
+      chatState = universalState.chat;
     } catch {
       decisionError = 'Could not answer question.';
       pushToast({ severity: 'error', message: decisionError });
@@ -1059,15 +1145,16 @@
                 </p>
               {/if}
               <div class="inline-actions approval-actions">
-                {#each approvalUiChoices(item) as decisionBtn}
+                {#each approvalUiChoices(item) as choice}
                   <button
-                    class:secondary={decisionBtn === 'decline' || decisionBtn === 'cancel'}
+                    class:secondary={choice.decision === 'decline' || choice.decision === 'cancel'}
                     class="compact approval-decision"
                     type="button"
-                    disabled={item.resolutionState === 'resolving'}
-                    on:click={() => resolveApproval(item, decisionBtn)}
+                    title={choice.description}
+                    disabled={!approvalControlEnabled || item.resolutionState === 'resolving'}
+                    on:click={() => resolveApproval(item, choice.decision, choice.optionId)}
                   >
-                    {approvalUiButtonLabel(decisionBtn)}
+                    {choice.label || approvalUiButtonLabel(choice.decision)}
                   </button>
                 {/each}
               </div>
@@ -1220,7 +1307,7 @@
           aria-expanded={openComposerMenu === 'mode'}
           aria-label="Collaboration mode"
           class="composer-chip"
-          disabled={agentOptions.collaboration_modes.length === 0}
+          disabled={!modeControlEnabled || agentOptions.collaboration_modes.length === 0}
           type="button"
           on:click={() => toggleComposerMenu('mode')}
         >
@@ -1251,6 +1338,7 @@
           aria-expanded={openComposerMenu === 'model'}
           aria-label="Model"
           class="composer-chip"
+          disabled={!modelControlEnabled}
           type="button"
           on:click={() => toggleComposerMenu('model')}
         >
@@ -1277,6 +1365,7 @@
           aria-expanded={openComposerMenu === 'reasoning'}
           aria-label="Thinking level"
           class="composer-chip"
+          disabled={!reasoningControlEnabled}
           type="button"
           on:click={() => toggleComposerMenu('reasoning')}
         >

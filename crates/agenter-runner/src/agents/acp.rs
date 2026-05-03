@@ -177,7 +177,7 @@ impl AcpInitializeCapabilities {
             file_changes: true,
             command_execution: true,
             plan_updates: true,
-            interrupt: true,
+            interrupt: false,
             ..AgentCapabilities::default()
         }
     }
@@ -462,7 +462,7 @@ impl AcpRunnerRuntime {
                 pending_approvals
                     .lock()
                     .await
-                    .insert(approval_id, PendingAcpApproval::new(sender));
+                    .insert(approval_id, PendingAcpApproval::new(session_id, sender));
                 event_sender
                     .send(AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
                         session_id,
@@ -751,7 +751,11 @@ pub fn normalize_acp_message(
             content: string_at(message, &["/params/update/content", "/params/update/text"])
                 .map(str::to_owned),
             entries: plan_entries(message),
-            append: false,
+            append: bool_at(
+                message,
+                &["/params/update/partial", "/params/update/isPartial"],
+            )
+            .unwrap_or(false),
             provider_payload: Some(message.clone()),
         })],
         "tool_call" => vec![AppEvent::ToolStarted(tool_event(session_id, message))],
@@ -770,6 +774,156 @@ pub fn normalize_acp_message(
             message,
             update_type,
         ))],
+    }
+}
+
+#[allow(dead_code)]
+pub mod acp_codec {
+    use serde_json::Value;
+
+    #[must_use]
+    pub fn method(message: &Value) -> Option<&str> {
+        super::jsonrpc_method(message)
+    }
+}
+
+#[allow(dead_code)]
+pub mod acp_reducer {
+    use agenter_core::{
+        AgentProviderId, NativeRef, SessionId, TurnId, TurnState, TurnStatus, UniversalEventKind,
+        UniversalEventSource,
+    };
+    use serde_json::Value;
+    use uuid::Uuid;
+
+    use crate::agents::adapter::{
+        legacy_events_to_adapter_events, AdapterEvent, AdapterUniversalEvent,
+    };
+
+    #[derive(Clone, Debug)]
+    pub struct AcpReducerState {
+        session_id: SessionId,
+        provider_id: AgentProviderId,
+        active_turn_id: Option<TurnId>,
+    }
+
+    impl AcpReducerState {
+        #[must_use]
+        pub fn new(session_id: SessionId, provider_id: AgentProviderId) -> Self {
+            Self {
+                session_id,
+                provider_id,
+                active_turn_id: None,
+            }
+        }
+
+        #[must_use]
+        pub fn start_prompt(&mut self, native_prompt_id: &str) -> AdapterEvent {
+            let turn_id = self.prompt_turn_id(native_prompt_id);
+            self.active_turn_id = Some(turn_id);
+            AdapterEvent {
+                universal: AdapterUniversalEvent {
+                    session_id: Some(self.session_id),
+                    turn_id: Some(turn_id),
+                    item_id: None,
+                    source: UniversalEventSource::Native,
+                    native: Some(NativeRef {
+                        protocol: "acp-stdio".to_owned(),
+                        method: Some("session/prompt".to_owned()),
+                        kind: Some(self.provider_id.to_string()),
+                        native_id: Some(native_prompt_id.to_owned()),
+                        summary: Some("ACP prompt started".to_owned()),
+                        hash: None,
+                        pointer: None,
+                    }),
+                    event: UniversalEventKind::TurnStarted {
+                        turn: TurnState {
+                            turn_id,
+                            session_id: self.session_id,
+                            status: TurnStatus::Running,
+                            started_at: None,
+                            completed_at: None,
+                            model: None,
+                            mode: None,
+                        },
+                    },
+                },
+                legacy: None,
+            }
+        }
+
+        #[must_use]
+        pub fn complete_prompt(&mut self, native_prompt_id: &str) -> Option<AdapterEvent> {
+            let turn_id = self.active_turn_id.take()?;
+            Some(AdapterEvent {
+                universal: AdapterUniversalEvent {
+                    session_id: Some(self.session_id),
+                    turn_id: Some(turn_id),
+                    item_id: None,
+                    source: UniversalEventSource::Native,
+                    native: Some(NativeRef {
+                        protocol: "acp-stdio".to_owned(),
+                        method: Some("session/prompt".to_owned()),
+                        kind: Some(self.provider_id.to_string()),
+                        native_id: Some(native_prompt_id.to_owned()),
+                        summary: Some("ACP prompt completed".to_owned()),
+                        hash: None,
+                        pointer: None,
+                    }),
+                    event: UniversalEventKind::TurnCompleted {
+                        turn: TurnState {
+                            turn_id,
+                            session_id: self.session_id,
+                            status: TurnStatus::Completed,
+                            started_at: None,
+                            completed_at: None,
+                            model: None,
+                            mode: None,
+                        },
+                    },
+                },
+                legacy: None,
+            })
+        }
+
+        #[must_use]
+        pub fn reduce_native_message(&mut self, message: &Value) -> Vec<AdapterEvent> {
+            let events = reduce_native_message(self.session_id, self.provider_id.clone(), message);
+            if let Some(turn_id) = self.active_turn_id {
+                events
+                    .into_iter()
+                    .map(|event| event.with_turn_id(turn_id))
+                    .collect()
+            } else {
+                events
+            }
+        }
+
+        fn prompt_turn_id(&self, native_prompt_id: &str) -> TurnId {
+            TurnId::from_uuid(Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                format!(
+                    "agenter:acp:turn:{}:{}:{native_prompt_id}",
+                    self.provider_id, self.session_id
+                )
+                .as_bytes(),
+            ))
+        }
+    }
+
+    #[must_use]
+    pub fn reduce_native_message(
+        session_id: SessionId,
+        provider_id: AgentProviderId,
+        message: &Value,
+    ) -> Vec<AdapterEvent> {
+        let method = super::acp_codec::method(message);
+        legacy_events_to_adapter_events(
+            provider_id.clone(),
+            "acp-stdio",
+            method,
+            super::normalize_acp_message(session_id, provider_id, message),
+        )
     }
 }
 
@@ -865,7 +1019,7 @@ fn normalize_acp_permission_request(
             approval_id,
             kind: ApprovalKind::ProviderSpecific,
             title,
-            details,
+            details: details.clone(),
             expires_at: None,
             presentation: Some(json!({
                 "provider_id": provider_id,
@@ -873,6 +1027,15 @@ fn normalize_acp_permission_request(
             })),
             resolution_state: None,
             resolving_decision: None,
+            status: None,
+            turn_id: None,
+            item_id: None,
+            options: agenter_core::ApprovalOption::canonical_defaults(),
+            risk: None,
+            subject: details.clone(),
+            native_request_id: message.get("id").map(ToString::to_string),
+            native_blocking: true,
+            policy: None,
             provider_payload: Some(message.clone()),
         }),
     ))
@@ -1165,6 +1328,8 @@ fn plan_entries(message: &Value) -> Vec<PlanEntry> {
                         status: match string_at(entry, &["/status"]).unwrap_or("pending") {
                             "in_progress" | "running" => PlanEntryStatus::InProgress,
                             "completed" | "complete" | "done" => PlanEntryStatus::Completed,
+                            "failed" | "error" => PlanEntryStatus::Failed,
+                            "cancelled" | "canceled" => PlanEntryStatus::Cancelled,
                             _ => PlanEntryStatus::Pending,
                         },
                     })
@@ -1233,6 +1398,12 @@ fn string_at<'a>(message: &'a Value, pointers: &[&str]) -> Option<&'a str> {
     pointers
         .iter()
         .find_map(|pointer| message.pointer(pointer).and_then(Value::as_str))
+}
+
+fn bool_at(message: &Value, pointers: &[&str]) -> Option<bool> {
+    pointers
+        .iter()
+        .find_map(|pointer| message.pointer(pointer).and_then(Value::as_bool))
 }
 
 #[cfg(test)]
@@ -1306,7 +1477,7 @@ mod tests {
         assert!(capabilities.file_changes);
         assert!(capabilities.command_execution);
         assert!(capabilities.plan_updates);
-        assert!(capabilities.interrupt);
+        assert!(!capabilities.interrupt);
     }
 
     #[test]
@@ -1412,6 +1583,272 @@ mod tests {
         assert_eq!(event.method, "session/update");
         assert_eq!(event.category, "new_provider_thing");
         assert_eq!(event.title, "Provider thing");
+    }
+
+    #[test]
+    fn acp_semantic_reducer_preserves_legacy_projection() {
+        let session_id = SessionId::nil();
+        let provider_id = AgentProviderId::from(AgentProviderId::QWEN);
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "native-1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "id": "chunk-1",
+                    "content": "hello"
+                }
+            }
+        });
+
+        let legacy = normalize_acp_message(session_id, provider_id.clone(), &message);
+        let semantic = super::acp_reducer::reduce_native_message(session_id, provider_id, &message);
+
+        assert_eq!(semantic.len(), legacy.len());
+        assert_eq!(semantic[0].legacy_projection(), Some(&legacy[0]));
+        assert_eq!(semantic[0].universal.session_id, Some(session_id));
+        let native = semantic[0].universal.native.as_ref().expect("native ref");
+        assert_eq!(native.protocol, "acp-stdio");
+        assert_eq!(native.method.as_deref(), Some("session/update"));
+        assert_eq!(native.kind.as_deref(), Some(AgentProviderId::QWEN));
+        assert_eq!(native.native_id.as_deref(), Some("chunk-1"));
+        assert_eq!(native.summary.as_deref(), Some("assistant message delta"));
+        let agenter_core::UniversalEventKind::ContentDelta {
+            block_id,
+            kind,
+            delta,
+        } = &semantic[0].universal.event
+        else {
+            panic!("expected universal content delta");
+        };
+        assert_eq!(block_id, "text-chunk-1");
+        assert_eq!(kind, &Some(agenter_core::ContentBlockKind::Text));
+        assert_eq!(delta, "hello");
+    }
+
+    #[test]
+    fn acp_stage6_golden_trace_attaches_updates_to_active_prompt_turn() {
+        let session_id = SessionId::nil();
+        let provider_id = AgentProviderId::from(AgentProviderId::QWEN);
+        let trace: Vec<Value> =
+            serde_json::from_str(include_str!("../../tests/fixtures/acp_stage6_trace.json"))
+                .expect("fixture parses");
+        let mut reducer = super::acp_reducer::AcpReducerState::new(session_id, provider_id.clone());
+        let turn = reducer.start_prompt("prompt-1");
+        let turn_id = turn.universal.turn_id.expect("turn id");
+        let semantic = trace
+            .iter()
+            .flat_map(|message| reducer.reduce_native_message(message))
+            .collect::<Vec<_>>();
+
+        let agenter_core::UniversalEventKind::TurnStarted { turn: started } = &turn.universal.event
+        else {
+            panic!("expected turn started");
+        };
+        assert_eq!(started.turn_id, turn_id);
+        assert!(semantic
+            .iter()
+            .all(|event| event.universal.turn_id == Some(turn_id)));
+        let content = semantic
+            .iter()
+            .find_map(|event| match &event.universal.event {
+                agenter_core::UniversalEventKind::ContentDelta {
+                    block_id,
+                    kind,
+                    delta,
+                } => Some((block_id, kind, delta)),
+                _ => None,
+            })
+            .expect("message delta");
+        assert_eq!(content.0, "text-msg-1");
+        assert_eq!(content.1, &Some(agenter_core::ContentBlockKind::Text));
+        assert_eq!(content.2, "hello");
+        let tool = semantic
+            .iter()
+            .find_map(|event| match &event.universal.event {
+                agenter_core::UniversalEventKind::ItemCreated { item } => Some(item),
+                _ => None,
+            })
+            .expect("tool item");
+        assert_eq!(tool.turn_id, Some(turn_id));
+        assert_eq!(
+            tool.content[0].kind,
+            agenter_core::ContentBlockKind::ToolCall
+        );
+        assert_eq!(tool.content[0].text.as_deref(), Some("Read file"));
+        let plan = semantic
+            .iter()
+            .find_map(|event| match &event.universal.event {
+                agenter_core::UniversalEventKind::PlanUpdated { plan } => Some(plan),
+                _ => None,
+            })
+            .expect("plan");
+        assert_eq!(plan.turn_id, Some(turn_id));
+        assert_eq!(plan.entries[0].label, "Inspect");
+        assert_eq!(plan.entries[1].status, PlanEntryStatus::InProgress);
+        assert!(!semantic.iter().any(|event| matches!(
+            &event.universal.event,
+            agenter_core::UniversalEventKind::ArtifactCreated { .. }
+        )));
+
+        let permission = json!({
+            "jsonrpc": "2.0",
+            "id": "permission-1",
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": {"toolCallId": "tool-1", "name": "write_file"},
+                "options": [{"optionId": "allow_once", "kind": "allow_once"}]
+            }
+        });
+        let (_approval_id, legacy) =
+            normalize_acp_permission_request(session_id, provider_id.clone(), &permission)
+                .expect("permission");
+        let approval = crate::agents::adapter::AdapterEvent::from_legacy(
+            provider_id,
+            "acp-stdio",
+            Some("session/request_permission"),
+            legacy,
+        )
+        .with_turn_id(turn_id);
+        assert!(matches!(
+            approval.universal.event,
+            agenter_core::UniversalEventKind::ApprovalRequested { .. }
+        ));
+        let completed = reducer.complete_prompt("prompt-1").expect("completion");
+        assert!(matches!(
+            completed.universal.event,
+            agenter_core::UniversalEventKind::TurnCompleted { .. }
+        ));
+        let later = reducer.reduce_native_message(&trace[0]);
+        assert!(later
+            .iter()
+            .all(|event| event.universal.turn_id != Some(turn_id)));
+    }
+
+    #[test]
+    fn acp_stage10_provider_traces_share_prompt_plan_permission_shape() {
+        let trace: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/acp_stage10_trace.json"))
+                .expect("fixture parses");
+        let cases = trace.as_object().expect("provider trace object");
+
+        for (provider, messages) in cases {
+            let provider_id = AgentProviderId::from(provider.as_str());
+            let session_id = SessionId::nil();
+            let mut reducer =
+                super::acp_reducer::AcpReducerState::new(session_id, provider_id.clone());
+            let turn = reducer.start_prompt("prompt-1");
+            let turn_id = turn.universal.turn_id.expect("turn id");
+            let semantic = messages
+                .as_array()
+                .expect("provider messages")
+                .iter()
+                .flat_map(|message| reducer.reduce_native_message(message))
+                .collect::<Vec<_>>();
+
+            assert!(semantic.iter().all(|event| {
+                event.universal.session_id == Some(session_id)
+                    && event.universal.turn_id == Some(turn_id)
+            }));
+            assert!(semantic.iter().any(|event| matches!(
+                event.universal.event,
+                agenter_core::UniversalEventKind::PlanUpdated { .. }
+            )));
+            assert!(semantic.iter().any(|event| matches!(
+                event.universal.event,
+                agenter_core::UniversalEventKind::ItemCreated { .. }
+                    | agenter_core::UniversalEventKind::ContentDelta { .. }
+            )));
+
+            let permission = messages
+                .as_array()
+                .expect("provider messages")
+                .iter()
+                .find(|message| jsonrpc_method(message) == Some("session/request_permission"))
+                .expect("permission request");
+            let (_approval_id, legacy) =
+                normalize_acp_permission_request(session_id, provider_id.clone(), permission)
+                    .expect("permission should normalize");
+            let approval = crate::agents::adapter::AdapterEvent::from_legacy(
+                provider_id,
+                "acp-stdio",
+                Some("session/request_permission"),
+                legacy,
+            )
+            .with_turn_id(turn_id);
+            let agenter_core::UniversalEventKind::ApprovalRequested { approval } =
+                approval.universal.event
+            else {
+                panic!("expected universal approval");
+            };
+            assert!(
+                approval
+                    .options
+                    .iter()
+                    .any(|option| option.option_id == "cancel_turn"),
+                "{provider} permission should expose terminal cancel semantics"
+            );
+        }
+    }
+
+    #[test]
+    fn acp_prompt_turn_ids_include_session_and_provider_scope() {
+        let same_prompt = "prompt-1";
+        let mut first = super::acp_reducer::AcpReducerState::new(
+            SessionId::nil(),
+            AgentProviderId::from(AgentProviderId::QWEN),
+        );
+        let mut second = super::acp_reducer::AcpReducerState::new(
+            SessionId::new(),
+            AgentProviderId::from(AgentProviderId::QWEN),
+        );
+        let mut third = super::acp_reducer::AcpReducerState::new(
+            SessionId::nil(),
+            AgentProviderId::from("opencode"),
+        );
+
+        let first_id = first.start_prompt(same_prompt).universal.turn_id;
+        let second_id = second.start_prompt(same_prompt).universal.turn_id;
+        let third_id = third.start_prompt(same_prompt).universal.turn_id;
+
+        assert_ne!(first_id, second_id);
+        assert_ne!(first_id, third_id);
+    }
+
+    #[test]
+    fn acp_stage6_unknown_native_update_stays_safe_native_unknown() {
+        let session_id = SessionId::nil();
+        let provider_id = AgentProviderId::from(AgentProviderId::QWEN);
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "native-1",
+                "update": {
+                    "sessionUpdate": "future_native_update",
+                    "title": "Future native update",
+                    "secret": "must-not-be-copied"
+                }
+            }
+        });
+        let semantic = super::acp_reducer::reduce_native_message(session_id, provider_id, &message);
+
+        assert_eq!(semantic.len(), 1);
+        let agenter_core::UniversalEventKind::NativeUnknown { summary } =
+            &semantic[0].universal.event
+        else {
+            panic!("expected unknown native event");
+        };
+        assert_eq!(summary.as_deref(), Some("provider event"));
+        assert_eq!(
+            semantic[0]
+                .universal
+                .native
+                .as_ref()
+                .and_then(|native| native.method.as_deref()),
+            Some("session/update")
+        );
     }
 
     #[test]

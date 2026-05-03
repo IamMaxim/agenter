@@ -39,3 +39,17 @@ Open questions to close during implementation:
 - Whether provider-native slash commands should be surfaced through ACP `available_commands_update` in this pass or kept as fallback `ProviderEvent`s.
 - Qwen browser smoke still needs a working configured model path; the current live prompt failed at provider/model connectivity, not ACP framing.
 - OpenCode prompt/session smoke still needs follow-up after its outside-sandbox state database requirement is handled.
+
+## 2026-05-03 Stage 10
+
+Conformance artifacts added:
+
+- `docs/runbooks/universal-protocol-smoke.md` defines fake-runner, DB-backed, provider-trace, snapshot/replay, approval/question/cancel, chaos, cleanup, and troubleshooting checks for `uap/1`.
+- `crates/agenter-runner/tests/fixtures/acp_stage10_trace.json` covers sanitized Qwen/Gemini/OpenCode-style prompt, plan, tool/message, and permission slices.
+- `cargo test -p agenter-runner acp_stage10_provider_traces_share_prompt_plan_permission_shape` validates the ACP fixture slices against the current universal reducer shape.
+
+Live capture status:
+
+- Qwen Stage 10 conformance story is pending until a locally configured model path can complete a prompt beyond ACP framing.
+- Gemini Stage 10 conformance story is pending because this sandbox can block the auth helper listener; rerun outside the restrictive sandbox.
+- OpenCode Stage 10 conformance story is pending until its local state database access is available outside the sandbox.

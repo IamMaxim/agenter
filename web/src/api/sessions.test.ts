@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest';
 
 import {
   createSession,
+  decideApproval,
   executeSlashCommand,
   listSlashCommands,
   refreshWorkspaceProviderSessions,
@@ -11,6 +12,43 @@ import {
 describe('session APIs', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  test('decideApproval preserves canonical universal option ids when present', async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: () =>
+        Promise.resolve(
+          JSON.stringify({
+            type: 'app_event',
+            event_id: 'evt-approval',
+            event: {
+              type: 'approval_resolved',
+              payload: { approval_id: 'approval 1', decision: { decision: 'decline' } }
+            }
+          })
+        )
+    });
+    vi.stubGlobal('fetch', fetch);
+
+    await decideApproval('approval 1', {
+      decision: 'decline',
+      option_id: 'deny_with_feedback',
+      feedback: 'Needs a safer command.'
+    });
+
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/approvals/approval%201/decision',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          decision: 'decline',
+          option_id: 'deny_with_feedback',
+          feedback: 'Needs a safer command.'
+        })
+      })
+    );
   });
 
   test('refreshes provider sessions for a workspace', async () => {

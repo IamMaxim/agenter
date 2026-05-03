@@ -6,6 +6,16 @@
 | Gemini CLI | `gemini --acp` | `0.40.1` | stdio JSON-RPC JSONL | answered outside sandbox in `./` and `./tmp/workspace/`; sandbox hits local auth bind `EPERM` | `loadSession` advertised; `list` and `resume` not advertised | local prerequisite |
 | OpenCode | `opencode acp --cwd <workspace>` | `1.14.32` | stdio JSON-RPC JSONL; command also accepts server flags | answered | `loadSession`, `list`, `resume`, `fork` advertised | local prerequisite |
 
+## Universal Protocol Stage 10 Fixture Coverage
+
+The Stage 10 repo-local fixture `crates/agenter-runner/tests/fixtures/acp_stage10_trace.json` uses sanitized golden slices derived from the current ACP reducer vocabulary. It is not a fresh live-provider capture.
+
+| Provider profile | Fixture story | Automated check | Live Stage 10 capture |
+| --- | --- | --- | --- |
+| Qwen Code | prompt text, plan update, permission request | `cargo test -p agenter-runner acp_stage10_provider_traces_share_prompt_plan_permission_shape` | pending; last live prompt reached ACP framing but failed later with provider/model connectivity |
+| Gemini CLI | plan-mode-like plan update, clarifying question/permission shape | `cargo test -p agenter-runner acp_stage10_provider_traces_share_prompt_plan_permission_shape` | pending; live checks may need outside-sandbox auth helper access |
+| OpenCode | `todowrite`-like tool update, plan update, bash permission request | `cargo test -p agenter-runner acp_stage10_provider_traces_share_prompt_plan_permission_shape` | pending; live checks may need outside-sandbox local state database access |
+
 ## Shared ACP Expectations
 
 - `initialize` negotiates protocol version and agent capabilities.

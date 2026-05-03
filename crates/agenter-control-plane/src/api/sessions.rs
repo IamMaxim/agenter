@@ -29,6 +29,10 @@ pub(super) struct CreateSessionRequest {
 #[derive(Debug, Deserialize)]
 pub(super) struct SendMessageRequest {
     pub(super) content: String,
+    #[serde(default)]
+    pub(super) command_id: Option<agenter_core::CommandId>,
+    #[serde(default)]
+    pub(super) idempotency_key: Option<String>,
     /// Atomic per-turn settings override. When present we persist these
     /// settings as the session's sticky configuration BEFORE forwarding the
     /// runner command, so the model sees the new collaboration mode on this
@@ -46,6 +50,10 @@ pub(super) struct UpdateSessionRequest {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct UpdateSessionSettingsRequest {
+    #[serde(default)]
+    pub(super) command_id: Option<agenter_core::CommandId>,
+    #[serde(default)]
+    pub(super) idempotency_key: Option<String>,
     #[serde(flatten)]
     pub(super) settings: agenter_core::AgentTurnSettings,
 }
@@ -508,7 +516,29 @@ pub(super) async fn send_session_message(
         tracing::debug!(user_id = %user.user_id, %session_id, "send session message rejected empty content");
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let settings = if let Some(override_settings) = request.settings_override {
+    let settings_override = request.settings_override.clone();
+    let command = agenter_core::UniversalCommandEnvelope {
+        command_id: request
+            .command_id
+            .unwrap_or_else(agenter_core::CommandId::new),
+        idempotency_key: request.idempotency_key.unwrap_or_else(|| {
+            format!("legacy:send_message:{session_id}:{}", uuid::Uuid::new_v4())
+        }),
+        session_id: Some(session_id),
+        turn_id: None,
+        command: agenter_core::UniversalCommand::StartTurn {
+            input: agenter_core::UserInput::Text {
+                text: content.to_owned(),
+            },
+            settings: settings_override.clone(),
+        },
+    };
+    if let Some(response) =
+        super::command_replay_response(state.begin_universal_command(&command).await)
+    {
+        return response;
+    }
+    let settings = if let Some(override_settings) = settings_override {
         state
             .update_session_turn_settings(user.user_id, session_id, override_settings)
             .await
@@ -577,6 +607,17 @@ pub(super) async fn send_session_message(
                 content_len = content.len(),
                 "session message accepted by runner channel"
             );
+            let response = super::command_response(StatusCode::ACCEPTED, None);
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &command,
+                crate::state::UniversalCommandIdempotencyStatus::Succeeded,
+                response,
+            )
+            .await
+            {
+                return response;
+            }
             StatusCode::ACCEPTED.into_response()
         }
         Ok(agenter_protocol::runner::RunnerResponseOutcome::Error { error }) => {
@@ -604,6 +645,17 @@ pub(super) async fn send_session_message(
                 Some(error.message.clone()),
             )
             .await;
+            let body = serde_json::to_value(&error).ok();
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &command,
+                crate::state::UniversalCommandIdempotencyStatus::Failed,
+                super::command_response(StatusCode::BAD_GATEWAY, body.clone()),
+            )
+            .await
+            {
+                return response;
+            }
             (StatusCode::BAD_GATEWAY, Json(error)).into_response()
         }
         Ok(other) => {
@@ -631,14 +683,22 @@ pub(super) async fn send_session_message(
                 Some(detail.clone()),
             )
             .await;
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(agenter_protocol::runner::RunnerError {
-                    code: "unexpected_runner_response".to_owned(),
-                    message: detail,
-                }),
+            let error = agenter_protocol::runner::RunnerError {
+                code: "unexpected_runner_response".to_owned(),
+                message: detail,
+            };
+            let body = serde_json::to_value(&error).ok();
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &command,
+                crate::state::UniversalCommandIdempotencyStatus::Failed,
+                super::command_response(StatusCode::BAD_GATEWAY, body.clone()),
             )
-                .into_response()
+            .await
+            {
+                return response;
+            }
+            (StatusCode::BAD_GATEWAY, Json(error)).into_response()
         }
         Err(error) => {
             tracing::warn!(
@@ -667,14 +727,22 @@ pub(super) async fn send_session_message(
                 Some(message.to_owned()),
             )
             .await;
-            (
-                status,
-                Json(agenter_protocol::runner::RunnerError {
-                    code: code.to_owned(),
-                    message: message.to_owned(),
-                }),
+            let error = agenter_protocol::runner::RunnerError {
+                code: code.to_owned(),
+                message: message.to_owned(),
+            };
+            let body = serde_json::to_value(&error).ok();
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &command,
+                crate::state::UniversalCommandIdempotencyStatus::Failed,
+                super::command_response(status, body.clone()),
             )
-                .into_response()
+            .await
+            {
+                return response;
+            }
+            (status, Json(error)).into_response()
         }
     }
 }
@@ -765,12 +833,54 @@ pub(super) async fn update_session_settings(
     let Some(user) = super::authenticated_user_from_headers(&state, &headers).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    let command = agenter_core::UniversalCommandEnvelope {
+        command_id: request
+            .command_id
+            .unwrap_or_else(agenter_core::CommandId::new),
+        idempotency_key: request.idempotency_key.unwrap_or_else(|| {
+            format!(
+                "legacy:update_settings:{session_id}:{}",
+                uuid::Uuid::new_v4()
+            )
+        }),
+        session_id: Some(session_id),
+        turn_id: None,
+        command: agenter_core::UniversalCommand::SetTurnSettings {
+            settings: request.settings.clone(),
+        },
+    };
+    if let Some(response) =
+        super::command_replay_response(state.begin_universal_command(&command).await)
+    {
+        return response;
+    }
     let Some(settings) = state
         .update_session_turn_settings(user.user_id, session_id, request.settings)
         .await
     else {
+        if let Some(response) = super::finish_command_or_error_response(
+            &state,
+            &command,
+            crate::state::UniversalCommandIdempotencyStatus::Failed,
+            super::command_response(StatusCode::NOT_FOUND, None),
+        )
+        .await
+        {
+            return response;
+        }
         return StatusCode::NOT_FOUND.into_response();
     };
+    let body = serde_json::to_value(&settings).ok();
+    if let Some(response) = super::finish_command_or_error_response(
+        &state,
+        &command,
+        crate::state::UniversalCommandIdempotencyStatus::Succeeded,
+        super::command_response(StatusCode::OK, body.clone()),
+    )
+    .await
+    {
+        return response;
+    }
     Json(settings).into_response()
 }
 

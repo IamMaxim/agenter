@@ -116,8 +116,6 @@ pub(super) async fn execute_slash_command(
         )
             .into_response();
     }
-    publish_slash_user_echo(&state, user.user_id, session.session_id, &request).await;
-
     if request.command_id.starts_with("local.") {
         return execute_local_slash_command(state, user.user_id, session, request, definition)
             .await;
@@ -154,6 +152,20 @@ async fn execute_local_slash_command(
     let session_id = session.session_id;
     match request.command_id.as_str() {
         "local.title" => {
+            let universal_command = slash_command_envelope(
+                user_id,
+                session.session_id,
+                &request,
+                agenter_core::UniversalCommand::ExecuteProviderCommand {
+                    command: semantic_slash_request(&request),
+                },
+            );
+            if let Some(response) = super::command_replay_response(
+                state.begin_universal_command(&universal_command).await,
+            ) {
+                return response;
+            }
+            publish_slash_user_echo(&state, user_id, session.session_id, &request).await;
             let title = request
                 .arguments
                 .get("title")
@@ -165,6 +177,16 @@ async fn execute_local_slash_command(
                 .update_session_title(user_id, session.session_id, title)
                 .await
             else {
+                if let Some(response) = super::finish_command_or_error_response(
+                    &state,
+                    &universal_command,
+                    crate::state::UniversalCommandIdempotencyStatus::Failed,
+                    super::command_response(StatusCode::NOT_FOUND, None),
+                )
+                .await
+                {
+                    return response;
+                }
                 return StatusCode::NOT_FOUND.into_response();
             };
             let result = agenter_core::SlashCommandResult {
@@ -173,6 +195,16 @@ async fn execute_local_slash_command(
                 session: Some(session),
                 provider_payload: None,
             };
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Succeeded,
+                super::command_response(StatusCode::OK, serde_json::to_value(&result).ok()),
+            )
+            .await
+            {
+                return response;
+            }
             slash_result_response(
                 &state,
                 session_id,
@@ -214,10 +246,54 @@ async fn execute_local_slash_command(
                 }
                 _ => {}
             }
+            let universal_command_kind = match request.command_id.as_str() {
+                "local.model" => request
+                    .arguments
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(|model| agenter_core::UniversalCommand::SetModel {
+                        model: model.to_owned(),
+                    }),
+                "local.mode" => request
+                    .arguments
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(|mode| agenter_core::UniversalCommand::SetMode {
+                        mode: mode.to_owned(),
+                    }),
+                _ => None,
+            }
+            .unwrap_or_else(|| agenter_core::UniversalCommand::SetTurnSettings {
+                settings: settings.clone(),
+            });
+            let universal_command = slash_command_envelope(
+                user_id,
+                session.session_id,
+                &request,
+                universal_command_kind,
+            );
+            if let Some(response) = super::command_replay_response(
+                state.begin_universal_command(&universal_command).await,
+            ) {
+                return response;
+            }
+            publish_slash_user_echo(&state, user_id, session.session_id, &request).await;
             let Some(settings) = state
                 .update_session_turn_settings(user_id, session.session_id, settings)
                 .await
             else {
+                if let Some(response) = super::finish_command_or_error_response(
+                    &state,
+                    &universal_command,
+                    crate::state::UniversalCommandIdempotencyStatus::Failed,
+                    super::command_response(StatusCode::NOT_FOUND, None),
+                )
+                .await
+                {
+                    return response;
+                }
                 return StatusCode::NOT_FOUND.into_response();
             };
             let result = agenter_core::SlashCommandResult {
@@ -226,6 +302,16 @@ async fn execute_local_slash_command(
                 session: None,
                 provider_payload: Some(serde_json::to_value(settings).unwrap_or_default()),
             };
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Succeeded,
+                super::command_response(StatusCode::OK, serde_json::to_value(&result).ok()),
+            )
+            .await
+            {
+                return response;
+            }
             slash_result_response(
                 &state,
                 session.session_id,
@@ -237,6 +323,7 @@ async fn execute_local_slash_command(
             .await
         }
         "local.help" => {
+            publish_slash_user_echo(&state, user_id, session.session_id, &request).await;
             let result = agenter_core::SlashCommandResult {
                 accepted: true,
                 message: "Type / to browse commands. Provider commands are marked with their provider and dangerous commands require confirmation.".to_owned(),
@@ -254,6 +341,20 @@ async fn execute_local_slash_command(
             .await
         }
         "local.new" => {
+            let universal_command = slash_command_envelope(
+                user_id,
+                session.session_id,
+                &request,
+                agenter_core::UniversalCommand::ExecuteProviderCommand {
+                    command: semantic_slash_request(&request),
+                },
+            );
+            if let Some(response) = super::command_replay_response(
+                state.begin_universal_command(&universal_command).await,
+            ) {
+                return response;
+            }
+            publish_slash_user_echo(&state, user_id, session.session_id, &request).await;
             let title = request
                 .arguments
                 .get("title")
@@ -261,15 +362,38 @@ async fn execute_local_slash_command(
                 .map(str::trim)
                 .filter(|title| !title.is_empty())
                 .map(str::to_owned);
-            create_session_from_slash(state, user_id, session, request, definition, title).await
+            create_session_from_slash(
+                state,
+                user_id,
+                session,
+                request,
+                definition,
+                title,
+                universal_command,
+            )
+            .await
         }
         "local.refresh" => {
+            let universal_command = slash_command_envelope(
+                user_id,
+                session.session_id,
+                &request,
+                agenter_core::UniversalCommand::ExecuteProviderCommand {
+                    command: semantic_slash_request(&request),
+                },
+            );
+            if let Some(response) = super::command_replay_response(
+                state.begin_universal_command(&universal_command).await,
+            ) {
+                return response;
+            }
+            publish_slash_user_echo(&state, user_id, session.session_id, &request).await;
             refresh_workspace_provider_sessions_for_user(
                 state,
                 user_id,
                 session.workspace.workspace_id,
                 session.provider_id,
-                Some((session.session_id, request, definition)),
+                Some((session.session_id, request, definition, universal_command)),
             )
             .await
         }
@@ -293,6 +417,7 @@ async fn create_session_from_slash(
     request: agenter_core::SlashCommandRequest,
     definition: agenter_core::SlashCommandDefinition,
     title: Option<String>,
+    universal_command: agenter_core::UniversalCommandEnvelope,
 ) -> Response {
     let source_session_id = source.session_id;
     let session_id = agenter_core::SessionId::new();
@@ -334,6 +459,19 @@ async fn create_session_from_slash(
                     session: None,
                     provider_payload: Some(serde_json::json!({ "code": error.code })),
                 };
+                if let Some(response) = super::finish_command_or_error_response(
+                    &state,
+                    &universal_command,
+                    crate::state::UniversalCommandIdempotencyStatus::Failed,
+                    super::command_response(
+                        StatusCode::BAD_GATEWAY,
+                        serde_json::to_value(&result).ok(),
+                    ),
+                )
+                .await
+                {
+                    return response;
+                }
                 return slash_result_response(
                     &state,
                     source_session_id,
@@ -355,6 +493,19 @@ async fn create_session_from_slash(
                     session: None,
                     provider_payload: None,
                 };
+                if let Some(response) = super::finish_command_or_error_response(
+                    &state,
+                    &universal_command,
+                    crate::state::UniversalCommandIdempotencyStatus::Failed,
+                    super::command_response(
+                        StatusCode::BAD_GATEWAY,
+                        serde_json::to_value(&result).ok(),
+                    ),
+                )
+                .await
+                {
+                    return response;
+                }
                 return slash_result_response(
                     &state,
                     source_session_id,
@@ -374,12 +525,23 @@ async fn create_session_from_slash(
                         "code": super::runner_wait_error_code(error),
                     })),
                 };
+                let status = super::runner_wait_error_status(error);
+                if let Some(response) = super::finish_command_or_error_response(
+                    &state,
+                    &universal_command,
+                    crate::state::UniversalCommandIdempotencyStatus::Failed,
+                    super::command_response(status, serde_json::to_value(&result).ok()),
+                )
+                .await
+                {
+                    return response;
+                }
                 return slash_result_response(
                     &state,
                     source_session_id,
                     &request,
                     &definition,
-                    super::runner_wait_error_status(error),
+                    status,
                     result,
                 )
                 .await;
@@ -413,6 +575,16 @@ async fn create_session_from_slash(
         session: Some(info),
         provider_payload: None,
     };
+    if let Some(response) = super::finish_command_or_error_response(
+        &state,
+        &universal_command,
+        crate::state::UniversalCommandIdempotencyStatus::Succeeded,
+        super::command_response(StatusCode::OK, serde_json::to_value(&result).ok()),
+    )
+    .await
+    {
+        return response;
+    }
     slash_result_response(
         &state,
         source_session_id,
@@ -424,12 +596,57 @@ async fn create_session_from_slash(
     .await
 }
 
+fn slash_command_envelope(
+    user_id: agenter_core::UserId,
+    session_id: agenter_core::SessionId,
+    request: &agenter_core::SlashCommandRequest,
+    command: agenter_core::UniversalCommand,
+) -> agenter_core::UniversalCommandEnvelope {
+    agenter_core::UniversalCommandEnvelope {
+        command_id: request
+            .universal_command_id
+            .unwrap_or_else(agenter_core::CommandId::new),
+        idempotency_key: request.idempotency_key.clone().unwrap_or_else(|| {
+            format!(
+                "legacy:slash:{user_id}:{session_id}:{}",
+                uuid::Uuid::new_v4()
+            )
+        }),
+        session_id: Some(session_id),
+        turn_id: None,
+        command,
+    }
+}
+
+fn semantic_slash_request(
+    request: &agenter_core::SlashCommandRequest,
+) -> agenter_core::SlashCommandRequest {
+    let mut request = request.clone();
+    request.universal_command_id = None;
+    request.idempotency_key = None;
+    request
+}
+
 async fn execute_runner_interrupt_slash_command(
     state: crate::state::AppState,
     session: crate::state::RegisteredSession,
     request: agenter_core::SlashCommandRequest,
     definition: agenter_core::SlashCommandDefinition,
 ) -> Response {
+    let universal_command = slash_command_envelope(
+        session.owner_user_id,
+        session.session_id,
+        &request,
+        agenter_core::UniversalCommand::CancelTurn {
+            request: Some(semantic_slash_request(&request)),
+        },
+    );
+    if let Some(response) =
+        super::command_replay_response(state.begin_universal_command(&universal_command).await)
+    {
+        return response;
+    }
+    publish_slash_user_echo(&state, session.owner_user_id, session.session_id, &request).await;
     let request_id = agenter_protocol::RequestId::from(uuid::Uuid::new_v4().to_string());
     let message = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
         agenter_protocol::runner::RunnerCommandEnvelope {
@@ -457,6 +674,16 @@ async fn execute_runner_interrupt_slash_command(
                 session: None,
                 provider_payload: None,
             };
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Succeeded,
+                super::command_response(StatusCode::OK, serde_json::to_value(&result).ok()),
+            )
+            .await
+            {
+                return response;
+            }
             slash_result_response(
                 &state,
                 session.session_id,
@@ -474,6 +701,19 @@ async fn execute_runner_interrupt_slash_command(
                 session: None,
                 provider_payload: Some(serde_json::json!({ "code": error.code })),
             };
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Failed,
+                super::command_response(
+                    StatusCode::BAD_GATEWAY,
+                    serde_json::to_value(&result).ok(),
+                ),
+            )
+            .await
+            {
+                return response;
+            }
             slash_result_response(
                 &state,
                 session.session_id,
@@ -492,6 +732,19 @@ async fn execute_runner_interrupt_slash_command(
                 session: None,
                 provider_payload: None,
             };
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Failed,
+                super::command_response(
+                    StatusCode::BAD_GATEWAY,
+                    serde_json::to_value(&result).ok(),
+                ),
+            )
+            .await
+            {
+                return response;
+            }
             slash_result_response(
                 &state,
                 session.session_id,
@@ -511,12 +764,23 @@ async fn execute_runner_interrupt_slash_command(
                     "code": super::runner_wait_error_code(error),
                 })),
             };
+            let status = super::runner_wait_error_status(error);
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Failed,
+                super::command_response(status, serde_json::to_value(&result).ok()),
+            )
+            .await
+            {
+                return response;
+            }
             slash_result_response(
                 &state,
                 session.session_id,
                 &request,
                 &definition,
-                super::runner_wait_error_status(error),
+                status,
                 result,
             )
             .await
@@ -548,6 +812,20 @@ async fn execute_provider_slash_command(
     }
 
     let request_id = agenter_protocol::RequestId::from(uuid::Uuid::new_v4().to_string());
+    let universal_command = slash_command_envelope(
+        user_id,
+        session.session_id,
+        &request,
+        agenter_core::UniversalCommand::ExecuteProviderCommand {
+            command: semantic_slash_request(&request),
+        },
+    );
+    if let Some(response) =
+        super::command_replay_response(state.begin_universal_command(&universal_command).await)
+    {
+        return response;
+    }
+    publish_slash_user_echo(&state, user_id, session.session_id, &request).await;
     let command_id = request.command_id.clone();
     let command_request = request.clone();
     let message = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
@@ -613,6 +891,16 @@ async fn execute_provider_slash_command(
                     result.session = Some(updated);
                 }
             }
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Succeeded,
+                super::command_response(StatusCode::OK, serde_json::to_value(&result).ok()),
+            )
+            .await
+            {
+                return response;
+            }
             slash_result_response(
                 &state,
                 session.session_id,
@@ -630,6 +918,19 @@ async fn execute_provider_slash_command(
                 session: None,
                 provider_payload: Some(serde_json::json!({ "code": error.code })),
             };
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Failed,
+                super::command_response(
+                    StatusCode::BAD_GATEWAY,
+                    serde_json::to_value(&result).ok(),
+                ),
+            )
+            .await
+            {
+                return response;
+            }
             slash_result_response(
                 &state,
                 session.session_id,
@@ -648,6 +949,19 @@ async fn execute_provider_slash_command(
                 session: None,
                 provider_payload: None,
             };
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Failed,
+                super::command_response(
+                    StatusCode::BAD_GATEWAY,
+                    serde_json::to_value(&result).ok(),
+                ),
+            )
+            .await
+            {
+                return response;
+            }
             slash_result_response(
                 &state,
                 session.session_id,
@@ -667,12 +981,23 @@ async fn execute_provider_slash_command(
                     "code": super::runner_wait_error_code(error),
                 })),
             };
+            let status = super::runner_wait_error_status(error);
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Failed,
+                super::command_response(status, serde_json::to_value(&result).ok()),
+            )
+            .await
+            {
+                return response;
+            }
             slash_result_response(
                 &state,
                 session.session_id,
                 &request,
                 &definition,
-                super::runner_wait_error_status(error),
+                status,
                 result,
             )
             .await
@@ -821,12 +1146,40 @@ async fn refresh_workspace_provider_sessions_for_user(
         agenter_core::SessionId,
         agenter_core::SlashCommandRequest,
         agenter_core::SlashCommandDefinition,
+        agenter_core::UniversalCommandEnvelope,
     )>,
 ) -> Response {
     let Some((runner_id, workspace)) = state
         .resolve_runner_workspace(workspace_id, &provider_id)
         .await
     else {
+        if let Some((session_id, request, definition, universal_command)) = slash_context {
+            let result = agenter_core::SlashCommandResult {
+                accepted: false,
+                message: "Workspace/provider is not available for refresh.".to_owned(),
+                session: None,
+                provider_payload: None,
+            };
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &universal_command,
+                crate::state::UniversalCommandIdempotencyStatus::Failed,
+                super::command_response(StatusCode::NOT_FOUND, serde_json::to_value(&result).ok()),
+            )
+            .await
+            {
+                return response;
+            }
+            return slash_result_response(
+                &state,
+                session_id,
+                &request,
+                &definition,
+                StatusCode::NOT_FOUND,
+                result,
+            )
+            .await;
+        }
         return StatusCode::NOT_FOUND.into_response();
     };
     let request_id = agenter_protocol::RequestId::from(uuid::Uuid::new_v4().to_string());
@@ -866,7 +1219,17 @@ async fn refresh_workspace_provider_sessions_for_user(
                 session: None,
                 provider_payload: Some(serde_json::to_value(summary).unwrap_or_default()),
             };
-            if let Some((session_id, request, definition)) = slash_context {
+            if let Some((session_id, request, definition, universal_command)) = slash_context {
+                if let Some(response) = super::finish_command_or_error_response(
+                    &state,
+                    &universal_command,
+                    crate::state::UniversalCommandIdempotencyStatus::Succeeded,
+                    super::command_response(StatusCode::OK, serde_json::to_value(&result).ok()),
+                )
+                .await
+                {
+                    return response;
+                }
                 slash_result_response(
                     &state,
                     session_id,
@@ -888,7 +1251,20 @@ async fn refresh_workspace_provider_sessions_for_user(
                 session: None,
                 provider_payload: Some(serde_json::json!({ "code": error.code })),
             };
-            if let Some((session_id, request, definition)) = slash_context {
+            if let Some((session_id, request, definition, universal_command)) = slash_context {
+                if let Some(response) = super::finish_command_or_error_response(
+                    &state,
+                    &universal_command,
+                    crate::state::UniversalCommandIdempotencyStatus::Failed,
+                    super::command_response(
+                        StatusCode::BAD_GATEWAY,
+                        serde_json::to_value(&result).ok(),
+                    ),
+                )
+                .await
+                {
+                    return response;
+                }
                 slash_result_response(
                     &state,
                     session_id,
@@ -911,16 +1287,20 @@ async fn refresh_workspace_provider_sessions_for_user(
                     "code": super::runner_wait_error_code(error),
                 })),
             };
-            if let Some((session_id, request, definition)) = slash_context {
-                slash_result_response(
+            if let Some((session_id, request, definition, universal_command)) = slash_context {
+                let status = super::runner_wait_error_status(error);
+                if let Some(response) = super::finish_command_or_error_response(
                     &state,
-                    session_id,
-                    &request,
-                    &definition,
-                    super::runner_wait_error_status(error),
-                    result,
+                    &universal_command,
+                    crate::state::UniversalCommandIdempotencyStatus::Failed,
+                    super::command_response(status, serde_json::to_value(&result).ok()),
                 )
                 .await
+                {
+                    return response;
+                }
+                slash_result_response(&state, session_id, &request, &definition, status, result)
+                    .await
             } else {
                 super::runner_wait_error_status(error).into_response()
             }

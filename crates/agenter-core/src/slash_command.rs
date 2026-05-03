@@ -59,6 +59,10 @@ pub enum SlashCommandDangerLevel {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct SlashCommandRequest {
     pub command_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub universal_command_id: Option<crate::CommandId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     #[serde(default)]
     pub arguments: serde_json::Value,
     pub raw_input: String,
@@ -117,6 +121,8 @@ mod tests {
     fn slash_command_request_and_result_round_trip() {
         let request = SlashCommandRequest {
             command_id: "local.title".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
             arguments: json!({"title": "New title"}),
             raw_input: "/title New title".to_owned(),
             confirmed: false,

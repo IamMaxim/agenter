@@ -1,6 +1,7 @@
 mod api;
 mod auth;
 mod browser_ws;
+mod policy;
 mod runner_ws;
 mod state;
 

@@ -244,6 +244,106 @@ button.busy:disabled .button-spinner {
 .content {
   min-width: 0;
   background: var(--surface);
+  display: grid;
+  grid-template-rows: 1fr;
+}
+
+.content.with-tabs {
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100vh;
+}
+
+.session-tabs {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  height: 32px;
+  padding: 0;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--surface-2);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.session-tab,
+.session-tabs-empty {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-height: 1.6rem;
+  border: 1px solid var(--line-soft);
+  padding: 0.15rem 0.55rem;
+  color: var(--muted);
+  background: transparent;
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+}
+
+.session-tab {
+  cursor: pointer;
+  height: 30px;
+  border-radius: 6px;
+}
+
+.session-tab.active {
+  border-color: var(--line-strong);
+  color: var(--text);
+  background: var(--surface);
+}
+
+.session-tab:hover {
+  border-color: var(--line-strong);
+  color: var(--text);
+}
+
+.session-tab-title {
+  max-width: 13rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-tab-close {
+  --button-size: 1rem;
+  display: inline-grid;
+  width: 1.15rem;
+  height: 1.15rem;
+  place-items: center;
+  margin: -0.1rem -0.2rem -0.1rem 0.02rem;
+  border: 0;
+  border-radius: 999px;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.session-tab-close:hover,
+.session-tab-close:focus-visible {
+  color: var(--text);
+  background: var(--surface-3);
+}
+
+.session-tabs-empty {
+  border-color: var(--line);
+  color: var(--muted);
+  font-size: 0.73rem;
+}
+
+.chat-route-stack {
+  min-height: 0;
+  display: grid;
+  flex: 1;
+}
+
+.chat-route-slot {
+  min-height: 0;
+  display: block;
+}
+
+.chat-route-slot.hidden {
+  display: none;
 }
 
 .content-home {
@@ -769,7 +869,8 @@ button.busy:disabled .button-spinner {
 .chat-layout {
   display: flex;
   min-width: 0;
-  height: 100vh;
+  height: 100%;
+  min-height: 0;
   flex-direction: column;
   overflow: hidden;
   background: var(--surface);
@@ -1992,8 +2093,8 @@ button.busy:disabled .button-spinner {
   }
 
   .app-shell.mobile-chat .chat-layout {
-    height: 100vh;
-    min-height: 100vh;
+    height: 100%;
+    min-height: 100%;
   }
 
   .app-shell.mobile-chat .chat-back-button {
@@ -2060,6 +2161,20 @@ button.busy:disabled .button-spinner {
   .composer-chip-wrap,
   .model-chip-wrap {
     max-width: min(100%, 44vw);
+  }
+
+  .session-tabs {
+    gap: 0.28rem;
+    min-height: 2rem;
+    padding: 0.35rem 0.5rem 0.3rem;
+  }
+
+  .session-tab {
+    font-size: 0.73rem;
+  }
+
+  .session-tab-title {
+    max-width: 9rem;
   }
 
   .toast-host {

@@ -2,7 +2,7 @@ import './styles.css';
 import { mount } from 'svelte';
 import App from './App.svelte';
 
-if ('serviceWorker' in navigator) {
+if (import.meta.env.PROD && 'serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     void navigator.serviceWorker.register('/sw.js').catch((error) => {
       console.error('Service worker registration failed', error);

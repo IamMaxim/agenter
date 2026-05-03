@@ -13,12 +13,28 @@ export interface BrowserEventHandlers {
   onError?: (error: Error | Event) => void;
 }
 
+export interface BrowserEventSubscriptionOptions {
+  afterSeq?: string;
+  includeSnapshot?: boolean;
+}
+
 export function parseBrowserServerMessage(data: string): BrowserServerMessage {
   return normalizeBrowserServerMessage(JSON.parse(data));
 }
 
 export function connectSessionEvents(
   sessionId: string,
+  optionsOrHandlers: BrowserEventSubscriptionOptions | BrowserEventHandlers,
+  maybeHandlers?: BrowserEventHandlers
+): BrowserEventSocket {
+  const options = maybeHandlers ? (optionsOrHandlers as BrowserEventSubscriptionOptions) : {};
+  const handlers = maybeHandlers ?? (optionsOrHandlers as BrowserEventHandlers);
+  return connectSessionEventsInternal(sessionId, options, handlers);
+}
+
+function connectSessionEventsInternal(
+  sessionId: string,
+  options: BrowserEventSubscriptionOptions,
   handlers: BrowserEventHandlers
 ): BrowserEventSocket {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -32,7 +48,9 @@ export function connectSessionEvents(
       JSON.stringify({
         type: 'subscribe_session',
         request_id: requestId,
-        session_id: sessionId
+        session_id: sessionId,
+        ...(options.afterSeq ? { after_seq: options.afterSeq } : {}),
+        ...(options.includeSnapshot ? { include_snapshot: true } : {})
       })
     );
     handlers.onOpen?.();

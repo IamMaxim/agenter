@@ -1,4 +1,5 @@
 mod agents;
+mod wal;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -25,6 +26,7 @@ use agenter_protocol::{
     RunnerTransportOutboundFrame,
 };
 use agents::acp::{AcpProviderProfile, AcpRunnerRuntime, AcpTurnRequest, PendingAcpApproval};
+use agents::adapter::{AdapterProviderRegistration, AdapterRuntime};
 use agents::approval_state::{PendingApprovalSubmitError, PendingProviderApproval};
 use agents::codex::{
     codex_provider_slash_commands, is_codex_no_rollout_resume_error,
@@ -35,6 +37,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
+use wal::{RunnerWal, RunnerWalRecord};
 
 const DEFAULT_CONTROL_PLANE_WS: &str = "ws://127.0.0.1:7777/api/runner/ws";
 const DEFAULT_DEV_RUNNER_TOKEN: &str = "dev-runner-token";
@@ -105,6 +108,60 @@ async fn answer_pending_provider_approval(
                     "{provider_label} approval response acknowledgement was dropped"
                 ),
             },
+        },
+    }
+}
+
+async fn cancel_pending_provider_approvals_for_session(
+    session_id: SessionId,
+    approvals: Arc<Mutex<HashMap<ApprovalId, PendingProviderApproval>>>,
+    provider_label: &'static str,
+) -> usize {
+    let candidates = {
+        let approvals = approvals.lock().await;
+        approvals
+            .iter()
+            .map(|(&approval_id, approval)| (approval_id, approval.clone()))
+            .collect::<Vec<_>>()
+    };
+    let mut pending = Vec::new();
+    for (approval_id, approval) in candidates {
+        if approval.session_id().await == session_id && approval.is_live().await {
+            pending.push((approval_id, approval));
+        }
+    }
+    let mut cancelled = 0;
+    for (approval_id, approval) in pending {
+        match answer_pending_provider_approval(
+            approval_id,
+            ApprovalDecision::Cancel,
+            approval,
+            provider_label,
+        )
+        .await
+        {
+            RunnerResponseOutcome::Ok { .. } => cancelled += 1,
+            RunnerResponseOutcome::Error { error } => {
+                tracing::warn!(
+                    %session_id,
+                    %approval_id,
+                    code = %error.code,
+                    message = %error.message,
+                    "failed to cancel blocked provider approval"
+                );
+            }
+        }
+    }
+    cancelled
+}
+
+fn provider_cancel_unsupported(provider_label: &'static str) -> RunnerResponseOutcome {
+    RunnerResponseOutcome::Error {
+        error: RunnerError {
+            code: "provider_cancel_not_supported".to_owned(),
+            message: format!(
+                "{provider_label} has no live turn cancellation hook in this runner path; only blocked native approvals can be cancelled"
+            ),
         },
     }
 }
@@ -422,10 +479,19 @@ async fn run_codex_runner() -> anyhow::Result<()> {
     let (mut sender, mut receiver) = socket.split();
     let mut server_message_reassembler =
         RunnerTransportChunkReassembler::new(runner_ws_max_message_bytes());
-    let hello = codex_hello(token, workspace_path.clone());
+    let mut hello = codex_hello(token, workspace_path.clone());
+    let wal = RunnerWal::open(runner_wal_path(hello.runner_id, &workspace_path)).await?;
+    let acked = wal.acked_seq().await;
+    hello.acked_runner_event_seq = (acked > 0).then_some(acked);
+    hello.replay_from_runner_event_seq = wal
+        .unacked()
+        .await
+        .first()
+        .map(|record| record.runner_event_seq);
     let advertised_workspace = hello.workspaces.first().cloned();
     tracing::info!(runner_id = %hello.runner_id, "sending codex runner hello");
     send_runner_message(&mut sender, RunnerClientMessage::Hello(hello)).await?;
+    replay_unacked_wal(&mut sender, &wal).await?;
 
     let pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingCodexApproval>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -433,6 +499,7 @@ async fn run_codex_runner() -> anyhow::Result<()> {
         Arc::new(Mutex::new(HashMap::new()));
     let (codex_event_sender, mut codex_event_receiver) = mpsc::unbounded_channel::<AppEvent>();
     let codex_runtime = CodexRunnerRuntime::new(workspace_path.clone());
+    let adapter_runtime = AdapterRuntime::new();
     if let Some(workspace) = advertised_workspace {
         match codex_runtime.discover_sessions().await {
             Ok(sessions) if !sessions.is_empty() => {
@@ -440,15 +507,15 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                     session_count = sessions.len(),
                     "sending discovered codex sessions to control plane"
                 );
-                send_runner_message(
+                send_wal_event(
                     &mut sender,
-                    RunnerClientMessage::Event(RunnerEventEnvelope {
-                        request_id: None,
-                        event: RunnerEvent::SessionsDiscovered(DiscoveredSessions {
-                            workspace,
-                            provider_id: AgentProviderId::from(AgentProviderId::CODEX),
-                            sessions,
-                        }),
+                    &wal,
+                    None,
+                    None,
+                    RunnerEvent::SessionsDiscovered(DiscoveredSessions {
+                        workspace,
+                        provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                        sessions,
                     }),
                 )
                 .await?;
@@ -468,18 +535,22 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                 let Some(event) = event else {
                     continue;
                 };
-                let Some(session_id) = app_event_session_id(&event) else {
+                let adapter_event = adapter_runtime.project_legacy_event(
+                    AgentProviderId::from(AgentProviderId::CODEX),
+                    "codex-app-server",
+                    None,
+                    event,
+                );
+                let Some(agent_event) = adapter_event.legacy_projection_for_wal() else {
                     continue;
                 };
-                send_runner_message(
+                let session_id = agent_event.session_id;
+                send_wal_event(
                     &mut sender,
-                    RunnerClientMessage::Event(RunnerEventEnvelope {
-                        request_id: None,
-                        event: RunnerEvent::AgentEvent(agenter_protocol::AgentEvent {
-                            session_id,
-                            event,
-                        }),
-                    }),
+                    &wal,
+                    None,
+                    Some(session_id),
+                    RunnerEvent::AgentEvent(Box::new(agent_event)),
                 )
                 .await?;
             }
@@ -491,9 +562,10 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                 let Message::Text(text) = message? else {
                     continue;
                 };
-                let Some(RunnerServerMessage::Command(envelope)) =
-                    next_runner_server_message(&mut server_message_reassembler, &text)?
-                else {
+                let Some(message) = next_runner_server_message(&mut server_message_reassembler, &text)? else {
+                    continue;
+                };
+                let Some(envelope) = handle_runner_server_message(&wal, message).await else {
                     continue;
                 };
 
@@ -546,15 +618,15 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                         tracing::info!(request_id = %envelope.request_id, workspace = %command.workspace.path, provider_id = %command.provider_id, "codex runner received refresh sessions");
                         let outcome = match codex_runtime.discover_sessions().await {
                             Ok(sessions) => {
-                                send_runner_message(
+                                send_wal_event(
                                     &mut sender,
-                                    RunnerClientMessage::Event(RunnerEventEnvelope {
-                                        request_id: Some(envelope.request_id.clone()),
-                                        event: RunnerEvent::SessionsDiscovered(DiscoveredSessions {
-                                            workspace: command.workspace,
-                                            provider_id: command.provider_id,
-                                            sessions,
-                                        }),
+                                    &wal,
+                                    Some(envelope.request_id.clone()),
+                                    None,
+                                    RunnerEvent::SessionsDiscovered(DiscoveredSessions {
+                                        workspace: command.workspace,
+                                        provider_id: command.provider_id,
+                                        sessions,
                                     }),
                                 )
                                 .await?;
@@ -732,15 +804,25 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                         )
                         .await?;
                     }
-                    RunnerCommand::InterruptSession { .. } => {
-                        tracing::debug!(request_id = %envelope.request_id, "codex runner accepted interrupt placeholder");
+                    RunnerCommand::InterruptSession { session_id } => {
+                        let cancelled = cancel_pending_provider_approvals_for_session(
+                            session_id,
+                            pending_approvals.clone(),
+                            "Codex",
+                        )
+                        .await;
+                        let outcome = if cancelled > 0 {
+                            RunnerResponseOutcome::Ok {
+                                result: RunnerCommandResult::Accepted,
+                            }
+                        } else {
+                            provider_cancel_unsupported("Codex")
+                        };
                         send_runner_message(
                             &mut sender,
                             RunnerClientMessage::Response(RunnerResponseEnvelope {
                                 request_id: envelope.request_id,
-                                outcome: RunnerResponseOutcome::Ok {
-                                    result: RunnerCommandResult::Accepted,
-                                },
+                                outcome,
                             }),
                         )
                         .await?;
@@ -802,15 +884,50 @@ async fn run_acp_runner(
     let (mut sender, mut receiver) = socket.split();
     let mut server_message_reassembler =
         RunnerTransportChunkReassembler::new(runner_ws_max_message_bytes());
-    let hello = acp_hello(token, workspace_path.clone(), &profiles, include_codex);
+    let mut hello = acp_hello(token, workspace_path.clone(), &profiles, include_codex);
+    let wal = RunnerWal::open(runner_wal_path(hello.runner_id, &workspace_path)).await?;
+    let acked = wal.acked_seq().await;
+    hello.acked_runner_event_seq = (acked > 0).then_some(acked);
+    hello.replay_from_runner_event_seq = wal
+        .unacked()
+        .await
+        .first()
+        .map(|record| record.runner_event_seq);
     let advertised_workspace = hello.workspaces.first().cloned();
     tracing::info!(runner_id = %hello.runner_id, "sending ACP runner hello");
     send_runner_message(&mut sender, RunnerClientMessage::Hello(hello)).await?;
+    replay_unacked_wal(&mut sender, &wal).await?;
 
     let profiles_by_id = profiles
         .into_iter()
         .map(|profile| (profile.provider_id.clone(), profile))
         .collect::<HashMap<_, _>>();
+    let mut adapter_runtime = AdapterRuntime::new();
+    for profile in profiles_by_id.values() {
+        adapter_runtime.register_provider(AdapterProviderRegistration {
+            provider_id: profile.provider_id.clone(),
+            capabilities: profile.advertised_capabilities().into(),
+        });
+    }
+    if include_codex {
+        adapter_runtime.register_provider(AdapterProviderRegistration {
+            provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+            capabilities: AgentCapabilities {
+                streaming: true,
+                approvals: true,
+                file_changes: true,
+                command_execution: true,
+                session_resume: true,
+                model_selection: true,
+                reasoning_effort: true,
+                collaboration_modes: true,
+                tool_user_input: true,
+                mcp_elicitation: true,
+                ..AgentCapabilities::default()
+            }
+            .into(),
+        });
+    }
     let mut session_profiles = HashMap::<SessionId, AgentProviderId>::new();
     let pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingAcpApproval>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -828,18 +945,20 @@ async fn run_acp_runner(
                 let Some(event) = event else {
                     continue;
                 };
-                let Some(session_id) = app_event_session_id(&event) else {
+                let provider_id = app_event_provider_id(&event)
+                    .unwrap_or_else(|| AgentProviderId::from("adapter"));
+                let adapter_event =
+                    adapter_runtime.project_legacy_event(provider_id, "runner-adapter", None, event);
+                let Some(agent_event) = adapter_event.legacy_projection_for_wal() else {
                     continue;
                 };
-                send_runner_message(
+                let session_id = agent_event.session_id;
+                send_wal_event(
                     &mut sender,
-                    RunnerClientMessage::Event(RunnerEventEnvelope {
-                        request_id: None,
-                        event: RunnerEvent::AgentEvent(agenter_protocol::AgentEvent {
-                            session_id,
-                            event,
-                        }),
-                    }),
+                    &wal,
+                    None,
+                    Some(session_id),
+                    RunnerEvent::AgentEvent(Box::new(agent_event)),
                 )
                 .await?;
             }
@@ -851,9 +970,10 @@ async fn run_acp_runner(
                 let Message::Text(text) = message? else {
                     continue;
                 };
-                let Some(RunnerServerMessage::Command(envelope)) =
-                    next_runner_server_message(&mut server_message_reassembler, &text)?
-                else {
+                let Some(message) = next_runner_server_message(&mut server_message_reassembler, &text)? else {
+                    continue;
+                };
+                let Some(envelope) = handle_runner_server_message(&wal, message).await else {
                     continue;
                 };
 
@@ -864,6 +984,7 @@ async fn run_acp_runner(
                             let outcome = match &codex_runtime {
                                 Some(runtime) => match runtime.create_session(command.session_id).await {
                                     Ok(external_session_id) => {
+                                        adapter_runtime.bind_session(command.session_id, command.provider_id.clone());
                                         session_profiles.insert(command.session_id, command.provider_id);
                                         RunnerResponseOutcome::Ok {
                                             result: RunnerCommandResult::SessionCreated {
@@ -911,6 +1032,7 @@ async fn run_acp_runner(
                         };
                         let outcome = match acp_runtime.create_session(command.session_id, profile).await {
                             Ok(external_session_id) => {
+                                adapter_runtime.bind_session(command.session_id, command.provider_id.clone());
                                 session_profiles.insert(command.session_id, command.provider_id);
                                 RunnerResponseOutcome::Ok {
                                     result: RunnerCommandResult::SessionCreated {
@@ -941,6 +1063,7 @@ async fn run_acp_runner(
                                     .await
                                 {
                                     Ok(external_session_id) => {
+                                        adapter_runtime.bind_session(command.session_id, command.provider_id.clone());
                                         session_profiles.insert(command.session_id, command.provider_id);
                                         RunnerResponseOutcome::Ok {
                                             result: RunnerCommandResult::SessionResumed {
@@ -991,6 +1114,7 @@ async fn run_acp_runner(
                             .await
                         {
                             Ok(external_session_id) => {
+                                adapter_runtime.bind_session(command.session_id, command.provider_id.clone());
                                 session_profiles.insert(command.session_id, command.provider_id);
                                 RunnerResponseOutcome::Ok {
                                     result: RunnerCommandResult::SessionResumed {
@@ -1018,15 +1142,15 @@ async fn run_acp_runner(
                             let outcome = match &codex_runtime {
                                 Some(runtime) => match runtime.discover_sessions().await {
                                     Ok(sessions) => {
-                                        send_runner_message(
+                                        send_wal_event(
                                             &mut sender,
-                                            RunnerClientMessage::Event(RunnerEventEnvelope {
-                                                request_id: Some(envelope.request_id.clone()),
-                                                event: RunnerEvent::SessionsDiscovered(DiscoveredSessions {
-                                                    workspace: command.workspace,
-                                                    provider_id: command.provider_id,
-                                                    sessions,
-                                                }),
+                                            &wal,
+                                            Some(envelope.request_id.clone()),
+                                            None,
+                                            RunnerEvent::SessionsDiscovered(DiscoveredSessions {
+                                                workspace: command.workspace,
+                                                provider_id: command.provider_id,
+                                                sessions,
                                             }),
                                         )
                                         .await?;
@@ -1073,15 +1197,15 @@ async fn run_acp_runner(
                         };
                         let outcome = match acp_runtime.discover_sessions(profile).await {
                             Ok(sessions) => {
-                                send_runner_message(
+                                send_wal_event(
                                     &mut sender,
-                                    RunnerClientMessage::Event(RunnerEventEnvelope {
-                                        request_id: Some(envelope.request_id.clone()),
-                                        event: RunnerEvent::SessionsDiscovered(DiscoveredSessions {
-                                            workspace: command.workspace,
-                                            provider_id: command.provider_id,
-                                            sessions,
-                                        }),
+                                    &wal,
+                                    Some(envelope.request_id.clone()),
+                                    None,
+                                    RunnerEvent::SessionsDiscovered(DiscoveredSessions {
+                                        workspace: command.workspace,
+                                        provider_id: command.provider_id,
+                                        sessions,
                                     }),
                                 )
                                 .await?;
@@ -1104,10 +1228,10 @@ async fn run_acp_runner(
                     }
                     RunnerCommand::AgentSendInput(command) => {
                         tracing::info!(session_id = %command.session_id, request_id = %envelope.request_id, "multi-provider runner received agent input");
-                        let provider_id = session_profiles
-                            .get(&command.session_id)
-                            .cloned()
-                            .or_else(|| command.provider_id.clone())
+                        let provider_id = adapter_runtime
+                            .resolve_provider(Some(command.session_id), command.provider_id.as_ref())
+                            .map(|registration| registration.provider_id.clone())
+                            .or_else(|| session_profiles.get(&command.session_id).cloned())
                             .or_else(|| profiles_by_id.keys().next().cloned());
                         let Some(provider_id) = provider_id else {
                             send_runner_message(
@@ -1142,6 +1266,7 @@ async fn run_acp_runner(
                                 .await?;
                                 continue;
                             };
+                            adapter_runtime.bind_session(command.session_id, provider_id.clone());
                             session_profiles.insert(command.session_id, provider_id);
                             send_runner_message(
                                 &mut sender,
@@ -1213,6 +1338,7 @@ async fn run_acp_runner(
                             .await?;
                             continue;
                         };
+                        adapter_runtime.bind_session(command.session_id, provider_id.clone());
                         session_profiles.insert(command.session_id, provider_id);
                         send_runner_message(
                             &mut sender,
@@ -1421,14 +1547,31 @@ async fn run_acp_runner(
                         )
                         .await?;
                     }
-                    RunnerCommand::InterruptSession { .. } => {
+                    RunnerCommand::InterruptSession { session_id } => {
+                        let acp_cancelled = cancel_pending_provider_approvals_for_session(
+                            session_id,
+                            pending_approvals.clone(),
+                            "ACP",
+                        )
+                        .await;
+                        let codex_cancelled = cancel_pending_provider_approvals_for_session(
+                            session_id,
+                            pending_codex_approvals.clone(),
+                            "Codex",
+                        )
+                        .await;
+                        let outcome = if acp_cancelled + codex_cancelled > 0 {
+                            RunnerResponseOutcome::Ok {
+                                result: RunnerCommandResult::Accepted,
+                            }
+                        } else {
+                            provider_cancel_unsupported("provider")
+                        };
                         send_runner_message(
                             &mut sender,
                             RunnerClientMessage::Response(RunnerResponseEnvelope {
                                 request_id: envelope.request_id,
-                                outcome: RunnerResponseOutcome::Ok {
-                                    result: RunnerCommandResult::Accepted,
-                                },
+                                outcome,
                             }),
                         )
                         .await?;
@@ -1438,6 +1581,7 @@ async fn run_acp_runner(
                         if let Some(runtime) = &codex_runtime {
                             runtime.shutdown_session(command.session_id).await;
                         }
+                        adapter_runtime.unbind_session(command.session_id);
                         acp_event_sender
                             .send(AppEvent::SessionStatusChanged(SessionStatusChangedEvent {
                                 session_id: command.session_id,
@@ -1478,17 +1622,29 @@ async fn run_fake_runner() -> anyhow::Result<()> {
     let mut server_message_reassembler =
         RunnerTransportChunkReassembler::new(runner_ws_max_message_bytes());
 
-    let hello = fake_hello(token);
+    let mut hello = fake_hello(token);
+    let workspace_path = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let wal = RunnerWal::open(runner_wal_path(hello.runner_id, &workspace_path)).await?;
+    let acked = wal.acked_seq().await;
+    hello.acked_runner_event_seq = (acked > 0).then_some(acked);
+    hello.replay_from_runner_event_seq = wal
+        .unacked()
+        .await
+        .first()
+        .map(|record| record.runner_event_seq);
     tracing::info!(runner_id = %hello.runner_id, "sending fake runner hello");
     send_runner_message(&mut sender, RunnerClientMessage::Hello(hello)).await?;
+    replay_unacked_wal(&mut sender, &wal).await?;
 
     while let Some(message) = receiver.next().await {
         let Message::Text(text) = message? else {
             continue;
         };
-        let Some(RunnerServerMessage::Command(envelope)) =
-            next_runner_server_message(&mut server_message_reassembler, &text)?
+        let Some(message) = next_runner_server_message(&mut server_message_reassembler, &text)?
         else {
+            continue;
+        };
+        let Some(envelope) = handle_runner_server_message(&wal, message).await else {
             continue;
         };
 
@@ -1508,15 +1664,16 @@ async fn run_fake_runner() -> anyhow::Result<()> {
 
                 for event in deterministic_fake_events(command.session_id, &command.input) {
                     tracing::debug!(session_id = %command.session_id, "fake runner emitting event");
-                    send_runner_message(
+                    send_wal_event(
                         &mut sender,
-                        RunnerClientMessage::Event(RunnerEventEnvelope {
-                            request_id: Some(envelope.request_id.clone()),
-                            event: RunnerEvent::AgentEvent(agenter_protocol::AgentEvent {
-                                session_id: command.session_id,
-                                event,
-                            }),
-                        }),
+                        &wal,
+                        Some(envelope.request_id.clone()),
+                        Some(command.session_id),
+                        RunnerEvent::AgentEvent(Box::new(agenter_protocol::AgentEvent {
+                            session_id: command.session_id,
+                            event,
+                            universal_event: None,
+                        })),
                     )
                     .await?;
                 }
@@ -1615,6 +1772,70 @@ async fn send_runner_message(
     Ok(())
 }
 
+async fn send_wal_event(
+    sender: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        Message,
+    >,
+    wal: &RunnerWal,
+    request_id: Option<agenter_protocol::RequestId>,
+    session_id: Option<SessionId>,
+    event: RunnerEvent,
+) -> anyhow::Result<()> {
+    let record = wal.append(request_id, session_id, event).await?;
+    send_wal_record(sender, wal, &record).await
+}
+
+async fn send_wal_record(
+    sender: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        Message,
+    >,
+    wal: &RunnerWal,
+    record: &RunnerWalRecord,
+) -> anyhow::Result<()> {
+    let acked = wal.acked_seq().await;
+    send_runner_message(
+        sender,
+        RunnerClientMessage::Event(Box::new(RunnerEventEnvelope {
+            request_id: record.request_id.clone(),
+            runner_event_seq: Some(record.runner_event_seq),
+            acked_runner_event_seq: (acked > 0).then_some(acked),
+            event: record.event.clone(),
+        })),
+    )
+    .await
+}
+
+async fn replay_unacked_wal(
+    sender: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        Message,
+    >,
+    wal: &RunnerWal,
+) -> anyhow::Result<()> {
+    for record in wal.unacked().await {
+        send_wal_record(sender, wal, &record).await?;
+    }
+    Ok(())
+}
+
+fn runner_wal_path(runner_id: RunnerId, workspace_path: &Path) -> PathBuf {
+    env::var("AGENTER_RUNNER_WAL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            workspace_path
+                .join(".agenter")
+                .join(format!("runner-{runner_id}-events.jsonl"))
+        })
+}
+
 fn runner_client_message_type(message: &RunnerClientMessage) -> &'static str {
     match message {
         RunnerClientMessage::Hello(_) => "runner_hello",
@@ -1646,6 +1867,26 @@ fn next_runner_server_message(
             tracing::warn!(%error, "runner ignored undecodable control-plane message");
             Ok(None)
         }
+    }
+}
+
+async fn handle_runner_server_message(
+    wal: &RunnerWal,
+    message: RunnerServerMessage,
+) -> Option<Box<agenter_protocol::runner::RunnerCommandEnvelope>> {
+    match message {
+        RunnerServerMessage::Command(envelope) => Some(envelope),
+        RunnerServerMessage::EventAck(ack) => {
+            if let Err(error) = wal.ack(ack.runner_event_seq).await {
+                tracing::warn!(
+                    runner_event_seq = ack.runner_event_seq,
+                    %error,
+                    "failed to persist runner event ack"
+                );
+            }
+            None
+        }
+        RunnerServerMessage::HeartbeatAck(_) => None,
     }
 }
 
@@ -1703,6 +1944,8 @@ fn fake_hello(token: String) -> RunnerHello {
             transports: vec!["fake".to_owned()],
             workspace_discovery: false,
         },
+        acked_runner_event_seq: None,
+        replay_from_runner_event_seq: None,
         workspaces: vec![WorkspaceRef {
             workspace_id: WorkspaceId::from_uuid(Uuid::from_u128(
                 0x22222222222222222222222222222222,
@@ -1776,6 +2019,8 @@ fn acp_hello(
             },
             workspace_discovery: false,
         },
+        acked_runner_event_seq: None,
+        replay_from_runner_event_seq: None,
         workspaces: vec![WorkspaceRef {
             workspace_id,
             runner_id,
@@ -1823,6 +2068,8 @@ fn provider_hello(
             transports: vec![transport.to_owned()],
             workspace_discovery: false,
         },
+        acked_runner_event_seq: None,
+        replay_from_runner_event_seq: None,
         workspaces: vec![WorkspaceRef {
             workspace_id,
             runner_id,
@@ -1875,34 +2122,15 @@ fn agent_input_text(input: &AgentInput) -> String {
     }
 }
 
-fn app_event_session_id(event: &AppEvent) -> Option<SessionId> {
+fn app_event_provider_id(event: &AppEvent) -> Option<AgentProviderId> {
     match event {
-        AppEvent::SessionStarted(info) => Some(info.session_id),
-        AppEvent::SessionStatusChanged(event) => Some(event.session_id),
-        AppEvent::UserMessage(event) => Some(event.session_id),
-        AppEvent::AgentMessageDelta(event) => Some(event.session_id),
-        AppEvent::AgentMessageCompleted(event) => Some(event.session_id),
-        AppEvent::PlanUpdated(event) => Some(event.session_id),
-        AppEvent::ToolStarted(event)
-        | AppEvent::ToolUpdated(event)
-        | AppEvent::ToolCompleted(event) => Some(event.session_id),
-        AppEvent::CommandStarted(event) => Some(event.session_id),
-        AppEvent::CommandOutputDelta(event) => Some(event.session_id),
-        AppEvent::CommandCompleted(event) => Some(event.session_id),
-        AppEvent::FileChangeProposed(event)
-        | AppEvent::FileChangeApplied(event)
-        | AppEvent::FileChangeRejected(event) => Some(event.session_id),
-        AppEvent::ApprovalRequested(event) => Some(event.session_id),
-        AppEvent::ApprovalResolved(event) => Some(event.session_id),
-        AppEvent::QuestionRequested(event) => Some(event.session_id),
-        AppEvent::QuestionAnswered(event) => Some(event.session_id),
         AppEvent::TurnDiffUpdated(event)
         | AppEvent::ItemReasoning(event)
         | AppEvent::ServerRequestResolved(event)
         | AppEvent::McpToolCallProgress(event)
         | AppEvent::ThreadRealtimeEvent(event)
-        | AppEvent::ProviderEvent(event) => Some(event.session_id),
-        AppEvent::Error(event) => event.session_id,
+        | AppEvent::ProviderEvent(event) => Some(event.provider_id.clone()),
+        _ => None,
     }
 }
 
@@ -1987,6 +2215,15 @@ fn deterministic_fake_events(session_id: SessionId, input: &AgentInput) -> Vec<A
             presentation: None,
             resolution_state: None,
             resolving_decision: None,
+            status: None,
+            turn_id: None,
+            item_id: None,
+            options: agenter_core::ApprovalOption::canonical_defaults(),
+            risk: Some("medium".to_owned()),
+            subject: Some("This is an in-memory approval stub.".to_owned()),
+            native_request_id: Some("fake-approval".to_owned()),
+            native_blocking: true,
+            policy: None,
             provider_payload: None,
         }),
         AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {
@@ -2077,5 +2314,63 @@ mod tests {
             .transports
             .iter()
             .any(|transport| transport == "acp-stdio"));
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancels_blocked_approval_for_same_session() {
+        let session_id = SessionId::new();
+        let other_session_id = SessionId::new();
+        let approval_id = ApprovalId::new();
+        let other_approval_id = ApprovalId::new();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (other_sender, _other_receiver) = tokio::sync::oneshot::channel();
+        let approvals = Arc::new(Mutex::new(HashMap::from([
+            (
+                approval_id,
+                PendingProviderApproval::new(session_id, sender),
+            ),
+            (
+                other_approval_id,
+                PendingProviderApproval::new(other_session_id, other_sender),
+            ),
+        ])));
+
+        let cancel = tokio::spawn(cancel_pending_provider_approvals_for_session(
+            session_id,
+            approvals.clone(),
+            "test",
+        ));
+        let provider_decision = receiver.await.expect("provider decision");
+        assert_eq!(provider_decision.decision, ApprovalDecision::Cancel);
+        provider_decision
+            .acknowledged
+            .send(Ok(()))
+            .expect("ack cancel");
+
+        assert_eq!(cancel.await.expect("cancel task"), 1);
+    }
+
+    #[tokio::test]
+    async fn interrupt_does_not_count_completed_approval_cancel_replay_as_new_cancel() {
+        let session_id = SessionId::new();
+        let approval_id = ApprovalId::new();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let pending = PendingProviderApproval::new(session_id, sender);
+        let first_cancel = tokio::spawn({
+            let pending = pending.clone();
+            async move { pending.submit(ApprovalDecision::Cancel).await }
+        });
+        let provider_decision = receiver.await.expect("provider decision");
+        assert_eq!(provider_decision.decision, ApprovalDecision::Cancel);
+        provider_decision
+            .acknowledged
+            .send(Ok(()))
+            .expect("ack cancel");
+        assert_eq!(first_cancel.await.expect("first cancel"), Ok(()));
+
+        let approvals = Arc::new(Mutex::new(HashMap::from([(approval_id, pending)])));
+        let cancelled =
+            cancel_pending_provider_approvals_for_session(session_id, approvals, "test").await;
+        assert_eq!(cancelled, 0);
     }
 }

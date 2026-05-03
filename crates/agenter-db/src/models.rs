@@ -2,8 +2,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use agenter_core::{
-    AgentProviderId, AgentTurnSettings, ApprovalDecision, ApprovalId, ApprovalKind, RunnerId,
-    SessionId, SessionStatus, SessionUsageSnapshot, UserId, WorkspaceId,
+    AgentProviderId, AgentTurnSettings, ApprovalDecision, ApprovalId, ApprovalKind, ApprovalOption,
+    ApprovalStatus as UniversalApprovalStatus, CommandId, ItemId, NativeRef, RunnerId, SessionId,
+    SessionSnapshot, SessionStatus, SessionUsageSnapshot, TurnId, UniversalEventKind,
+    UniversalEventSource, UniversalSeq, UserId, WorkspaceId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,6 +70,74 @@ pub struct CachedEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentEvent {
+    pub seq: UniversalSeq,
+    pub event_id: uuid::Uuid,
+    pub workspace_id: WorkspaceId,
+    pub session_id: SessionId,
+    pub turn_id: Option<TurnId>,
+    pub item_id: Option<ItemId>,
+    pub event_type: String,
+    pub event: UniversalEventKind,
+    pub native: Option<NativeRef>,
+    pub source: UniversalEventSource,
+    pub command_id: Option<CommandId>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl AgentEvent {
+    #[must_use]
+    pub fn envelope(&self) -> agenter_core::UniversalEventEnvelope {
+        agenter_core::UniversalEventEnvelope {
+            event_id: self.event_id.to_string(),
+            seq: self.seq,
+            session_id: self.session_id,
+            turn_id: self.turn_id,
+            item_id: self.item_id,
+            ts: self.created_at,
+            source: self.source.clone(),
+            native: self.native.clone(),
+            event: self.event.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredSessionSnapshot {
+    pub session_id: SessionId,
+    pub latest_seq: UniversalSeq,
+    pub snapshot: SessionSnapshot,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UniversalAppendOutcome {
+    pub event: AgentEvent,
+    pub snapshot: StoredSessionSnapshot,
+    pub cached_event: Option<CachedEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandIdempotencyStatus {
+    Pending,
+    Succeeded,
+    Failed,
+    Conflict,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CommandIdempotencyRecord {
+    pub idempotency_key: String,
+    pub command_id: CommandId,
+    pub session_id: Option<SessionId>,
+    pub status: CommandIdempotencyStatus,
+    pub response_json: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PendingApproval {
     pub approval_id: ApprovalId,
     pub session_id: SessionId,
@@ -75,6 +145,13 @@ pub struct PendingApproval {
     pub title: String,
     pub details: Option<String>,
     pub provider_payload: Option<serde_json::Value>,
+    pub universal_status: UniversalApprovalStatus,
+    pub native_request_id: Option<String>,
+    pub canonical_options: Vec<ApprovalOption>,
+    pub risk: Option<String>,
+    pub subject: Option<String>,
+    pub native_summary: Option<String>,
+    pub native: Option<NativeRef>,
     pub expires_at: Option<DateTime<Utc>>,
     pub resolved_decision: Option<ApprovalDecision>,
     pub resolved_by_user_id: Option<UserId>,

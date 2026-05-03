@@ -1248,10 +1248,10 @@ pub async fn run_codex_turn_on_server(
                 )
             {
                 let (sender, receiver) = oneshot::channel();
-                pending_approvals
-                    .lock()
-                    .await
-                    .insert(approval_id, PendingCodexApproval::new(sender));
+                pending_approvals.lock().await.insert(
+                    approval_id,
+                    PendingCodexApproval::new(request.session_id, sender),
+                );
                 event_sender
                     .send(session_status_event(
                         request.session_id,
@@ -1558,6 +1558,35 @@ pub fn normalize_codex_message(session_id: SessionId, message: &Value) -> Vec<Ap
     normalize_codex_message_inner(session_id, message)
 }
 
+#[allow(dead_code)]
+pub mod codex_codec {
+    use serde_json::Value;
+
+    #[must_use]
+    pub fn method(message: &Value) -> Option<&str> {
+        super::jsonrpc_method(message)
+    }
+}
+
+#[allow(dead_code)]
+pub mod codex_reducer {
+    use agenter_core::{AgentProviderId, SessionId};
+    use serde_json::Value;
+
+    use crate::agents::adapter::{legacy_events_to_adapter_events, AdapterEvent};
+
+    #[must_use]
+    pub fn reduce_native_message(session_id: SessionId, message: &Value) -> Vec<AdapterEvent> {
+        let method = super::codex_codec::method(message);
+        legacy_events_to_adapter_events(
+            AgentProviderId::from(AgentProviderId::CODEX),
+            "codex-app-server",
+            method,
+            super::normalize_codex_message(session_id, message),
+        )
+    }
+}
+
 fn normalize_codex_message_for_scope(
     session_id: SessionId,
     message: &Value,
@@ -1756,11 +1785,20 @@ pub fn normalize_codex_approval_request(
         approval_id,
         kind,
         title: title.to_string(),
-        details,
+        details: details.clone(),
         expires_at: None,
         presentation,
         resolution_state: None,
         resolving_decision: None,
+        status: None,
+        turn_id: None,
+        item_id: None,
+        options: agenter_core::ApprovalOption::canonical_defaults(),
+        risk: None,
+        subject: details.clone(),
+        native_request_id: Some(native_request_id.to_string()),
+        native_blocking: true,
+        policy: None,
         provider_payload: Some(message.clone()),
     });
     Some((approval_id, native_request_id, approval_kind, event))
@@ -2251,6 +2289,8 @@ fn turn_plan_updated(session_id: SessionId, message: &Value) -> Option<AppEvent>
                 status: match string_at(entry, &["/status"]) {
                     Some("completed") => PlanEntryStatus::Completed,
                     Some("inProgress" | "in_progress") => PlanEntryStatus::InProgress,
+                    Some("failed" | "error") => PlanEntryStatus::Failed,
+                    Some("cancelled" | "canceled") => PlanEntryStatus::Cancelled,
                     _ => PlanEntryStatus::Pending,
                 },
             })
@@ -2279,7 +2319,13 @@ fn plan_delta(session_id: SessionId, message: &Value) -> Option<AppEvent> {
         session_id,
         plan_id: string_at(
             message,
-            &["/params/itemId", "/params/item/id", "/params/id"],
+            &[
+                "/params/turnId",
+                "/params/item/turnId",
+                "/params/itemId",
+                "/params/item/id",
+                "/params/id",
+            ],
         )
         .map(str::to_owned),
         title: Some("Implementation plan".to_owned()),
@@ -3339,6 +3385,270 @@ mod tests {
     }
 
     #[test]
+    fn codex_semantic_reducer_preserves_legacy_projection() {
+        let session_id = SessionId::nil();
+        let message = json!({
+            "method": "agentMessage/delta",
+            "params": {
+                "messageId": "msg-1",
+                "delta": "hello"
+            }
+        });
+
+        let legacy = normalize_codex_message(session_id, &message);
+        let semantic = super::codex_reducer::reduce_native_message(session_id, &message);
+
+        assert_eq!(semantic.len(), legacy.len());
+        assert_eq!(semantic[0].legacy_projection(), Some(&legacy[0]));
+        assert_eq!(semantic[0].universal.session_id, Some(session_id));
+        let native = semantic[0].universal.native.as_ref().expect("native ref");
+        assert_eq!(native.protocol, "codex-app-server");
+        assert_eq!(native.method.as_deref(), Some("agentMessage/delta"));
+        assert_eq!(native.kind.as_deref(), Some(AgentProviderId::CODEX));
+        assert_eq!(native.native_id.as_deref(), Some("msg-1"));
+        assert_eq!(native.summary.as_deref(), Some("assistant message delta"));
+        let agenter_core::UniversalEventKind::ContentDelta {
+            block_id,
+            kind,
+            delta,
+        } = &semantic[0].universal.event
+        else {
+            panic!("expected universal content delta");
+        };
+        assert_eq!(block_id, "text-msg-1");
+        assert_eq!(kind, &Some(agenter_core::ContentBlockKind::Text));
+        assert_eq!(delta, "hello");
+    }
+
+    #[test]
+    fn codex_stage6_golden_trace_maps_plan_approval_command_and_diff() {
+        let session_id = SessionId::nil();
+        let trace: Vec<Value> =
+            serde_json::from_str(include_str!("../../tests/fixtures/codex_stage6_trace.json"))
+                .expect("fixture parses");
+        let semantic = trace
+            .iter()
+            .flat_map(|message| super::codex_reducer::reduce_native_message(session_id, message))
+            .collect::<Vec<_>>();
+
+        let turn = semantic
+            .iter()
+            .find_map(|event| match &event.universal.event {
+                agenter_core::UniversalEventKind::TurnStarted { turn } => Some(turn),
+                _ => None,
+            })
+            .expect("turn start");
+        let turn_id = turn.turn_id;
+        assert_eq!(turn.turn_id, turn_id);
+        assert_eq!(turn.status, agenter_core::TurnStatus::Running);
+
+        let plan = semantic
+            .iter()
+            .find_map(|event| match &event.universal.event {
+                agenter_core::UniversalEventKind::PlanUpdated { plan } => Some(plan),
+                _ => None,
+            })
+            .expect("plan");
+        assert_eq!(plan.turn_id, Some(turn_id));
+        assert_eq!(plan.entries[0].label, "Map events");
+        assert_eq!(plan.entries[1].status, PlanEntryStatus::InProgress);
+
+        let command_item = semantic
+            .iter()
+            .find_map(|event| match &event.universal.event {
+                agenter_core::UniversalEventKind::ItemCreated { item }
+                    if item.content[0].kind == agenter_core::ContentBlockKind::ToolCall =>
+                {
+                    Some(item)
+                }
+                _ => None,
+            })
+            .expect("command item");
+        assert_eq!(command_item.turn_id, Some(turn_id));
+        assert_eq!(command_item.content[0].block_id, "command-cmd-1");
+        assert_eq!(command_item.content[0].text.as_deref(), Some("cargo test"));
+
+        let output = semantic
+            .iter()
+            .find_map(|event| match &event.universal.event {
+                agenter_core::UniversalEventKind::ContentDelta {
+                    block_id,
+                    kind,
+                    delta,
+                } => Some((block_id, kind, delta)),
+                _ => None,
+            })
+            .expect("output delta");
+        assert_eq!(output.0, "command-cmd-1-stdout");
+        assert_eq!(
+            output.1,
+            &Some(agenter_core::ContentBlockKind::CommandOutput)
+        );
+        assert_eq!(output.2, "running tests\n");
+
+        let status = semantic
+            .iter()
+            .find_map(|event| match &event.universal.event {
+                agenter_core::UniversalEventKind::ContentCompleted {
+                    block_id,
+                    kind,
+                    text,
+                } => Some((block_id, kind, text)),
+                _ => None,
+            })
+            .expect("command status");
+        assert_eq!(status.0, "command-cmd-1-status");
+        assert_eq!(
+            status.1,
+            &Some(agenter_core::ContentBlockKind::CommandOutput)
+        );
+        assert_eq!(status.2.as_deref(), Some("command completed"));
+
+        assert!(semantic.iter().any(|event| matches!(
+            &event.universal.event,
+            agenter_core::UniversalEventKind::DiffUpdated { .. }
+        )));
+        assert!(!semantic.iter().any(|event| matches!(
+            &event.universal.event,
+            agenter_core::UniversalEventKind::ArtifactCreated { .. }
+        )));
+
+        let approval = json!({
+            "id": "approval-1",
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "turnId": "turn-1",
+                "itemId": "cmd-1",
+                "command": "cargo test"
+            }
+        });
+        let (_approval_id, _native_request_id, _kind, legacy) =
+            normalize_codex_approval_request(session_id, &approval, None).expect("approval");
+        let semantic = crate::agents::adapter::AdapterEvent::from_legacy(
+            AgentProviderId::from(AgentProviderId::CODEX),
+            "codex-app-server",
+            Some("item/commandExecution/requestApproval"),
+            legacy,
+        );
+        assert!(matches!(
+            semantic.universal.event,
+            agenter_core::UniversalEventKind::ApprovalRequested { .. }
+        ));
+    }
+
+    #[test]
+    fn codex_stage10_conformance_trace_preserves_expected_milestones() {
+        let session_id = SessionId::nil();
+        let trace: Vec<Value> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/codex_stage10_trace.json"
+        ))
+        .expect("fixture parses");
+        let semantic = trace
+            .iter()
+            .flat_map(|message| super::codex_reducer::reduce_native_message(session_id, message))
+            .collect::<Vec<_>>();
+
+        let milestones = semantic
+            .iter()
+            .filter_map(|event| match &event.universal.event {
+                agenter_core::UniversalEventKind::TurnStarted { .. } => Some("turn.started"),
+                agenter_core::UniversalEventKind::PlanUpdated { .. } => Some("plan.updated"),
+                agenter_core::UniversalEventKind::ItemCreated { item }
+                    if item
+                        .content
+                        .iter()
+                        .any(|block| block.kind == agenter_core::ContentBlockKind::ToolCall) =>
+                {
+                    Some("item.tool")
+                }
+                agenter_core::UniversalEventKind::ContentDelta {
+                    kind: Some(agenter_core::ContentBlockKind::CommandOutput),
+                    ..
+                } => Some("content.command_delta"),
+                agenter_core::UniversalEventKind::ContentCompleted {
+                    kind: Some(agenter_core::ContentBlockKind::CommandOutput),
+                    ..
+                } => Some("content.command_completed"),
+                agenter_core::UniversalEventKind::DiffUpdated { .. } => Some("diff.updated"),
+                agenter_core::UniversalEventKind::TurnCompleted { .. } => Some("turn.completed"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            milestones,
+            vec![
+                "turn.started",
+                "plan.updated",
+                "item.tool",
+                "content.command_delta",
+                "content.command_completed",
+                "diff.updated",
+                "turn.completed",
+            ]
+        );
+
+        for approval in trace.iter().filter(|message| {
+            matches!(
+                jsonrpc_method(message),
+                Some("item/commandExecution/requestApproval" | "item/fileChange/requestApproval")
+            )
+        }) {
+            let (_approval_id, native_request_id, _kind, legacy) =
+                normalize_codex_approval_request(session_id, approval, None)
+                    .expect("approval should normalize");
+            assert!(native_request_id.is_string());
+            let semantic = crate::agents::adapter::AdapterEvent::from_legacy(
+                AgentProviderId::from(AgentProviderId::CODEX),
+                "codex-app-server",
+                jsonrpc_method(approval),
+                legacy,
+            );
+            let agenter_core::UniversalEventKind::ApprovalRequested { approval } =
+                semantic.universal.event
+            else {
+                panic!("expected universal approval");
+            };
+            assert!(
+                approval
+                    .options
+                    .iter()
+                    .any(|option| option.option_id == "cancel_turn"),
+                "all approval fixtures should expose terminal cancel semantics"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_stage6_unknown_native_event_stays_safe_native_unknown() {
+        let session_id = SessionId::nil();
+        let message = json!({
+            "method": "turn/newFutureThing",
+            "params": {
+                "turnId": "turn-1",
+                "secret": "must-not-be-copied"
+            }
+        });
+        let semantic = super::codex_reducer::reduce_native_message(session_id, &message);
+
+        assert_eq!(semantic.len(), 1);
+        let agenter_core::UniversalEventKind::NativeUnknown { summary } =
+            &semantic[0].universal.event
+        else {
+            panic!("expected unknown native event");
+        };
+        assert_eq!(summary.as_deref(), Some("provider event"));
+        assert_eq!(
+            semantic[0]
+                .universal
+                .native
+                .as_ref()
+                .and_then(|native| native.method.as_deref()),
+            Some("turn/newFutureThing")
+        );
+    }
+
+    #[test]
     fn normalizes_live_codex_item_agent_message_delta() {
         let message = json!({
             "method": "item/agentMessage/delta",
@@ -3856,6 +4166,29 @@ mod tests {
             plan.entries[1].status,
             agenter_core::PlanEntryStatus::InProgress
         );
+    }
+
+    #[test]
+    fn normalizes_codex_plan_delta_against_turn_plan_when_turn_id_is_present() {
+        let message = json!({
+            "method": "item/plan/delta",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "plan-item-1",
+                "delta": "Add the reducer"
+            }
+        });
+
+        let events = normalize_codex_message(SessionId::nil(), &message);
+
+        assert_eq!(events.len(), 1);
+        let AppEvent::PlanUpdated(plan) = &events[0] else {
+            panic!("expected plan update");
+        };
+        assert_eq!(plan.plan_id.as_deref(), Some("turn-1"));
+        assert_eq!(plan.content.as_deref(), Some("Add the reducer"));
+        assert!(plan.append);
     }
 
     #[test]
@@ -4526,6 +4859,8 @@ mod tests {
         let workspace = PathBuf::from("/work/agenter");
         let compact = SlashCommandRequest {
             command_id: "codex.compact".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
             arguments: json!({}),
             raw_input: "/compact".to_owned(),
             confirmed: false,
@@ -4538,6 +4873,8 @@ mod tests {
 
         let steer = SlashCommandRequest {
             command_id: "codex.steer".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
             arguments: json!({"input": "please focus"}),
             raw_input: "/steer please focus".to_owned(),
             confirmed: false,
@@ -4551,6 +4888,8 @@ mod tests {
 
         let shell = SlashCommandRequest {
             command_id: "codex.shell".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
             arguments: json!({"command": "pwd | cat"}),
             raw_input: "/shell pwd | cat".to_owned(),
             confirmed: true,
@@ -4567,6 +4906,8 @@ mod tests {
         let workspace = PathBuf::from("/work/agenter");
         let review = SlashCommandRequest {
             command_id: "codex.review".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
             arguments: json!({"base": "main", "detached": true}),
             raw_input: "/review --base main --detached".to_owned(),
             confirmed: false,
@@ -4583,6 +4924,8 @@ mod tests {
 
         let rollback = SlashCommandRequest {
             command_id: "codex.rollback".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
             arguments: json!({"numTurns": 2}),
             raw_input: "/rollback 2".to_owned(),
             confirmed: true,
