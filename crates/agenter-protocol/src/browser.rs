@@ -1,4 +1,4 @@
-use agenter_core::{AppEvent, SessionId, SessionSnapshot, UniversalEventEnvelope, UniversalSeq};
+use agenter_core::{SessionId, SessionSnapshot, UniversalEventEnvelope, UniversalSeq};
 use serde::{Deserialize, Serialize};
 
 pub use crate::{EventId, RequestId};
@@ -24,8 +24,6 @@ pub struct SubscribeSession {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrowserServerMessage {
-    #[serde(rename = "app_event")]
-    Event(BrowserEventEnvelope),
     UniversalEvent(UniversalEventEnvelope),
     SessionSnapshot(BrowserSessionSnapshot),
     Ack(BrowserAck),
@@ -34,13 +32,6 @@ pub enum BrowserServerMessage {
 
 fn is_false(value: &bool) -> bool {
     !*value
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct BrowserEventEnvelope {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub event_id: Option<EventId>,
-    pub event: AppEvent,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -73,8 +64,8 @@ pub struct BrowserError {
 #[cfg(test)]
 mod tests {
     use agenter_core::{
-        AppEvent, SessionId, SessionSnapshot, UniversalEventEnvelope, UniversalEventKind,
-        UniversalEventSource, UniversalSeq, UserMessageEvent,
+        SessionId, SessionSnapshot, UniversalEventEnvelope, UniversalEventKind,
+        UniversalEventSource, UniversalSeq,
     };
 
     use super::*;
@@ -120,28 +111,6 @@ mod tests {
             }
             other => panic!("unexpected message {other:?}"),
         }
-    }
-
-    #[test]
-    fn round_trips_browser_app_event_envelope() {
-        let message = BrowserServerMessage::Event(BrowserEventEnvelope {
-            event_id: Some(EventId::from("evt-1")),
-            event: AppEvent::UserMessage(UserMessageEvent {
-                session_id: SessionId::nil(),
-                message_id: Some("msg-1".to_owned()),
-                author_user_id: None,
-                content: "hello".to_owned(),
-            }),
-        });
-
-        let json = serde_json::to_value(&message).expect("serialize browser event");
-        let decoded: BrowserServerMessage =
-            serde_json::from_value(json.clone()).expect("deserialize browser event");
-
-        assert_eq!(json["type"], "app_event");
-        assert_eq!(json["event_id"], "evt-1");
-        assert_eq!(json["event"]["type"], "user_message");
-        assert_eq!(decoded, message);
     }
 
     #[test]

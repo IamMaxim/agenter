@@ -40,7 +40,7 @@ The universal protocol can grow without making the browser provider-specific, an
 
 Adapters must include safe native reference preservation and capability declaration from the beginning. This increases type surface area, but makes protocol drift observable without moving raw wire payloads into the control-plane privacy boundary.
 
-The current `AppEvent` model remains a compatibility projection while `uap/1` rolls out. Existing REST and WebSocket clients can be bridged until the frontend consumes universal snapshots and events directly.
+The browser and runner transport contracts are universal-only after the migration cutover. Provider adapters may keep private compatibility projections internally while they are being rewritten, but `app_event` frames and `event_cache` are not part of the Agenter-facing protocol.
 
 Approvals, user-input requests, and plan-implementation requests must remain distinct state machines so the frontend does not present clarifying questions or plan handoffs as ordinary danger approvals.
 

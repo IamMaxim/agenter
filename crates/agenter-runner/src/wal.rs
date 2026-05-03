@@ -174,22 +174,32 @@ async fn persist_records(path: &Path, records: &[RunnerWalRecord]) -> anyhow::Re
 
 #[cfg(test)]
 mod tests {
-    use agenter_core::{AgentMessageDeltaEvent, AppEvent, SessionId};
-    use agenter_protocol::runner::{AgentEvent, RunnerEvent};
+    use agenter_core::{NativeRef, SessionId, UniversalEventKind, UniversalEventSource};
+    use agenter_protocol::runner::{AgentUniversalEvent, RunnerEvent};
     use uuid::Uuid;
 
     use super::*;
 
     fn wal_event(session_id: SessionId) -> RunnerEvent {
-        RunnerEvent::AgentEvent(Box::new(AgentEvent {
+        RunnerEvent::AgentEvent(Box::new(AgentUniversalEvent {
             session_id,
-            event: AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {
-                session_id,
-                message_id: "msg-1".to_owned(),
-                delta: "hello".to_owned(),
-                provider_payload: None,
+            event_id: None,
+            turn_id: None,
+            item_id: None,
+            ts: None,
+            source: UniversalEventSource::Native,
+            native: Some(NativeRef {
+                protocol: "test".to_owned(),
+                method: Some("agentMessage/delta".to_owned()),
+                kind: None,
+                native_id: None,
+                summary: Some("hello".to_owned()),
+                hash: None,
+                pointer: None,
             }),
-            universal_event: None,
+            event: UniversalEventKind::NativeUnknown {
+                summary: Some("hello".to_owned()),
+            },
         }))
     }
 

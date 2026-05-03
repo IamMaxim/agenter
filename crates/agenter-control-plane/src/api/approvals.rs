@@ -290,7 +290,7 @@ async fn finish_approval_operation(
         agenter_protocol::runner::RunnerResponseOutcome,
         crate::state::RunnerCommandWaitError,
     >,
-) -> Result<agenter_protocol::browser::BrowserEventEnvelope, StatusCode> {
+) -> Result<crate::state::AppEventEnvelope, StatusCode> {
     match outcome {
         Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok {
             result: agenter_protocol::runner::RunnerCommandResult::Accepted,

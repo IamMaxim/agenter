@@ -20,6 +20,27 @@ export function cloneSnapshot(snapshot: SessionSnapshot): SessionSnapshot {
     items: Object.fromEntries(
       Object.entries(snapshot.items).map(([id, item]) => [id, cloneItem(item)])
     ),
+    questions: Object.fromEntries(
+      Object.entries(snapshot.questions ?? {}).map(([id, question]) => [
+        id,
+        {
+          ...question,
+          fields: question.fields.map((field) => ({
+            ...field,
+            choices: [...field.choices],
+            default_answers: [...field.default_answers]
+          })),
+          answer: question.answer
+            ? {
+                ...question.answer,
+                answers: Object.fromEntries(
+                  Object.entries(question.answer.answers).map(([key, value]) => [key, [...value]])
+                )
+              }
+            : null
+        }
+      ])
+    ),
     approvals: Object.fromEntries(
       Object.entries(snapshot.approvals).map(([id, approval]) => [
         id,
@@ -90,6 +111,17 @@ export function applyUniversalEvent(snapshot: SessionSnapshot, envelope: Univers
       next.approvals[envelope.event.data.approval.approval_id] = {
         ...envelope.event.data.approval,
         options: [...envelope.event.data.approval.options]
+      };
+      break;
+    case 'question.requested':
+    case 'question.answered':
+      next.questions[envelope.event.data.question.question_id] = {
+        ...envelope.event.data.question,
+        fields: envelope.event.data.question.fields.map((field) => ({
+          ...field,
+          choices: [...field.choices],
+          default_answers: [...field.default_answers]
+        }))
       };
       break;
     case 'plan.updated':

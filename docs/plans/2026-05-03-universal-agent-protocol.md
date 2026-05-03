@@ -30,8 +30,8 @@ Current Agenter already has useful foundations:
 
 - `AppEvent` normalizes user, assistant, plan, tool, command, file-change, approval, question, usage-ish provider, and error events in `crates/agenter-core/src/events.rs`.
 - Runner commands and responses use `RunnerCommandEnvelope { request_id, command }` in `crates/agenter-protocol/src/runner.rs`.
-- Browser WebSocket subscribes to one session and receives `BrowserEventEnvelope { event_id, event }` from `crates/agenter-protocol/src/browser.rs`.
-- Control plane keeps in-memory per-session broadcast/cache state and persists lightweight `event_cache` rows.
+- Browser WebSocket subscribes to one session and receives universal snapshot/replay frames from `crates/agenter-protocol/src/browser.rs`.
+- Control plane keeps in-memory per-session broadcast state and persists universal `agent_events` plus `session_snapshots`.
 - Approval delivery is already ack-sensitive: browser decisions become resolved only after runner acknowledgement.
 - The runner has a generic ACP runtime for Qwen, Gemini, and OpenCode, and a richer Codex app-server runtime.
 
@@ -76,7 +76,7 @@ Steps:
 - [x] Write ADR: universal protocol version `uap/1`, Codex-native primary, ACP baseline for Qwen/Gemini/OpenCode, native payload preservation, capability-gated frontend.
 - [x] Write ADR: durable append-only `agent_events` supersedes lightweight `event_cache` for browser replay, while native harnesses remain the canonical history source when history can be reloaded.
 - [x] Update the remote control-plane spec with the universal entities: session, turn, item, content block, approval, plan, diff, artifact, native ref, command envelope.
-- [x] Record the compatibility rule: old `AppEvent` and `event_cache` stay readable during migration; new code may emit both until the frontend fully consumes `uap/1`.
+- [x] Record the compatibility rule: old `AppEvent` and `event_cache` were migration-only and are no longer Agenter-facing after the `uap/1` cutover.
 - [x] Run documentation verification.
 
 Discovered constraints:
@@ -189,24 +189,24 @@ Steps:
 - [x] Write repository methods to load and store `SessionSnapshot`.
 - [x] Write a reducer that applies one universal event to a `SessionSnapshot`.
 - [x] Persist snapshots after append in the same logical operation.
-- [x] Keep writing the existing `event_cache` during the transition so current browser history still works.
+- [x] Stop writing `event_cache` after the browser cutover; universal app-event compatibility ingress writes only `agent_events` and `session_snapshots`.
 - [x] Add tests for monotonic seq, snapshot reconstruction, `after_seq` listing, pending approval materialization, and old event cache coexistence.
 
 Stage 2 verification evidence:
 
 - `cargo fmt --all -- --check` passed.
-- `cargo test -p agenter-db` passed with 2 non-ignored tests and 9 ignored disposable-Postgres integration tests. The ignored universal event log test covers monotonic seq, `after_seq`, snapshot storage, pending approval materialization/resolution, projection reset, and legacy `event_cache` coexistence.
+- `cargo test -p agenter-db` passed with 2 non-ignored tests and ignored disposable-Postgres integration tests. The ignored universal event log test covers monotonic seq, `after_seq`, snapshot storage, pending approval materialization/resolution, and projection reset without legacy cache tables.
 - `cargo test -p agenter-control-plane snapshot` passed with 5 tests.
 - `cargo test -p agenter-control-plane event` passed with 10 tests.
 - `cargo check --workspace` passed.
 
 Stage 2 notes:
 
-- Runtime browser delivery remains legacy `BrowserEventEnvelope` / `event_cache` compatible.
+- Runtime browser delivery uses universal snapshot/replay frames only.
 - Legacy `AppEvent` dual-write is explicitly compatibility-only: provider payloads are not copied into universal `native_json`; only safe native IDs/summaries are projected where available.
 - Universal snapshot writes now lock the parent `agent_sessions` row before assigning/reducing a session event, and snapshot storage rejects `latest_seq` regressions.
 - Durable approval resolution updates `pending_approvals.universal_status`; legacy `ApprovalResolved` events project into universal approval state without raw provider payload persistence.
-- Forced discovered-history refresh clears the session's compatibility projection (`agent_events`, `session_snapshots`, recent turn cache, and legacy cache) before rewriting imported history. This is not canonical native history deletion.
+- Forced discovered-history refresh clears the session's universal projection (`agent_events`, `session_snapshots`, and recent turn cache) before rewriting imported history. This is not canonical native history deletion.
 - `agent_events.event_id` is a control-plane UUID. Native stable event/request IDs belong in `NativeRef`; non-UUID envelope event IDs fail with a clear error.
 - A narrow compile-only test update was required in `crates/agenter-control-plane/src/api.rs` to ignore the Stage 1 `BrowserServerMessage::SessionSnapshot` test frame while waiting for Stage 3 browser replay wiring.
 
@@ -222,7 +222,7 @@ cargo test -p agenter-control-plane event
 Exit criteria:
 
 - Universal event append and snapshot reducer work without changing browser behavior yet.
-- `event_cache` remains populated until the frontend migration stage removes that dependency.
+- `event_cache` is dropped by migration `0008_drop_legacy_event_cache.sql`; new writes must not reference those tables.
 - DB migration is append-only and does not rewrite existing migrations.
 
 ## Stage 3: Browser Snapshot Replay And Command Idempotency
@@ -615,7 +615,7 @@ Steps:
 - [x] Change WebSocket subscription to send `after_seq` and `include_snapshot`.
 - [x] Track `latestSeq` in route state and use it for reconnect.
 - [x] Apply snapshot first, then replay events after the snapshot seq.
-- [x] Keep legacy history loading as fallback until the backend marks `uap/1` ready.
+- [x] Remove legacy history loading fallback after backend `uap/1` readiness.
 - [x] Add universal reducer that materializes timeline rows from snapshot state.
 - [x] Render plans from `PlanState.entries` while preserving markdown content and Codex handoff actions.
 - [x] Render approval options from canonical options rather than hard-coded Codex decisions.
@@ -627,9 +627,9 @@ Steps:
 Stage 9 evidence:
 
 - Added frontend universal protocol types, WebSocket cursor subscription options, browser message normalization for `session_snapshot` and `universal_event`, and snapshot/replay reducers in `web/src/lib/sessionSnapshot.ts` and `web/src/lib/universalEvents.ts`.
-- `ChatRoute.svelte` keeps the legacy `/history` load path, subscribes with `include_snapshot`, preserves `latestSeq` across reconnect for the same route, and applies universal snapshot/replay messages without duplicating replay/live boundary events.
+- `ChatRoute.svelte` subscribes with `include_snapshot`, preserves `latestSeq` across reconnect for the same route, and applies only universal snapshot/replay messages without duplicating replay/live boundary events.
 - Plans now render structured `PlanState.entries` while preserving markdown content and existing Codex plan handoff actions.
-- Approval buttons are derived from canonical universal options when present and fall back to legacy Codex decisions for compatibility; question cards remain separate from approvals through the existing legacy question event path.
+- Approval buttons are derived from canonical universal options. Question cards now materialize from first-class universal question state instead of dual-delivered legacy events.
 - Diff and artifact state materialize as inline rows; richer right-rail organization remains deferred.
 - Capability data gates mode/model/reasoning/approval controls only when the snapshot advertises a real capability signal; controls remain available for legacy/no-capability sessions.
 - Focused tests cover snapshot materialization, after-seq replay, duplicate seq/event-id dedupe, incomplete replay cursor safety, legacy fallback, capability detection, and WebSocket subscription options.

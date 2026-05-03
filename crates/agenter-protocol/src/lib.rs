@@ -7,17 +7,18 @@ pub mod runner_transport;
 use serde::{Deserialize, Serialize};
 
 pub use browser::{
-    BrowserClientMessage, BrowserEventEnvelope, BrowserServerMessage, BrowserSessionSnapshot,
-    SubscribeSession,
+    BrowserClientMessage, BrowserServerMessage, BrowserSessionSnapshot, SubscribeSession,
 };
 pub use runner::{
-    AgentEvent, AgentInput, AgentInputCommand, AgentProviderAdvertisement, ApprovalAnswerCommand,
-    CreateSessionCommand, DiscoveredCommandAction, DiscoveredFileChangeStatus, DiscoveredSession,
-    DiscoveredSessionHistoryItem, DiscoveredSessionHistoryStatus, DiscoveredSessions,
-    DiscoveredToolStatus, ListProviderCommandsCommand, ProviderCommandExecutionCommand,
-    RefreshSessionsCommand, ResumeSessionCommand, RunnerCapabilities, RunnerClientMessage,
-    RunnerCommand, RunnerCommandEnvelope, RunnerCommandResult, RunnerError, RunnerEvent,
-    RunnerEventEnvelope, RunnerHeartbeat, RunnerHeartbeatAck, RunnerHello, RunnerResponseEnvelope,
+    AgentInput, AgentInputCommand, AgentProviderAdvertisement, AgentUniversalEvent,
+    ApprovalAnswerCommand, CreateSessionCommand, DiscoveredCommandAction,
+    DiscoveredFileChangeStatus, DiscoveredSession, DiscoveredSessionHistoryItem,
+    DiscoveredSessionHistoryStatus, DiscoveredSessions, DiscoveredToolStatus,
+    ListProviderCommandsCommand, ProviderCommandExecutionCommand, RefreshSessionsCommand,
+    ResumeSessionCommand, RunnerCapabilities, RunnerClientMessage, RunnerCommand,
+    RunnerCommandEnvelope, RunnerCommandResult, RunnerError, RunnerEvent, RunnerEventEnvelope,
+    RunnerHeartbeat, RunnerHeartbeatAck, RunnerHello, RunnerOperationKind, RunnerOperationLogLevel,
+    RunnerOperationProgress, RunnerOperationStatus, RunnerOperationUpdate, RunnerResponseEnvelope,
     RunnerResponseOutcome, RunnerServerMessage, ShutdownSessionCommand,
 };
 pub use runner_transport::{

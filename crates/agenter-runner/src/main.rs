@@ -19,14 +19,16 @@ use agenter_protocol::runner::{
     AgentInput, AgentProviderAdvertisement, DiscoveredSession, DiscoveredSessionHistoryStatus,
     DiscoveredSessions, RunnerCapabilities, RunnerClientMessage, RunnerCommand,
     RunnerCommandResult, RunnerError, RunnerEvent, RunnerEventEnvelope, RunnerHello,
-    RunnerResponseEnvelope, RunnerResponseOutcome, RunnerServerMessage, PROTOCOL_VERSION,
+    RunnerOperationKind, RunnerOperationLogLevel, RunnerOperationProgress, RunnerOperationStatus,
+    RunnerOperationUpdate, RunnerResponseEnvelope, RunnerResponseOutcome, RunnerServerMessage,
+    PROTOCOL_VERSION,
 };
 use agenter_protocol::{
-    chunk_message, reassemble_message, RunnerTransportChunkFrame, RunnerTransportChunkReassembler,
-    RunnerTransportOutboundFrame,
+    chunk_message, reassemble_message, RequestId, RunnerTransportChunkFrame,
+    RunnerTransportChunkReassembler, RunnerTransportOutboundFrame,
 };
 use agents::acp::{AcpProviderProfile, AcpRunnerRuntime, AcpTurnRequest, PendingAcpApproval};
-use agents::adapter::{AdapterProviderRegistration, AdapterRuntime};
+use agents::adapter::{AdapterEvent, AdapterProviderRegistration, AdapterRuntime};
 use agents::approval_state::{PendingApprovalSubmitError, PendingProviderApproval};
 use agents::codex::{
     codex_provider_slash_commands, is_codex_no_rollout_resume_error,
@@ -48,6 +50,12 @@ const DEFAULT_RUNNER_WS_MAX_MESSAGE_BYTES: usize = 512 * 1024 * 1024;
 struct CodexRunnerRuntime {
     workspace_path: PathBuf,
     sessions: Arc<Mutex<HashMap<SessionId, Arc<Mutex<CodexSessionRuntime>>>>>,
+}
+
+#[derive(Clone)]
+struct RunnerOperationReporter {
+    request_id: RequestId,
+    sender: mpsc::UnboundedSender<(Option<RequestId>, RunnerEvent)>,
 }
 
 struct CodexSessionRuntime {
@@ -223,29 +231,62 @@ impl CodexRunnerRuntime {
         Ok(external_session_id.to_owned())
     }
 
-    async fn discover_sessions(&self) -> anyhow::Result<Vec<DiscoveredSession>> {
+    async fn discover_sessions(
+        &self,
+        include_history: bool,
+        reporter: Option<RunnerOperationReporter>,
+    ) -> anyhow::Result<Vec<DiscoveredSession>> {
+        if let Some(reporter) = &reporter {
+            reporter.info(
+                RunnerOperationStatus::Discovering,
+                "Discovering sessions",
+                None,
+                Some("Listing Codex threads".to_owned()),
+            );
+        }
         let mut server = spawn_codex_server(self.workspace_path.clone()).await?;
         let threads = server.list_threads(&self.workspace_path).await?;
         let mut discovered = Vec::with_capacity(threads.len());
-        for thread in threads {
-            let (history_status, history) = match server
-                .read_thread_history(&thread.external_session_id)
-                .await
-            {
-                Ok(history) => (DiscoveredSessionHistoryStatus::Loaded, history),
-                Err(error) => {
-                    tracing::warn!(
-                        external_session_id = %thread.external_session_id,
-                        %error,
-                        "failed to read codex thread history during discovery"
+        let total = u64::try_from(threads.len()).ok();
+        for (index, thread) in threads.into_iter().enumerate() {
+            let (history_status, history) = if include_history {
+                if let Some(reporter) = &reporter {
+                    let current = u64::try_from(index).ok();
+                    reporter.info(
+                        RunnerOperationStatus::ReadingHistory,
+                        "Reading Codex history",
+                        Some(RunnerOperationProgress {
+                            current,
+                            total,
+                            percent: percent_progress(current, total),
+                        }),
+                        Some(format!(
+                            "Reading {}",
+                            thread.title.as_deref().unwrap_or("session")
+                        )),
                     );
-                    (
-                        DiscoveredSessionHistoryStatus::Failed {
-                            message: error.to_string(),
-                        },
-                        Vec::new(),
-                    )
                 }
+                match server
+                    .read_thread_history(&thread.external_session_id)
+                    .await
+                {
+                    Ok(history) => (DiscoveredSessionHistoryStatus::Loaded, history),
+                    Err(error) => {
+                        tracing::warn!(
+                            external_session_id = %thread.external_session_id,
+                            %error,
+                            "failed to read codex thread history during discovery"
+                        );
+                        (
+                            DiscoveredSessionHistoryStatus::Failed {
+                                message: error.to_string(),
+                            },
+                            Vec::new(),
+                        )
+                    }
+                }
+            } else {
+                (DiscoveredSessionHistoryStatus::NotLoaded, Vec::new())
             };
             discovered.push(DiscoveredSession {
                 external_session_id: thread.external_session_id,
@@ -254,6 +295,18 @@ impl CodexRunnerRuntime {
                 history_status,
                 history,
             });
+        }
+        if let Some(reporter) = &reporter {
+            reporter.info(
+                RunnerOperationStatus::SendingResults,
+                "Sending refresh results",
+                Some(RunnerOperationProgress {
+                    current: total,
+                    total,
+                    percent: percent_progress(total, total),
+                }),
+                Some(format!("Sending {} discovered sessions", discovered.len())),
+            );
         }
         Ok(discovered)
     }
@@ -392,6 +445,69 @@ impl CodexRunnerRuntime {
     }
 }
 
+impl RunnerOperationReporter {
+    fn info(
+        &self,
+        status: RunnerOperationStatus,
+        stage_label: &str,
+        progress: Option<RunnerOperationProgress>,
+        message: Option<String>,
+    ) {
+        self.send(
+            status,
+            stage_label,
+            progress,
+            message,
+            RunnerOperationLogLevel::Info,
+        );
+    }
+
+    fn error(&self, status: RunnerOperationStatus, stage_label: &str, message: Option<String>) {
+        self.send(
+            status,
+            stage_label,
+            None,
+            message,
+            RunnerOperationLogLevel::Error,
+        );
+    }
+
+    fn send(
+        &self,
+        status: RunnerOperationStatus,
+        stage_label: &str,
+        progress: Option<RunnerOperationProgress>,
+        message: Option<String>,
+        level: RunnerOperationLogLevel,
+    ) {
+        self.sender
+            .send((
+                Some(self.request_id.clone()),
+                RunnerEvent::OperationUpdated(RunnerOperationUpdate {
+                    operation_id: self.request_id.clone(),
+                    kind: RunnerOperationKind::SessionRefresh,
+                    status,
+                    stage_label: stage_label.to_owned(),
+                    progress,
+                    message,
+                    level,
+                    ts: None,
+                }),
+            ))
+            .ok();
+    }
+}
+
+fn percent_progress(current: Option<u64>, total: Option<u64>) -> Option<u8> {
+    let (Some(current), Some(total)) = (current, total) else {
+        return None;
+    };
+    if total == 0 {
+        return Some(100);
+    }
+    Some(((current.saturating_mul(100)) / total).min(100) as u8)
+}
+
 async fn spawn_codex_server(workspace_path: PathBuf) -> anyhow::Result<CodexAppServer> {
     let mut app_server = CodexAppServer::spawn(workspace_path)?;
     app_server.initialize().await?;
@@ -498,39 +614,56 @@ async fn run_codex_runner() -> anyhow::Result<()> {
     let pending_questions: Arc<Mutex<HashMap<QuestionId, PendingCodexQuestion>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let (codex_event_sender, mut codex_event_receiver) = mpsc::unbounded_channel::<AppEvent>();
+    let (background_event_sender, mut background_event_receiver) =
+        mpsc::unbounded_channel::<(Option<RequestId>, RunnerEvent)>();
     let codex_runtime = CodexRunnerRuntime::new(workspace_path.clone());
     let adapter_runtime = AdapterRuntime::new();
     if let Some(workspace) = advertised_workspace {
-        match codex_runtime.discover_sessions().await {
-            Ok(sessions) if !sessions.is_empty() => {
-                tracing::info!(
-                    session_count = sessions.len(),
-                    "sending discovered codex sessions to control plane"
-                );
-                send_wal_event(
-                    &mut sender,
-                    &wal,
-                    None,
-                    None,
-                    RunnerEvent::SessionsDiscovered(DiscoveredSessions {
-                        workspace,
-                        provider_id: AgentProviderId::from(AgentProviderId::CODEX),
-                        sessions,
-                    }),
-                )
-                .await?;
+        let runtime = codex_runtime.clone();
+        let sender = background_event_sender.clone();
+        tokio::spawn(async move {
+            match runtime.discover_sessions(false, None).await {
+                Ok(sessions) if !sessions.is_empty() => {
+                    tracing::info!(
+                        session_count = sessions.len(),
+                        "sending discovered codex session metadata to control plane"
+                    );
+                    sender
+                        .send((
+                            None,
+                            RunnerEvent::SessionsDiscovered(DiscoveredSessions {
+                                workspace,
+                                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                                sessions,
+                            }),
+                        ))
+                        .ok();
+                }
+                Ok(_) => {
+                    tracing::debug!("codex discovery found no native threads");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "codex native session discovery failed");
+                }
             }
-            Ok(_) => {
-                tracing::debug!("codex discovery found no native threads");
-            }
-            Err(error) => {
-                tracing::warn!(%error, "codex native session discovery failed");
-            }
-        }
+        });
     }
 
     loop {
         tokio::select! {
+            background = background_event_receiver.recv() => {
+                let Some((request_id, event)) = background else {
+                    continue;
+                };
+                send_wal_event(
+                    &mut sender,
+                    &wal,
+                    request_id,
+                    None,
+                    event,
+                )
+                .await?;
+            }
             event = codex_event_receiver.recv() => {
                 let Some(event) = event else {
                     continue;
@@ -541,7 +674,7 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                     None,
                     event,
                 );
-                let Some(agent_event) = adapter_event.legacy_projection_for_wal() else {
+                let Some(agent_event) = adapter_event.universal_projection_for_wal() else {
                     continue;
                 };
                 let session_id = agent_event.session_id;
@@ -616,27 +749,42 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                     }
                     RunnerCommand::RefreshSessions(command) => {
                         tracing::info!(request_id = %envelope.request_id, workspace = %command.workspace.path, provider_id = %command.provider_id, "codex runner received refresh sessions");
-                        let outcome = match codex_runtime.discover_sessions().await {
-                            Ok(sessions) => {
-                                send_wal_event(
-                                    &mut sender,
-                                    &wal,
-                                    Some(envelope.request_id.clone()),
-                                    None,
-                                    RunnerEvent::SessionsDiscovered(DiscoveredSessions {
-                                        workspace: command.workspace,
-                                        provider_id: command.provider_id,
-                                        sessions,
-                                    }),
-                                )
-                                .await?;
-                                RunnerResponseOutcome::Ok {
-                                    result: RunnerCommandResult::Accepted,
+                        let request_id = envelope.request_id.clone();
+                        let runtime = codex_runtime.clone();
+                        let background_sender = background_event_sender.clone();
+                        tokio::spawn(async move {
+                            let reporter = RunnerOperationReporter {
+                                request_id: request_id.clone(),
+                                sender: background_sender.clone(),
+                            };
+                            reporter.info(
+                                RunnerOperationStatus::Accepted,
+                                "Refresh accepted",
+                                None,
+                                Some("Codex refresh task started".to_owned()),
+                            );
+                            let event = match runtime.discover_sessions(true, Some(reporter.clone())).await {
+                                Ok(sessions) => RunnerEvent::SessionsDiscovered(DiscoveredSessions {
+                                    workspace: command.workspace,
+                                    provider_id: command.provider_id,
+                                    sessions,
+                                }),
+                                Err(error) => {
+                                    reporter.error(
+                                        RunnerOperationStatus::Failed,
+                                        "Refresh failed",
+                                        Some(error.to_string()),
+                                    );
+                                    RunnerEvent::Error(runner_error(
+                                        "codex_refresh_sessions_failed",
+                                        error,
+                                    ))
                                 }
-                            }
-                            Err(error) => RunnerResponseOutcome::Error {
-                                error: runner_error("codex_refresh_sessions_failed", error),
-                            },
+                            };
+                            background_sender.send((Some(request_id), event)).ok();
+                        });
+                        let outcome = RunnerResponseOutcome::Ok {
+                            result: RunnerCommandResult::Accepted,
                         };
                         send_runner_message(
                             &mut sender,
@@ -936,11 +1084,26 @@ async fn run_acp_runner(
     let pending_codex_questions: Arc<Mutex<HashMap<QuestionId, PendingCodexQuestion>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let (acp_event_sender, mut acp_event_receiver) = mpsc::unbounded_channel::<AppEvent>();
+    let (background_event_sender, mut background_event_receiver) =
+        mpsc::unbounded_channel::<(Option<RequestId>, RunnerEvent)>();
     let acp_runtime = AcpRunnerRuntime::new(workspace_path.clone());
     let codex_runtime = include_codex.then(|| CodexRunnerRuntime::new(workspace_path.clone()));
 
     loop {
         tokio::select! {
+            background = background_event_receiver.recv() => {
+                let Some((request_id, event)) = background else {
+                    continue;
+                };
+                send_wal_event(
+                    &mut sender,
+                    &wal,
+                    request_id,
+                    None,
+                    event,
+                )
+                .await?;
+            }
             event = acp_event_receiver.recv() => {
                 let Some(event) = event else {
                     continue;
@@ -949,7 +1112,7 @@ async fn run_acp_runner(
                     .unwrap_or_else(|| AgentProviderId::from("adapter"));
                 let adapter_event =
                     adapter_runtime.project_legacy_event(provider_id, "runner-adapter", None, event);
-                let Some(agent_event) = adapter_event.legacy_projection_for_wal() else {
+                let Some(agent_event) = adapter_event.universal_projection_for_wal() else {
                     continue;
                 };
                 let session_id = agent_event.session_id;
@@ -1140,28 +1303,50 @@ async fn run_acp_runner(
                         tracing::info!(request_id = %envelope.request_id, workspace = %command.workspace.path, provider_id = %command.provider_id, "multi-provider runner received refresh sessions");
                         if command.provider_id.as_str() == AgentProviderId::CODEX {
                             let outcome = match &codex_runtime {
-                                Some(runtime) => match runtime.discover_sessions().await {
-                                    Ok(sessions) => {
-                                        send_wal_event(
-                                            &mut sender,
-                                            &wal,
-                                            Some(envelope.request_id.clone()),
+                                Some(runtime) => {
+                                    let request_id = envelope.request_id.clone();
+                                    let runtime = runtime.clone();
+                                    let background_sender = background_event_sender.clone();
+                                    tokio::spawn(async move {
+                                        let reporter = RunnerOperationReporter {
+                                            request_id: request_id.clone(),
+                                            sender: background_sender.clone(),
+                                        };
+                                        reporter.info(
+                                            RunnerOperationStatus::Accepted,
+                                            "Refresh accepted",
                                             None,
-                                            RunnerEvent::SessionsDiscovered(DiscoveredSessions {
-                                                workspace: command.workspace,
-                                                provider_id: command.provider_id,
-                                                sessions,
-                                            }),
-                                        )
-                                        .await?;
-                                        RunnerResponseOutcome::Ok {
-                                            result: RunnerCommandResult::Accepted,
-                                        }
+                                            Some("Codex refresh task started".to_owned()),
+                                        );
+                                        let event = match runtime
+                                            .discover_sessions(true, Some(reporter.clone()))
+                                            .await
+                                        {
+                                            Ok(sessions) => {
+                                                RunnerEvent::SessionsDiscovered(DiscoveredSessions {
+                                                    workspace: command.workspace,
+                                                    provider_id: command.provider_id,
+                                                    sessions,
+                                                })
+                                            }
+                                            Err(error) => {
+                                                reporter.error(
+                                                    RunnerOperationStatus::Failed,
+                                                    "Refresh failed",
+                                                    Some(error.to_string()),
+                                                );
+                                                RunnerEvent::Error(runner_error(
+                                                    "codex_refresh_sessions_failed",
+                                                    error,
+                                                ))
+                                            }
+                                        };
+                                        background_sender.send((Some(request_id), event)).ok();
+                                    });
+                                    RunnerResponseOutcome::Ok {
+                                        result: RunnerCommandResult::Accepted,
                                     }
-                                    Err(error) => RunnerResponseOutcome::Error {
-                                        error: runner_error("codex_refresh_sessions_failed", error),
-                                    },
-                                },
+                                }
                                 None => RunnerResponseOutcome::Error {
                                     error: agenter_protocol::runner::RunnerError {
                                         code: "codex_provider_not_available".to_owned(),
@@ -1195,27 +1380,56 @@ async fn run_acp_runner(
                             .await?;
                             continue;
                         };
-                        let outcome = match acp_runtime.discover_sessions(profile).await {
-                            Ok(sessions) => {
-                                send_wal_event(
-                                    &mut sender,
-                                    &wal,
-                                    Some(envelope.request_id.clone()),
-                                    None,
+                        let request_id = envelope.request_id.clone();
+                        let background_sender = background_event_sender.clone();
+                        let runtime = acp_runtime.clone();
+                        tokio::spawn(async move {
+                            let reporter = RunnerOperationReporter {
+                                request_id: request_id.clone(),
+                                sender: background_sender.clone(),
+                            };
+                            reporter.info(
+                                RunnerOperationStatus::Accepted,
+                                "Refresh accepted",
+                                None,
+                                Some(format!("{} refresh task started", command.provider_id)),
+                            );
+                            reporter.info(
+                                RunnerOperationStatus::Discovering,
+                                "Discovering sessions",
+                                None,
+                                Some("Listing ACP sessions".to_owned()),
+                            );
+                            let event = match runtime.discover_sessions(profile).await {
+                                Ok(sessions) => {
+                                    reporter.info(
+                                        RunnerOperationStatus::SendingResults,
+                                        "Sending refresh results",
+                                        None,
+                                        Some(format!("Sending {} discovered sessions", sessions.len())),
+                                    );
                                     RunnerEvent::SessionsDiscovered(DiscoveredSessions {
                                         workspace: command.workspace,
                                         provider_id: command.provider_id,
                                         sessions,
-                                    }),
-                                )
-                                .await?;
-                                RunnerResponseOutcome::Ok {
-                                    result: RunnerCommandResult::Accepted,
+                                    })
                                 }
-                            }
-                            Err(error) => RunnerResponseOutcome::Error {
-                                error: runner_error("acp_refresh_sessions_failed", error),
-                            },
+                                Err(error) => {
+                                    reporter.error(
+                                        RunnerOperationStatus::Failed,
+                                        "Refresh failed",
+                                        Some(error.to_string()),
+                                    );
+                                    RunnerEvent::Error(runner_error(
+                                        "acp_refresh_sessions_failed",
+                                        error,
+                                    ))
+                                }
+                            };
+                            background_sender.send((Some(request_id), event)).ok();
+                        });
+                        let outcome = RunnerResponseOutcome::Ok {
+                            result: RunnerCommandResult::Accepted,
                         };
                         send_runner_message(
                             &mut sender,
@@ -1664,16 +1878,21 @@ async fn run_fake_runner() -> anyhow::Result<()> {
 
                 for event in deterministic_fake_events(command.session_id, &command.input) {
                     tracing::debug!(session_id = %command.session_id, "fake runner emitting event");
+                    let Some(agent_event) = AdapterEvent::from_legacy(
+                        AgentProviderId::from("fake"),
+                        "fake-runner",
+                        None,
+                        event,
+                    )
+                    .universal_projection_for_wal() else {
+                        continue;
+                    };
                     send_wal_event(
                         &mut sender,
                         &wal,
                         Some(envelope.request_id.clone()),
                         Some(command.session_id),
-                        RunnerEvent::AgentEvent(Box::new(agenter_protocol::AgentEvent {
-                            session_id: command.session_id,
-                            event,
-                            universal_event: None,
-                        })),
+                        RunnerEvent::AgentEvent(Box::new(agent_event)),
                     )
                     .await?;
                 }

@@ -4,6 +4,7 @@ import {
   createSession,
   decideApproval,
   executeSlashCommand,
+  getWorkspaceProviderSessionRefreshStatus,
   listSlashCommands,
   refreshWorkspaceProviderSessions,
   sendSessionMessage
@@ -58,22 +59,87 @@ describe('session APIs', () => {
       text: () =>
         Promise.resolve(
           JSON.stringify({
-            discovered_count: 3,
-            refreshed_cache_count: 2,
-            skipped_failed_count: 1
+            refresh_id: 'refresh-1',
+            status: 'queued'
           })
         )
     });
     vi.stubGlobal('fetch', fetch);
 
     await expect(refreshWorkspaceProviderSessions('workspace 1', 'codex')).resolves.toEqual({
-      discovered_count: 3,
-      refreshed_cache_count: 2,
-      skipped_failed_count: 1
+      refresh_id: 'refresh-1',
+      status: 'queued'
     });
     expect(fetch).toHaveBeenCalledWith(
       '/api/workspaces/workspace%201/providers/codex/sessions/refresh',
       expect.objectContaining({ method: 'POST' })
+    );
+  });
+
+  test('loads provider session refresh status', async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: () =>
+        Promise.resolve(
+          JSON.stringify({
+            refresh_id: 'refresh-1',
+            status: 'reading_history',
+            progress: {
+              current: 2,
+              total: 4,
+              percent: 50
+            },
+            log: [
+              {
+                ts: '2026-05-03T00:00:00Z',
+                level: 'info',
+                status: 'reading_history',
+                message: 'Read 2 of 4 sessions',
+                progress: { current: 2, total: 4, percent: 50 }
+              }
+            ],
+            summary: {
+              discovered_count: 3,
+              refreshed_cache_count: 2,
+              skipped_failed_count: 1
+            },
+            updated_at: '2026-05-03T00:00:00Z'
+          })
+        )
+    });
+    vi.stubGlobal('fetch', fetch);
+
+    await expect(
+      getWorkspaceProviderSessionRefreshStatus('workspace 1', 'codex', 'refresh-1')
+    ).resolves.toEqual({
+      refresh_id: 'refresh-1',
+      status: 'reading_history',
+      progress: {
+        current: 2,
+        total: 4,
+        percent: 50
+      },
+      log: [
+        {
+          ts: '2026-05-03T00:00:00Z',
+          level: 'info',
+          status: 'reading_history',
+          message: 'Read 2 of 4 sessions',
+          progress: { current: 2, total: 4, percent: 50 }
+        }
+      ],
+      summary: {
+        discovered_count: 3,
+        refreshed_cache_count: 2,
+        skipped_failed_count: 1
+      },
+      error: undefined,
+      updated_at: '2026-05-03T00:00:00Z'
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/workspaces/workspace%201/providers/codex/sessions/refresh/refresh-1',
+      expect.objectContaining({ credentials: 'include' })
     );
   });
 

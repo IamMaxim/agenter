@@ -1,8 +1,8 @@
-use agenter_core::{AppEvent, SessionId};
+#[cfg(test)]
+use agenter_core::SessionId;
 use agenter_protocol::runner::{
-    AgentEvent, RunnerClientMessage, RunnerCommand, RunnerEvent, RunnerEventAck,
-    RunnerEventEnvelope, RunnerHeartbeat, RunnerResponseEnvelope, RunnerServerMessage,
-    PROTOCOL_VERSION,
+    RunnerClientMessage, RunnerCommand, RunnerEvent, RunnerEventAck, RunnerEventEnvelope,
+    RunnerHeartbeat, RunnerResponseEnvelope, RunnerServerMessage, PROTOCOL_VERSION,
 };
 use agenter_protocol::{
     chunk_message, reassemble_message, RunnerTransportChunkFrame, RunnerTransportChunkReassembler,
@@ -22,6 +22,12 @@ use crate::state::AppState;
 
 const DEFAULT_RUNNER_WS_CHUNK_BYTES: usize = 1024 * 1024;
 const DEFAULT_RUNNER_WS_MAX_MESSAGE_BYTES: usize = 512 * 1024 * 1024;
+
+#[derive(Debug)]
+struct DiscoveryImportCompletion {
+    runner_event_seq: Option<u64>,
+    accepted: bool,
+}
 
 #[cfg(test)]
 pub fn smoke_session_id() -> SessionId {
@@ -93,9 +99,37 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     state
         .seed_runner_event_ack(runner.runner_id, hello.acked_runner_event_seq)
         .await;
+    let (discovery_import_sender, mut discovery_import_receiver) =
+        mpsc::unbounded_channel::<DiscoveryImportCompletion>();
 
     loop {
         tokio::select! {
+            completion = discovery_import_receiver.recv() => {
+                let Some(completion) = completion else {
+                    continue;
+                };
+                if completion.accepted {
+                    if let Some(seq) = completion.runner_event_seq {
+                        state.mark_runner_event_accepted(runner.runner_id, seq).await;
+                        if let Err(error) = send_server_message(
+                            &mut sender,
+                            RunnerServerMessage::EventAck(RunnerEventAck {
+                                runner_event_seq: seq,
+                            }),
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                runner_id = %runner.runner_id,
+                                runner_event_seq = seq,
+                                %error,
+                                "runner event ack send failed"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
             message = receiver.next() => {
                 match message {
                     Some(Ok(Message::Text(text))) => {
@@ -112,19 +146,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 if !duplicate {
                                     match envelope.event {
                                         RunnerEvent::AgentEvent(agent_event) => {
-                                            let AgentEvent {
-                                                session_id,
-                                                event,
-                                                universal_event,
-                                            } = *agent_event;
-                                            if app_event_session_id(&event) != Some(session_id) {
-                                                tracing::warn!(
-                                                    %session_id,
-                                                    "runner event envelope session_id did not match embedded event"
-                                                );
-                                                continue;
-                                            }
-                                            match state.accept_runner_agent_event(session_id, event, universal_event).await {
+                                            match state.accept_runner_agent_event(*agent_event).await {
                                                 Ok(_) => {
                                                     accepted = true;
                                                 }
@@ -139,23 +161,54 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             }
                                         }
                                         RunnerEvent::SessionsDiscovered(discovered) => {
-                                            let db_backed = state.db_pool().is_some();
-                                            accepted = state
-                                                .process_runner_discovered_sessions(
-                                                    runner.runner_id,
-                                                    envelope.request_id.clone(),
-                                                    discovered,
-                                                )
-                                                .await;
-                                            if db_backed && !accepted {
-                                                tracing::warn!(
-                                                    runner_id = %runner.runner_id,
-                                                    runner_event_seq = ?runner_event_seq,
-                                                    "processed discovered sessions but withholding ack because import did not complete successfully"
-                                                );
+                                            accepted = false;
+                                            let state = state.clone();
+                                            let completion_sender = discovery_import_sender.clone();
+                                            let request_id = envelope.request_id.clone();
+                                            let runner_id = runner.runner_id;
+                                            tokio::spawn(async move {
+                                                let db_backed = state.db_pool().is_some();
+                                                let accepted = state
+                                                    .process_runner_discovered_sessions(
+                                                        runner_id,
+                                                        request_id,
+                                                        discovered,
+                                                    )
+                                                    .await;
+                                                if db_backed && !accepted {
+                                                    tracing::warn!(
+                                                        %runner_id,
+                                                        runner_event_seq = ?runner_event_seq,
+                                                        "processed discovered sessions but withholding ack because import did not complete successfully"
+                                                    );
+                                                }
+                                                completion_sender
+                                                    .send(DiscoveryImportCompletion {
+                                                        runner_event_seq,
+                                                        accepted,
+                                                    })
+                                                    .ok();
+                                            });
+                                            if runner_event_seq.is_none() {
+                                                accepted = true;
                                             }
                                         }
-                                        RunnerEvent::HealthChanged(_) | RunnerEvent::Error(_) => {
+                                        RunnerEvent::HealthChanged(_) => {
+                                            accepted = true;
+                                        }
+                                        RunnerEvent::OperationUpdated(update) => {
+                                            state.record_refresh_operation_update(update).await;
+                                            accepted = true;
+                                        }
+                                        RunnerEvent::Error(error) => {
+                                            if let Some(request_id) = envelope.request_id {
+                                                state
+                                                    .fail_workspace_session_refresh(
+                                                        request_id,
+                                                        format!("{}: {}", error.code, error.message),
+                                                    )
+                                                    .await;
+                                            }
                                             accepted = true;
                                         }
                                     }
@@ -356,37 +409,6 @@ fn env_usize(name: &str, default: usize) -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
-}
-
-fn app_event_session_id(event: &AppEvent) -> Option<SessionId> {
-    match event {
-        AppEvent::SessionStarted(info) => Some(info.session_id),
-        AppEvent::SessionStatusChanged(event) => Some(event.session_id),
-        AppEvent::UserMessage(event) => Some(event.session_id),
-        AppEvent::AgentMessageDelta(event) => Some(event.session_id),
-        AppEvent::AgentMessageCompleted(event) => Some(event.session_id),
-        AppEvent::PlanUpdated(event) => Some(event.session_id),
-        AppEvent::ToolStarted(event)
-        | AppEvent::ToolUpdated(event)
-        | AppEvent::ToolCompleted(event) => Some(event.session_id),
-        AppEvent::CommandStarted(event) => Some(event.session_id),
-        AppEvent::CommandOutputDelta(event) => Some(event.session_id),
-        AppEvent::CommandCompleted(event) => Some(event.session_id),
-        AppEvent::FileChangeProposed(event)
-        | AppEvent::FileChangeApplied(event)
-        | AppEvent::FileChangeRejected(event) => Some(event.session_id),
-        AppEvent::ApprovalRequested(event) => Some(event.session_id),
-        AppEvent::ApprovalResolved(event) => Some(event.session_id),
-        AppEvent::QuestionRequested(event) => Some(event.session_id),
-        AppEvent::QuestionAnswered(event) => Some(event.session_id),
-        AppEvent::TurnDiffUpdated(event)
-        | AppEvent::ItemReasoning(event)
-        | AppEvent::ServerRequestResolved(event)
-        | AppEvent::McpToolCallProgress(event)
-        | AppEvent::ThreadRealtimeEvent(event)
-        | AppEvent::ProviderEvent(event) => Some(event.session_id),
-        AppEvent::Error(event) => event.session_id,
-    }
 }
 
 #[cfg(test)]

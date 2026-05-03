@@ -1,5 +1,5 @@
 use agenter_core::{
-    AgentProviderId, AgentTurnSettings, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind,
+    AgentProviderId, AgentTurnSettings, ApprovalDecision, ApprovalId, ApprovalKind,
     ApprovalRequest, ApprovalStatus as UniversalApprovalStatus, CommandId, ItemId, RunnerId,
     SessionId, SessionSnapshot, SessionStatus, SessionUsageSnapshot, TurnId,
     UniversalEventEnvelope, UniversalEventKind, UniversalEventSource, UniversalSeq, UserId,
@@ -10,7 +10,7 @@ use sqlx::{postgres::PgRow, PgPool, Postgres, Result, Row, Transaction};
 use uuid::Uuid;
 
 use crate::models::{
-    AgentEvent, AgentSession, AgentSessionWithWorkspace, BrowserAuthSession, CachedEvent,
+    AgentEvent, AgentSession, AgentSessionWithWorkspace, BrowserAuthSession,
     CommandIdempotencyRecord, CommandIdempotencyStatus, ConnectorAccount, ConnectorLinkCode,
     OidcLoginState, OidcProvider, PendingApproval, Runner, StoredSessionSnapshot,
     UniversalAppendOutcome, User, Workspace,
@@ -619,6 +619,12 @@ pub struct UpsertSessionByExternalId<'a> {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ImportedSessionRecord {
+    pub session: AgentSession,
+    pub imported_history_fingerprint: Option<String>,
+}
+
 pub async fn upsert_session_by_external_id(
     pool: &PgPool,
     record: UpsertSessionByExternalId<'_>,
@@ -658,6 +664,57 @@ pub async fn upsert_session_by_external_id(
     .await?;
 
     session_from_row(&row)
+}
+
+pub async fn find_imported_session_by_external_id(
+    pool: &PgPool,
+    runner_id: RunnerId,
+    workspace_id: WorkspaceId,
+    provider_id: &AgentProviderId,
+    external_session_id: &str,
+) -> Result<Option<ImportedSessionRecord>> {
+    let row = sqlx::query(
+        "select session_id, owner_user_id, runner_id, workspace_id, provider_id,
+                external_session_id, status, title, usage_snapshot, turn_settings,
+                created_at, updated_at, imported_history_fingerprint
+         from agent_sessions
+         where runner_id = $1
+           and workspace_id = $2
+           and provider_id = $3
+           and external_session_id = $4",
+    )
+    .bind(runner_id.as_uuid())
+    .bind(workspace_id.as_uuid())
+    .bind(provider_id.as_str())
+    .bind(external_session_id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref()
+        .map(|row| {
+            Ok(ImportedSessionRecord {
+                session: session_from_row(row)?,
+                imported_history_fingerprint: row.try_get("imported_history_fingerprint")?,
+            })
+        })
+        .transpose()
+}
+
+pub async fn update_session_imported_history_fingerprint(
+    pool: &PgPool,
+    session_id: SessionId,
+    fingerprint: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "update agent_sessions
+         set imported_history_fingerprint = $2
+         where session_id = $1",
+    )
+    .bind(session_id.as_uuid())
+    .bind(fingerprint)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn list_sessions_for_user(
@@ -875,36 +932,6 @@ pub async fn session_turn_settings(
     Ok(settings.and_then(|settings| serde_json::from_value(settings).ok()))
 }
 
-pub async fn list_event_cache(pool: &PgPool, session_id: SessionId) -> Result<Vec<CachedEvent>> {
-    let rows = sqlx::query(
-        "select event_id, session_id, event_index, event_type, payload, created_at
-         from event_cache
-         where session_id = $1
-         order by event_index asc",
-    )
-    .bind(session_id.as_uuid())
-    .fetch_all(pool)
-    .await?;
-
-    rows.iter()
-        .map(cached_event_from_row)
-        .collect::<Result<Vec<_>>>()
-}
-
-pub async fn clear_event_cache(pool: &PgPool, session_id: SessionId) -> Result<()> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("delete from event_cache where session_id = $1")
-        .bind(session_id.as_uuid())
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("delete from event_cache_cursors where session_id = $1")
-        .bind(session_id.as_uuid())
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(())
-}
-
 /// Clears Agenter's compatibility projection for a session before rewriting history
 /// from native-agent discovery. Native harness history remains the source of truth.
 pub async fn clear_session_event_projection(pool: &PgPool, session_id: SessionId) -> Result<()> {
@@ -912,14 +939,6 @@ pub async fn clear_session_event_projection(pool: &PgPool, session_id: SessionId
     sqlx::query("select 1 from agent_sessions where session_id = $1 for update")
         .bind(session_id.as_uuid())
         .fetch_one(&mut *tx)
-        .await?;
-    sqlx::query("delete from event_cache where session_id = $1")
-        .bind(session_id.as_uuid())
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("delete from event_cache_cursors where session_id = $1")
-        .bind(session_id.as_uuid())
-        .execute(&mut *tx)
         .await?;
     sqlx::query("delete from recent_turn_caches where session_id = $1")
         .bind(session_id.as_uuid())
@@ -937,42 +956,36 @@ pub async fn clear_session_event_projection(pool: &PgPool, session_id: SessionId
     Ok(())
 }
 
-pub async fn append_event_cache(
+pub async fn replace_session_event_projection(
     pool: &PgPool,
+    workspace_id: WorkspaceId,
     session_id: SessionId,
-    event: &AppEvent,
-) -> Result<CachedEvent> {
-    let payload = serde_json::to_value(event).map_err(sqlx::Error::decode)?;
-    let event_type = payload
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown")
-        .to_owned();
+    envelopes: &[UniversalEventEnvelope],
+) -> Result<Vec<AgentEvent>> {
     let mut tx = pool.begin().await?;
-    let event_index: i64 = sqlx::query_scalar(
-        "insert into event_cache_cursors (session_id, next_event_index)
-         values ($1, 2)
-         on conflict (session_id)
-         do update set next_event_index = event_cache_cursors.next_event_index + 1
-         returning next_event_index - 1",
-    )
-    .bind(session_id.as_uuid())
-    .fetch_one(&mut *tx)
-    .await?;
-    let row = sqlx::query(
-        "insert into event_cache (session_id, event_index, event_type, payload)
-         values ($1, $2, $3, $4)
-         returning event_id, session_id, event_index, event_type, payload, created_at",
-    )
-    .bind(session_id.as_uuid())
-    .bind(event_index)
-    .bind(&event_type)
-    .bind(payload)
-    .fetch_one(&mut *tx)
-    .await?;
-    tx.commit().await?;
+    sqlx::query("select 1 from agent_sessions where session_id = $1 for update")
+        .bind(session_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+    sqlx::query("delete from recent_turn_caches where session_id = $1")
+        .bind(session_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from session_snapshots where session_id = $1")
+        .bind(session_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from agent_events where session_id = $1")
+        .bind(session_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
 
-    cached_event_from_row(&row)
+    let mut inserted = Vec::with_capacity(envelopes.len());
+    for envelope in envelopes {
+        inserted.push(insert_universal_event_tx(&mut tx, workspace_id, envelope, None).await?);
+    }
+    tx.commit().await?;
+    Ok(inserted)
 }
 
 pub async fn append_universal_event(
@@ -992,7 +1005,6 @@ pub async fn append_universal_event_reducing_snapshot<F>(
     workspace_id: WorkspaceId,
     envelope: UniversalEventEnvelope,
     command_id: Option<CommandId>,
-    legacy_event: Option<&AppEvent>,
     reduce: F,
 ) -> Result<UniversalAppendOutcome>
 where
@@ -1012,17 +1024,8 @@ where
     reduce(&mut snapshot, &event.envelope());
     snapshot.latest_seq = Some(event.seq);
     let snapshot = store_session_snapshot_tx(&mut tx, &snapshot).await?;
-    let cached_event = if let Some(legacy_event) = legacy_event {
-        Some(insert_event_cache_tx(&mut tx, event.event_id, event.session_id, legacy_event).await?)
-    } else {
-        None
-    };
     tx.commit().await?;
-    Ok(UniversalAppendOutcome {
-        event,
-        snapshot,
-        cached_event,
-    })
+    Ok(UniversalAppendOutcome { event, snapshot })
 }
 
 pub async fn list_universal_events_after(
@@ -1504,44 +1507,6 @@ async fn store_session_snapshot_tx(
     stored_session_snapshot_from_row(&row)
 }
 
-async fn insert_event_cache_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    event_id: Uuid,
-    session_id: SessionId,
-    event: &AppEvent,
-) -> Result<CachedEvent> {
-    let payload = serde_json::to_value(event).map_err(sqlx::Error::decode)?;
-    let event_type = payload
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown")
-        .to_owned();
-    let event_index: i64 = sqlx::query_scalar(
-        "insert into event_cache_cursors (session_id, next_event_index)
-         values ($1, 2)
-         on conflict (session_id)
-         do update set next_event_index = event_cache_cursors.next_event_index + 1
-         returning next_event_index - 1",
-    )
-    .bind(session_id.as_uuid())
-    .fetch_one(&mut **tx)
-    .await?;
-    let row = sqlx::query(
-        "insert into event_cache (event_id, session_id, event_index, event_type, payload)
-         values ($1, $2, $3, $4, $5)
-         returning event_id, session_id, event_index, event_type, payload, created_at",
-    )
-    .bind(event_id)
-    .bind(session_id.as_uuid())
-    .bind(event_index)
-    .bind(&event_type)
-    .bind(payload)
-    .fetch_one(&mut **tx)
-    .await?;
-
-    cached_event_from_row(&row)
-}
-
 async fn materialize_pending_approval_tx(
     tx: &mut Transaction<'_, Postgres>,
     approval: &ApprovalRequest,
@@ -1737,17 +1702,6 @@ fn session_from_row(row: &PgRow) -> Result<AgentSession> {
         turn_settings: turn_settings.and_then(|settings| serde_json::from_value(settings).ok()),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
-    })
-}
-
-fn cached_event_from_row(row: &PgRow) -> Result<CachedEvent> {
-    Ok(CachedEvent {
-        event_id: row.try_get("event_id")?,
-        session_id: SessionId::from_uuid(row.try_get("session_id")?),
-        event_index: row.try_get("event_index")?,
-        event_type: row.try_get("event_type")?,
-        payload: row.try_get("payload")?,
-        created_at: row.try_get("created_at")?,
     })
 }
 
@@ -2016,6 +1970,8 @@ fn universal_event_type(event: &UniversalEventKind) -> &'static str {
         UniversalEventKind::ContentDelta { .. } => "content.delta",
         UniversalEventKind::ContentCompleted { .. } => "content.completed",
         UniversalEventKind::ApprovalRequested { .. } => "approval.requested",
+        UniversalEventKind::QuestionRequested { .. } => "question.requested",
+        UniversalEventKind::QuestionAnswered { .. } => "question.answered",
         UniversalEventKind::PlanUpdated { .. } => "plan.updated",
         UniversalEventKind::DiffUpdated { .. } => "diff.updated",
         UniversalEventKind::ArtifactCreated { .. } => "artifact.created",
@@ -2147,10 +2103,10 @@ fn command_idempotency_status_from_db(value: &str) -> Result<CommandIdempotencyS
 #[cfg(test)]
 mod tests {
     use agenter_core::{
-        AgentProviderId, AppEvent, ApprovalDecision, ApprovalId, ApprovalKind, ApprovalRequest,
+        AgentProviderId, ApprovalDecision, ApprovalId, ApprovalKind, ApprovalRequest,
         ApprovalStatus as UniversalApprovalStatus, NativeRef, SessionInfo, SessionSnapshot,
         SessionStatus, UniversalEventEnvelope, UniversalEventKind, UniversalEventSource,
-        UniversalSeq, UserMessageEvent,
+        UniversalSeq,
     };
     use sqlx::{Executor, PgPool, Row};
 
@@ -2220,7 +2176,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
-    async fn creates_registry_rows_and_appends_event_cache() {
+    async fn creates_registry_rows() {
         let pool = test_pool().await;
 
         let suffix = uuid::Uuid::new_v4();
@@ -2272,39 +2228,12 @@ mod tests {
 
         assert_eq!(session.status, SessionStatus::Starting);
 
-        let first_event = append_event_cache(
-            &pool,
-            session.session_id,
-            &AppEvent::UserMessage(UserMessageEvent {
-                session_id: session.session_id,
-                message_id: Some("message-1".to_owned()),
-                author_user_id: Some(user.user_id),
-                content: "hello".to_owned(),
-            }),
-        )
-        .await
-        .expect("append event");
-        let second_event = append_event_cache(
-            &pool,
-            session.session_id,
-            &AppEvent::UserMessage(UserMessageEvent {
-                session_id: session.session_id,
-                message_id: Some("message-2".to_owned()),
-                author_user_id: Some(user.user_id),
-                content: "again".to_owned(),
-            }),
-        )
-        .await
-        .expect("append second event");
-
-        assert_eq!(first_event.event_index, 1);
-        assert_eq!(first_event.event_type, "user_message");
-        assert_eq!(second_event.event_index, 2);
+        assert_eq!(session.title.as_deref(), Some("First Session"));
     }
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
-    async fn universal_event_log_sequences_replays_snapshots_approvals_and_legacy_cache() {
+    async fn universal_event_log_sequences_replays_snapshots_and_approvals() {
         let pool = test_pool().await;
 
         let suffix = uuid::Uuid::new_v4();
@@ -2368,7 +2297,6 @@ mod tests {
             workspace.workspace_id,
             session_event,
             None,
-            None,
             |snapshot: &mut SessionSnapshot, event| {
                 snapshot.session_id = event.session_id;
                 snapshot.latest_seq = Some(event.seq);
@@ -2420,18 +2348,11 @@ mod tests {
                 }),
             },
         };
-        let legacy_event = AppEvent::UserMessage(UserMessageEvent {
-            session_id: session.session_id,
-            message_id: Some("legacy-user-1".to_owned()),
-            author_user_id: Some(user.user_id),
-            content: "legacy cache still exists".to_owned(),
-        });
         let second = append_universal_event_reducing_snapshot(
             &pool,
             workspace.workspace_id,
             approval_event,
             None,
-            Some(&legacy_event),
             |snapshot: &mut SessionSnapshot, event| {
                 snapshot.session_id = event.session_id;
                 snapshot.latest_seq = Some(event.seq);
@@ -2446,7 +2367,6 @@ mod tests {
         .expect("append universal approval event");
 
         assert!(second.event.seq > first.event.seq);
-        assert!(second.cached_event.is_some());
 
         let replay =
             list_universal_events_after(&pool, session.session_id, Some(first.event.seq), 10)
@@ -2497,13 +2417,6 @@ mod tests {
         .expect("approval resolved");
         assert_eq!(resolved.universal_status, UniversalApprovalStatus::Approved);
 
-        let legacy_cache = list_event_cache(&pool, session.session_id)
-            .await
-            .expect("list legacy cache");
-        assert_eq!(legacy_cache.len(), 1);
-        assert_eq!(legacy_cache[0].event_type, "user_message");
-        assert_eq!(legacy_cache[0].event_id, second.event.event_id);
-
         clear_session_event_projection(&pool, session.session_id)
             .await
             .expect("clear compatibility projection");
@@ -2517,15 +2430,11 @@ mod tests {
             .await
             .expect("load cleared snapshot")
             .is_none());
-        assert!(list_event_cache(&pool, session.session_id)
-            .await
-            .expect("list cleared legacy cache")
-            .is_empty());
     }
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
-    async fn upserts_codex_imports_and_replays_cached_events() {
+    async fn upserts_codex_imports_and_preserves_source_timestamps() {
         let pool = test_pool().await;
 
         let suffix = uuid::Uuid::new_v4();
@@ -2623,31 +2532,12 @@ mod tests {
         .expect("upsert imported session without timestamp");
         assert_eq!(preserved.updated_at, source_updated_at);
 
-        append_event_cache(
-            &pool,
-            imported.session_id,
-            &AppEvent::UserMessage(UserMessageEvent {
-                session_id: imported.session_id,
-                message_id: Some("user-message-1".to_owned()),
-                author_user_id: Some(user.user_id),
-                content: "persist me".to_owned(),
-            }),
-        )
-        .await
-        .expect("append cached event");
-
         let sessions = list_sessions_for_user(&pool, user.user_id)
             .await
             .expect("list sessions");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session.session_id, imported.session_id);
         assert_eq!(sessions[0].workspace.workspace_id, workspace.workspace_id);
-
-        let events = list_event_cache(&pool, imported.session_id)
-            .await
-            .expect("list cached events");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "user_message");
     }
 
     #[tokio::test]
@@ -2941,7 +2831,6 @@ mod tests {
             "runners",
             "runner_tokens",
             "workspaces",
-            "event_cache_cursors",
             "agent_sessions",
             "connector_accounts",
             "connector_link_codes",
@@ -2949,7 +2838,6 @@ mod tests {
             "oidc_login_states",
             "browser_auth_sessions",
             "pending_approvals",
-            "event_cache",
             "agent_events",
             "agent_event_idempotency",
             "session_snapshots",

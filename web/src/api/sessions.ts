@@ -1,7 +1,6 @@
 import { requestJson } from './http';
 import {
   normalizeAgentOptions,
-  normalizeBrowserEventEnvelope,
   normalizeRunners,
   normalizeSessionInfo,
   normalizeSessions,
@@ -13,7 +12,6 @@ import type {
   AgentOptions,
   AgentQuestionAnswer,
   AgentTurnSettings,
-  BrowserEventEnvelope,
   RunnerInfo,
   SessionInfo,
   SlashCommandDefinition,
@@ -61,6 +59,49 @@ export interface WorkspaceSessionRefreshSummary {
   skipped_failed_count: number;
 }
 
+export type WorkspaceSessionRefreshStatus =
+  | 'queued'
+  | 'sent'
+  | 'accepted'
+  | 'discovering'
+  | 'reading_history'
+  | 'sending_results'
+  | 'importing'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled';
+
+export type WorkspaceSessionRefreshLogLevel = 'debug' | 'info' | 'warning' | 'error';
+
+export interface WorkspaceSessionRefreshProgress {
+  current?: number;
+  total?: number;
+  percent?: number;
+}
+
+export interface WorkspaceSessionRefreshLogEntry {
+  ts: string;
+  level: WorkspaceSessionRefreshLogLevel;
+  status: WorkspaceSessionRefreshStatus;
+  message: string;
+  progress?: WorkspaceSessionRefreshProgress;
+}
+
+export interface WorkspaceSessionRefreshAccepted {
+  refresh_id: string;
+  status: 'queued';
+}
+
+export interface WorkspaceSessionRefreshJob {
+  refresh_id: string;
+  status: WorkspaceSessionRefreshStatus;
+  progress?: WorkspaceSessionRefreshProgress;
+  log: WorkspaceSessionRefreshLogEntry[];
+  summary?: WorkspaceSessionRefreshSummary;
+  error?: string;
+  updated_at: string;
+}
+
 export async function listRunners(): Promise<RunnerInfo[]> {
   return normalizeRunners(await requestJson<unknown>('/api/runners'));
 }
@@ -78,7 +119,7 @@ export async function listSessions(): Promise<SessionInfo[]> {
 export async function refreshWorkspaceProviderSessions(
   workspaceId: string,
   providerId: string
-): Promise<WorkspaceSessionRefreshSummary> {
+): Promise<WorkspaceSessionRefreshAccepted> {
   const value = await requestJson<unknown>(
     `/api/workspaces/${encodeURIComponent(workspaceId)}/providers/${encodeURIComponent(providerId)}/sessions/refresh`,
     { method: 'POST' }
@@ -87,10 +128,49 @@ export async function refreshWorkspaceProviderSessions(
     throw new Error('Refresh sessions returned malformed data.');
   }
   const record = value as Record<string, unknown>;
+  const refreshId = stringField(record, 'refresh_id');
+  const status = stringField(record, 'status');
+  if (status !== 'queued') {
+    throw new Error('Refresh sessions returned malformed status.');
+  }
   return {
-    discovered_count: numberField(record, 'discovered_count'),
-    refreshed_cache_count: numberField(record, 'refreshed_cache_count'),
-    skipped_failed_count: numberField(record, 'skipped_failed_count')
+    refresh_id: refreshId,
+    status
+  };
+}
+
+export async function getWorkspaceProviderSessionRefreshStatus(
+  workspaceId: string,
+  providerId: string,
+  refreshId: string
+): Promise<WorkspaceSessionRefreshJob> {
+  const value = await requestJson<unknown>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/providers/${encodeURIComponent(providerId)}/sessions/refresh/${encodeURIComponent(refreshId)}`
+  );
+  if (typeof value !== 'object' || value === null) {
+    throw new Error('Refresh status returned malformed data.');
+  }
+  const record = value as Record<string, unknown>;
+  const status = stringField(record, 'status') as WorkspaceSessionRefreshStatus;
+  if (!isWorkspaceSessionRefreshStatus(status)) {
+    throw new Error('Refresh status returned malformed status.');
+  }
+  const summaryValue = record.summary;
+  return {
+    refresh_id: stringField(record, 'refresh_id'),
+    status,
+    progress: normalizeRefreshProgress(record.progress),
+    log: Array.isArray(record.log) ? record.log.map(normalizeRefreshLogEntry).filter((entry) => entry !== undefined) : [],
+    summary:
+      typeof summaryValue === 'object' && summaryValue !== null
+        ? {
+            discovered_count: numberField(summaryValue as Record<string, unknown>, 'discovered_count'),
+            refreshed_cache_count: numberField(summaryValue as Record<string, unknown>, 'refreshed_cache_count'),
+            skipped_failed_count: numberField(summaryValue as Record<string, unknown>, 'skipped_failed_count')
+          }
+        : undefined,
+    error: typeof record.error === 'string' ? record.error : undefined,
+    updated_at: stringField(record, 'updated_at')
   };
 }
 
@@ -102,11 +182,6 @@ export async function getSession(sessionId: string): Promise<SessionInfo> {
     throw new Error(`Session ${sessionId} returned malformed data.`);
   }
   return session;
-}
-
-export async function getSessionHistory(sessionId: string): Promise<BrowserEventEnvelope[]> {
-  const value = await requestJson<unknown>(`/api/sessions/${encodeURIComponent(sessionId)}/history`);
-  return Array.isArray(value) ? value.map(normalizeBrowserEventEnvelope) : [];
 }
 
 export async function getSessionAgentOptions(sessionId: string): Promise<AgentOptions> {
@@ -212,30 +287,95 @@ export async function executeSlashCommand(
 export async function decideApproval(
   approvalId: string,
   decision: ApprovalDecision
-): Promise<BrowserEventEnvelope> {
-  return normalizeBrowserEventEnvelope(
-    await requestJson<unknown>(`/api/approvals/${encodeURIComponent(approvalId)}/decision`, {
-      method: 'POST',
-      body: JSON.stringify(decision)
-    })
-  );
+): Promise<void> {
+  await requestJson<void>(`/api/approvals/${encodeURIComponent(approvalId)}/decision`, {
+    method: 'POST',
+    body: JSON.stringify(decision)
+  });
 }
 
 export async function answerQuestion(
   questionId: string,
   answer: AgentQuestionAnswer
-): Promise<BrowserEventEnvelope> {
-  return normalizeBrowserEventEnvelope(
-    await requestJson<unknown>(`/api/questions/${encodeURIComponent(questionId)}/answer`, {
-      method: 'POST',
-      body: JSON.stringify(answer)
-    })
-  );
+): Promise<void> {
+  await requestJson<void>(`/api/questions/${encodeURIComponent(questionId)}/answer`, {
+    method: 'POST',
+    body: JSON.stringify(answer)
+  });
 }
 
 function numberField(record: Record<string, unknown>, field: string): number {
   const value = record[field];
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function stringField(record: Record<string, unknown>, field: string): string {
+  const value = record[field];
+  if (typeof value !== 'string') {
+    throw new Error(`Expected ${field} to be a string.`);
+  }
+  return value;
+}
+
+function isWorkspaceSessionRefreshStatus(value: string): value is WorkspaceSessionRefreshStatus {
+  return [
+    'queued',
+    'sent',
+    'accepted',
+    'discovering',
+    'reading_history',
+    'sending_results',
+    'importing',
+    'succeeded',
+    'failed',
+    'cancelled'
+  ].includes(value);
+}
+
+function isWorkspaceSessionRefreshLogLevel(value: string): value is WorkspaceSessionRefreshLogLevel {
+  return ['debug', 'info', 'warning', 'error'].includes(value);
+}
+
+function normalizeRefreshProgress(value: unknown): WorkspaceSessionRefreshProgress | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const progress: WorkspaceSessionRefreshProgress = {};
+  if (typeof record.current === 'number' && Number.isFinite(record.current)) {
+    progress.current = record.current;
+  }
+  if (typeof record.total === 'number' && Number.isFinite(record.total)) {
+    progress.total = record.total;
+  }
+  if (typeof record.percent === 'number' && Number.isFinite(record.percent)) {
+    progress.percent = record.percent;
+  }
+  return Object.keys(progress).length > 0 ? progress : undefined;
+}
+
+function normalizeRefreshLogEntry(value: unknown): WorkspaceSessionRefreshLogEntry | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.ts !== 'string' ||
+    typeof record.status !== 'string' ||
+    !isWorkspaceSessionRefreshStatus(record.status) ||
+    typeof record.level !== 'string' ||
+    !isWorkspaceSessionRefreshLogLevel(record.level) ||
+    typeof record.message !== 'string'
+  ) {
+    return undefined;
+  }
+  return {
+    ts: record.ts,
+    level: record.level,
+    status: record.status,
+    message: record.message,
+    progress: normalizeRefreshProgress(record.progress)
+  };
 }
 
 function normalizeSlashCommandDefinition(value: unknown): SlashCommandDefinition | undefined {

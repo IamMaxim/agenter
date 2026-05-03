@@ -131,21 +131,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: UserId) {
     tracing::info!(
         %user_id,
         session_id = %subscription.session_id,
-        cached_event_count = session_subscription.cached_events.len(),
         "browser websocket subscribed"
     );
-    for event in session_subscription.cached_events {
-        if universal_subscription {
-            continue;
-        }
-        if send_server_message(&mut sender, BrowserServerMessage::Event(event))
-            .await
-            .is_err()
-        {
-            tracing::warn!(%user_id, session_id = %subscription.session_id, "browser websocket failed while replaying cache");
-            return;
-        }
-    }
 
     loop {
         tokio::select! {
@@ -174,44 +161,22 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: UserId) {
             event = session_subscription.receiver.recv() => {
                 match event {
                     Ok(event) => {
-                        if universal_subscription {
-                            if let Some(universal_event) = event.universal_event {
-                                if !sent_universal_events
-                                    .insert((universal_event.seq, universal_event.event_id.clone()))
-                                {
-                                    continue;
-                                }
-                                if send_server_message(
-                                    &mut sender,
-                                    BrowserServerMessage::UniversalEvent(universal_event),
-                                )
-                                .await
-                                .is_err()
-                                {
-                                    tracing::warn!(%user_id, session_id = %subscription.session_id, "browser websocket send universal event failed");
-                                    return;
-                                }
-                            }
-                            if is_question_app_event(&event.app_event.event)
-                                && send_server_message(
-                                    &mut sender,
-                                    BrowserServerMessage::Event(event.app_event),
-                                )
-                                .await
-                                .is_err()
+                        if let Some(universal_event) = event.universal_event {
+                            if !sent_universal_events
+                                .insert((universal_event.seq, universal_event.event_id.clone()))
                             {
-                                tracing::warn!(%user_id, session_id = %subscription.session_id, "browser websocket send dual-delivered question event failed");
+                                continue;
+                            }
+                            if send_server_message(
+                                &mut sender,
+                                BrowserServerMessage::UniversalEvent(universal_event),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                tracing::warn!(%user_id, session_id = %subscription.session_id, "browser websocket send universal event failed");
                                 return;
                             }
-                        } else if send_server_message(
-                            &mut sender,
-                            BrowserServerMessage::Event(event.app_event),
-                        )
-                        .await
-                        .is_err()
-                        {
-                            tracing::warn!(%user_id, session_id = %subscription.session_id, "browser websocket send event failed");
-                            return;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -237,13 +202,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: UserId) {
             }
         }
     }
-}
-
-fn is_question_app_event(event: &agenter_core::AppEvent) -> bool {
-    matches!(
-        event,
-        agenter_core::AppEvent::QuestionRequested(_) | agenter_core::AppEvent::QuestionAnswered(_)
-    )
 }
 
 async fn send_server_message(

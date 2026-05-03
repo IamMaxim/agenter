@@ -1195,7 +1195,7 @@ async fn refresh_workspace_provider_sessions_for_user(
         },
     ));
     match state
-        .send_runner_command_and_wait(
+        .start_workspace_session_refresh(
             runner_id,
             request_id.clone(),
             command,
@@ -1203,21 +1203,15 @@ async fn refresh_workspace_provider_sessions_for_user(
         )
         .await
     {
-        Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok { .. }) => {
-            let summary = state
-                .take_refresh_summary(&request_id)
-                .await
-                .unwrap_or_default();
+        Ok(()) => {
             let result = agenter_core::SlashCommandResult {
                 accepted: true,
-                message: format!(
-                    "Refresh complete: {} discovered, {} cache refreshed, {} skipped.",
-                    summary.discovered_count,
-                    summary.refreshed_cache_count,
-                    summary.skipped_failed_count
-                ),
+                message: format!("Refresh queued: {request_id}."),
                 session: None,
-                provider_payload: Some(serde_json::to_value(summary).unwrap_or_default()),
+                provider_payload: Some(serde_json::json!({
+                    "refresh_id": request_id.to_string(),
+                    "status": "queued",
+                })),
             };
             if let Some((session_id, request, definition, universal_command)) = slash_context {
                 if let Some(response) = super::finish_command_or_error_response(
@@ -1241,41 +1235,6 @@ async fn refresh_workspace_provider_sessions_for_user(
                 .await
             } else {
                 Json(result).into_response()
-            }
-        }
-        Ok(agenter_protocol::runner::RunnerResponseOutcome::Error { error }) => {
-            tracing::warn!(%workspace_id, code = %error.code, message = %error.message, "slash refresh failed in runner");
-            let result = agenter_core::SlashCommandResult {
-                accepted: false,
-                message: error.message.clone(),
-                session: None,
-                provider_payload: Some(serde_json::json!({ "code": error.code })),
-            };
-            if let Some((session_id, request, definition, universal_command)) = slash_context {
-                if let Some(response) = super::finish_command_or_error_response(
-                    &state,
-                    &universal_command,
-                    crate::state::UniversalCommandIdempotencyStatus::Failed,
-                    super::command_response(
-                        StatusCode::BAD_GATEWAY,
-                        serde_json::to_value(&result).ok(),
-                    ),
-                )
-                .await
-                {
-                    return response;
-                }
-                slash_result_response(
-                    &state,
-                    session_id,
-                    &request,
-                    &definition,
-                    StatusCode::BAD_GATEWAY,
-                    result,
-                )
-                .await
-            } else {
-                (StatusCode::BAD_GATEWAY, Json(error)).into_response()
             }
         }
         Err(error) => {

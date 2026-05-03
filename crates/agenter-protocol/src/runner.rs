@@ -1,6 +1,6 @@
 use agenter_core::{
     AgentCapabilities, AgentOptions, AgentProviderId, AgentQuestionAnswer, AgentTurnSettings,
-    AppEvent, ApprovalDecision, ApprovalId, FileChangeKind, ItemId, NativeRef, SessionId,
+    ApprovalDecision, ApprovalId, FileChangeKind, ItemId, NativeRef, SessionId,
     SlashCommandDefinition, SlashCommandRequest, SlashCommandResult, TurnId, UniversalEventKind,
     UniversalEventSource, UserMessageEvent, WorkspaceRef,
 };
@@ -242,22 +242,70 @@ pub struct RunnerEventEnvelope {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunnerEvent {
-    AgentEvent(Box<AgentEvent>),
+    AgentEvent(Box<AgentUniversalEvent>),
     HealthChanged(RunnerHealthChanged),
+    OperationUpdated(RunnerOperationUpdate),
     SessionsDiscovered(DiscoveredSessions),
     Error(RunnerError),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct AgentEvent {
-    pub session_id: SessionId,
-    pub event: AppEvent,
+pub struct RunnerOperationUpdate {
+    pub operation_id: RequestId,
+    pub kind: RunnerOperationKind,
+    pub status: RunnerOperationStatus,
+    pub stage_label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub universal_event: Option<AgentUniversalEvent>,
+    pub progress: Option<RunnerOperationProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub level: RunnerOperationLogLevel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerOperationKind {
+    SessionRefresh,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerOperationStatus {
+    Queued,
+    Accepted,
+    Discovering,
+    ReadingHistory,
+    SendingResults,
+    Importing,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RunnerOperationProgress {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerOperationLogLevel {
+    Debug,
+    Info,
+    Warning,
+    Error,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AgentUniversalEvent {
+    pub session_id: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -297,6 +345,7 @@ pub struct DiscoveredSession {
 pub enum DiscoveredSessionHistoryStatus {
     #[default]
     Loaded,
+    NotLoaded,
     Failed {
         message: String,
     },
@@ -429,9 +478,9 @@ pub enum RunnerHealthStatus {
 #[cfg(test)]
 mod tests {
     use agenter_core::{
-        AgentCapabilities, AgentMessageDeltaEvent, AgentProviderId, AgentQuestionAnswer,
-        AgentReasoningEffort, AgentTurnSettings, AppEvent, ApprovalDecision, ApprovalId,
-        QuestionId, RunnerId, SessionId, UserMessageEvent, WorkspaceId, WorkspaceRef,
+        AgentCapabilities, AgentProviderId, AgentQuestionAnswer, AgentReasoningEffort,
+        AgentTurnSettings, ApprovalDecision, ApprovalId, QuestionId, RunnerId, SessionId,
+        UserMessageEvent, WorkspaceId, WorkspaceRef,
     };
 
     use super::*;
@@ -619,33 +668,25 @@ mod tests {
             request_id: Some(RequestId::from("event-1")),
             runner_event_seq: Some(123),
             acked_runner_event_seq: Some(122),
-            event: RunnerEvent::AgentEvent(Box::new(AgentEvent {
+            event: RunnerEvent::AgentEvent(Box::new(AgentUniversalEvent {
                 session_id: SessionId::nil(),
-                event: AppEvent::AgentMessageDelta(AgentMessageDeltaEvent {
-                    session_id: SessionId::nil(),
-                    message_id: "msg-1".to_owned(),
-                    delta: "hello".to_owned(),
-                    provider_payload: None,
+                event_id: Some("11111111-1111-1111-1111-111111111111".to_owned()),
+                turn_id: None,
+                item_id: None,
+                ts: None,
+                source: UniversalEventSource::Native,
+                native: Some(NativeRef {
+                    protocol: "codex-app-server".to_owned(),
+                    method: Some("thread/item".to_owned()),
+                    kind: Some("codex".to_owned()),
+                    native_id: Some("native-msg-1".to_owned()),
+                    summary: Some("native message".to_owned()),
+                    hash: None,
+                    pointer: None,
                 }),
-                universal_event: Some(AgentUniversalEvent {
-                    event_id: Some("11111111-1111-1111-1111-111111111111".to_owned()),
-                    turn_id: None,
-                    item_id: None,
-                    ts: None,
-                    source: UniversalEventSource::Native,
-                    native: Some(NativeRef {
-                        protocol: "codex-app-server".to_owned(),
-                        method: Some("thread/item".to_owned()),
-                        kind: Some("codex".to_owned()),
-                        native_id: Some("native-msg-1".to_owned()),
-                        summary: Some("native message".to_owned()),
-                        hash: None,
-                        pointer: None,
-                    }),
-                    event: UniversalEventKind::NativeUnknown {
-                        summary: Some("native message".to_owned()),
-                    },
-                }),
+                event: UniversalEventKind::NativeUnknown {
+                    summary: Some("native message".to_owned()),
+                },
             })),
         }));
 
@@ -658,15 +699,8 @@ mod tests {
         assert_eq!(json["runner_event_seq"], 123);
         assert_eq!(json["acked_runner_event_seq"], 122);
         assert_eq!(json["event"]["type"], "agent_event");
-        assert_eq!(json["event"]["event"]["type"], "agent_message_delta");
-        assert_eq!(
-            json["event"]["universal_event"]["native"]["protocol"],
-            "codex-app-server"
-        );
-        assert_eq!(
-            json["event"]["universal_event"]["event"]["type"],
-            "native.unknown"
-        );
+        assert_eq!(json["event"]["native"]["protocol"], "codex-app-server");
+        assert_eq!(json["event"]["event"]["type"], "native.unknown");
         assert_eq!(decoded, message);
     }
 
@@ -686,20 +720,17 @@ mod tests {
     }
 
     #[test]
-    fn decodes_legacy_runner_event_without_universal_ack_fields() {
+    fn decodes_runner_event_without_ack_fields() {
         let json = serde_json::json!({
             "type": "runner_event",
-            "request_id": "legacy-event-1",
+            "request_id": "event-1",
             "event": {
                 "type": "agent_event",
                 "session_id": SessionId::nil(),
+                "source": "native",
                 "event": {
-                    "type": "user_message",
-                    "payload": {
-                        "session_id": SessionId::nil(),
-                        "message_id": "msg-1",
-                        "content": "hello"
-                    }
+                    "type": "native.unknown",
+                    "data": {"summary": "hello"}
                 }
             }
         });
@@ -709,7 +740,7 @@ mod tests {
 
         match decoded {
             RunnerClientMessage::Event(envelope) => {
-                assert_eq!(envelope.request_id, Some(RequestId::from("legacy-event-1")));
+                assert_eq!(envelope.request_id, Some(RequestId::from("event-1")));
                 assert_eq!(envelope.runner_event_seq, None);
                 assert_eq!(envelope.acked_runner_event_seq, None);
             }
@@ -809,6 +840,41 @@ mod tests {
             json["event"]["sessions"][0]["history_status"]["message"],
             "thread/read failed"
         );
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn round_trips_operation_updated_event() {
+        let message = RunnerClientMessage::Event(Box::new(RunnerEventEnvelope {
+            request_id: Some(RequestId::from("refresh-1")),
+            runner_event_seq: Some(7),
+            acked_runner_event_seq: None,
+            event: RunnerEvent::OperationUpdated(RunnerOperationUpdate {
+                operation_id: RequestId::from("refresh-1"),
+                kind: RunnerOperationKind::SessionRefresh,
+                status: RunnerOperationStatus::ReadingHistory,
+                stage_label: "Reading Codex history".to_owned(),
+                progress: Some(RunnerOperationProgress {
+                    current: Some(2),
+                    total: Some(5),
+                    percent: Some(40),
+                }),
+                message: Some("Read 2 of 5 sessions".to_owned()),
+                level: RunnerOperationLogLevel::Info,
+                ts: Some(Utc::now()),
+            }),
+        }));
+
+        let json = serde_json::to_value(&message).expect("serialize operation update");
+        let decoded: RunnerClientMessage =
+            serde_json::from_value(json.clone()).expect("deserialize operation update");
+
+        assert_eq!(json["event"]["type"], "operation_updated");
+        assert_eq!(json["event"]["kind"], "session_refresh");
+        assert_eq!(json["event"]["status"], "reading_history");
+        assert_eq!(json["event"]["progress"]["current"], 2);
+        assert_eq!(json["event"]["progress"]["total"], 5);
+        assert_eq!(json["event"]["progress"]["percent"], 40);
         assert_eq!(decoded, message);
     }
 

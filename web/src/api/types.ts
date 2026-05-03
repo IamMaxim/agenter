@@ -163,6 +163,22 @@ export interface AgentQuestionAnswer {
   answers: Record<string, string[]>;
 }
 
+export type QuestionStatus = 'pending' | 'answered' | 'cancelled' | string;
+
+export interface QuestionState {
+  question_id: string;
+  session_id: string;
+  turn_id?: string | null;
+  title: string;
+  description?: string | null;
+  fields: AgentQuestionField[];
+  status: QuestionStatus;
+  answer?: AgentQuestionAnswer | null;
+  native?: NativeRef | null;
+  requested_at?: string | null;
+  answered_at?: string | null;
+}
+
 export type UniversalSeq = string;
 export type UniversalEventSource = 'control_plane' | 'runner' | 'browser' | 'connector' | 'native' | string;
 
@@ -455,6 +471,7 @@ export interface SessionSnapshot {
   turns: Record<string, TurnState>;
   items: Record<string, ItemState>;
   approvals: Record<string, ApprovalRequest>;
+  questions: Record<string, QuestionState>;
   plans: Record<string, PlanState>;
   diffs: Record<string, DiffState>;
   artifacts: Record<string, ArtifactState>;
@@ -468,6 +485,8 @@ export type UniversalEventKind =
   | { type: 'content.delta'; data: { block_id: string; kind?: ContentBlockKind | null; delta: string } }
   | { type: 'content.completed'; data: { block_id: string; kind?: ContentBlockKind | null; text?: string | null } }
   | { type: 'approval.requested'; data: { approval: ApprovalRequest } }
+  | { type: 'question.requested'; data: { question: QuestionState } }
+  | { type: 'question.answered'; data: { question: QuestionState } }
   | { type: 'plan.updated'; data: { plan: PlanState } }
   | { type: 'diff.updated'; data: { diff: DiffState } }
   | { type: 'artifact.created'; data: { artifact: ArtifactState } }
@@ -569,7 +588,6 @@ export interface BrowserError {
 }
 
 export type BrowserServerMessage =
-  | BrowserEventEnvelope
   | BrowserUniversalEventEnvelope
   | BrowserSessionSnapshot
   | BrowserAck

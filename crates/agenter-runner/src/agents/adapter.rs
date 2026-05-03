@@ -13,9 +13,7 @@ use agenter_core::{
     ToolSubagentStateProjection, TurnId, TurnState, TurnStatus, UniversalCommandEnvelope,
     UniversalEventKind, UniversalEventSource, UserInput, WorkspaceRef,
 };
-use agenter_protocol::runner::{
-    AgentEvent, AgentInput, AgentUniversalEvent, RunnerCommandResult, RunnerError,
-};
+use agenter_protocol::runner::{AgentInput, AgentUniversalEvent, RunnerCommandResult, RunnerError};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -166,21 +164,17 @@ impl AdapterEvent {
     }
 
     #[must_use]
-    pub fn legacy_projection_for_wal(&self) -> Option<AgentEvent> {
-        let event = self.legacy.clone()?;
-        let session_id = app_event_session_id(&event)?;
-        Some(AgentEvent {
+    pub fn universal_projection_for_wal(&self) -> Option<AgentUniversalEvent> {
+        let session_id = self.universal.session_id?;
+        Some(AgentUniversalEvent {
             session_id,
-            event,
-            universal_event: self.universal.session_id.map(|_| AgentUniversalEvent {
-                event_id: None,
-                turn_id: self.universal.turn_id,
-                item_id: self.universal.item_id,
-                ts: None,
-                source: self.universal.source.clone(),
-                native: self.universal.native.clone(),
-                event: self.universal.event.clone(),
-            }),
+            event_id: None,
+            turn_id: self.universal.turn_id,
+            item_id: self.universal.item_id,
+            ts: None,
+            source: self.universal.source.clone(),
+            native: self.universal.native.clone(),
+            event: self.universal.event.clone(),
         })
     }
 
@@ -202,6 +196,10 @@ impl AdapterEvent {
             }
             UniversalEventKind::ApprovalRequested { approval } => {
                 approval.turn_id = Some(turn_id);
+            }
+            UniversalEventKind::QuestionRequested { question }
+            | UniversalEventKind::QuestionAnswered { question } => {
+                question.turn_id = Some(turn_id);
             }
             UniversalEventKind::PlanUpdated { plan } => {
                 plan.turn_id = Some(turn_id);
@@ -1516,11 +1514,11 @@ mod tests {
         );
 
         assert_eq!(event.legacy_projection(), Some(&legacy));
-        let wal_event = event.legacy_projection_for_wal().expect("wal event");
+        let wal_event = event.universal_projection_for_wal().expect("wal event");
         assert_eq!(wal_event.session_id, session_id);
         assert!(matches!(
-            wal_event.universal_event.as_ref().map(|event| &event.event),
-            Some(UniversalEventKind::ContentDelta { .. })
+            &wal_event.event,
+            UniversalEventKind::ContentDelta { .. }
         ));
         assert!(event.universal.native.is_some());
         assert_eq!(event.universal.session_id, Some(session_id));
@@ -1692,7 +1690,7 @@ mod tests {
         );
 
         assert_eq!(event.universal.session_id, None);
-        assert!(event.legacy_projection_for_wal().is_none());
+        assert!(event.universal_projection_for_wal().is_none());
         let native = event.universal.native.as_ref().expect("native ref");
         assert_eq!(native.protocol, "acp-stdio");
         assert_eq!(native.kind.as_deref(), Some(AgentProviderId::QWEN));

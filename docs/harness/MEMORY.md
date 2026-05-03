@@ -36,6 +36,7 @@ Do not store large transcripts here. Link to specs, plans, decisions, and runboo
 
 ## Recent Notes
 
+- 2026-05-03: Implemented `docs/plans/2026-05-03-nonblocking-session-refresh.md`: workspace/provider refresh now returns a background `refresh_id`, runner discovery runs off the connection path, Codex startup discovery is metadata-only, DB-backed forced imports use a history fingerprint to skip unchanged projection rewrites, and runner refresh progress is exposed as an operation state machine with sidebar progress/log UI.
 - 2026-05-03: Accepted `docs/decisions/2026-05-03-runner-local-codex-wire-logs.md` and implemented `docs/plans/2026-05-03-codex-runner-observability.md`: Codex raw JSON-RPC/stdout/stderr wire logs are runner-local and opt-in via `AGENTER_CODEX_RAW_LOG=1`, with operator usage in `docs/runbooks/codex-wire-logging.md`.
 - 2026-05-03: Accepted `docs/decisions/2026-05-03-persistent-browser-auth-sessions.md`: Postgres-backed browser auth now persists SHA-256 cookie token hashes for 30 days in `browser_auth_sessions`; without `DATABASE_URL`, browser sessions remain in-memory development state.
 - 2026-05-02: Accepted `docs/decisions/2026-05-02-runner-session-process-lifecycle.md` and implemented `docs/plans/2026-05-02-runner-session-lifecycle.md`: sessions now use durable `idle`/`stopped` statuses, `SessionStatusChanged` updates registry/database state, runner disconnect marks active sessions stopped, default runner mode advertises Codex plus available ACP providers, and Codex app-server runtime ownership is per Agenter session.

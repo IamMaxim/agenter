@@ -3,10 +3,16 @@
   import AgenterIcon from './AgenterIcon.svelte';
   import {
     createSession,
+    getWorkspaceProviderSessionRefreshStatus,
     listRunners,
     listRunnerWorkspaces,
     listSessions,
     refreshWorkspaceProviderSessions
+  } from '../api/sessions';
+  import type {
+    WorkspaceSessionRefreshJob,
+    WorkspaceSessionRefreshProgress,
+    WorkspaceSessionRefreshStatus
   } from '../api/sessions';
   import type { AuthenticatedUser, RunnerInfo, SessionInfo, SessionStatus, WorkspaceRef } from '../api/types';
   import { routeHref, type AppRoute } from '../lib/router';
@@ -33,7 +39,10 @@
   let contextMenuY = 0;
   let contextMenuGroupId = '';
   let contextMenuVisible = false;
+  let refreshJobsByGroup: Record<string, WorkspaceSessionRefreshJob[]> = {};
+  let refreshExpandedGroups: Record<string, boolean> = {};
   const FALLBACK_REFRESH_PROVIDER = 'codex';
+  const TERMINAL_REFRESH_STATUSES: WorkspaceSessionRefreshStatus[] = ['succeeded', 'failed', 'cancelled'];
 
   $: groups = buildSessionTree({ runners, workspacesByRunner, sessions });
   $: activeSessionId = route.name === 'chat' ? route.sessionId : undefined;
@@ -258,10 +267,77 @@
     const providers = getGroupProviderIds(group);
     const providerIds = providers.length > 0 ? providers : [FALLBACK_REFRESH_PROVIDER];
     const startedProviderCount = providerIds.length;
+    closeContextMenu();
+    refreshJobsByGroup = {
+      ...refreshJobsByGroup,
+      [group.id]: providerIds.map((providerId) => ({
+        refresh_id: `${group.id}:${providerId}:pending`,
+        status: 'queued',
+        log: [
+          {
+            ts: new Date().toISOString(),
+            level: 'info',
+            status: 'queued',
+            message: `Queued ${providerId} refresh.`
+          }
+        ],
+        updated_at: new Date().toISOString()
+      }))
+    };
+    refreshExpandedGroups = { ...refreshExpandedGroups, [group.id]: true };
+
     const refreshResults = await Promise.allSettled(
       providerIds.map((providerId) =>
         refreshWorkspaceProviderSessions(group.workspace.workspace_id, providerId)
       )
+    );
+    refreshResults.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        refreshJobsByGroup = replaceRefreshJob(group.id, `${group.id}:${providerIds[index]}:pending`, {
+          refresh_id: result.value.refresh_id,
+          status: result.value.status,
+          log: [
+            {
+              ts: new Date().toISOString(),
+              level: 'info',
+              status: result.value.status,
+              message: `${providerIds[index]} refresh accepted.`
+            }
+          ],
+          updated_at: new Date().toISOString()
+        });
+        return;
+      }
+      refreshJobsByGroup = replaceRefreshJob(group.id, `${group.id}:${providerIds[index]}:pending`, {
+        refresh_id: `${group.id}:${providerIds[index]}:failed`,
+        status: 'failed',
+        log: [
+          {
+            ts: new Date().toISOString(),
+            level: 'error',
+            status: 'failed',
+            message: result.reason instanceof Error ? result.reason.message : `Could not start ${providerIds[index]} refresh.`
+          }
+        ],
+        error: result.reason instanceof Error ? result.reason.message : `Could not start ${providerIds[index]} refresh.`,
+        updated_at: new Date().toISOString()
+      });
+    });
+    const refreshJobs = refreshResults.map((result, index) => ({
+      providerId: providerIds[index],
+      result
+    }));
+    const terminalResults = await Promise.allSettled(
+      refreshJobs
+        .filter(
+          (job): job is {
+            providerId: string;
+            result: PromiseFulfilledResult<{ refresh_id: string; status: 'queued' }>;
+          } => job.result.status === 'fulfilled'
+        )
+        .map((job) =>
+          waitForRefreshJob(group.workspace.workspace_id, job.providerId, job.result.value.refresh_id)
+        )
     );
 
     const summary = {
@@ -270,18 +346,27 @@
       skipped_failed_count: 0
     };
     const failedProviderIds: string[] = [];
+    let terminalIndex = 0;
 
     refreshResults.forEach((result, index) => {
-      if (result.status === 'fulfilled') {
-        summary.discovered_count += result.value.discovered_count;
-        summary.refreshed_cache_count += result.value.refreshed_cache_count;
-        summary.skipped_failed_count += result.value.skipped_failed_count;
-      } else {
+      if (result.status !== 'fulfilled') {
         failedProviderIds.push(providerIds[index]);
+        return;
+      }
+      const terminal = terminalResults[terminalIndex];
+      terminalIndex += 1;
+      if (terminal?.status !== 'fulfilled' || terminal.value.status !== 'succeeded') {
+        failedProviderIds.push(providerIds[index]);
+        return;
+      }
+      const resultSummary = terminal.value.summary;
+      if (resultSummary) {
+        summary.discovered_count += resultSummary.discovered_count;
+        summary.refreshed_cache_count += resultSummary.refreshed_cache_count;
+        summary.skipped_failed_count += resultSummary.skipped_failed_count;
       }
     });
 
-    closeContextMenu();
     if (failedProviderIds.length === 0) {
       if (startedProviderCount === 1) {
         pushToast({
@@ -307,6 +392,170 @@
       });
     }
     await refreshSidebar();
+  }
+
+  async function waitForRefreshJob(
+    workspaceId: string,
+    providerId: string,
+    refreshId: string
+  ): Promise<WorkspaceSessionRefreshJob> {
+    for (let attempt = 0; attempt < 180; attempt += 1) {
+      const job = await getWorkspaceProviderSessionRefreshStatus(workspaceId, providerId, refreshId);
+      refreshJobsByGroup = updateRefreshJob(workspaceId, providerId, job);
+      if (TERMINAL_REFRESH_STATUSES.includes(job.status)) {
+        return job;
+      }
+      await new Promise((resolve) => setTimeout(resolve, attempt < 10 ? 500 : 1000));
+    }
+    throw new Error(`Refresh ${refreshId} did not finish in time.`);
+  }
+
+  function updateRefreshJob(
+    workspaceId: string,
+    providerId: string,
+    job: WorkspaceSessionRefreshJob
+  ): Record<string, WorkspaceSessionRefreshJob[]> {
+    const group = groups.find(
+      (candidate) => candidate.workspace.workspace_id === workspaceId && getGroupProviderIds(candidate).includes(providerId)
+    );
+    const groupId =
+      group?.id ??
+      groups.find((candidate) => candidate.workspace.workspace_id === workspaceId)?.id;
+    if (!groupId) {
+      return refreshJobsByGroup;
+    }
+    const current = refreshJobsByGroup[groupId] ?? [];
+    const existingIndex = current.findIndex((candidate) => candidate.refresh_id === job.refresh_id);
+    const withoutPending = current.filter(
+      (candidate) => candidate.refresh_id !== `${groupId}:${providerId}:pending`
+    );
+    const next =
+      existingIndex >= 0
+        ? current.map((candidate, index) => (index === existingIndex ? job : candidate))
+        : [...withoutPending, job];
+    return {
+      ...refreshJobsByGroup,
+      [groupId]: next
+    };
+  }
+
+  function replaceRefreshJob(
+    groupId: string,
+    oldRefreshId: string,
+    job: WorkspaceSessionRefreshJob
+  ): Record<string, WorkspaceSessionRefreshJob[]> {
+    const current = refreshJobsByGroup[groupId] ?? [];
+    const replaced = current.some((candidate) => candidate.refresh_id === oldRefreshId);
+    return {
+      ...refreshJobsByGroup,
+      [groupId]: replaced
+        ? current.map((candidate) => (candidate.refresh_id === oldRefreshId ? job : candidate))
+        : [...current, job]
+    };
+  }
+
+  function refreshStatusLabel(status: WorkspaceSessionRefreshStatus) {
+    return status.replaceAll('_', ' ');
+  }
+
+  function refreshProgressPercent(job: WorkspaceSessionRefreshJob): number | undefined {
+    return progressPercent(job.progress);
+  }
+
+  function progressPercent(progress: WorkspaceSessionRefreshProgress | undefined): number | undefined {
+    if (!progress) {
+      return undefined;
+    }
+    if (typeof progress.percent === 'number') {
+      return Math.max(0, Math.min(100, progress.percent));
+    }
+    if (typeof progress.current === 'number' && typeof progress.total === 'number' && progress.total > 0) {
+      return Math.max(0, Math.min(100, Math.round((progress.current / progress.total) * 100)));
+    }
+    return undefined;
+  }
+
+  function refreshJobRunning(job: WorkspaceSessionRefreshJob) {
+    return !TERMINAL_REFRESH_STATUSES.includes(job.status);
+  }
+
+  function refreshJobSummary(job: WorkspaceSessionRefreshJob) {
+    if (job.summary) {
+      return `${job.summary.discovered_count} discovered · ${job.summary.refreshed_cache_count} refreshed · ${job.summary.skipped_failed_count} skipped`;
+    }
+    if (job.error) {
+      return job.error;
+    }
+    const lastLog = job.log.at(-1);
+    return lastLog?.message ?? refreshStatusLabel(job.status);
+  }
+
+  function refreshPanelJobs(group: SessionTreeGroup) {
+    return refreshJobsByGroup[group.id] ?? [];
+  }
+
+  function refreshPanelRunning(group: SessionTreeGroup) {
+    return refreshPanelJobs(group).some(refreshJobRunning);
+  }
+
+  function refreshPanelFailed(group: SessionTreeGroup) {
+    return refreshPanelJobs(group).some((job) => job.status === 'failed' || job.status === 'cancelled');
+  }
+
+  function refreshPanelPercent(group: SessionTreeGroup): number | undefined {
+    const jobs = refreshPanelJobs(group);
+    if (jobs.length === 0) {
+      return undefined;
+    }
+    const values = jobs.map(refreshProgressPercent).filter((value): value is number => value !== undefined);
+    if (values.length === 0) {
+      if (jobs.every((job) => job.status === 'succeeded')) {
+        return 100;
+      }
+      return undefined;
+    }
+    return Math.round(values.reduce((sum, value) => sum + value, 0) / values.length);
+  }
+
+  function refreshPanelTitle(group: SessionTreeGroup) {
+    const jobs = refreshPanelJobs(group);
+    if (jobs.length === 0) {
+      return 'Refresh';
+    }
+    if (refreshPanelRunning(group)) {
+      return jobs.length === 1 ? refreshStatusLabel(jobs[0].status) : `Refreshing ${jobs.length} providers`;
+    }
+    if (jobs.every((job) => job.status === 'succeeded')) {
+      return 'Refresh complete';
+    }
+    return 'Refresh needs attention';
+  }
+
+  function refreshPanelMessage(group: SessionTreeGroup) {
+    const jobs = refreshPanelJobs(group);
+    const running = jobs.find(refreshJobRunning);
+    if (running) {
+      return refreshJobSummary(running);
+    }
+    if (jobs.length === 1) {
+      return refreshJobSummary(jobs[0]);
+    }
+    const failed = jobs.filter((job) => job.status === 'failed' || job.status === 'cancelled').length;
+    const succeeded = jobs.filter((job) => job.status === 'succeeded').length;
+    return `${succeeded} succeeded · ${failed} failed`;
+  }
+
+  function refreshPanelLog(group: SessionTreeGroup) {
+    return refreshPanelJobs(group).flatMap((job) => job.log);
+  }
+
+  function dismissRefreshPanel(groupId: string) {
+    const nextJobs = { ...refreshJobsByGroup };
+    const nextExpanded = { ...refreshExpandedGroups };
+    delete nextJobs[groupId];
+    delete nextExpanded[groupId];
+    refreshJobsByGroup = nextJobs;
+    refreshExpandedGroups = nextExpanded;
   }
 </script>
 
@@ -382,6 +631,74 @@
           </button>
 
           {#if isGroupOpen(group)}
+            {#if refreshPanelJobs(group).length > 0}
+              <div
+                class:failed={refreshPanelFailed(group)}
+                class:running={refreshPanelRunning(group)}
+                class="refresh-panel"
+              >
+                <div class="refresh-panel-header">
+                  <span class="refresh-panel-title">{refreshPanelTitle(group)}</span>
+                  <span class="refresh-panel-state">{refreshPanelMessage(group)}</span>
+                  <button
+                    class="refresh-panel-dismiss"
+                    type="button"
+                    title="Dismiss"
+                    aria-label="Dismiss refresh status"
+                    on:click={() => dismissRefreshPanel(group.id)}
+                  >
+                    ×
+                  </button>
+                </div>
+                <div
+                  aria-label="Session refresh progress"
+                  aria-valuemax="100"
+                  aria-valuemin="0"
+                  aria-valuenow={refreshPanelPercent(group)}
+                  class:indeterminate={refreshPanelPercent(group) === undefined && refreshPanelRunning(group)}
+                  class="refresh-progress"
+                  role="progressbar"
+                >
+                  <span
+                    class="refresh-progress-bar"
+                    style={`width: ${refreshPanelPercent(group) ?? 100}%;`}
+                  ></span>
+                </div>
+                <div class="refresh-panel-actions">
+                  <button
+                    class="refresh-log-toggle"
+                    type="button"
+                    on:click={() => (refreshExpandedGroups = { ...refreshExpandedGroups, [group.id]: !refreshExpandedGroups[group.id] })}
+                  >
+                    {refreshExpandedGroups[group.id] ? 'hide log' : 'show log'}
+                  </button>
+                  {#if refreshPanelFailed(group)}
+                    <button
+                      class="refresh-log-toggle"
+                      type="button"
+                      on:click={() => void reloadRunnerWorkspaceSessions(group)}
+                    >
+                      retry
+                    </button>
+                  {/if}
+                </div>
+                {#if refreshExpandedGroups[group.id]}
+                  <ol class="refresh-log">
+                    {#each refreshPanelLog(group) as entry, index (`${entry.ts}:${index}:${entry.message}`)}
+                      <li class={entry.level}>
+                        <span>{refreshStatusLabel(entry.status)}</span>
+                        <p>{entry.message}</p>
+                      </li>
+                    {:else}
+                      <li class="info">
+                        <span>queued</span>
+                        <p>Waiting for runner progress.</p>
+                      </li>
+                    {/each}
+                  </ol>
+                {/if}
+              </div>
+            {/if}
             <div class="tree-session-list">
               {#each group.sessions as session (session.session_id)}
                 <a

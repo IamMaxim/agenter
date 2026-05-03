@@ -114,7 +114,6 @@ pub struct StoredSessionSnapshot {
 pub struct UniversalAppendOutcome {
     pub event: AgentEvent,
     pub snapshot: StoredSessionSnapshot,
-    pub cached_event: Option<CachedEvent>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

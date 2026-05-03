@@ -9,10 +9,12 @@ import type {
   ArtifactKind,
   ArtifactState,
   AgentReasoningEffort,
+  AgentQuestionAnswer,
+  AgentQuestionField,
   AgentTurnSettings,
   AppEventType,
-  BrowserSessionSnapshot,
   BrowserEventEnvelope,
+  BrowserSessionSnapshot,
   CapabilitySet,
   ContentBlock,
   ContentBlockKind,
@@ -27,6 +29,8 @@ import type {
   PlanSource,
   PlanState,
   PlanStatus,
+  QuestionState,
+  QuestionStatus,
   BrowserServerMessage,
   RunnerInfo,
   RunnerStatus,
@@ -156,19 +160,6 @@ export function normalizeSessionInfo(value: unknown): SessionInfo | undefined {
   return normalizeSession(value);
 }
 
-export function normalizeBrowserEventEnvelope(value: unknown): BrowserEventEnvelope {
-  const record = objectRecord(value);
-  const eventRecord = objectRecord(record.event);
-  return {
-    type: 'app_event',
-    ...(typeof record.event_id === 'string' ? { event_id: record.event_id } : {}),
-    event: {
-      type: isAppEventType(eventRecord.type) ? eventRecord.type : 'error',
-      payload: objectRecord(eventRecord.payload)
-    }
-  };
-}
-
 export function normalizeBrowserServerMessage(value: unknown): BrowserServerMessage {
   const record = objectRecord(value);
   if (record.type === 'session_snapshot') {
@@ -194,7 +185,20 @@ export function normalizeBrowserServerMessage(value: unknown): BrowserServerMess
       message: typeof record.message === 'string' ? record.message : 'Unknown browser event error.'
     };
   }
-  return normalizeBrowserEventEnvelope(value);
+  throw new Error(`Unsupported browser server message type: ${String(record.type ?? 'unknown')}`);
+}
+
+export function normalizeBrowserEventEnvelope(value: unknown): BrowserEventEnvelope {
+  const record = objectRecord(value);
+  const eventRecord = objectRecord(record.event);
+  return {
+    type: 'app_event',
+    ...(typeof record.event_id === 'string' ? { event_id: record.event_id } : {}),
+    event: {
+      type: isAppEventType(eventRecord.type) ? eventRecord.type : 'error',
+      payload: objectRecord(eventRecord.payload)
+    }
+  };
 }
 
 export function normalizeBrowserSessionSnapshot(value: unknown): BrowserSessionSnapshot {
@@ -220,6 +224,7 @@ export function normalizeSessionSnapshot(value: unknown): SessionSnapshot {
     turns: normalizeRecord(record.turns, normalizeTurnState),
     items: normalizeRecord(record.items, normalizeItemState),
     approvals: normalizeRecord(record.approvals, normalizeApprovalRequest),
+    questions: normalizeRecord(record.questions, normalizeQuestionState),
     plans: normalizeRecord(record.plans, normalizePlanState),
     diffs: normalizeRecord(record.diffs, normalizeDiffState),
     artifacts: normalizeRecord(record.artifacts, normalizeArtifactState),
@@ -289,6 +294,9 @@ function normalizeUniversalEventKind(value: unknown): UniversalEventKind {
       };
     case 'approval.requested':
       return { type, data: { approval: normalizeApprovalRequest(data.approval) } };
+    case 'question.requested':
+    case 'question.answered':
+      return { type, data: { question: normalizeQuestionState(data.question) } };
     case 'plan.updated':
       return { type, data: { plan: normalizePlanState(data.plan) } };
     case 'diff.updated':
@@ -342,7 +350,27 @@ function normalizeItemState(value: unknown): ItemState {
     role: stringOr(record.role, 'system') as ItemRole,
     status: stringOr(record.status, 'created') as ItemStatus,
     content: arrayValue(record.content).map(normalizeContentBlock),
+    tool: normalizeToolProjection(record.tool),
     native: normalizeNativeRef(record.native)
+  };
+}
+
+function normalizeToolProjection(value: unknown): ItemState['tool'] {
+  const record = objectRecord(value);
+  if (Object.keys(record).length === 0) {
+    return null;
+  }
+  return {
+    kind: stringOr(record.kind, 'tool'),
+    name: stringOr(record.name, ''),
+    title: stringOr(record.title, stringOr(record.name, 'Tool')),
+    status: stringOr(record.status, 'created') as ItemState['status'],
+    detail: typeof record.detail === 'string' ? record.detail : null,
+    input_summary: typeof record.input_summary === 'string' ? record.input_summary : null,
+    output_summary: typeof record.output_summary === 'string' ? record.output_summary : null,
+    command: objectOrNull(record.command) as NonNullable<ItemState['tool']>['command'],
+    subagent: objectOrNull(record.subagent) as NonNullable<ItemState['tool']>['subagent'],
+    mcp: objectOrNull(record.mcp) as NonNullable<ItemState['tool']>['mcp']
   };
 }
 
@@ -393,6 +421,55 @@ function normalizeApprovalOption(value: unknown): ApprovalOption {
     description: typeof record.description === 'string' ? record.description : null,
     scope: typeof record.scope === 'string' ? record.scope : null,
     native_option_id: typeof record.native_option_id === 'string' ? record.native_option_id : null
+  };
+}
+
+function normalizeQuestionState(value: unknown): QuestionState {
+  const record = objectRecord(value);
+  return {
+    question_id: stringOr(record.question_id, ''),
+    session_id: stringOr(record.session_id, ''),
+    turn_id: typeof record.turn_id === 'string' ? record.turn_id : null,
+    title: stringOr(record.title, 'Input requested'),
+    description: typeof record.description === 'string' ? record.description : null,
+    fields: arrayValue(record.fields).map(normalizeQuestionField),
+    status: stringOr(record.status, 'pending') as QuestionStatus,
+    answer: normalizeQuestionAnswer(record.answer),
+    native: normalizeNativeRef(record.native),
+    requested_at: typeof record.requested_at === 'string' ? record.requested_at : null,
+    answered_at: typeof record.answered_at === 'string' ? record.answered_at : null
+  };
+}
+
+function normalizeQuestionField(value: unknown): AgentQuestionField {
+  const record = objectRecord(value);
+  return {
+    id: stringOr(record.id, ''),
+    label: stringOr(record.label, stringOr(record.id, 'Field')),
+    prompt: typeof record.prompt === 'string' ? record.prompt : null,
+    kind: stringOr(record.kind, 'text'),
+    required: record.required === true,
+    secret: record.secret === true,
+    choices: arrayValue(record.choices).map((choice) => {
+      const choiceRecord = objectRecord(choice);
+      return {
+        value: stringOr(choiceRecord.value, ''),
+        label: stringOr(choiceRecord.label, stringOr(choiceRecord.value, 'Option')),
+        description: typeof choiceRecord.description === 'string' ? choiceRecord.description : null
+      };
+    }),
+    default_answers: arrayValue(record.default_answers).filter(isString)
+  };
+}
+
+function normalizeQuestionAnswer(value: unknown): AgentQuestionAnswer | null {
+  const record = objectRecord(value);
+  if (Object.keys(record).length === 0) {
+    return null;
+  }
+  return {
+    question_id: stringOr(record.question_id, ''),
+    answers: normalizeRecord(record.answers, (answers) => arrayValue(answers).filter(isString))
   };
 }
 

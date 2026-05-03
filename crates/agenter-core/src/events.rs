@@ -4,8 +4,8 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use crate::{
     AgentProviderId, AgentQuestionAnswer, AgentTurnSettings, ApprovalId, ApprovalRequest,
     ApprovalRequestEvent, ApprovalResolvedEvent, ArtifactId, CommandId, DiffId, ItemId, PlanId,
-    QuestionAnsweredEvent, QuestionId, QuestionRequestedEvent, SessionId, SessionInfo,
-    SessionStatus, SlashCommandRequest, TurnId, TurnState, UserId, WorkspaceRef,
+    QuestionAnsweredEvent, QuestionId, QuestionRequestedEvent, QuestionState, SessionId,
+    SessionInfo, SessionStatus, SlashCommandRequest, TurnId, TurnState, UserId, WorkspaceRef,
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -463,6 +463,10 @@ pub enum UniversalEventKind {
     },
     #[serde(rename = "approval.requested")]
     ApprovalRequested { approval: Box<ApprovalRequest> },
+    #[serde(rename = "question.requested")]
+    QuestionRequested { question: Box<QuestionState> },
+    #[serde(rename = "question.answered")]
+    QuestionAnswered { question: Box<QuestionState> },
     #[serde(rename = "plan.updated")]
     PlanUpdated { plan: PlanState },
     #[serde(rename = "diff.updated")]

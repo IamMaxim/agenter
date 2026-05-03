@@ -9,21 +9,23 @@ use agenter_core::{
     ApprovalId, ApprovalKind, ApprovalOption, ApprovalRequest, ApprovalResolutionState,
     ApprovalStatus as UniversalApprovalStatus, CommandAction, CommandOutputStream, ContentBlock,
     ContentBlockKind, ItemRole, ItemState, ItemStatus, NativeRef, ProviderEvent, QuestionId,
-    RunnerId, SessionId, SessionInfo, SessionSnapshot, SessionStatus, SessionUsageContext,
-    SessionUsageSnapshot, SessionUsageWindow, TurnStatus, UniversalCommandEnvelope,
-    UniversalEventEnvelope, UniversalEventKind, UniversalEventSource, UniversalSeq, UserId,
-    WorkspaceId, WorkspaceRef,
+    QuestionState, QuestionStatus, RunnerId, SessionId, SessionInfo, SessionSnapshot,
+    SessionStatus, SessionUsageContext, SessionUsageSnapshot, SessionUsageWindow, TurnStatus,
+    UniversalCommandEnvelope, UniversalEventEnvelope, UniversalEventKind, UniversalEventSource,
+    UniversalSeq, UserId, WorkspaceId, WorkspaceRef,
 };
 use agenter_protocol::{
-    browser::{BrowserEventEnvelope, BrowserSessionSnapshot},
+    browser::BrowserSessionSnapshot,
     runner::{
         AgentUniversalEvent, DiscoveredFileChangeStatus, DiscoveredSessionHistoryItem,
         DiscoveredSessionHistoryStatus, DiscoveredSessions, DiscoveredToolStatus,
-        RunnerCapabilities, RunnerResponseOutcome, RunnerServerMessage,
+        RunnerCapabilities, RunnerOperationKind, RunnerOperationLogLevel, RunnerOperationProgress,
+        RunnerOperationStatus, RunnerOperationUpdate, RunnerResponseOutcome, RunnerServerMessage,
     },
     RequestId,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -38,6 +40,7 @@ use crate::policy::PolicyEngine;
 
 const SESSION_EVENT_CACHE_LIMIT: usize = 128;
 const UNIVERSAL_EVENT_REPLAY_LIMIT: usize = 1024;
+const REFRESH_JOB_LOG_LIMIT: usize = 200;
 pub const BROWSER_AUTH_SESSION_TTL: ChronoDuration = ChronoDuration::days(30);
 
 #[derive(Clone, Debug)]
@@ -59,6 +62,7 @@ struct AppStateInner {
         Mutex<HashMap<(RunnerId, RequestId), oneshot::Sender<RunnerResponseOutcome>>>,
     runner_command_operations: Mutex<HashMap<RequestId, RunnerCommandOperation>>,
     refresh_summaries: Mutex<HashMap<RequestId, WorkspaceSessionRefreshSummary>>,
+    refresh_jobs: Mutex<HashMap<RequestId, WorkspaceSessionRefreshJob>>,
     universal_command_idempotency: Mutex<HashMap<String, UniversalCommandIdempotencyEntry>>,
     runner_event_acks: Mutex<HashMap<RunnerId, u64>>,
     seen_runner_events: Mutex<HashSet<(RunnerId, u64)>>,
@@ -88,14 +92,14 @@ pub struct RegisteredQuestion {
 /// `approval_requested` envelope so reconnects still render cards after cache eviction.
 #[derive(Clone, Debug)]
 enum ApprovalStatus {
-    Pending(Box<BrowserEventEnvelope>),
-    Presented(Box<BrowserEventEnvelope>),
+    Pending(Box<AppEventEnvelope>),
+    Presented(Box<AppEventEnvelope>),
     Resolving {
-        request: Box<BrowserEventEnvelope>,
+        request: Box<AppEventEnvelope>,
         decision: ApprovalDecision,
     },
-    Resolved(Box<BrowserEventEnvelope>),
-    Orphaned(Box<BrowserEventEnvelope>),
+    Resolved(Box<AppEventEnvelope>),
+    Orphaned(Box<AppEventEnvelope>),
 }
 
 #[derive(Debug)]
@@ -116,10 +120,7 @@ enum RunnerCommandOperationStatus {
     TimedOut,
 }
 
-fn envelope_references_approval_id(
-    envelope: &BrowserEventEnvelope,
-    approval_id: ApprovalId,
-) -> bool {
+fn envelope_references_approval_id(envelope: &AppEventEnvelope, approval_id: ApprovalId) -> bool {
     match &envelope.event {
         AppEvent::ApprovalRequested(req) => req.approval_id == approval_id,
         AppEvent::ApprovalResolved(res) => res.approval_id == approval_id,
@@ -128,10 +129,10 @@ fn envelope_references_approval_id(
 }
 
 fn approval_request_envelope_with_state(
-    envelope: &BrowserEventEnvelope,
+    envelope: &AppEventEnvelope,
     state: ApprovalResolutionState,
     decision: Option<ApprovalDecision>,
-) -> BrowserEventEnvelope {
+) -> AppEventEnvelope {
     let mut envelope = envelope.clone();
     if let AppEvent::ApprovalRequested(request) = &mut envelope.event {
         request.resolution_state = Some(state);
@@ -180,9 +181,9 @@ fn enrich_approval_event(event: &mut AppEvent) {
 
 fn merge_pending_approval_envelopes_for_session(
     session_id: SessionId,
-    mut envelopes: Vec<BrowserEventEnvelope>,
+    mut envelopes: Vec<AppEventEnvelope>,
     registry: &Registry,
-) -> Vec<BrowserEventEnvelope> {
+) -> Vec<AppEventEnvelope> {
     for (&approval_id, approval) in &registry.approvals {
         if approval.session_id != session_id {
             continue;
@@ -221,8 +222,8 @@ fn merge_pending_approval_envelopes_for_session(
 #[derive(Clone, Debug)]
 pub enum ApprovalResolutionStart {
     Missing,
-    InProgress { envelope: Box<BrowserEventEnvelope> },
-    AlreadyResolved { envelope: Box<BrowserEventEnvelope> },
+    InProgress { envelope: Box<AppEventEnvelope> },
+    AlreadyResolved { envelope: Box<AppEventEnvelope> },
     Started,
 }
 
@@ -234,11 +235,11 @@ pub enum ApprovalResolutionLookup {
     },
     InProgress {
         session_id: SessionId,
-        envelope: Box<BrowserEventEnvelope>,
+        envelope: Box<AppEventEnvelope>,
     },
     AlreadyResolved {
         session_id: SessionId,
-        envelope: Box<BrowserEventEnvelope>,
+        envelope: Box<AppEventEnvelope>,
     },
 }
 
@@ -294,15 +295,22 @@ impl RegisteredSession {
 #[derive(Debug)]
 struct SessionEvents {
     sender: broadcast::Sender<SessionBroadcastEvent>,
-    cache: Vec<BrowserEventEnvelope>,
+    cache: Vec<AppEventEnvelope>,
     universal_cache: Vec<UniversalEventEnvelope>,
     snapshot: SessionSnapshot,
     next_seq: i64,
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct AppEventEnvelope {
+    pub event_id: Option<agenter_protocol::EventId>,
+    pub event: AppEvent,
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionBroadcastEvent {
-    pub app_event: BrowserEventEnvelope,
+    #[cfg(test)]
+    pub app_event: AppEventEnvelope,
     pub universal_event: Option<UniversalEventEnvelope>,
 }
 
@@ -351,7 +359,8 @@ pub struct UniversalCommandPersistenceError {
 
 #[derive(Debug)]
 pub struct SessionSubscription {
-    pub cached_events: Vec<BrowserEventEnvelope>,
+    #[cfg(test)]
+    pub cached_events: Vec<AppEventEnvelope>,
     pub snapshot: Option<BrowserSessionSnapshot>,
     pub receiver: broadcast::Receiver<SessionBroadcastEvent>,
 }
@@ -396,6 +405,55 @@ pub struct WorkspaceSessionRefreshSummary {
     pub skipped_failed_count: usize,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSessionRefreshStatus {
+    Queued,
+    Sent,
+    Accepted,
+    Discovering,
+    ReadingHistory,
+    SendingResults,
+    Importing,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkspaceSessionRefreshLogEntry {
+    pub ts: DateTime<Utc>,
+    pub level: WorkspaceSessionRefreshLogLevel,
+    pub status: WorkspaceSessionRefreshStatus,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<RunnerOperationProgress>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSessionRefreshLogLevel {
+    Debug,
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkspaceSessionRefreshJob {
+    pub refresh_id: RequestId,
+    pub status: WorkspaceSessionRefreshStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<RunnerOperationProgress>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log: Vec<WorkspaceSessionRefreshLogEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<WorkspaceSessionRefreshSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
 impl AppState {
     #[must_use]
     pub fn new(runner_token: String, cookie_security: CookieSecurity) -> Self {
@@ -412,6 +470,7 @@ impl AppState {
                 pending_runner_responses: Mutex::new(HashMap::new()),
                 runner_command_operations: Mutex::new(HashMap::new()),
                 refresh_summaries: Mutex::new(HashMap::new()),
+                refresh_jobs: Mutex::new(HashMap::new()),
                 universal_command_idempotency: Mutex::new(HashMap::new()),
                 runner_event_acks: Mutex::new(HashMap::new()),
                 seen_runner_events: Mutex::new(HashSet::new()),
@@ -447,6 +506,7 @@ impl AppState {
                 pending_runner_responses: Mutex::new(HashMap::new()),
                 runner_command_operations: Mutex::new(HashMap::new()),
                 refresh_summaries: Mutex::new(HashMap::new()),
+                refresh_jobs: Mutex::new(HashMap::new()),
                 universal_command_idempotency: Mutex::new(HashMap::new()),
                 runner_event_acks: Mutex::new(HashMap::new()),
                 seen_runner_events: Mutex::new(HashSet::new()),
@@ -494,6 +554,7 @@ impl AppState {
                 pending_runner_responses: Mutex::new(HashMap::new()),
                 runner_command_operations: Mutex::new(HashMap::new()),
                 refresh_summaries: Mutex::new(HashMap::new()),
+                refresh_jobs: Mutex::new(HashMap::new()),
                 universal_command_idempotency: Mutex::new(HashMap::new()),
                 runner_event_acks: Mutex::new(HashMap::new()),
                 seen_runner_events: Mutex::new(HashSet::new()),
@@ -516,6 +577,7 @@ impl AppState {
                 pending_runner_responses: Mutex::new(HashMap::new()),
                 runner_command_operations: Mutex::new(HashMap::new()),
                 refresh_summaries: Mutex::new(HashMap::new()),
+                refresh_jobs: Mutex::new(HashMap::new()),
                 universal_command_idempotency: Mutex::new(HashMap::new()),
                 runner_event_acks: Mutex::new(HashMap::new()),
                 seen_runner_events: Mutex::new(HashSet::new()),
@@ -879,6 +941,80 @@ impl AppState {
         receiver
     }
 
+    pub async fn start_workspace_session_refresh(
+        &self,
+        runner_id: RunnerId,
+        request_id: RequestId,
+        message: RunnerServerMessage,
+        wait_for: Duration,
+    ) -> Result<(), RunnerCommandWaitError> {
+        if !self
+            .inner
+            .runner_connections
+            .lock()
+            .await
+            .contains_key(&runner_id)
+        {
+            return Err(RunnerCommandWaitError::NotConnected);
+        }
+        self.upsert_refresh_job(
+            request_id.clone(),
+            WorkspaceSessionRefreshStatus::Queued,
+            None,
+            None,
+        )
+        .await;
+        let receiver = self
+            .start_runner_command_operation(runner_id, request_id.clone(), message, wait_for)
+            .await;
+        let state = self.clone();
+        tokio::spawn(async move {
+            match receiver.await {
+                Ok(Ok(RunnerResponseOutcome::Ok { .. })) => {
+                    state
+                        .upsert_refresh_job(
+                            request_id,
+                            WorkspaceSessionRefreshStatus::Discovering,
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+                Ok(Ok(RunnerResponseOutcome::Error { error })) => {
+                    state
+                        .upsert_refresh_job(
+                            request_id,
+                            WorkspaceSessionRefreshStatus::Failed,
+                            None,
+                            Some(format!("{}: {}", error.code, error.message)),
+                        )
+                        .await;
+                }
+                Ok(Err(error)) => {
+                    state
+                        .upsert_refresh_job(
+                            request_id,
+                            WorkspaceSessionRefreshStatus::Failed,
+                            None,
+                            Some(format!("{error:?}")),
+                        )
+                        .await;
+                }
+                Err(_) => {
+                    state
+                        .upsert_refresh_job(
+                            request_id,
+                            WorkspaceSessionRefreshStatus::Failed,
+                            None,
+                            Some("runner command waiter closed".to_owned()),
+                        )
+                        .await;
+                }
+            }
+        });
+        Ok(())
+    }
+
     async fn run_runner_command_operation(
         &self,
         runner_id: RunnerId,
@@ -949,6 +1085,10 @@ impl AppState {
                 ?status,
                 "runner command operation status changed"
             );
+        }
+        if matches!(status, RunnerCommandOperationStatus::Delivered) {
+            self.update_refresh_job_status(request_id, WorkspaceSessionRefreshStatus::Sent)
+                .await;
         }
     }
 
@@ -1305,22 +1445,21 @@ impl AppState {
         after_seq: Option<UniversalSeq>,
         include_snapshot: bool,
     ) -> SessionSubscription {
-        let (mut cached, receiver) = {
+        let (cached, receiver) = {
             let mut sessions = self.inner.sessions.lock().await;
             let events = sessions
                 .entry(session_id)
                 .or_insert_with(SessionEvents::new);
-            let receiver = events.sender.subscribe();
-            (events.cache.clone(), receiver)
+            (events.cache.clone(), events.sender.subscribe())
         };
-        let registry = self.inner.registry.lock().await;
-        cached = merge_pending_approval_envelopes_for_session(session_id, cached, &registry);
-        drop(registry);
 
         let snapshot = self
             .session_snapshot_replay(session_id, after_seq, include_snapshot)
             .await;
+        #[cfg(not(test))]
+        let _ = cached;
         SessionSubscription {
+            #[cfg(test)]
             cached_events: cached,
             snapshot,
             receiver,
@@ -1591,39 +1730,13 @@ impl AppState {
         &self,
         user_id: UserId,
         session_id: SessionId,
-    ) -> Option<Vec<BrowserEventEnvelope>> {
+    ) -> Option<Vec<AppEventEnvelope>> {
         if !self.can_access_session(user_id, session_id).await {
             return None;
         }
 
-        let mut history = if let Some(pool) = &self.inner.db_pool {
-            agenter_db::list_event_cache(pool, session_id)
-                .await
-                .map(|events| {
-                    events
-                        .into_iter()
-                        .filter_map(|event| {
-                            serde_json::from_value::<AppEvent>(event.payload)
-                                .map(|app_event| BrowserEventEnvelope {
-                                    event_id: Some(event.event_id.to_string().into()),
-                                    event: app_event,
-                                })
-                                .map_err(|error| {
-                                    tracing::warn!(
-                                        %session_id,
-                                        event_id = %event.event_id,
-                                        %error,
-                                        "failed to decode cached app event"
-                                    );
-                                })
-                                .ok()
-                        })
-                        .collect()
-                })
-                .unwrap_or_else(|error| {
-                    tracing::warn!(%session_id, %error, "failed to load persisted session history");
-                    Vec::new()
-                })
+        let mut history = if self.inner.db_pool.is_some() {
+            Vec::new()
         } else {
             self.inner
                 .sessions
@@ -1643,7 +1756,7 @@ impl AppState {
     pub async fn pending_approval_request_envelopes(
         &self,
         session_id: SessionId,
-    ) -> Vec<BrowserEventEnvelope> {
+    ) -> Vec<AppEventEnvelope> {
         let mut to_persist = Vec::new();
         let mut registry = self.inner.registry.lock().await;
         let mut out = Vec::new();
@@ -1737,9 +1850,9 @@ impl AppState {
         &self,
         session_id: SessionId,
         mut event: AppEvent,
-    ) -> BrowserEventEnvelope {
+    ) -> AppEventEnvelope {
         enrich_approval_event(&mut event);
-        let envelope = BrowserEventEnvelope {
+        let envelope = AppEventEnvelope {
             event_id: Some(Uuid::new_v4().to_string().into()),
             event,
         };
@@ -1855,115 +1968,66 @@ impl AppState {
 
     pub async fn accept_runner_agent_event(
         &self,
-        session_id: SessionId,
-        mut event: AppEvent,
-        universal_event: Option<AgentUniversalEvent>,
-    ) -> anyhow::Result<BrowserEventEnvelope> {
-        enrich_approval_event(&mut event);
-        let envelope = BrowserEventEnvelope {
-            event_id: Some(Uuid::new_v4().to_string().into()),
-            event,
-        };
+        universal_event: AgentUniversalEvent,
+    ) -> anyhow::Result<UniversalEventEnvelope> {
+        let session_id = universal_event.session_id;
         let stored = self
-            .store_event_with_universal_acceptance(session_id, envelope, universal_event, true)
+            .store_universal_event_with_acceptance(session_id, universal_event, true)
             .await?;
-        self.apply_accepted_app_event(session_id, &stored).await;
+        self.apply_accepted_universal_event(&stored).await;
         Ok(stored)
     }
 
-    async fn apply_accepted_app_event(
-        &self,
-        session_id: SessionId,
-        envelope: &BrowserEventEnvelope,
-    ) {
-        let mut orphan_session = None;
+    async fn apply_accepted_universal_event(&self, envelope: &UniversalEventEnvelope) {
         match &envelope.event {
-            AppEvent::ApprovalRequested(request) => {
+            UniversalEventKind::ApprovalRequested { approval } => {
                 self.inner.registry.lock().await.approvals.insert(
-                    request.approval_id,
+                    approval.approval_id,
                     RegisteredApproval {
-                        session_id,
-                        status: ApprovalStatus::Pending(Box::new(envelope.clone())),
+                        session_id: envelope.session_id,
+                        status: ApprovalStatus::Pending(Box::new(AppEventEnvelope {
+                            event_id: Some(envelope.event_id.clone().into()),
+                            event: AppEvent::ApprovalRequested(
+                                legacy_approval_request_event_from_universal(approval),
+                            ),
+                        })),
                     },
                 );
             }
-            AppEvent::ApprovalResolved(resolved) => {
-                let mut registry = self.inner.registry.lock().await;
-                match registry.approvals.get_mut(&resolved.approval_id) {
-                    Some(approval) => match &approval.status {
-                        ApprovalStatus::Resolved(_) => {}
-                        ApprovalStatus::Pending(_)
-                        | ApprovalStatus::Presented(_)
-                        | ApprovalStatus::Resolving { .. } => {
-                            approval.status = ApprovalStatus::Resolved(Box::new(envelope.clone()));
-                        }
-                        ApprovalStatus::Orphaned(_) => {}
-                    },
-                    None => {
-                        registry.approvals.insert(
-                            resolved.approval_id,
-                            RegisteredApproval {
-                                session_id,
-                                status: ApprovalStatus::Resolved(Box::new(envelope.clone())),
-                            },
-                        );
-                    }
-                }
-            }
-            AppEvent::QuestionRequested(request) => {
+            UniversalEventKind::QuestionRequested { question } => {
                 self.inner.registry.lock().await.questions.insert(
-                    request.question_id,
+                    question.question_id,
                     RegisteredQuestion {
-                        session_id,
+                        session_id: envelope.session_id,
                         resolved: false,
                     },
                 );
             }
-            AppEvent::QuestionAnswered(answered) => {
+            UniversalEventKind::QuestionAnswered { question } => {
                 let mut registry = self.inner.registry.lock().await;
-                if let Some(question) = registry.questions.get_mut(&answered.question_id) {
-                    question.resolved = true;
+                if let Some(registered) = registry.questions.get_mut(&question.question_id) {
+                    registered.resolved = true;
                 }
             }
-            AppEvent::SessionStatusChanged(status) => {
-                self.apply_session_status(status.session_id, status.status.clone())
+            UniversalEventKind::SessionCreated { session } => {
+                self.apply_session_status(session.session_id, session.status.clone())
                     .await;
-                if session_status_orphans_approvals(&status.status) {
-                    orphan_session = Some(status.session_id);
-                }
             }
-            AppEvent::ProviderEvent(provider_event)
-            | AppEvent::TurnDiffUpdated(provider_event)
-            | AppEvent::ItemReasoning(provider_event)
-            | AppEvent::ServerRequestResolved(provider_event)
-            | AppEvent::McpToolCallProgress(provider_event)
-            | AppEvent::ThreadRealtimeEvent(provider_event) => {
-                if let Some(usage) = self
-                    .apply_provider_usage_event(session_id, provider_event)
-                    .await
-                {
-                    if let Some(pool) = &self.inner.db_pool {
-                        if let Err(error) =
-                            agenter_db::update_session_usage_snapshot(pool, session_id, &usage)
-                                .await
-                        {
-                            tracing::warn!(
-                                %session_id,
-                                %error,
-                                "failed to persist session usage snapshot"
-                            );
-                        }
+            UniversalEventKind::UsageUpdated { usage } => {
+                if let Some(pool) = &self.inner.db_pool {
+                    if let Err(error) =
+                        agenter_db::update_session_usage_snapshot(pool, envelope.session_id, usage)
+                            .await
+                    {
+                        tracing::warn!(
+                            session_id = %envelope.session_id,
+                            %error,
+                            "failed to persist session usage snapshot"
+                        );
                     }
                 }
             }
             _ => {}
-        }
-        if let Some(session_id) = orphan_session {
-            self.orphan_pending_approvals_for_session(
-                session_id,
-                "runner reported native session ownership ended",
-            )
-            .await;
         }
     }
 
@@ -2113,8 +2177,8 @@ impl AppState {
         approval_id: ApprovalId,
         session_id: SessionId,
         event: AppEvent,
-    ) -> Option<BrowserEventEnvelope> {
-        let envelope = BrowserEventEnvelope {
+    ) -> Option<AppEventEnvelope> {
+        let envelope = AppEventEnvelope {
             event_id: Some(Uuid::new_v4().to_string().into()),
             event,
         };
@@ -2154,7 +2218,7 @@ impl AppState {
         &self,
         session_id: SessionId,
         answer: AgentQuestionAnswer,
-    ) -> BrowserEventEnvelope {
+    ) -> AppEventEnvelope {
         let event = AppEvent::QuestionAnswered(agenter_core::QuestionAnsweredEvent {
             session_id,
             question_id: answer.question_id,
@@ -2201,13 +2265,13 @@ impl AppState {
     async fn store_event(
         &self,
         session_id: SessionId,
-        envelope: BrowserEventEnvelope,
-    ) -> BrowserEventEnvelope {
+        envelope: AppEventEnvelope,
+    ) -> AppEventEnvelope {
         self.store_event_with_acceptance(session_id, envelope, false)
             .await
             .unwrap_or_else(|error| {
                 tracing::warn!(%session_id, %error, "event storage failed");
-                BrowserEventEnvelope {
+                AppEventEnvelope {
                     event_id: Some(Uuid::new_v4().to_string().into()),
                     event: AppEvent::Error(agenter_core::AgentErrorEvent {
                         session_id: Some(session_id),
@@ -2222,20 +2286,101 @@ impl AppState {
     async fn store_event_with_acceptance(
         &self,
         session_id: SessionId,
-        envelope: BrowserEventEnvelope,
+        envelope: AppEventEnvelope,
         strict_db: bool,
-    ) -> anyhow::Result<BrowserEventEnvelope> {
+    ) -> anyhow::Result<AppEventEnvelope> {
         self.store_event_with_universal_acceptance(session_id, envelope, None, strict_db)
             .await
+    }
+
+    async fn store_universal_event_with_acceptance(
+        &self,
+        session_id: SessionId,
+        universal_event: AgentUniversalEvent,
+        strict_db: bool,
+    ) -> anyhow::Result<UniversalEventEnvelope> {
+        let fallback_event_id = universal_event
+            .event_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let mut envelope =
+            runner_universal_event_envelope(session_id, &fallback_event_id, &universal_event);
+        if let Some(pool) = &self.inner.db_pool {
+            if let Some(workspace_id) = self.workspace_id_for_session(session_id).await {
+                match agenter_db::append_universal_event_reducing_snapshot(
+                    pool,
+                    workspace_id,
+                    envelope.clone(),
+                    None,
+                    apply_universal_event_to_snapshot,
+                )
+                .await
+                {
+                    Ok(outcome) => {
+                        envelope = outcome.event.envelope();
+                    }
+                    Err(error) => {
+                        if strict_db {
+                            return Err(anyhow::anyhow!(
+                                "failed to durably append universal runner event: {error}"
+                            ));
+                        }
+                        tracing::warn!(%session_id, %error, "failed to persist universal runner event");
+                    }
+                }
+            } else if strict_db {
+                return Err(anyhow::anyhow!(
+                    "failed to durably append universal runner event without a registered workspace"
+                ));
+            }
+        }
+
+        let sender = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let events = sessions
+                .entry(session_id)
+                .or_insert_with(SessionEvents::new);
+            if envelope.seq == UniversalSeq::zero() {
+                events.next_seq += 1;
+                envelope.seq = UniversalSeq::new(events.next_seq);
+            }
+            apply_universal_event_to_snapshot(&mut events.snapshot, &envelope);
+            events.universal_cache.push(envelope.clone());
+            if events.universal_cache.len() > UNIVERSAL_EVENT_REPLAY_LIMIT {
+                let overflow = events.universal_cache.len() - UNIVERSAL_EVENT_REPLAY_LIMIT;
+                events.universal_cache.drain(..overflow);
+            }
+            events.sender.clone()
+        };
+
+        let _ = sender.send(SessionBroadcastEvent {
+            #[cfg(test)]
+            app_event: AppEventEnvelope {
+                event_id: Some(envelope.event_id.clone().into()),
+                event: AppEvent::ProviderEvent(ProviderEvent {
+                    session_id,
+                    provider_id: AgentProviderId::from("universal"),
+                    event_id: Some(envelope.event_id.clone()),
+                    category: "universal".to_owned(),
+                    method: "universal_event".to_owned(),
+                    title: "Universal event".to_owned(),
+                    detail: None,
+                    status: None,
+                    provider_payload: None,
+                }),
+            },
+            universal_event: Some(envelope.clone()),
+        });
+        Ok(envelope)
     }
 
     async fn store_event_with_universal_acceptance(
         &self,
         session_id: SessionId,
-        mut envelope: BrowserEventEnvelope,
+        mut envelope: AppEventEnvelope,
         universal_event: Option<AgentUniversalEvent>,
         strict_db: bool,
-    ) -> anyhow::Result<BrowserEventEnvelope> {
+    ) -> anyhow::Result<AppEventEnvelope> {
         let mut broadcast_universal_event = None;
         if let Some(pool) = &self.inner.db_pool {
             if let Some(workspace_id) = self.workspace_id_for_session(session_id).await {
@@ -2257,17 +2402,12 @@ impl AppState {
                     workspace_id,
                     universal_event,
                     None,
-                    Some(&envelope.event),
                     apply_universal_event_to_snapshot,
                 )
                 .await
                 {
                     Ok(outcome) => {
-                        if let Some(cached) = outcome.cached_event {
-                            envelope.event_id = Some(cached.event_id.to_string().into());
-                        } else {
-                            envelope.event_id = Some(outcome.event.event_id.to_string().into());
-                        }
+                        envelope.event_id = Some(outcome.event.event_id.to_string().into());
                         broadcast_universal_event = Some(outcome.event.envelope());
                     }
                     Err(error) => {
@@ -2279,22 +2419,8 @@ impl AppState {
                         tracing::warn!(
                             %session_id,
                             %error,
-                            "failed to persist universal app event; falling back to legacy event cache"
+                            "failed to persist universal app event; continuing with in-memory universal broadcast"
                         );
-                        match agenter_db::append_event_cache(pool, session_id, &envelope.event)
-                            .await
-                        {
-                            Ok(cached) => {
-                                envelope.event_id = Some(cached.event_id.to_string().into());
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    %session_id,
-                                    %error,
-                                    "failed to persist app event cache row"
-                                );
-                            }
-                        }
                     }
                 }
             } else {
@@ -2305,16 +2431,8 @@ impl AppState {
                 }
                 tracing::warn!(
                     %session_id,
-                    "failed to persist universal app event without a registered workspace"
+                    "failed to persist universal app event without a registered workspace; continuing with in-memory universal broadcast"
                 );
-                match agenter_db::append_event_cache(pool, session_id, &envelope.event).await {
-                    Ok(cached) => {
-                        envelope.event_id = Some(cached.event_id.to_string().into());
-                    }
-                    Err(error) => {
-                        tracing::warn!(%session_id, %error, "failed to persist app event cache row");
-                    }
-                }
             }
         }
         let sender = {
@@ -2355,6 +2473,7 @@ impl AppState {
         };
 
         let _ = sender.send(SessionBroadcastEvent {
+            #[cfg(test)]
             app_event: envelope.clone(),
             universal_event: broadcast_universal_event,
         });
@@ -2422,43 +2541,65 @@ impl AppState {
         for discovered_session in discovered.sessions {
             let discovered_session_updated_at =
                 discovered_session_timestamp(discovered_session.updated_at.as_deref());
-            let session = if let Some(pool) = &self.inner.db_pool {
-                match agenter_db::upsert_session_by_external_id(
+            let existing_import = if let Some(pool) = &self.inner.db_pool {
+                match agenter_db::find_imported_session_by_external_id(
                     pool,
-                    agenter_db::UpsertSessionByExternalId {
-                        owner_user_id,
-                        runner_id,
-                        workspace_id: discovered.workspace.workspace_id,
-                        provider_id: discovered.provider_id.clone(),
-                        external_session_id: &discovered_session.external_session_id,
-                        title: discovered_session.title.as_deref(),
-                        updated_at: discovered_session_updated_at,
-                    },
+                    runner_id,
+                    discovered.workspace.workspace_id,
+                    &discovered.provider_id,
+                    &discovered_session.external_session_id,
                 )
                 .await
                 {
-                    Ok(session) => RegisteredSession {
-                        session_id: session.session_id,
-                        owner_user_id: session.owner_user_id,
-                        runner_id: session.runner_id,
-                        workspace: discovered.workspace.clone(),
-                        provider_id: session.provider_id,
-                        status: session.status,
-                        title: session.title,
-                        external_session_id: session.external_session_id,
-                        turn_settings: session.turn_settings,
-                        usage: session.usage_snapshot,
-                        created_at: session.created_at,
-                        updated_at: session.updated_at,
-                    },
+                    Ok(existing) => existing,
                     Err(error) => {
                         tracing::warn!(
                             %runner_id,
                             external_session_id = %discovered_session.external_session_id,
                             %error,
-                            "failed to persist discovered session"
+                            "failed to load existing discovered session"
                         );
-                        continue;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let session = if let Some(pool) = &self.inner.db_pool {
+                let can_reuse_existing = existing_import.as_ref().is_some_and(|existing| {
+                    discovered_session.title.as_deref() == existing.session.title.as_deref()
+                        && discovered_session_updated_at
+                            .map(|updated_at| updated_at == existing.session.updated_at)
+                            .unwrap_or(true)
+                });
+                if can_reuse_existing {
+                    let existing = existing_import.as_ref().expect("checked existing session");
+                    registered_session_from_db(&existing.session, &discovered.workspace)
+                } else {
+                    match agenter_db::upsert_session_by_external_id(
+                        pool,
+                        agenter_db::UpsertSessionByExternalId {
+                            owner_user_id,
+                            runner_id,
+                            workspace_id: discovered.workspace.workspace_id,
+                            provider_id: discovered.provider_id.clone(),
+                            external_session_id: &discovered_session.external_session_id,
+                            title: discovered_session.title.as_deref(),
+                            updated_at: discovered_session_updated_at,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(session) => registered_session_from_db(&session, &discovered.workspace),
+                        Err(error) => {
+                            tracing::warn!(
+                                %runner_id,
+                                external_session_id = %discovered_session.external_session_id,
+                                %error,
+                                "failed to persist discovered session"
+                            );
+                            continue;
+                        }
                     }
                 }
             } else {
@@ -2513,20 +2654,76 @@ impl AppState {
                 DiscoveredSessionHistoryStatus::Loaded
             );
             if !history_loaded {
-                summary.skipped_failed_count += 1;
+                if matches!(
+                    discovered_session.history_status,
+                    DiscoveredSessionHistoryStatus::Failed { .. }
+                ) {
+                    summary.skipped_failed_count += 1;
+                }
                 continue;
             }
             if !discovered_events.is_empty() || matches!(mode, SessionImportMode::Forced) {
+                let history_fingerprint = discovered_history_fingerprint(
+                    &discovered_session.history_status,
+                    &discovered_session.history,
+                );
+                if existing_import.as_ref().is_some_and(|existing| {
+                    existing.imported_history_fingerprint == history_fingerprint
+                }) {
+                    continue;
+                }
                 if matches!(mode, SessionImportMode::Forced) {
                     if let Some(pool) = &self.inner.db_pool {
-                        if let Err(error) =
-                            agenter_db::clear_session_event_projection(pool, session.session_id)
-                                .await
+                        let envelopes = discovered_events
+                            .iter()
+                            .map(|event| {
+                                let event_id = Uuid::new_v4().to_string();
+                                compatibility_universal_event(session.session_id, event_id, event)
+                            })
+                            .collect::<Vec<_>>();
+                        match agenter_db::replace_session_event_projection(
+                            pool,
+                            discovered.workspace.workspace_id,
+                            session.session_id,
+                            &envelopes,
+                        )
+                        .await
                         {
-                            tracing::warn!(%session.session_id, %error, "failed to clear discovered session event projection");
+                            Ok(inserted) => {
+                                let mut snapshot = SessionSnapshot {
+                                    session_id: session.session_id,
+                                    ..SessionSnapshot::default()
+                                };
+                                for event in &inserted {
+                                    let envelope = event.envelope();
+                                    apply_universal_event_to_snapshot(&mut snapshot, &envelope);
+                                    snapshot.latest_seq = Some(envelope.seq);
+                                }
+                                if let Err(error) =
+                                    agenter_db::store_session_snapshot(pool, &snapshot).await
+                                {
+                                    tracing::warn!(%session.session_id, %error, "failed to store imported session snapshot");
+                                }
+                                if let Err(error) =
+                                    agenter_db::update_session_imported_history_fingerprint(
+                                        pool,
+                                        session.session_id,
+                                        history_fingerprint.as_deref(),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(%session.session_id, %error, "failed to store imported history fingerprint");
+                                }
+                                summary.refreshed_cache_count += 1;
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%session.session_id, %error, "failed to replace discovered session event projection");
+                                summary.skipped_failed_count += 1;
+                                continue;
+                            }
                         }
-                    }
-                    {
+                    } else {
                         let mut sessions = self.inner.sessions.lock().await;
                         sessions
                             .entry(session.session_id)
@@ -2547,7 +2744,7 @@ impl AppState {
                 for event in discovered_events {
                     self.store_event(
                         session.session_id,
-                        BrowserEventEnvelope {
+                        AppEventEnvelope {
                             event_id: Some(Uuid::new_v4().to_string().into()),
                             event,
                         },
@@ -2571,12 +2768,29 @@ impl AppState {
         } else {
             SessionImportMode::Automatic
         };
+        if let Some(request_id) = &request_id {
+            self.update_refresh_job_status(request_id, WorkspaceSessionRefreshStatus::Importing)
+                .await;
+        }
         let summary = self
             .import_discovered_sessions(runner_id, discovered, mode)
             .await;
         if let Some(request_id) = request_id {
-            self.record_refresh_summary(request_id, summary.clone())
+            self.record_refresh_summary(request_id.clone(), summary.clone())
                 .await;
+            let accepted = !db_backed || summary.skipped_failed_count == 0;
+            self.upsert_refresh_job(
+                request_id,
+                if accepted {
+                    WorkspaceSessionRefreshStatus::Succeeded
+                } else {
+                    WorkspaceSessionRefreshStatus::Failed
+                },
+                Some(summary.clone()),
+                (!accepted)
+                    .then(|| "discovered session import did not complete successfully".to_owned()),
+            )
+            .await;
         }
         !db_backed || summary.skipped_failed_count == 0
     }
@@ -2593,6 +2807,113 @@ impl AppState {
             .insert(request_id, summary);
     }
 
+    async fn upsert_refresh_job(
+        &self,
+        request_id: RequestId,
+        status: WorkspaceSessionRefreshStatus,
+        summary: Option<WorkspaceSessionRefreshSummary>,
+        error: Option<String>,
+    ) {
+        self.inner.refresh_jobs.lock().await.insert(
+            request_id.clone(),
+            WorkspaceSessionRefreshJob {
+                refresh_id: request_id,
+                status,
+                progress: None,
+                log: Vec::new(),
+                summary,
+                error,
+                updated_at: Utc::now(),
+            },
+        );
+    }
+
+    async fn update_refresh_job_status(
+        &self,
+        request_id: &RequestId,
+        status: WorkspaceSessionRefreshStatus,
+    ) {
+        if let Some(job) = self.inner.refresh_jobs.lock().await.get_mut(request_id) {
+            if matches!(
+                job.status,
+                WorkspaceSessionRefreshStatus::Succeeded | WorkspaceSessionRefreshStatus::Failed
+            ) {
+                return;
+            }
+            job.status = status;
+            job.updated_at = Utc::now();
+        }
+    }
+
+    pub async fn record_refresh_operation_update(&self, update: RunnerOperationUpdate) {
+        if update.kind != RunnerOperationKind::SessionRefresh {
+            return;
+        }
+        let mut jobs = self.inner.refresh_jobs.lock().await;
+        let Some(job) = jobs.get_mut(&update.operation_id) else {
+            return;
+        };
+        if matches!(
+            job.status,
+            WorkspaceSessionRefreshStatus::Succeeded
+                | WorkspaceSessionRefreshStatus::Failed
+                | WorkspaceSessionRefreshStatus::Cancelled
+        ) && !matches!(
+            update.status,
+            RunnerOperationStatus::Succeeded
+                | RunnerOperationStatus::Failed
+                | RunnerOperationStatus::Cancelled
+        ) {
+            return;
+        }
+
+        let status = workspace_refresh_status_from_runner(&update.status);
+        job.status = status.clone();
+        job.progress = update.progress.clone();
+        if matches!(status, WorkspaceSessionRefreshStatus::Failed) {
+            job.error = update.message.clone().or(Some(update.stage_label.clone()));
+        }
+        let message = update
+            .message
+            .clone()
+            .unwrap_or_else(|| update.stage_label.clone());
+        job.log.push(WorkspaceSessionRefreshLogEntry {
+            ts: update.ts.unwrap_or_else(Utc::now),
+            level: workspace_refresh_log_level_from_runner(&update.level),
+            status,
+            message,
+            progress: update.progress,
+        });
+        if job.log.len() > REFRESH_JOB_LOG_LIMIT {
+            let overflow = job.log.len() - REFRESH_JOB_LOG_LIMIT;
+            job.log.drain(..overflow);
+        }
+        job.updated_at = Utc::now();
+    }
+
+    pub async fn workspace_session_refresh_status(
+        &self,
+        request_id: &RequestId,
+    ) -> Option<WorkspaceSessionRefreshJob> {
+        self.inner
+            .refresh_jobs
+            .lock()
+            .await
+            .get(request_id)
+            .cloned()
+    }
+
+    pub async fn fail_workspace_session_refresh(&self, request_id: RequestId, error: String) {
+        self.upsert_refresh_job(
+            request_id,
+            WorkspaceSessionRefreshStatus::Failed,
+            None,
+            Some(error),
+        )
+        .await;
+    }
+
+    #[cfg(test)]
     pub async fn take_refresh_summary(
         &self,
         request_id: &RequestId,
@@ -2711,6 +3032,23 @@ pub fn apply_universal_event_to_snapshot(
                 set_active_turn(snapshot, turn_id, true);
             }
         }
+        UniversalEventKind::QuestionRequested { question }
+        | UniversalEventKind::QuestionAnswered { question } => {
+            merge_question_into_snapshot(snapshot, question);
+            if let Some(turn_id) = question.turn_id {
+                if let Some(turn) = snapshot.turns.get_mut(&turn_id) {
+                    turn.status = match &question.status {
+                        QuestionStatus::Pending => TurnStatus::WaitingForInput,
+                        QuestionStatus::Answered | QuestionStatus::Cancelled => turn.status.clone(),
+                    };
+                }
+                set_active_turn(
+                    snapshot,
+                    turn_id,
+                    question.status == QuestionStatus::Pending,
+                );
+            }
+        }
         UniversalEventKind::PlanUpdated { plan } => {
             merge_plan_into_snapshot(snapshot, envelope, plan);
         }
@@ -2765,6 +3103,32 @@ fn merge_approval_into_snapshot(snapshot: &mut SessionSnapshot, approval: &Appro
         snapshot
             .approvals
             .insert(approval.approval_id, approval.clone());
+    }
+}
+
+fn merge_question_into_snapshot(snapshot: &mut SessionSnapshot, question: &QuestionState) {
+    if let Some(existing) = snapshot.questions.get_mut(&question.question_id) {
+        existing.status = question.status.clone();
+        existing.answered_at = question.answered_at.or(existing.answered_at);
+        if question.answer.is_some() {
+            existing.answer = question.answer.clone();
+        }
+        if !question.fields.is_empty() {
+            existing.fields = question.fields.clone();
+        }
+        if question.description.is_some() {
+            existing.description = question.description.clone();
+        }
+        if question.native.is_some() {
+            existing.native = question.native.clone();
+        }
+        if question.title != "Input requested" {
+            existing.title = question.title.clone();
+        }
+    } else {
+        snapshot
+            .questions
+            .insert(question.question_id, question.clone());
     }
 }
 
@@ -3321,6 +3685,35 @@ fn string_at_value<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a str> {
         .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
 }
 
+fn legacy_approval_request_event_from_universal(
+    approval: &ApprovalRequest,
+) -> agenter_core::ApprovalRequestEvent {
+    agenter_core::ApprovalRequestEvent {
+        session_id: approval.session_id,
+        approval_id: approval.approval_id,
+        kind: approval.kind.clone(),
+        title: approval.title.clone(),
+        details: approval.details.clone(),
+        expires_at: None,
+        presentation: None,
+        resolution_state: Some(match approval.status {
+            UniversalApprovalStatus::Resolving => ApprovalResolutionState::Resolving,
+            _ => ApprovalResolutionState::Pending,
+        }),
+        resolving_decision: None,
+        status: Some(approval.status.clone()),
+        turn_id: approval.turn_id,
+        item_id: approval.item_id,
+        options: approval.options.clone(),
+        risk: approval.risk.clone(),
+        subject: approval.subject.clone(),
+        native_request_id: approval.native_request_id.clone(),
+        native_blocking: approval.native_blocking,
+        policy: approval.policy.clone(),
+        provider_payload: None,
+    }
+}
+
 fn legacy_approval_request(
     request: &agenter_core::ApprovalRequestEvent,
     requested_at: DateTime<Utc>,
@@ -3860,6 +4253,64 @@ fn discovered_session_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
                 .map(|seconds| seconds.round() as i64)
                 .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
         })
+}
+
+fn registered_session_from_db(
+    session: &agenter_db::models::AgentSession,
+    workspace: &WorkspaceRef,
+) -> RegisteredSession {
+    RegisteredSession {
+        session_id: session.session_id,
+        owner_user_id: session.owner_user_id,
+        runner_id: session.runner_id,
+        workspace: workspace.clone(),
+        provider_id: session.provider_id.clone(),
+        status: session.status.clone(),
+        title: session.title.clone(),
+        external_session_id: session.external_session_id.clone(),
+        turn_settings: session.turn_settings.clone(),
+        usage: session.usage_snapshot.clone(),
+        created_at: session.created_at,
+        updated_at: session.updated_at,
+    }
+}
+
+fn discovered_history_fingerprint(
+    status: &DiscoveredSessionHistoryStatus,
+    history: &[DiscoveredSessionHistoryItem],
+) -> Option<String> {
+    if !matches!(status, DiscoveredSessionHistoryStatus::Loaded) {
+        return None;
+    }
+    let value = serde_json::to_vec(history).ok()?;
+    Some(format!("{:x}", Sha256::digest(value)))
+}
+
+fn workspace_refresh_status_from_runner(
+    status: &RunnerOperationStatus,
+) -> WorkspaceSessionRefreshStatus {
+    match status {
+        RunnerOperationStatus::Queued => WorkspaceSessionRefreshStatus::Queued,
+        RunnerOperationStatus::Accepted => WorkspaceSessionRefreshStatus::Accepted,
+        RunnerOperationStatus::Discovering => WorkspaceSessionRefreshStatus::Discovering,
+        RunnerOperationStatus::ReadingHistory => WorkspaceSessionRefreshStatus::ReadingHistory,
+        RunnerOperationStatus::SendingResults => WorkspaceSessionRefreshStatus::SendingResults,
+        RunnerOperationStatus::Importing => WorkspaceSessionRefreshStatus::Importing,
+        RunnerOperationStatus::Succeeded => WorkspaceSessionRefreshStatus::Succeeded,
+        RunnerOperationStatus::Failed => WorkspaceSessionRefreshStatus::Failed,
+        RunnerOperationStatus::Cancelled => WorkspaceSessionRefreshStatus::Cancelled,
+    }
+}
+
+fn workspace_refresh_log_level_from_runner(
+    level: &RunnerOperationLogLevel,
+) -> WorkspaceSessionRefreshLogLevel {
+    match level {
+        RunnerOperationLogLevel::Debug => WorkspaceSessionRefreshLogLevel::Debug,
+        RunnerOperationLogLevel::Info => WorkspaceSessionRefreshLogLevel::Info,
+        RunnerOperationLogLevel::Warning => WorkspaceSessionRefreshLogLevel::Warning,
+        RunnerOperationLogLevel::Error => WorkspaceSessionRefreshLogLevel::Error,
+    }
 }
 
 fn integer_at(value: &Value, pointers: &[&str]) -> Option<u64> {
@@ -5946,16 +6397,18 @@ mod tests {
         let session_id = SessionId::new();
 
         let result = state
-            .accept_runner_agent_event(
+            .accept_runner_agent_event(AgentUniversalEvent {
                 session_id,
-                AppEvent::AgentMessageDelta(agenter_core::AgentMessageDeltaEvent {
-                    session_id,
-                    message_id: "msg-1".to_owned(),
-                    delta: "hello".to_owned(),
-                    provider_payload: None,
-                }),
-                None,
-            )
+                event_id: None,
+                turn_id: None,
+                item_id: None,
+                ts: None,
+                source: UniversalEventSource::Native,
+                native: None,
+                event: UniversalEventKind::NativeUnknown {
+                    summary: Some("hello".to_owned()),
+                },
+            })
             .await;
 
         assert!(result.is_err());
@@ -5976,26 +6429,18 @@ mod tests {
         };
 
         state
-            .accept_runner_agent_event(
+            .accept_runner_agent_event(AgentUniversalEvent {
                 session_id,
-                AppEvent::AgentMessageDelta(agenter_core::AgentMessageDeltaEvent {
-                    session_id,
-                    message_id: "legacy-msg-1".to_owned(),
-                    delta: "legacy text".to_owned(),
-                    provider_payload: None,
-                }),
-                Some(AgentUniversalEvent {
-                    event_id: None,
-                    turn_id: None,
-                    item_id: None,
-                    ts: None,
-                    source: UniversalEventSource::Native,
-                    native: Some(native.clone()),
-                    event: UniversalEventKind::NativeUnknown {
-                        summary: Some("codex native plan update".to_owned()),
-                    },
-                }),
-            )
+                event_id: None,
+                turn_id: None,
+                item_id: None,
+                ts: None,
+                source: UniversalEventSource::Native,
+                native: Some(native.clone()),
+                event: UniversalEventKind::NativeUnknown {
+                    summary: Some("codex native plan update".to_owned()),
+                },
+            })
             .await
             .expect("accept runner event");
 
@@ -6088,6 +6533,46 @@ mod tests {
             .await;
 
         assert!(accepted);
+    }
+
+    #[tokio::test]
+    async fn refresh_operation_update_advances_job_and_records_log() {
+        let state = AppState::new("dev-token".to_owned(), CookieSecurity::DevelopmentInsecure);
+        let request_id = RequestId::from("refresh-progress-1");
+        state
+            .upsert_refresh_job(
+                request_id.clone(),
+                WorkspaceSessionRefreshStatus::Queued,
+                None,
+                None,
+            )
+            .await;
+
+        state
+            .record_refresh_operation_update(agenter_protocol::runner::RunnerOperationUpdate {
+                operation_id: request_id.clone(),
+                kind: agenter_protocol::runner::RunnerOperationKind::SessionRefresh,
+                status: agenter_protocol::runner::RunnerOperationStatus::ReadingHistory,
+                stage_label: "Reading Codex history".to_owned(),
+                progress: Some(agenter_protocol::runner::RunnerOperationProgress {
+                    current: Some(2),
+                    total: Some(4),
+                    percent: Some(50),
+                }),
+                message: Some("Read 2 of 4 sessions".to_owned()),
+                level: agenter_protocol::runner::RunnerOperationLogLevel::Info,
+                ts: None,
+            })
+            .await;
+
+        let job = state
+            .workspace_session_refresh_status(&request_id)
+            .await
+            .expect("refresh job");
+        assert_eq!(job.status, WorkspaceSessionRefreshStatus::ReadingHistory);
+        assert_eq!(job.progress.expect("progress").percent, Some(50));
+        assert_eq!(job.log.len(), 1);
+        assert_eq!(job.log[0].message, "Read 2 of 4 sessions");
     }
 
     #[tokio::test]

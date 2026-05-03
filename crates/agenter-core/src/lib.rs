@@ -33,9 +33,9 @@ pub use session::{
     AgentQuestionAnswer, AgentQuestionChoice, AgentQuestionField, AgentReasoningEffort,
     AgentTurnSettings, ApprovalCapabilities, CapabilitySet, ContentCapabilities,
     IntegrationCapabilities, ModeCapabilities, PlanCapabilities, ProtocolCapabilities,
-    QuestionAnsweredEvent, QuestionRequestedEvent, SessionInfo, SessionSnapshot, SessionStatus,
-    SessionUsageContext, SessionUsageSnapshot, SessionUsageWindow, ToolCapabilities, TurnState,
-    TurnStatus,
+    QuestionAnsweredEvent, QuestionRequestedEvent, QuestionState, QuestionStatus, SessionInfo,
+    SessionSnapshot, SessionStatus, SessionUsageContext, SessionUsageSnapshot, SessionUsageWindow,
+    ToolCapabilities, TurnState, TurnStatus,
 };
 pub use slash_command::{
     SlashCommandArgument, SlashCommandArgumentKind, SlashCommandDangerLevel,

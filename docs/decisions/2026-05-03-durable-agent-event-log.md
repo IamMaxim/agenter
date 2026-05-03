@@ -5,7 +5,7 @@ Date: 2026-05-03
 
 ## Context
 
-Agenter already keeps a lightweight `event_cache` for UI and connector recovery, while native agent systems remain the preferred source of truth for conversation history when their sessions can be listed, loaded, or read. The universal protocol requires browser reload and reconnect behavior that can rebuild visible state from a snapshot plus missed events. It also needs clear boundaries for runner reconnects, approval recovery, and recent native-turn correlation.
+Agenter previously kept a lightweight `event_cache` for UI and connector recovery, while native agent systems remain the preferred source of truth for conversation history when their sessions can be listed, loaded, or read. The universal protocol requires browser reload and reconnect behavior that can rebuild visible state from a snapshot plus missed events. It also needs clear boundaries for runner reconnects, approval recovery, and recent native-turn correlation.
 
 The first product scope still excludes audit-grade full transcript storage. A durable browser projection log must not silently redefine the control plane as the canonical full transcript database.
 
@@ -15,7 +15,7 @@ Add an append-only `agent_events` log as the durable `uap/1` browser replay and 
 
 `seq` is global across `agent_events`, not per session. In Rust it is represented as a 64-bit integer type (`i64` for SQLx/Postgres `bigint`, or `u64` where the domain type guarantees non-negative values). On JSON wires it is serialized as a string to avoid JavaScript integer precision loss. Browser `after_seq` uses this global cursor, filtered by the subscribed session.
 
-`event_cache` remains readable and writable as a compatibility cache during migration. New code may emit both `agent_events` and `event_cache` until the browser no longer depends on the legacy event model.
+`event_cache` was a migration cache only. Once the browser and runner wires became universal-only, `agent_events` plus `session_snapshots` became the sole Agenter replay/projection contract, and migration `0008_drop_legacy_event_cache.sql` drops the legacy cache tables.
 
 Native harnesses remain canonical history where their history can be reloaded. The control-plane `agent_events` log is authoritative for Agenter's browser/reconnect projection and pending control-plane state, not an audit-grade full transcript unless a future ADR explicitly expands that scope.
 
@@ -40,7 +40,7 @@ Browser reconnect uses snapshot plus `after_seq` replay. The browser subscribes 
 
 ## Consequences
 
-Frontend reload and reconnect can become deterministic without making `event_cache` canonical.
+Frontend reload and reconnect use only universal snapshots and replay cursors.
 
 The database gains an append-only projection log and materialized snapshots. This adds storage and reducer work, but gives a clear cursor-based replay contract.
 

@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub(super) struct CreateSessionRequest {
@@ -56,6 +56,12 @@ pub(super) struct UpdateSessionSettingsRequest {
     pub(super) idempotency_key: Option<String>,
     #[serde(flatten)]
     pub(super) settings: agenter_core::AgentTurnSettings,
+}
+
+#[derive(Debug, Serialize)]
+struct RefreshAcceptedResponse {
+    refresh_id: String,
+    status: &'static str,
 }
 
 pub(super) fn router() -> Router<crate::state::AppState> {
@@ -467,7 +473,7 @@ pub(super) async fn refresh_workspace_provider_sessions(
         },
     ));
     match state
-        .send_runner_command_and_wait(
+        .start_workspace_session_refresh(
             runner_id,
             request_id.clone(),
             command,
@@ -475,24 +481,38 @@ pub(super) async fn refresh_workspace_provider_sessions(
         )
         .await
     {
-        Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok { .. }) => {
-            let summary = state
-                .take_refresh_summary(&request_id)
-                .await
-                .unwrap_or_default();
-            Json(summary).into_response()
-        }
-        Ok(agenter_protocol::runner::RunnerResponseOutcome::Error { error }) => {
-            tracing::warn!(
-                user_id = %user.user_id,
-                %workspace_id,
-                code = %error.code,
-                message = %error.message,
-                "session refresh failed in runner"
-            );
-            (StatusCode::BAD_GATEWAY, Json(error)).into_response()
-        }
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(RefreshAcceptedResponse {
+                refresh_id: request_id.to_string(),
+                status: "queued",
+            }),
+        )
+            .into_response(),
         Err(error) => super::runner_wait_error_status(error).into_response(),
+    }
+}
+
+pub(super) async fn workspace_provider_session_refresh_status(
+    State(state): State<crate::state::AppState>,
+    headers: HeaderMap,
+    Path((workspace_id, provider_id, refresh_id)): Path<(WorkspaceId, String, String)>,
+) -> Response {
+    let Some(_user) = super::authenticated_user_from_headers(&state, &headers).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let provider_id = agenter_core::AgentProviderId::from(provider_id);
+    if state
+        .resolve_runner_workspace(workspace_id, &provider_id)
+        .await
+        .is_none()
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let request_id = agenter_protocol::RequestId::from(refresh_id);
+    match state.workspace_session_refresh_status(&request_id).await {
+        Some(status) => Json(status).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 

@@ -14,7 +14,6 @@
     getSessionAgentOptions,
     getSessionSettings,
     getSession,
-    getSessionHistory,
     listSlashCommands,
     renameSession,
     executeSlashCommand,
@@ -43,7 +42,6 @@
   } from '../lib/normalizers';
   import { pushToast } from '../lib/toasts';
   import {
-    applyChatEnvelope,
     approvalUiButtonLabel,
     approvalUiChoices,
     createChatState,
@@ -79,12 +77,12 @@
   let socket: BrowserEventSocket | undefined;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let closedByRoute = false;
+  let suppressNextReconnect = false;
   let mounted = false;
   let activeSessionId = '';
   let connectionGeneration = 0;
   let chatState: ChatState = createChatState();
   let universalState: UniversalClientState = createUniversalClientState();
-  let forceLegacyStream = false;
   let session: SessionInfo | undefined;
   let connectionState = 'Connecting';
   let draft = '';
@@ -191,7 +189,6 @@
   $: emitSessionMeta();
   $: if (mounted && sessionId !== activeSessionId) {
     universalState = createUniversalClientState();
-    forceLegacyStream = false;
     activeSessionId = sessionId;
     void reloadAndConnect();
   }
@@ -217,8 +214,7 @@
 
   async function reloadAndConnect() {
     const generation = ++connectionGeneration;
-    const useUniversalStream = !forceLegacyStream;
-    const replayCursor = useUniversalStream ? universalState.latestSeq : undefined;
+    const replayCursor = universalState.latestSeq;
     openComposerMenu = null;
     socket?.close();
     if (reconnectTimer) {
@@ -245,24 +241,7 @@
       titleDraft = session.title ?? '';
       void loadAgentSettings(generation);
       void loadSlashCommands(generation);
-      const history = await getSessionHistory(sessionId);
-      if (generation !== connectionGeneration) {
-        return;
-      }
-      let nextState = createChatState();
-      for (const envelope of history) {
-        try {
-          nextState = applyChatEnvelope(nextState, envelope);
-        } catch {
-          pushToast({ severity: 'warning', message: 'Skipped a malformed history event.' });
-        }
-      }
-      chatState = nextState;
-      universalState = {
-        ...createUniversalClientState(),
-        chat: nextState,
-        latestSeq: replayCursor
-      };
+      universalState = { ...createUniversalClientState(), latestSeq: replayCursor };
       await tick();
       scrollEventStreamToBottom();
     } catch {
@@ -276,8 +255,8 @@
 
     connectionState = 'Connecting';
     socket = connectSessionEvents(sessionId, {
-      afterSeq: useUniversalStream ? universalState.latestSeq : undefined,
-      includeSnapshot: useUniversalStream
+      afterSeq: universalState.latestSeq,
+      includeSnapshot: true
     }, {
       onOpen: () => {
         if (generation !== connectionGeneration) {
@@ -290,13 +269,14 @@
         if (generation !== connectionGeneration) {
           return;
         }
-        if (message.type === 'app_event' || message.type === 'session_snapshot' || message.type === 'universal_event') {
+        if (message.type === 'session_snapshot' || message.type === 'universal_event') {
           try {
             universalState = applyUniversalClientMessage(universalState, message);
             chatState = universalState.chat;
             if (message.type === 'session_snapshot' && message.has_more) {
-              forceLegacyStream = true;
-              connectionState = 'Falling back to legacy stream';
+              connectionState = 'Snapshot replay incomplete';
+              pushToast({ severity: 'error', message: 'Session replay is incomplete. Refresh later after the event log catches up.' });
+              suppressNextReconnect = true;
               socket?.close();
               return;
             }
@@ -309,13 +289,6 @@
                 scrollEventStreamToBottom();
               }
             });
-            if (
-              message.type === 'app_event' &&
-              message.event.type === 'provider_event' &&
-              ['token_usage', 'rate_limits'].includes(String(message.event.payload.category ?? ''))
-            ) {
-              void refreshSessionUsage(generation);
-            }
           } catch {
             pushToast({ severity: 'warning', message: 'Skipped a malformed live event.' });
           }
@@ -323,13 +296,17 @@
         if (message.type === 'error') {
           connectionState = message.message;
           if (message.code === 'snapshot_replay_incomplete') {
-            forceLegacyStream = true;
+            suppressNextReconnect = true;
             socket?.close();
           }
           pushToast({ severity: 'error', message: message.message });
         }
       },
       onClose: () => {
+        if (suppressNextReconnect) {
+          suppressNextReconnect = false;
+          return;
+        }
         if (!closedByRoute && generation === connectionGeneration) {
           connectionState = 'Reconnecting';
           reconnectTimer = setTimeout(() => void reloadAndConnect(), 900);
@@ -646,9 +623,7 @@
         decision,
         ...(optionId ? { option_id: optionId } : {})
       };
-      const envelope = await decideApproval(item.approvalId, request);
-      universalState = applyUniversalClientMessage(universalState, envelope);
-      chatState = universalState.chat;
+      await decideApproval(item.approvalId, request);
     } catch {
       decisionError = 'Could not resolve approval.';
       pushToast({ severity: 'error', message: decisionError });
@@ -674,19 +649,6 @@
       settingsError = 'Agent options are unavailable.';
       agentOptions = { models: [], collaboration_modes: [] };
       pushToast({ severity: 'warning', message: 'Agent options are unavailable. Using defaults.' });
-    }
-  }
-
-  async function refreshSessionUsage(generation = connectionGeneration) {
-    try {
-      const refreshed = await getSession(sessionId);
-      if (generation !== connectionGeneration) {
-        return;
-      }
-      session = refreshed;
-      titleDraft = session.title ?? '';
-    } catch {
-      // Usage metrics are informational; retain the last-known snapshot across transient refresh errors.
     }
   }
 
@@ -1010,9 +972,7 @@
     };
     decisionError = '';
     try {
-      const envelope = await answerQuestion(item.questionId, answers);
-      universalState = applyUniversalClientMessage(universalState, envelope);
-      chatState = universalState.chat;
+      await answerQuestion(item.questionId, answers);
     } catch {
       decisionError = 'Could not answer question.';
       pushToast({ severity: 'error', message: decisionError });

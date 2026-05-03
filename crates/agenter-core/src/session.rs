@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 
 use crate::{
     ApprovalId, ApprovalRequest, ArtifactId, ArtifactState, DiffId, DiffState, ItemId, ItemState,
-    PlanId, PlanState, QuestionId, RunnerId, SessionId, TurnId, UniversalSeq, UserId, WorkspaceId,
+    NativeRef, PlanId, PlanState, QuestionId, RunnerId, SessionId, TurnId, UniversalSeq, UserId,
+    WorkspaceId,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -388,6 +389,36 @@ pub struct AgentQuestionAnswer {
     pub answers: std::collections::BTreeMap<String, Vec<String>>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionStatus {
+    Pending,
+    Answered,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct QuestionState {
+    pub question_id: QuestionId,
+    pub session_id: SessionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<AgentQuestionField>,
+    pub status: QuestionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer: Option<AgentQuestionAnswer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct SessionSnapshot {
     pub session_id: SessionId,
@@ -403,6 +434,8 @@ pub struct SessionSnapshot {
     pub items: BTreeMap<ItemId, ItemState>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub approvals: BTreeMap<ApprovalId, ApprovalRequest>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub questions: BTreeMap<QuestionId, QuestionState>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub plans: BTreeMap<PlanId, PlanState>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -423,6 +456,7 @@ impl Default for SessionSnapshot {
             turns: BTreeMap::new(),
             items: BTreeMap::new(),
             approvals: BTreeMap::new(),
+            questions: BTreeMap::new(),
             plans: BTreeMap::new(),
             diffs: BTreeMap::new(),
             artifacts: BTreeMap::new(),

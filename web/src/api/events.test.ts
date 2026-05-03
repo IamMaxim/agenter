@@ -21,8 +21,8 @@ describe('browser websocket events', () => {
     expect(error).toHaveBeenCalledWith(expect.any(Error));
   });
 
-  test('normalizes valid websocket messages', () => {
-    expect(
+  test('rejects legacy app_event websocket messages', () => {
+    expect(() =>
       parseBrowserServerMessage(
         JSON.stringify({
           type: 'app_event',
@@ -30,13 +30,7 @@ describe('browser websocket events', () => {
           event: { type: 'error', payload: null }
         })
       )
-    ).toEqual({
-      type: 'app_event',
-      event: {
-        type: 'error',
-        payload: {}
-      }
-    });
+    ).toThrow(/Unsupported browser server message type: app_event/);
   });
 
   test('subscribes with snapshot replay cursor options', () => {

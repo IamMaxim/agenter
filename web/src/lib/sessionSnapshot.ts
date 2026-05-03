@@ -1,16 +1,17 @@
 import type {
   ApprovalRequest,
+  BrowserEventEnvelope,
   BrowserServerMessage,
   CapabilitySet,
   ContentBlock,
   DiffState,
   ItemState,
   PlanState,
+  QuestionState,
   SessionSnapshot,
   UniversalEventEnvelope
 } from '../api/types';
 import {
-  applyChatEnvelope,
   approvalChoiceFromOption,
   createChatState,
   type ChatActivity,
@@ -21,7 +22,6 @@ import { applyUniversalEvent, cloneSnapshot, compareSeq, universalEventKey } fro
 
 export interface UniversalClientState {
   chat: ChatState;
-  legacyOverlay: ChatState;
   snapshot?: SessionSnapshot;
   latestSeq?: string;
   usingUniversal: boolean;
@@ -39,7 +39,6 @@ interface RowOrder {
 export function createUniversalClientState(): UniversalClientState {
   return {
     chat: createChatState(),
-    legacyOverlay: createChatState(),
     latestSeq: undefined,
     snapshot: undefined,
     usingUniversal: false,
@@ -51,21 +50,13 @@ export function createUniversalClientState(): UniversalClientState {
 
 export function applyUniversalClientMessage(
   state: UniversalClientState,
-  message: BrowserServerMessage
+  message: BrowserServerMessage | BrowserEventEnvelope
 ): UniversalClientState {
   if (message.type === 'session_snapshot') {
     return applySessionSnapshotMessage(state, message);
   }
   if (message.type === 'universal_event') {
     return applyLiveUniversalEvent(state, message);
-  }
-  if (message.type === 'app_event') {
-    const legacyOverlay = applyChatEnvelope(state.legacyOverlay, message);
-    return {
-      ...state,
-      legacyOverlay,
-      chat: mergeChatStates(state.chat, legacyOverlay)
-    };
   }
   return state;
 }
@@ -90,6 +81,9 @@ export function materializeSnapshotChatState(
   }
   for (const approval of Object.values(snapshot.approvals)) {
     items.push(materializeApproval(approval));
+  }
+  for (const question of Object.values(snapshot.questions ?? {})) {
+    items.push(materializeQuestion(question));
   }
   for (const diff of Object.values(snapshot.diffs)) {
     items.push(materializeDiff(diff));
@@ -153,8 +147,7 @@ function applySessionSnapshotMessage(
   }
 
   return {
-    chat: mergeChatStates(materializeSnapshotChatState(snapshot, rowOrder), state.legacyOverlay),
-    legacyOverlay: state.legacyOverlay,
+    chat: materializeSnapshotChatState(snapshot, rowOrder),
     snapshot,
     latestSeq,
     usingUniversal: true,
@@ -184,8 +177,7 @@ function applyLiveUniversalEvent(
   const seenUniversalEvents = new Set(state.seenUniversalEvents);
   seenUniversalEvents.add(key);
   return {
-    chat: mergeChatStates(materializeSnapshotChatState(snapshot, rowOrder), state.legacyOverlay),
-    legacyOverlay: state.legacyOverlay,
+    chat: materializeSnapshotChatState(snapshot, rowOrder),
     snapshot,
     latestSeq: compareSeq(event.seq, state.latestSeq) > 0 ? event.seq : state.latestSeq,
     usingUniversal: true,
@@ -195,44 +187,6 @@ function applyLiveUniversalEvent(
   };
 }
 
-function mergeChatStates(base: ChatState, overlay: ChatState): ChatState {
-  const overlayById = new Map(overlay.items.map((item) => [item.id, item]));
-  const baseIds = new Set(base.items.map((item) => item.id));
-  const items = base.items.map((item) => mergeChatItem(item, overlayById.get(item.id)));
-  const overlayItems = overlay.items.filter((item) => !baseIds.has(item.id));
-  return {
-    ...base,
-    items: [...items, ...overlayItems],
-    seenEventIds: new Set([...base.seenEventIds, ...overlay.seenEventIds]),
-    activity: base.activity ?? overlay.activity,
-    latestPlanId: base.latestPlanId ?? overlay.latestPlanId,
-    planTurnComplete: base.latestPlanId ? base.planTurnComplete : overlay.planTurnComplete
-  };
-}
-
-function mergeChatItem(base: ChatItem, overlay: ChatItem | undefined): ChatItem {
-  if (!overlay) {
-    return base;
-  }
-  if (base.kind === 'approval' && overlay.kind === 'approval') {
-    return {
-      ...base,
-      ...overlay,
-      options: overlay.resolvedDecision ? [] : (overlay.options ?? base.options),
-      resolutionState: overlay.resolvedDecision ? undefined : overlay.resolutionState ?? base.resolutionState,
-      resolvingDecision: overlay.resolvedDecision ? undefined : overlay.resolvingDecision ?? base.resolvingDecision
-    };
-  }
-  if (base.kind === 'question' && overlay.kind === 'question') {
-    return {
-      ...base,
-      ...overlay,
-      fields: overlay.fields.length > 0 ? overlay.fields : base.fields
-    };
-  }
-  return overlay;
-}
-
 function emptySnapshot(sessionId: string, latestSeq?: string): SessionSnapshot {
   return {
     session_id: sessionId,
@@ -240,10 +194,32 @@ function emptySnapshot(sessionId: string, latestSeq?: string): SessionSnapshot {
     turns: {},
     items: {},
     approvals: {},
+    questions: {},
     plans: {},
     diffs: {},
     artifacts: {},
     active_turns: []
+  };
+}
+
+function materializeQuestion(question: QuestionState): Extract<ChatItem, { kind: 'question' }> {
+  return {
+    id: `question:${question.question_id}`,
+    kind: 'question',
+    questionId: question.question_id,
+    title: question.title,
+    description: question.description ?? undefined,
+    fields: question.fields.map((field) => ({
+      id: field.id,
+      label: field.label,
+      prompt: field.prompt ?? undefined,
+      kind: field.kind,
+      required: field.required,
+      secret: field.secret,
+      choices: field.choices ?? [],
+      default_answers: field.default_answers ?? []
+    })),
+    answered: question.status === 'answered'
   };
 }
 
@@ -542,6 +518,9 @@ function rowIdsForEvent(event: UniversalEventEnvelope): string[] {
       return [`agent:${event.item_id ?? event.event.data.block_id}`];
     case 'approval.requested':
       return [`approval:${event.event.data.approval.approval_id}`];
+    case 'question.requested':
+    case 'question.answered':
+      return [`question:${event.event.data.question.question_id}`];
     case 'plan.updated':
       return [`plan:${event.event.data.plan.plan_id}`];
     case 'diff.updated':

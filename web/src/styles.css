@@ -755,6 +755,157 @@ button.busy:disabled .button-spinner {
   gap: 1px;
 }
 
+.refresh-panel {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0.15rem 0.35rem 0.45rem;
+  border-left: 2px solid var(--wait);
+  padding: 0.55rem 0.6rem;
+  background: var(--surface);
+}
+
+.refresh-panel.running {
+  border-left-color: var(--run);
+}
+
+.refresh-panel.failed {
+  border-left-color: var(--danger);
+}
+
+.refresh-panel-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.15rem 0.45rem;
+  align-items: start;
+}
+
+.refresh-panel-title {
+  overflow: hidden;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.refresh-panel-state {
+  grid-column: 1;
+  overflow-wrap: anywhere;
+  color: var(--dim);
+  font-size: 0.74rem;
+  line-height: 1.25;
+}
+
+.refresh-panel-dismiss {
+  display: grid;
+  grid-row: 1 / span 2;
+  grid-column: 2;
+  width: 1.35rem;
+  min-height: 1.35rem;
+  place-items: center;
+  border: 0;
+  border-radius: 4px;
+  padding: 0;
+  color: var(--dim);
+  background: transparent;
+  line-height: 1;
+}
+
+.refresh-panel-dismiss:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+.refresh-progress {
+  position: relative;
+  overflow: hidden;
+  height: 0.28rem;
+  border-radius: 999px;
+  background: var(--line-soft);
+}
+
+.refresh-progress-bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+.refresh-panel.failed .refresh-progress-bar {
+  background: var(--danger);
+}
+
+.refresh-progress.indeterminate .refresh-progress-bar {
+  width: 36%;
+  animation: refresh-indeterminate 1.05s ease-in-out infinite;
+}
+
+.refresh-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.refresh-log-toggle {
+  width: auto;
+  min-height: 1.45rem;
+  border: 0;
+  border-radius: 4px;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.refresh-log-toggle:hover:not(:disabled) {
+  color: var(--accent);
+  background: transparent;
+}
+
+.refresh-log {
+  display: grid;
+  gap: 0.25rem;
+  max-height: 9rem;
+  margin: 0;
+  overflow: auto;
+  padding: 0;
+  list-style: none;
+}
+
+.refresh-log li {
+  display: grid;
+  grid-template-columns: 5.7rem minmax(0, 1fr);
+  gap: 0.45rem;
+  align-items: start;
+  color: var(--dim);
+  font-size: 0.72rem;
+}
+
+.refresh-log li.error {
+  color: #ff9b91;
+}
+
+.refresh-log li.warning {
+  color: var(--wait);
+}
+
+.refresh-log span {
+  overflow: hidden;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.refresh-log p {
+  overflow-wrap: anywhere;
+}
+
 .tree-session,
 .tree-empty {
   min-width: 0;
@@ -2041,6 +2192,16 @@ button.busy:disabled .button-spinner {
 
   100% {
     box-shadow: 0 0 0 0.42rem rgb(215 247 95 / 0);
+  }
+}
+
+@keyframes refresh-indeterminate {
+  0% {
+    transform: translateX(-120%);
+  }
+
+  100% {
+    transform: translateX(280%);
   }
 }
 
