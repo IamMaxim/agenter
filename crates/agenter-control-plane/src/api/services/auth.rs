@@ -4,7 +4,7 @@ use crate::{
         expired_session_cookie_with_policy, session_cookie_with_policy, session_token_from_headers,
         AuthenticatedUser,
     },
-    state::AppState,
+    state::{AppState, BROWSER_AUTH_SESSION_TTL},
 };
 use axum::{
     http::{HeaderMap, StatusCode},
@@ -34,7 +34,11 @@ impl AuthService {
             StatusCode::OK,
             [(
                 axum::http::header::SET_COOKIE,
-                session_cookie_with_policy(&token, state.cookie_security()),
+                session_cookie_with_policy(
+                    &token,
+                    state.cookie_security(),
+                    Some(BROWSER_AUTH_SESSION_TTL),
+                ),
             )],
             axum::Json(serde_json::json!({ "ok": true })),
         )
@@ -162,7 +166,11 @@ impl AuthService {
             StatusCode::OK,
             [(
                 axum::http::header::SET_COOKIE,
-                session_cookie_with_policy(&token, state.cookie_security()),
+                session_cookie_with_policy(
+                    &token,
+                    state.cookie_security(),
+                    Some(BROWSER_AUTH_SESSION_TTL),
+                ),
             )],
             axum::Json(serde_json::json!({ "ok": true })),
         )

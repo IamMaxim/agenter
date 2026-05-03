@@ -1,8 +1,10 @@
 use std::{
     collections::{HashMap, VecDeque},
-    path::PathBuf,
+    fs::{File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::agents::approval_state::PendingProviderApproval;
@@ -36,6 +38,7 @@ use tokio::{
 
 const STARTUP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const RECENT_STDERR_LINES: usize = 20;
+const DEFAULT_CODEX_RAW_LOG_DIR: &str = "tmp/agenter-logs/codex-wire";
 
 /// Shown when Codex emits `account/chatgptAuthTokens/refresh` — browser cannot authenticate the runner host.
 pub const CODEX_AUTH_REFRESH_OPERATOR_MESSAGE: &str = "Codex login or token refresh is required on the runner host (for example HTTP 401 from the Codex backend). SSH into the machine running `agenter-runner`, sign in using the Codex CLI in that environment, then retry this chat.";
@@ -112,6 +115,8 @@ pub struct CodexAppServer {
     _child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    workspace_path: PathBuf,
+    active_session_id: Option<SessionId>,
     next_id: i64,
     thread_id: Option<String>,
     turn_id: Option<String>,
@@ -120,6 +125,190 @@ pub struct CodexAppServer {
     /// Responses/notifications/read while awaiting a synchronous request; drained by `next_message`.
     interleaved_messages: VecDeque<Value>,
     initialize_capabilities: Vec<String>,
+    wire_logger: CodexWireLogger,
+}
+
+#[derive(Clone, Debug)]
+struct CodexWireLogger {
+    file: Option<Arc<Mutex<File>>>,
+}
+
+#[derive(Clone, Debug)]
+struct CodexWireLogRecord {
+    direction: &'static str,
+    classification: &'static str,
+    session_id: Option<SessionId>,
+    workspace: Option<String>,
+    runtime_thread_id: Option<String>,
+    runtime_turn_id: Option<String>,
+    reason: Option<&'static str>,
+    message: Option<Value>,
+    stderr_line: Option<String>,
+    scope: Option<CodexScopeLogContext>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CodexScopeLogContext {
+    expected_thread_id: Option<String>,
+    expected_turn_id: Option<String>,
+    actual_thread_id: Option<String>,
+    actual_turn_id: Option<String>,
+    scope_match: bool,
+    reason: Option<String>,
+}
+
+impl CodexWireLogger {
+    fn from_env(workspace_path: &Path) -> Self {
+        if !env_flag_enabled("AGENTER_CODEX_RAW_LOG") {
+            return Self::disabled();
+        }
+        match Self::open_from_env(workspace_path) {
+            Ok(logger) => logger,
+            Err(error) => {
+                tracing::warn!(%error, "failed to initialize codex raw wire log");
+                Self::disabled()
+            }
+        }
+    }
+
+    fn disabled() -> Self {
+        Self { file: None }
+    }
+
+    fn open_from_env(workspace_path: &Path) -> anyhow::Result<Self> {
+        let dir = std::env::var("AGENTER_CODEX_RAW_LOG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_CODEX_RAW_LOG_DIR));
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create codex raw log dir {}", dir.display()))?;
+        let workspace_label = raw_log_workspace_label(workspace_path);
+        let path = dir.join(format!(
+            "codex-wire-{workspace_label}-{}.jsonl",
+            std::process::id()
+        ));
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open codex raw log {}", path.display()))?;
+        tracing::info!(path = %path.display(), "codex raw wire log enabled");
+        Ok(Self {
+            file: Some(Arc::new(Mutex::new(file))),
+        })
+    }
+
+    #[cfg(test)]
+    fn for_test_file(path: PathBuf) -> Self {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("test log file should open");
+        Self {
+            file: Some(Arc::new(Mutex::new(file))),
+        }
+    }
+
+    fn record(&self, record: CodexWireLogRecord) -> anyhow::Result<()> {
+        let Some(file) = &self.file else {
+            return Ok(());
+        };
+        let mut output = json!({
+            "ts": unix_timestamp_millis(),
+            "direction": record.direction,
+            "classification": record.classification,
+        });
+        insert_optional_string(
+            &mut output,
+            "session_id",
+            record.session_id.map(|id| id.to_string()),
+        );
+        insert_optional_string(&mut output, "workspace", record.workspace);
+        insert_optional_string(&mut output, "runtime_thread_id", record.runtime_thread_id);
+        insert_optional_string(&mut output, "runtime_turn_id", record.runtime_turn_id);
+        insert_optional_string(
+            &mut output,
+            "provider_thread_id",
+            record
+                .message
+                .as_ref()
+                .and_then(message_thread_id)
+                .map(str::to_owned),
+        );
+        insert_optional_string(
+            &mut output,
+            "provider_turn_id",
+            record
+                .message
+                .as_ref()
+                .and_then(message_turn_id)
+                .map(str::to_owned),
+        );
+        insert_optional_string(
+            &mut output,
+            "jsonrpc_id",
+            record
+                .message
+                .as_ref()
+                .map(codex_jsonrpc_request_id_summary),
+        );
+        insert_optional_string(
+            &mut output,
+            "method",
+            record
+                .message
+                .as_ref()
+                .and_then(jsonrpc_method)
+                .map(str::to_owned),
+        );
+        insert_optional_string(&mut output, "reason", record.reason.map(str::to_owned));
+        if let Some(scope) = record.scope {
+            output["expected_thread_id"] = option_string_value(scope.expected_thread_id);
+            output["expected_turn_id"] = option_string_value(scope.expected_turn_id);
+            output["actual_thread_id"] = option_string_value(scope.actual_thread_id);
+            output["actual_turn_id"] = option_string_value(scope.actual_turn_id);
+            output["scope_match"] = Value::Bool(scope.scope_match);
+            output["scope_reason"] = option_string_value(scope.reason);
+        }
+        if let Some(message) = record.message {
+            output["payload"] = message;
+        }
+        if let Some(line) = record.stderr_line {
+            output["stderr"] = Value::String(line);
+        }
+
+        let encoded = serde_json::to_vec(&output)?;
+        let mut file = file
+            .lock()
+            .map_err(|_| anyhow!("codex raw wire log file lock poisoned"))?;
+        file.write_all(&encoded)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        Ok(())
+    }
+}
+
+impl CodexScopeLogContext {
+    fn from_message(message: &Value, scope: &CodexTurnScope) -> Self {
+        let expected_thread_id = scope.thread_id.clone();
+        let expected_turn_id = scope.turn_id.clone();
+        let actual_thread_id = message_thread_id(message).map(str::to_owned);
+        let actual_turn_id = message_turn_id(message).map(str::to_owned);
+        let scope_match = codex_message_belongs_to_scope(message, scope);
+        let reason = if !scope_match {
+            Some("thread_id_mismatch".to_owned())
+        } else {
+            None
+        };
+        Self {
+            expected_thread_id,
+            expected_turn_id,
+            actual_thread_id,
+            actual_turn_id,
+            scope_match,
+            reason,
+        }
+    }
 }
 
 impl CodexAppServer {
@@ -132,6 +321,7 @@ impl CodexAppServer {
         opt_out_notification_methods: Vec<String>,
     ) -> anyhow::Result<Self> {
         tracing::info!(workspace = %workspace_path.display(), "spawning codex app-server");
+        let wire_logger = CodexWireLogger::from_env(&workspace_path);
         let mut child = Command::new("codex")
             .args(["app-server", "--listen", "stdio://"])
             .current_dir(&workspace_path)
@@ -147,6 +337,8 @@ impl CodexAppServer {
         let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
         if let Some(stderr) = child.stderr.take() {
             let stderr_tail = stderr_tail.clone();
+            let stderr_wire_logger = wire_logger.clone();
+            let stderr_workspace = workspace_path.display().to_string();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -155,6 +347,20 @@ impl CodexAppServer {
                             tail.pop_front();
                         }
                         tail.push_back(line.clone());
+                    }
+                    if let Err(error) = stderr_wire_logger.record(CodexWireLogRecord {
+                        direction: "stderr",
+                        classification: "provider_stderr",
+                        session_id: None,
+                        workspace: Some(stderr_workspace.clone()),
+                        runtime_thread_id: None,
+                        runtime_turn_id: None,
+                        reason: None,
+                        message: None,
+                        stderr_line: Some(line.clone()),
+                        scope: None,
+                    }) {
+                        tracing::warn!(%error, "failed to write codex stderr wire log record");
                     }
                     tracing::warn!(target: "codex-stderr", "{line}");
                 }
@@ -165,6 +371,8 @@ impl CodexAppServer {
             _child: child,
             stdin,
             stdout: BufReader::new(stdout),
+            workspace_path,
+            active_session_id: None,
             next_id: 1,
             thread_id: None,
             turn_id: None,
@@ -172,6 +380,7 @@ impl CodexAppServer {
             stderr_tail,
             interleaved_messages: VecDeque::new(),
             initialize_capabilities: opt_out_notification_methods,
+            wire_logger,
         })
     }
 
@@ -330,6 +539,7 @@ impl CodexAppServer {
     }
 
     pub async fn send_turn(&mut self, request: &CodexTurnRequest) -> anyhow::Result<()> {
+        self.active_session_id = Some(request.session_id);
         let Some(thread_id) = &self.thread_id else {
             return Err(anyhow!(
                 "codex thread id was not observed before turn start"
@@ -357,7 +567,16 @@ impl CodexAppServer {
 
     pub async fn next_message(&mut self) -> anyhow::Result<Option<Value>> {
         let message = match self.interleaved_messages.pop_front() {
-            Some(m) => m,
+            Some(m) => {
+                self.record_wire_message(
+                    "internal",
+                    "interleaved_drained",
+                    Some("dequeued_for_turn_loop"),
+                    &m,
+                    None,
+                );
+                m
+            }
             None => match self.read_codex_stdio_json_line().await? {
                 Some(m) => {
                     Self::observe_codex_thread_turn_targets(self, &m);
@@ -389,17 +608,21 @@ impl CodexAppServer {
         tracing::info!(
             native_request_id = ?native_request_id,
             ?approval_kind,
-            ?decision,
-            "sending codex approval response"
+                ?decision,
+                "sending codex approval response"
         );
-        write_json(
-            &mut self.stdin,
-            &json!({
-                "id": native_request_id,
-                "result": approval_response_for_decision(approval_kind, decision)
-            }),
-        )
-        .await
+        let response = json!({
+            "id": native_request_id,
+            "result": approval_response_for_decision(approval_kind, decision)
+        });
+        self.record_wire_message(
+            "send",
+            "client_response_sent",
+            Some("approval_answer"),
+            &response,
+            None,
+        );
+        write_json(&mut self.stdin, &response).await
     }
 
     pub async fn send_question_response(
@@ -414,14 +637,18 @@ impl CodexAppServer {
             question_id = %answer.question_id,
             "sending codex question response"
         );
-        write_json(
-            &mut self.stdin,
-            &json!({
-                "id": native_request_id,
-                "result": question_response_for_answer(kind, answer)
-            }),
-        )
-        .await
+        let response = json!({
+            "id": native_request_id,
+            "result": question_response_for_answer(kind, answer)
+        });
+        self.record_wire_message(
+            "send",
+            "client_response_sent",
+            Some("question_answer"),
+            &response,
+            None,
+        );
+        write_json(&mut self.stdin, &response).await
     }
 
     pub async fn send_unsupported_request_response(
@@ -434,11 +661,15 @@ impl CodexAppServer {
             method,
             "rejecting unsupported codex server request"
         );
-        write_json(
-            &mut self.stdin,
-            &unsupported_request_response(native_request_id, method),
-        )
-        .await
+        let response = unsupported_request_response(native_request_id, method);
+        self.record_wire_message(
+            "send",
+            "client_response_sent",
+            Some("unsupported_request"),
+            &response,
+            None,
+        );
+        write_json(&mut self.stdin, &response).await
     }
 
     pub async fn send_jsonrpc_application_error_response(
@@ -459,6 +690,13 @@ impl CodexAppServer {
             envelope["error"]["data"] = d.clone();
         }
         tracing::warn!(%code, %message, "sending codex json-rpc application error response");
+        self.record_wire_message(
+            "send",
+            "client_response_sent",
+            Some("application_error"),
+            &envelope,
+            None,
+        );
         write_json(&mut self.stdin, &envelope).await
     }
 
@@ -480,15 +718,19 @@ impl CodexAppServer {
             .as_deref(),
             "sending codex json-rpc request"
         );
-        write_json(
-            &mut self.stdin,
-            &json!({
-                "id": request_id.as_value(),
-                "method": method,
-                "params": params
-            }),
-        )
-        .await?;
+        let request = json!({
+            "id": request_id.as_value(),
+            "method": method,
+            "params": params
+        });
+        self.record_wire_message(
+            "send",
+            "client_request_sent",
+            Some("jsonrpc_request"),
+            &request,
+            None,
+        );
+        write_json(&mut self.stdin, &request).await?;
         Ok(request_id)
     }
 
@@ -568,6 +810,13 @@ impl CodexAppServer {
                         return Ok(Some(m));
                     }
                     Self::observe_codex_thread_turn_targets(self, &m);
+                    self.record_wire_message(
+                        "internal",
+                        "interleaved_queued",
+                        Some("waiting_for_matching_response"),
+                        &m,
+                        None,
+                    );
                     self.interleaved_messages.push_back(m);
                 }
             }
@@ -581,7 +830,38 @@ impl CodexAppServer {
         }
         let message = serde_json::from_str::<Value>(line.trim())
             .with_context(|| format!("codex emitted invalid JSON-RPC line: {line}"))?;
+        self.record_wire_message(
+            "recv",
+            codex_wire_classification(&message),
+            None,
+            &message,
+            None,
+        );
         Ok(Some(message))
+    }
+
+    fn record_wire_message(
+        &self,
+        direction: &'static str,
+        classification: &'static str,
+        reason: Option<&'static str>,
+        message: &Value,
+        scope: Option<CodexScopeLogContext>,
+    ) {
+        if let Err(error) = self.wire_logger.record(CodexWireLogRecord {
+            direction,
+            classification,
+            session_id: self.active_session_id,
+            workspace: Some(self.workspace_path.display().to_string()),
+            runtime_thread_id: self.thread_id.clone(),
+            runtime_turn_id: self.turn_id.clone(),
+            reason,
+            message: Some(message.clone()),
+            stderr_line: None,
+            scope,
+        }) {
+            tracing::warn!(%error, "failed to write codex wire log record");
+        }
     }
 
     fn observe_codex_thread_turn_targets(server: &mut CodexAppServer, message: &Value) {
@@ -984,10 +1264,21 @@ pub async fn run_codex_turn_on_server(
                     %approval_id,
                     native_request_id = ?native_request_id,
                     ?approval_kind,
+                    provider_thread_id = message_thread_id(&message),
+                    provider_turn_id = message_turn_id(&message),
+                    method = jsonrpc_method(&message),
                     "codex approval request pending"
                 );
                 event_sender.send(event).ok();
                 if let Ok(answer) = receiver.await {
+                    tracing::info!(
+                        session_id = %request.session_id,
+                        %approval_id,
+                        native_request_id = ?native_request_id,
+                        ?approval_kind,
+                        decision = ?answer.decision,
+                        "delivering codex approval response"
+                    );
                     let result = server
                         .send_approval_response(native_request_id, approval_kind, answer.decision)
                         .await
@@ -1026,10 +1317,21 @@ pub async fn run_codex_turn_on_server(
                     session_id = %request.session_id,
                     %question_id,
                     ?question_kind,
+                    native_request_id = ?native_request_id,
+                    provider_thread_id = message_thread_id(&message),
+                    provider_turn_id = message_turn_id(&message),
+                    method = jsonrpc_method(&message),
                     "codex question request pending"
                 );
                 event_sender.send(event).ok();
                 if let Ok(answer) = receiver.await {
+                    tracing::info!(
+                        session_id = %request.session_id,
+                        %question_id,
+                        native_request_id = ?native_request_id,
+                        ?question_kind,
+                        "delivering codex question response"
+                    );
                     server
                         .send_question_response(native_request_id, question_kind, answer)
                         .await?;
@@ -1044,6 +1346,14 @@ pub async fn run_codex_turn_on_server(
                 continue;
             }
             if let Some((native_request_id, method)) = unsupported_codex_server_request(&message) {
+                tracing::warn!(
+                    session_id = %request.session_id,
+                    method,
+                    request_id = ?native_request_id,
+                    provider_thread_id = message_thread_id(&message),
+                    provider_turn_id = message_turn_id(&message),
+                    "unsupported codex server request observed in turn loop"
+                );
                 for event in normalize_codex_message(request.session_id, &message) {
                     event_sender.send(event).ok();
                 }
@@ -1066,6 +1376,7 @@ pub async fn run_codex_turn_on_server(
             tracing::warn!(
                 provider_thread_id = message_thread_id(&message),
                 provider_turn_id = message_turn_id(&message),
+                method = jsonrpc_method(&message),
                 jsonrpc_request_id = %codex_jsonrpc_request_id_summary(&message),
                 "received unexpected codex response while in turn loop; dropping"
             );
@@ -1073,9 +1384,24 @@ pub async fn run_codex_turn_on_server(
         }
 
         if !codex_message_belongs_to_scope(&message, &scope) {
+            let scope_context = CodexScopeLogContext::from_message(&message, &scope);
+            server.record_wire_message(
+                "internal",
+                "scope_dropped",
+                Some("thread_id_mismatch"),
+                &message,
+                Some(scope_context.clone()),
+            );
             tracing::debug!(
-                provider_thread_id = message_thread_id(&message),
-                provider_turn_id = message_turn_id(&message),
+                method = jsonrpc_method(&message),
+                jsonrpc_request_id = %codex_jsonrpc_request_id_summary(&message),
+                classification = codex_wire_classification(&message),
+                expected_thread_id = scope_context.expected_thread_id.as_deref(),
+                expected_turn_id = scope_context.expected_turn_id.as_deref(),
+                actual_thread_id = scope_context.actual_thread_id.as_deref(),
+                actual_turn_id = scope_context.actual_turn_id.as_deref(),
+                scope_match = scope_context.scope_match,
+                reason = scope_context.reason.as_deref(),
                 "ignored codex message outside active turn scope"
             );
             continue;
@@ -1176,6 +1502,56 @@ async fn write_json(stdin: &mut ChildStdin, message: &Value) -> anyhow::Result<(
     stdin.write_all(&encoded).await?;
     stdin.flush().await?;
     Ok(())
+}
+
+fn codex_wire_classification(message: &Value) -> &'static str {
+    if codex_rpc_is_codex_server_to_client_request(message) {
+        "server_request_received"
+    } else if codex_rpc_is_codex_server_to_client_response(message) {
+        "server_response_received"
+    } else if jsonrpc_method(message).is_some() {
+        "server_notification_received"
+    } else {
+        "unknown_received"
+    }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "True"))
+}
+
+fn raw_log_workspace_label(path: &Path) -> String {
+    let raw = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("workspace");
+    raw.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn unix_timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn option_string_value(value: Option<String>) -> Value {
+    value.map(Value::String).unwrap_or(Value::Null)
+}
+
+fn insert_optional_string(output: &mut Value, key: &str, value: Option<String>) {
+    if let Some(value) = value {
+        output[key] = Value::String(value);
+    }
 }
 
 pub fn normalize_codex_message(session_id: SessionId, message: &Value) -> Vec<AppEvent> {
@@ -4151,6 +4527,123 @@ mod tests {
             normalize_codex_message_for_scope(SessionId::nil(), &thread_only, &target).len(),
             2
         );
+    }
+
+    #[test]
+    fn codex_wire_classification_names_requests_responses_and_notifications() {
+        assert_eq!(
+            codex_wire_classification(&json!({"id": 1, "method": "turn/start", "params": {}})),
+            "server_request_received"
+        );
+        assert_eq!(
+            codex_wire_classification(&json!({"id": 1, "result": {"ok": true}})),
+            "server_response_received"
+        );
+        assert_eq!(
+            codex_wire_classification(&json!({"method": "turn/completed", "params": {}})),
+            "server_notification_received"
+        );
+        assert_eq!(
+            codex_wire_classification(&json!({"jsonrpc": "2.0"})),
+            "unknown_received"
+        );
+    }
+
+    #[test]
+    fn codex_scope_context_reports_expected_and_actual_targets() {
+        let scope = CodexTurnScope {
+            thread_id: Some("thread-1".to_owned()),
+            turn_id: Some("turn-1".to_owned()),
+        };
+        let message = json!({
+            "id": "request-1",
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread-2",
+                "turnId": "turn-9",
+                "delta": "wrong thread"
+            }
+        });
+
+        let context = CodexScopeLogContext::from_message(&message, &scope);
+
+        assert_eq!(context.expected_thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(context.expected_turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(context.actual_thread_id.as_deref(), Some("thread-2"));
+        assert_eq!(context.actual_turn_id.as_deref(), Some("turn-9"));
+        assert!(!context.scope_match);
+        assert_eq!(context.reason.as_deref(), Some("thread_id_mismatch"));
+    }
+
+    #[test]
+    fn codex_wire_logger_is_disabled_by_default() {
+        let logger = CodexWireLogger::disabled();
+
+        logger
+            .record(CodexWireLogRecord {
+                direction: "recv",
+                classification: "server_notification_received",
+                session_id: None,
+                workspace: None,
+                runtime_thread_id: None,
+                runtime_turn_id: None,
+                reason: None,
+                message: Some(json!({"method": "turn/completed"})),
+                stderr_line: None,
+                scope: None,
+            })
+            .expect("disabled logger should be a no-op");
+    }
+
+    #[test]
+    fn codex_wire_logger_writes_jsonl_records_with_payload_and_context() {
+        let path = std::env::temp_dir().join(format!(
+            "agenter-codex-wire-log-test-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let logger = CodexWireLogger::for_test_file(path.clone());
+        let session_id = SessionId::new();
+        let message = json!({
+            "id": "native-1",
+            "method": "item/fileChange/requestApproval",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-1"
+            }
+        });
+
+        logger
+            .record(CodexWireLogRecord {
+                direction: "recv",
+                classification: "server_request_received",
+                session_id: Some(session_id),
+                workspace: Some("/tmp/workspace".into()),
+                runtime_thread_id: Some("thread-runtime".into()),
+                runtime_turn_id: Some("turn-runtime".into()),
+                reason: Some("approval_pending"),
+                message: Some(message.clone()),
+                stderr_line: None,
+                scope: None,
+            })
+            .expect("record write should succeed");
+
+        let line = std::fs::read_to_string(&path).expect("wire log file should exist");
+        let record: Value = serde_json::from_str(line.trim()).expect("jsonl record should parse");
+        assert_eq!(record["direction"], "recv");
+        assert_eq!(record["classification"], "server_request_received");
+        assert_eq!(record["session_id"], session_id.to_string());
+        assert_eq!(record["workspace"], "/tmp/workspace");
+        assert_eq!(record["provider_thread_id"], "thread-1");
+        assert_eq!(record["provider_turn_id"], "turn-1");
+        assert_eq!(record["runtime_thread_id"], "thread-runtime");
+        assert_eq!(record["runtime_turn_id"], "turn-runtime");
+        assert_eq!(record["jsonrpc_id"], "native-1");
+        assert_eq!(record["method"], "item/fileChange/requestApproval");
+        assert_eq!(record["reason"], "approval_pending");
+        assert_eq!(record["payload"], message);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

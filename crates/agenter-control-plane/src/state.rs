@@ -15,7 +15,7 @@ use agenter_protocol::{
     },
     RequestId,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::Value;
 use tokio::{
     sync::{broadcast, mpsc, oneshot, Mutex},
@@ -27,6 +27,7 @@ use crate::auth::CookieSecurity;
 use crate::auth::{self, AuthenticatedUser, BootstrapAdmin};
 
 const SESSION_EVENT_CACHE_LIMIT: usize = 128;
+pub const BROWSER_AUTH_SESSION_TTL: ChronoDuration = ChronoDuration::days(30);
 
 #[derive(Clone, Debug)]
 pub struct AppState {
@@ -396,12 +397,7 @@ impl AppState {
                 email: user.email,
                 display_name: user.display_name,
             };
-            let token = Uuid::new_v4().to_string();
-            self.inner
-                .auth_sessions
-                .lock()
-                .await
-                .insert(token.clone(), user);
+            let token = self.create_authenticated_session(user).await;
             tracing::debug!(email, "created database-backed authenticated session");
             return Some(token);
         }
@@ -422,11 +418,41 @@ impl AppState {
     }
 
     pub async fn authenticated_user(&self, token: &str) -> Option<AuthenticatedUser> {
-        self.inner.auth_sessions.lock().await.get(token).cloned()
+        if let Some(user) = self.inner.auth_sessions.lock().await.get(token).cloned() {
+            return Some(user);
+        }
+
+        let pool = self.inner.db_pool.as_ref()?;
+        let token_hash = auth::session_token_hash(token);
+        let user = agenter_db::find_browser_auth_session_user(pool, &token_hash, Utc::now())
+            .await
+            .ok()??;
+        Some(AuthenticatedUser {
+            user_id: user.user_id,
+            email: user.email,
+            display_name: user.display_name,
+        })
     }
 
     pub async fn create_authenticated_session(&self, user: AuthenticatedUser) -> String {
         let token = Uuid::new_v4().to_string();
+        if let Some(pool) = &self.inner.db_pool {
+            let token_hash = auth::session_token_hash(&token);
+            if let Err(error) = agenter_db::create_browser_auth_session(
+                pool,
+                &token_hash,
+                user.user_id,
+                Utc::now() + BROWSER_AUTH_SESSION_TTL,
+            )
+            .await
+            {
+                tracing::error!(
+                    user_id = %user.user_id,
+                    %error,
+                    "failed to persist browser authenticated session"
+                );
+            }
+        }
         self.inner
             .auth_sessions
             .lock()
@@ -452,6 +478,12 @@ impl AppState {
             .await
             .remove(token)
             .is_some();
+        if let Some(pool) = &self.inner.db_pool {
+            let token_hash = auth::session_token_hash(token);
+            if let Err(error) = agenter_db::revoke_browser_auth_session(pool, &token_hash).await {
+                tracing::warn!(%error, "failed to revoke persisted browser auth session");
+            }
+        }
         tracing::debug!(removed, "removed authenticated session");
     }
 

@@ -7,8 +7,8 @@ use sqlx::{postgres::PgRow, PgPool, Result, Row};
 use uuid::Uuid;
 
 use crate::models::{
-    AgentSession, AgentSessionWithWorkspace, CachedEvent, ConnectorAccount, ConnectorLinkCode,
-    OidcLoginState, OidcProvider, PendingApproval, Runner, User, Workspace,
+    AgentSession, AgentSessionWithWorkspace, BrowserAuthSession, CachedEvent, ConnectorAccount,
+    ConnectorLinkCode, OidcLoginState, OidcProvider, PendingApproval, Runner, User, Workspace,
 };
 
 #[derive(Clone, Debug)]
@@ -359,6 +359,66 @@ pub async fn update_password_credential(
 
     tx.commit().await?;
     Ok(())
+}
+
+pub async fn create_browser_auth_session(
+    pool: &PgPool,
+    session_token_hash: &str,
+    user_id: UserId,
+    expires_at: DateTime<Utc>,
+) -> Result<BrowserAuthSession> {
+    let row = sqlx::query(
+        "insert into browser_auth_sessions (session_token_hash, user_id, expires_at)
+         values ($1, $2, $3)
+         returning session_token_hash, user_id, expires_at, revoked_at, created_at, last_seen_at",
+    )
+    .bind(session_token_hash)
+    .bind(user_id.as_uuid())
+    .bind(expires_at)
+    .fetch_one(pool)
+    .await?;
+
+    browser_auth_session_from_row(&row)
+}
+
+pub async fn find_browser_auth_session_user(
+    pool: &PgPool,
+    session_token_hash: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<User>> {
+    let row = sqlx::query(
+        "with active_session as (
+            update browser_auth_sessions
+            set last_seen_at = $2
+            where session_token_hash = $1
+              and revoked_at is null
+              and expires_at > $2
+            returning user_id
+         )
+         select u.user_id, u.email, u.display_name, u.created_at, u.updated_at
+         from users u
+         join active_session s on s.user_id = u.user_id",
+    )
+    .bind(session_token_hash)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(user_from_row).transpose()
+}
+
+pub async fn revoke_browser_auth_session(pool: &PgPool, session_token_hash: &str) -> Result<bool> {
+    let result = sqlx::query(
+        "update browser_auth_sessions
+         set revoked_at = now()
+         where session_token_hash = $1
+           and revoked_at is null",
+    )
+    .bind(session_token_hash)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn register_runner(pool: &PgPool, name: &str, version: Option<&str>) -> Result<Runner> {
@@ -1209,6 +1269,17 @@ fn oidc_login_state_from_row(row: &PgRow) -> Result<OidcLoginState> {
     })
 }
 
+fn browser_auth_session_from_row(row: &PgRow) -> Result<BrowserAuthSession> {
+    Ok(BrowserAuthSession {
+        session_token_hash: row.try_get("session_token_hash")?,
+        user_id: UserId::from_uuid(row.try_get("user_id")?),
+        expires_at: row.try_get("expires_at")?,
+        revoked_at: row.try_get("revoked_at")?,
+        created_at: row.try_get("created_at")?,
+        last_seen_at: row.try_get("last_seen_at")?,
+    })
+}
+
 fn connector_account_from_row(row: &PgRow) -> Result<ConnectorAccount> {
     Ok(ConnectorAccount {
         connector_account_id: row.try_get("connector_account_id")?,
@@ -1560,6 +1631,53 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
+    async fn persists_browser_auth_sessions_until_expiry_or_revoke() {
+        let pool = test_pool().await;
+
+        let suffix = uuid::Uuid::new_v4();
+        let user = create_user(
+            &pool,
+            &format!("browser-session-user-{suffix}@example.test"),
+            Some("Browser Session User"),
+        )
+        .await
+        .expect("create user");
+        let token_hash = format!("browser-session-token-hash-{suffix}");
+        let expires_at = Utc::now() + chrono::Duration::days(30);
+
+        let session = create_browser_auth_session(&pool, &token_hash, user.user_id, expires_at)
+            .await
+            .expect("create browser auth session");
+        assert_eq!(session.session_token_hash, token_hash);
+        assert_eq!(session.user_id, user.user_id);
+        assert!(session.revoked_at.is_none());
+
+        let found = find_browser_auth_session_user(&pool, &token_hash, Utc::now())
+            .await
+            .expect("find active browser auth session")
+            .expect("session should authenticate");
+        assert_eq!(found.user_id, user.user_id);
+
+        let expired = find_browser_auth_session_user(
+            &pool,
+            &token_hash,
+            expires_at + chrono::Duration::seconds(1),
+        )
+        .await
+        .expect("find expired browser auth session");
+        assert!(expired.is_none());
+
+        revoke_browser_auth_session(&pool, &token_hash)
+            .await
+            .expect("revoke browser auth session");
+        let revoked = find_browser_auth_session_user(&pool, &token_hash, Utc::now())
+            .await
+            .expect("find revoked browser auth session");
+        assert!(revoked.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
     async fn creates_and_resolves_approval_once() {
         let pool = test_pool().await;
 
@@ -1778,6 +1896,7 @@ mod tests {
             "connector_link_codes",
             "session_bindings",
             "oidc_login_states",
+            "browser_auth_sessions",
             "pending_approvals",
             "event_cache",
             "connector_deliveries",

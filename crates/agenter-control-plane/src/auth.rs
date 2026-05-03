@@ -1,8 +1,10 @@
 use agenter_core::UserId;
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::http::{header, HeaderMap};
+use chrono::Duration;
 use rand_core::OsRng;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 pub const SESSION_COOKIE_NAME: &str = "agenter_session";
 
@@ -44,18 +46,29 @@ pub fn session_token_from_headers(headers: &HeaderMap) -> Option<&str> {
     })
 }
 
+pub fn session_token_hash(token: &str) -> String {
+    format!("{:x}", Sha256::digest(token.as_bytes()))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CookieSecurity {
     Secure,
     DevelopmentInsecure,
 }
 
-pub fn session_cookie_with_policy(token: &str, security: CookieSecurity) -> String {
+pub fn session_cookie_with_policy(
+    token: &str,
+    security: CookieSecurity,
+    max_age: Option<Duration>,
+) -> String {
     let secure = match security {
         CookieSecurity::Secure => "; Secure",
         CookieSecurity::DevelopmentInsecure => "",
     };
-    format!("{SESSION_COOKIE_NAME}={token}; HttpOnly; SameSite=Lax; Path=/{secure}")
+    let max_age = max_age
+        .map(|duration| format!("; Max-Age={}", duration.num_seconds()))
+        .unwrap_or_default();
+    format!("{SESSION_COOKIE_NAME}={token}; HttpOnly; SameSite=Lax; Path=/{max_age}{secure}")
 }
 
 pub fn expired_session_cookie_with_policy(security: CookieSecurity) -> String {
@@ -82,12 +95,35 @@ mod tests {
 
     #[test]
     fn session_cookie_defaults_to_secure_and_supports_explicit_dev_policy() {
-        let secure = session_cookie_with_policy("token-1", CookieSecurity::Secure);
+        let secure = session_cookie_with_policy("token-1", CookieSecurity::Secure, None);
         assert!(secure.contains("Secure"));
         assert!(secure.contains("HttpOnly"));
         assert!(secure.contains("SameSite=Lax"));
 
-        let dev = session_cookie_with_policy("token-1", CookieSecurity::DevelopmentInsecure);
+        let dev = session_cookie_with_policy("token-1", CookieSecurity::DevelopmentInsecure, None);
         assert!(!dev.contains("Secure"));
+    }
+
+    #[test]
+    fn session_token_hash_is_stable_and_does_not_expose_raw_token() {
+        let hash = session_token_hash("token-1");
+
+        assert_eq!(hash, session_token_hash("token-1"));
+        assert_ne!(hash, session_token_hash("token-2"));
+        assert_ne!(hash, "token-1");
+        assert_eq!(hash.len(), 64);
+    }
+
+    #[test]
+    fn session_cookie_can_set_30_day_max_age() {
+        let cookie = session_cookie_with_policy(
+            "token-1",
+            CookieSecurity::DevelopmentInsecure,
+            Some(chrono::Duration::days(30)),
+        );
+
+        assert!(cookie.contains("Max-Age=2592000"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
     }
 }

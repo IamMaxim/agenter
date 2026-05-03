@@ -91,6 +91,7 @@ Use Postgres via SQLx. Initial tables:
 - `users`: app user identity;
 - `auth_identities`: password and OIDC identity bindings;
 - `password_credentials`: Argon2id password hashes;
+- `browser_auth_sessions`: hashed HttpOnly browser session cookies with expiry and revocation state;
 - `oidc_providers`: configured OIDC providers, including Authentik;
 - `runners`: runner registry and heartbeat state;
 - `runner_tokens`: hashed runner connection tokens;

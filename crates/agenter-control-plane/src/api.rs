@@ -1885,6 +1885,7 @@ mod tests {
         assert!(cookie.contains("agenter_session="));
         assert!(cookie.contains("HttpOnly"));
         assert!(!cookie.contains("Secure"));
+        assert!(cookie.contains("Max-Age=2592000"));
 
         let me_response = app
             .oneshot(

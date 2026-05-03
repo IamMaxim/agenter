@@ -182,7 +182,7 @@ Exit criterion: a user can log in, see workspaces and sessions, open a browser c
 Active execution notes:
 
 - Task 2.1 adds Argon2id password hashing and optional dev bootstrap credentials through `AGENTER_BOOTSTRAP_ADMIN_EMAIL` plus `AGENTER_BOOTSTRAP_ADMIN_PASSWORD`.
-- Browser auth currently uses dev-grade opaque in-memory session cookies stored in control-plane process state; restart invalidates sessions and full DB-backed session persistence remains future work.
+- Browser auth uses opaque HttpOnly session cookies. With Postgres configured, cookie token hashes are persisted for 30 days in `browser_auth_sessions`, so control-plane restarts do not log out clients; without `DATABASE_URL`, development sessions remain process-local and restart-volatile.
 - Browser WebSocket now requires the same session cookie extraction as protected browser HTTP APIs. Runner WebSocket continues to use runner token auth.
 - Verification passed with `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace`; SQLx integration tests remain ignored without `DATABASE_URL`.
 

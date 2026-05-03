@@ -109,6 +109,16 @@ pub struct OidcLoginState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserAuthSession {
+    pub session_token_hash: String,
+    pub user_id: UserId,
+    pub expires_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorAccount {
     pub connector_account_id: uuid::Uuid,
     pub user_id: UserId,
