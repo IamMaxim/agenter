@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::agents::adapter::AdapterEvent;
-use crate::agents::approval_state::PendingProviderApproval;
+use crate::agents::approval_state::{PendingProviderApproval, ProviderApprovalDecision};
 use crate::agents::codex_approval_context::{
     presentation_for_command_execution_approval, sparse_file_change_fallback_details,
     CodexApprovalItemCache,
@@ -17,25 +17,28 @@ use agenter_core::{
     AgentCollaborationMode, AgentErrorEvent, AgentMessageDeltaEvent, AgentModelOption,
     AgentOptions, AgentProviderId, AgentQuestionAnswer, AgentQuestionChoice, AgentQuestionField,
     AgentReasoningEffort, AgentTurnSettings, ApprovalDecision, ApprovalId, ApprovalKind,
-    ApprovalRequestEvent, CommandCompletedEvent, CommandEvent, CommandOutputEvent,
-    CommandOutputStream, FileChangeEvent, FileChangeKind, MessageCompletedEvent,
-    NativeNotification, NormalizedEvent, PlanEntry, PlanEntryStatus, PlanEvent, QuestionId,
-    QuestionRequestedEvent, SessionId, SessionStatus, SessionStatusChangedEvent,
-    SlashCommandArgument, SlashCommandArgumentKind, SlashCommandDangerLevel,
-    SlashCommandDefinition, SlashCommandRequest, SlashCommandResult, SlashCommandTarget,
+    ApprovalRequestEvent, ApprovalResolvedEvent, CommandCompletedEvent, CommandEvent,
+    CommandOutputEvent, CommandOutputStream, FileChangeEvent, FileChangeKind,
+    MessageCompletedEvent, NativeNotification, NormalizedEvent, PlanEntry, PlanEntryStatus,
+    PlanEvent, QuestionAnsweredEvent, QuestionId, QuestionRequestedEvent, SessionId, SessionStatus,
+    SessionStatusChangedEvent, SlashCommandArgument, SlashCommandArgumentKind,
+    SlashCommandDangerLevel, SlashCommandDefinition, SlashCommandRequest, SlashCommandResult,
+    SlashCommandTarget, TurnId, TurnState, TurnStatus,
 };
 use agenter_protocol::{
     DiscoveredCommandAction, DiscoveredFileChangeStatus, DiscoveredSessionHistoryItem,
     DiscoveredToolStatus,
 };
 use anyhow::{anyhow, Context};
+use chrono::Utc;
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     time::timeout,
 };
+use uuid::Uuid;
 
 const STARTUP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const RECENT_STDERR_LINES: usize = 20;
@@ -80,11 +83,76 @@ fn codex_request_id_from_value(id: &Value) -> Option<CodexRequestId> {
     }
 }
 
+fn stable_uuid(namespace: &str, value: &str) -> Uuid {
+    Uuid::parse_str(value).unwrap_or_else(|_| {
+        Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("agenter:{namespace}:{value}").as_bytes(),
+        )
+    })
+}
+
+fn stable_turn_id(value: &str) -> TurnId {
+    TurnId::from_uuid(stable_uuid("turn", value))
+}
+
 pub type PendingCodexApproval = PendingProviderApproval;
 
 #[derive(Debug)]
 pub struct PendingCodexQuestion {
     pub response: oneshot::Sender<AgentQuestionAnswer>,
+}
+
+#[derive(Debug)]
+struct CodexPendingRequestDelivery {
+    native_request_id: Value,
+    response: CodexPendingRequestResponse,
+}
+
+#[derive(Debug)]
+enum CodexPendingRequestResponse {
+    Approval {
+        approval_id: ApprovalId,
+        approval_kind: CodexApprovalKind,
+        answer: ProviderApprovalDecision,
+    },
+    Question {
+        question_id: QuestionId,
+        kind: CodexQuestionKind,
+        answer: AgentQuestionAnswer,
+    },
+}
+
+#[derive(Debug, Default)]
+struct PendingCodexServerRequests {
+    by_native_request_id: HashMap<String, PendingCodexServerRequest>,
+}
+
+#[derive(Clone, Debug)]
+enum PendingCodexServerRequest {
+    Approval { approval_id: ApprovalId },
+    Question { question_id: QuestionId },
+}
+
+impl PendingCodexServerRequests {
+    fn insert_approval(&mut self, native_request_id: &Value, approval_id: ApprovalId) {
+        self.by_native_request_id.insert(
+            codex_request_id_value_key(native_request_id),
+            PendingCodexServerRequest::Approval { approval_id },
+        );
+    }
+
+    fn insert_question(&mut self, native_request_id: &Value, question_id: QuestionId) {
+        self.by_native_request_id.insert(
+            codex_request_id_value_key(native_request_id),
+            PendingCodexServerRequest::Question { question_id },
+        );
+    }
+
+    fn remove(&mut self, native_request_id: &Value) -> Option<PendingCodexServerRequest> {
+        self.by_native_request_id
+            .remove(&codex_request_id_value_key(native_request_id))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -539,9 +607,14 @@ impl CodexAppServer {
         self.turn_id = None;
     }
 
-    pub async fn send_turn(&mut self, request: &CodexTurnRequest) -> anyhow::Result<()> {
+    pub async fn send_turn(
+        &mut self,
+        request: &CodexTurnRequest,
+        turn_interrupt_tx: watch::Sender<bool>,
+        mut interrupt_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
         self.active_session_id = Some(request.session_id);
-        let Some(thread_id) = &self.thread_id else {
+        let Some(thread_id) = self.thread_id.clone() else {
             return Err(anyhow!(
                 "codex thread id was not observed before turn start"
             ));
@@ -557,9 +630,23 @@ impl CodexAppServer {
             "starting codex turn"
         );
         let turn_start_id = self
-            .send_request("turn/start", codex_turn_start_params(thread_id, request))
+            .send_request("turn/start", codex_turn_start_params(&thread_id, request))
             .await?;
-        let response = self.read_response(&turn_start_id, "turn/start").await?;
+        if *interrupt_rx.borrow() {
+            self.interrupt_startup_turn(&thread_id).await?;
+            let _ = turn_interrupt_tx.send(false);
+        }
+        let response = tokio::select! {
+            response = self.read_response(&turn_start_id, "turn/start") => response,
+            changed = interrupt_rx.changed() => {
+                let interrupted = changed.is_ok() && *interrupt_rx.borrow_and_update();
+                if interrupted {
+                    self.interrupt_startup_turn(&thread_id).await?;
+                    let _ = turn_interrupt_tx.send(false);
+                }
+                self.read_response(&turn_start_id, "turn/start").await
+            }
+        }?;
         if let Some(turn_id) = codex_turn_id(&response) {
             self.turn_id = Some(turn_id.to_owned());
         }
@@ -652,6 +739,18 @@ impl CodexAppServer {
         write_json(&mut self.stdin, &response).await
     }
 
+    pub async fn interrupt_turn(&mut self) -> anyhow::Result<()> {
+        let Some(thread_id) = self.thread_id.clone() else {
+            return Err(anyhow!("codex thread id was not observed before interrupt"));
+        };
+        let turn_id = self.turn_id.clone().unwrap_or_default();
+        self.send_turn_interrupt(&thread_id, &turn_id).await
+    }
+
+    pub async fn interrupt_startup_turn(&mut self, thread_id: &str) -> anyhow::Result<()> {
+        self.send_turn_interrupt(thread_id, "").await
+    }
+
     pub async fn send_unsupported_request_response(
         &mut self,
         native_request_id: Value,
@@ -699,6 +798,22 @@ impl CodexAppServer {
             None,
         );
         write_json(&mut self.stdin, &envelope).await
+    }
+
+    async fn send_turn_interrupt(&mut self, thread_id: &str, turn_id: &str) -> anyhow::Result<()> {
+        tracing::info!(
+            provider_thread_id = %thread_id,
+            provider_turn_id = %turn_id,
+            "sending codex turn interrupt"
+        );
+        let request_id = self
+            .send_request(
+                "turn/interrupt",
+                codex_turn_interrupt_params(thread_id, turn_id),
+            )
+            .await?;
+        let _response = self.read_response(&request_id, "turn/interrupt").await?;
+        Ok(())
     }
 
     async fn send_request(
@@ -929,6 +1044,13 @@ pub fn codex_turn_start_params(thread_id: &str, request: &CodexTurnRequest) -> V
         params["collaborationMode"] = mode_payload;
     }
     params
+}
+
+pub fn codex_turn_interrupt_params(thread_id: &str, turn_id: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "turnId": turn_id
+    })
 }
 
 pub fn codex_provider_slash_commands() -> Vec<SlashCommandDefinition> {
@@ -1175,8 +1297,13 @@ pub async fn run_codex_turn_on_server(
     pending_questions: std::sync::Arc<
         tokio::sync::Mutex<HashMap<QuestionId, PendingCodexQuestion>>,
     >,
+    turn_interrupt_tx: watch::Sender<bool>,
+    mut interrupt_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut codex_approval_ctx = CodexApprovalItemCache::default();
+    let mut pending_server_requests = PendingCodexServerRequests::default();
+    let (pending_delivery_tx, mut pending_delivery_rx) =
+        mpsc::unbounded_channel::<CodexPendingRequestDelivery>();
     while server.thread_id.is_none() {
         let Some(message) = server.next_message().await? else {
             return Err(anyhow!("codex exited before returning a thread id"));
@@ -1188,12 +1315,48 @@ pub async fn run_codex_turn_on_server(
         }
     }
 
-    server.send_turn(&request).await?;
+    server
+        .send_turn(&request, turn_interrupt_tx.clone(), interrupt_rx.clone())
+        .await?;
     let mut scope = CodexTurnScope {
         thread_id: server.thread_id.clone(),
         turn_id: server.turn_id.clone(),
     };
-    while let Some(message) = server.next_message().await? {
+    if *interrupt_rx.borrow() {
+        if let Err(error) = server.interrupt_turn().await {
+            tracing::warn!(%error, "failed to interrupt active codex turn");
+        }
+        let _ = turn_interrupt_tx.send(false);
+    }
+    loop {
+        let message = tokio::select! {
+            Some(delivery) = pending_delivery_rx.recv() => {
+                handle_codex_pending_request_delivery(
+                    server,
+                    request.session_id,
+                    delivery,
+                    &event_sender,
+                    &mut pending_server_requests,
+                    &pending_approvals,
+                    &pending_questions,
+                )
+                .await?;
+                continue;
+            }
+            changed = interrupt_rx.changed() => {
+                if changed.is_ok() && *interrupt_rx.borrow_and_update() {
+                    if let Err(error) = server.interrupt_turn().await {
+                        tracing::warn!(%error, "failed to interrupt active codex turn");
+                    }
+                    let _ = turn_interrupt_tx.send(false);
+                }
+                continue;
+            }
+            message = server.next_message() => message?,
+        };
+        let Some(message) = message else {
+            break;
+        };
         scope.observe(&message);
         codex_approval_ctx.observe_jsonrpc_message(&message);
         let is_server_request = codex_rpc_is_codex_server_to_client_request(&message);
@@ -1258,6 +1421,7 @@ pub async fn run_codex_turn_on_server(
                     approval_id,
                     PendingCodexApproval::new(request.session_id, sender),
                 );
+                pending_server_requests.insert_approval(&native_request_id, approval_id);
                 send_codex_event(
                     &event_sender,
                     jsonrpc_method(&message),
@@ -1278,31 +1442,13 @@ pub async fn run_codex_turn_on_server(
                     "codex approval request pending"
                 );
                 send_codex_event(&event_sender, jsonrpc_method(&message), event);
-                if let Ok(answer) = receiver.await {
-                    tracing::info!(
-                        session_id = %request.session_id,
-                        %approval_id,
-                        native_request_id = ?native_request_id,
-                        ?approval_kind,
-                        decision = ?answer.decision,
-                        "delivering codex approval response"
-                    );
-                    let result = server
-                        .send_approval_response(native_request_id, approval_kind, answer.decision)
-                        .await
-                        .map_err(|error| error.to_string());
-                    answer.acknowledged.send(result.clone()).ok();
-                    result.map_err(anyhow::Error::msg)?;
-                    send_codex_event(
-                        &event_sender,
-                        jsonrpc_method(&message),
-                        session_status_event(
-                            request.session_id,
-                            SessionStatus::Running,
-                            Some("Approval answered.".to_owned()),
-                        ),
-                    );
-                }
+                spawn_codex_approval_delivery_task(
+                    pending_delivery_tx.clone(),
+                    native_request_id,
+                    approval_id,
+                    approval_kind,
+                    receiver,
+                );
                 continue;
             }
             if let Some((question_id, native_request_id, event)) =
@@ -1316,6 +1462,7 @@ pub async fn run_codex_turn_on_server(
                     .lock()
                     .await
                     .insert(question_id, PendingCodexQuestion { response: sender });
+                pending_server_requests.insert_question(&native_request_id, question_id);
                 send_codex_event(
                     &event_sender,
                     jsonrpc_method(&message),
@@ -1336,27 +1483,13 @@ pub async fn run_codex_turn_on_server(
                     "codex question request pending"
                 );
                 send_codex_event(&event_sender, jsonrpc_method(&message), event);
-                if let Ok(answer) = receiver.await {
-                    tracing::info!(
-                        session_id = %request.session_id,
-                        %question_id,
-                        native_request_id = ?native_request_id,
-                        ?question_kind,
-                        "delivering codex question response"
-                    );
-                    server
-                        .send_question_response(native_request_id, question_kind, answer)
-                        .await?;
-                    send_codex_event(
-                        &event_sender,
-                        jsonrpc_method(&message),
-                        session_status_event(
-                            request.session_id,
-                            SessionStatus::Running,
-                            Some("Input answered.".to_owned()),
-                        ),
-                    );
-                }
+                spawn_codex_question_delivery_task(
+                    pending_delivery_tx.clone(),
+                    native_request_id,
+                    question_id,
+                    question_kind,
+                    receiver,
+                );
                 continue;
             }
             if let Some((native_request_id, method)) = unsupported_codex_server_request(&message) {
@@ -1396,6 +1529,18 @@ pub async fn run_codex_turn_on_server(
                 "received unexpected codex response while in turn loop; dropping"
             );
             continue;
+        }
+
+        if jsonrpc_method(&message) == Some("serverRequest/resolved") {
+            handle_codex_server_request_resolved(
+                request.session_id,
+                &message,
+                &event_sender,
+                &mut pending_server_requests,
+                &pending_approvals,
+                &pending_questions,
+            )
+            .await;
         }
 
         if !codex_message_belongs_to_scope(&message, &scope) {
@@ -1451,6 +1596,212 @@ fn send_codex_event(
     event: NormalizedEvent,
 ) {
     event_sender.send(codex_adapter_event(method, event)).ok();
+}
+
+fn spawn_codex_approval_delivery_task(
+    tx: mpsc::UnboundedSender<CodexPendingRequestDelivery>,
+    native_request_id: Value,
+    approval_id: ApprovalId,
+    approval_kind: CodexApprovalKind,
+    receiver: oneshot::Receiver<ProviderApprovalDecision>,
+) {
+    tokio::spawn(async move {
+        let Ok(answer) = receiver.await else {
+            return;
+        };
+        tx.send(CodexPendingRequestDelivery {
+            native_request_id,
+            response: CodexPendingRequestResponse::Approval {
+                approval_id,
+                approval_kind,
+                answer,
+            },
+        })
+        .ok();
+    });
+}
+
+fn spawn_codex_question_delivery_task(
+    tx: mpsc::UnboundedSender<CodexPendingRequestDelivery>,
+    native_request_id: Value,
+    question_id: QuestionId,
+    kind: CodexQuestionKind,
+    receiver: oneshot::Receiver<AgentQuestionAnswer>,
+) {
+    tokio::spawn(async move {
+        let Ok(answer) = receiver.await else {
+            return;
+        };
+        tx.send(CodexPendingRequestDelivery {
+            native_request_id,
+            response: CodexPendingRequestResponse::Question {
+                question_id,
+                kind,
+                answer,
+            },
+        })
+        .ok();
+    });
+}
+
+async fn handle_codex_pending_request_delivery(
+    server: &mut CodexAppServer,
+    session_id: SessionId,
+    delivery: CodexPendingRequestDelivery,
+    event_sender: &mpsc::UnboundedSender<AdapterEvent>,
+    pending_server_requests: &mut PendingCodexServerRequests,
+    pending_approvals: &std::sync::Arc<
+        tokio::sync::Mutex<HashMap<ApprovalId, PendingCodexApproval>>,
+    >,
+    pending_questions: &std::sync::Arc<
+        tokio::sync::Mutex<HashMap<QuestionId, PendingCodexQuestion>>,
+    >,
+) -> anyhow::Result<()> {
+    pending_server_requests.remove(&delivery.native_request_id);
+    match delivery.response {
+        CodexPendingRequestResponse::Approval {
+            approval_id,
+            approval_kind,
+            answer,
+        } => {
+            pending_approvals.lock().await.remove(&approval_id);
+            tracing::info!(
+                session_id = %session_id,
+                %approval_id,
+                native_request_id = ?delivery.native_request_id,
+                ?approval_kind,
+                decision = ?answer.decision,
+                "delivering codex approval response"
+            );
+            let decision = answer.decision.clone();
+            let result = server
+                .send_approval_response(delivery.native_request_id, approval_kind, answer.decision)
+                .await
+                .map_err(|error| error.to_string());
+            answer.acknowledged.send(result.clone()).ok();
+            result.map_err(anyhow::Error::msg)?;
+            send_codex_event(
+                event_sender,
+                Some("approval/answered"),
+                NormalizedEvent::ApprovalResolved(ApprovalResolvedEvent {
+                    session_id,
+                    approval_id,
+                    decision,
+                    resolved_by_user_id: None,
+                    resolved_at: Utc::now(),
+                    provider_payload: None,
+                }),
+            );
+            send_codex_event(
+                event_sender,
+                Some("approval/answered"),
+                session_status_event(
+                    session_id,
+                    SessionStatus::Running,
+                    Some("Approval answered.".to_owned()),
+                ),
+            );
+        }
+        CodexPendingRequestResponse::Question {
+            question_id,
+            kind,
+            answer,
+        } => {
+            pending_questions.lock().await.remove(&question_id);
+            tracing::info!(
+                session_id = %session_id,
+                %question_id,
+                native_request_id = ?delivery.native_request_id,
+                ?kind,
+                "delivering codex question response"
+            );
+            server
+                .send_question_response(delivery.native_request_id, kind, answer.clone())
+                .await?;
+            send_codex_event(
+                event_sender,
+                Some("question/answered"),
+                NormalizedEvent::QuestionAnswered(QuestionAnsweredEvent {
+                    session_id,
+                    question_id,
+                    answer,
+                    provider_payload: None,
+                }),
+            );
+            send_codex_event(
+                event_sender,
+                Some("question/answered"),
+                session_status_event(
+                    session_id,
+                    SessionStatus::Running,
+                    Some("Input answered.".to_owned()),
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn handle_codex_server_request_resolved(
+    session_id: SessionId,
+    message: &Value,
+    event_sender: &mpsc::UnboundedSender<AdapterEvent>,
+    pending_server_requests: &mut PendingCodexServerRequests,
+    pending_approvals: &std::sync::Arc<
+        tokio::sync::Mutex<HashMap<ApprovalId, PendingCodexApproval>>,
+    >,
+    pending_questions: &std::sync::Arc<
+        tokio::sync::Mutex<HashMap<QuestionId, PendingCodexQuestion>>,
+    >,
+) {
+    let Some(native_request_id) = message.pointer("/params/requestId") else {
+        return;
+    };
+    let Some(pending) = pending_server_requests.remove(native_request_id) else {
+        return;
+    };
+    match pending {
+        PendingCodexServerRequest::Approval { approval_id } => {
+            pending_approvals.lock().await.remove(&approval_id);
+            send_codex_event(
+                event_sender,
+                jsonrpc_method(message),
+                NormalizedEvent::ApprovalResolved(ApprovalResolvedEvent {
+                    session_id,
+                    approval_id,
+                    decision: ApprovalDecision::Cancel,
+                    resolved_by_user_id: None,
+                    resolved_at: Utc::now(),
+                    provider_payload: Some(message.clone()),
+                }),
+            );
+        }
+        PendingCodexServerRequest::Question { question_id } => {
+            pending_questions.lock().await.remove(&question_id);
+            send_codex_event(
+                event_sender,
+                jsonrpc_method(message),
+                NormalizedEvent::QuestionAnswered(QuestionAnsweredEvent {
+                    session_id,
+                    question_id,
+                    answer: AgentQuestionAnswer {
+                        question_id,
+                        answers: Default::default(),
+                    },
+                    provider_payload: Some(message.clone()),
+                }),
+            );
+        }
+    }
+    send_codex_event(
+        event_sender,
+        jsonrpc_method(message),
+        session_status_event(
+            session_id,
+            SessionStatus::Running,
+            Some("Codex resolved a pending request.".to_owned()),
+        ),
+    );
 }
 
 pub fn codex_agent_options_from_responses(models: &Value, modes: &Value) -> AgentOptions {
@@ -1736,21 +2087,100 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
         }
         "item/started" => item_started(session_id, message).into_iter().collect(),
         "item/completed" => item_completed(session_id, message).into_iter().collect(),
-        "turn/completed" => vec![
-            NormalizedEvent::AgentMessageCompleted(MessageCompletedEvent {
-                session_id,
-                message_id: string_at(message, &["/params/turnId", "/params/id"])
-                    .unwrap_or("codex-turn")
-                    .to_owned(),
-                content: None,
-                provider_payload: Some(message.clone()),
-            }),
-            session_status_event(
-                session_id,
-                SessionStatus::Idle,
-                Some("Codex turn completed.".to_owned()),
-            ),
-        ],
+        "turn/completed" => {
+            let status = string_at(message, &["/params/turn/status", "/params/status"])
+                .unwrap_or("completed");
+            let turn_id = string_at(message, &["/params/turn/id", "/params/turnId"])
+                .map(stable_turn_id)
+                .unwrap_or_else(|| stable_turn_id("codex-turn"));
+            match status {
+                "interrupted" => vec![
+                    NormalizedEvent::TurnInterrupted(TurnState {
+                        turn_id,
+                        session_id,
+                        status: TurnStatus::Interrupted,
+                        started_at: None,
+                        completed_at: None,
+                        model: None,
+                        mode: None,
+                    }),
+                    session_status_event(
+                        session_id,
+                        SessionStatus::Interrupted,
+                        Some("Codex turn interrupted.".to_owned()),
+                    ),
+                ],
+                "cancelled" | "canceled" => vec![
+                    NormalizedEvent::TurnCancelled(TurnState {
+                        turn_id,
+                        session_id,
+                        status: TurnStatus::Cancelled,
+                        started_at: None,
+                        completed_at: None,
+                        model: None,
+                        mode: None,
+                    }),
+                    session_status_event(
+                        session_id,
+                        SessionStatus::Interrupted,
+                        Some("Codex turn cancelled.".to_owned()),
+                    ),
+                ],
+                "failed" => {
+                    let message_text = string_at(
+                        message,
+                        &[
+                            "/params/turn/error/message",
+                            "/params/error/message",
+                            "/params/message",
+                        ],
+                    )
+                    .unwrap_or("Codex turn failed")
+                    .to_owned();
+                    vec![
+                        NormalizedEvent::TurnFailed(TurnState {
+                            turn_id,
+                            session_id,
+                            status: TurnStatus::Failed,
+                            started_at: None,
+                            completed_at: None,
+                            model: None,
+                            mode: None,
+                        }),
+                        NormalizedEvent::Error(AgentErrorEvent {
+                            session_id: Some(session_id),
+                            code: string_at(
+                                message,
+                                &[
+                                    "/params/turn/error/code",
+                                    "/params/error/code",
+                                    "/params/code",
+                                ],
+                            )
+                            .map(str::to_owned),
+                            message: message_text.clone(),
+                            provider_payload: Some(message.clone()),
+                        }),
+                        session_status_event(session_id, SessionStatus::Failed, Some(message_text)),
+                    ]
+                }
+                _ => vec![
+                    NormalizedEvent::AgentMessageCompleted(MessageCompletedEvent {
+                        session_id,
+                        message_id: string_at(message, &["/params/turnId", "/params/id"])
+                            .unwrap_or("codex-turn")
+                            .to_owned(),
+                        content: None,
+                        provider_payload: Some(message.clone()),
+                    }),
+                    session_status_event(
+                        session_id,
+                        SessionStatus::Idle,
+                        Some("Codex turn completed.".to_owned()),
+                    ),
+                ],
+            }
+        }
         "error" => vec![NormalizedEvent::Error(AgentErrorEvent {
             session_id: Some(session_id),
             code: string_at(message, &["/params/code"]).map(str::to_owned),
@@ -2714,6 +3144,14 @@ fn codex_jsonrpc_request_id_summary(message: &Value) -> String {
         Some(id) if id.is_number() => id.to_string(),
         Some(id) => id.to_string(),
         None => "<missing id>".to_owned(),
+    }
+}
+
+fn codex_request_id_value_key(id: &Value) -> String {
+    match id {
+        Value::String(value) => value.to_owned(),
+        Value::Number(_) => id.to_string(),
+        _ => id.to_string(),
     }
 }
 
@@ -5135,6 +5573,111 @@ mod tests {
             "null"
         );
         assert_eq!(codex_jsonrpc_request_id_summary(&json!({})), "<missing id>");
+    }
+
+    #[test]
+    fn codex_turn_interrupt_params_include_thread_and_turn_ids() {
+        assert_eq!(
+            codex_turn_interrupt_params("thread-1", "turn-9"),
+            json!({
+                "threadId": "thread-1",
+                "turnId": "turn-9"
+            })
+        );
+        assert_eq!(
+            codex_turn_interrupt_params("thread-1", ""),
+            json!({
+                "threadId": "thread-1",
+                "turnId": ""
+            })
+        );
+    }
+
+    #[test]
+    fn interrupted_turn_completion_maps_to_turn_interrupted() {
+        let session_id = SessionId::new();
+        let events = normalize_codex_message_inner(
+            session_id,
+            &json!({
+                "method": "turn/completed",
+                "params": {
+                    "turn": {
+                        "id": "turn-7",
+                        "status": "interrupted"
+                    }
+                }
+            }),
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                NormalizedEvent::TurnInterrupted(turn),
+                NormalizedEvent::SessionStatusChanged(status)
+            ] if turn.session_id == session_id
+                && turn.status == TurnStatus::Interrupted
+                && turn.turn_id == stable_turn_id("turn-7")
+                && status.session_id == session_id
+                && status.status == SessionStatus::Interrupted
+        ));
+    }
+
+    #[test]
+    fn failed_turn_completion_maps_to_turn_failed_and_error() {
+        let session_id = SessionId::new();
+        let events = normalize_codex_message_inner(
+            session_id,
+            &json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {
+                        "id": "turn-8",
+                        "status": "failed",
+                        "error": {
+                            "code": "model_error",
+                            "message": "request failed"
+                        }
+                    }
+                }
+            }),
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                NormalizedEvent::TurnFailed(turn),
+                NormalizedEvent::Error(error),
+                NormalizedEvent::SessionStatusChanged(status)
+            ] if turn.session_id == session_id
+                && turn.status == TurnStatus::Failed
+                && turn.turn_id == stable_turn_id("turn-8")
+                && error.session_id == Some(session_id)
+                && error.code.as_deref() == Some("model_error")
+                && error.message == "request failed"
+                && status.session_id == session_id
+                && status.status == SessionStatus::Failed
+        ));
+    }
+
+    #[test]
+    fn pending_codex_server_requests_match_numeric_and_string_request_ids() {
+        let approval_id = ApprovalId::new();
+        let question_id = QuestionId::new();
+        let mut pending = PendingCodexServerRequests::default();
+
+        pending.insert_approval(&json!(7), approval_id);
+        pending.insert_question(&json!("question-1"), question_id);
+
+        assert!(matches!(
+            pending.remove(&json!(7)),
+            Some(PendingCodexServerRequest::Approval { approval_id: id }) if id == approval_id
+        ));
+        assert!(matches!(
+            pending.remove(&json!("question-1")),
+            Some(PendingCodexServerRequest::Question { question_id: id }) if id == question_id
+        ));
+        assert!(pending.remove(&json!(7)).is_none());
     }
 
     #[test]

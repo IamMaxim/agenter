@@ -7,11 +7,12 @@ use agenter_core::{
     ApprovalRequest, ApprovalRequestEvent, ApprovalStatus, CapabilitySet, CommandAction,
     CommandOutputStream, ContentBlock, ContentBlockKind, DiffFile, DiffState, FileChangeEvent,
     ItemId, ItemRole, ItemState, ItemStatus, NativeNotification, NativeRef, NormalizedEvent,
-    PlanSource, PlanState, PlanStatus, SessionId, SlashCommandDefinition, SlashCommandRequest,
-    SlashCommandResult, ToolActionProjection, ToolCommandProjection, ToolEvent, ToolMcpProjection,
-    ToolProjection, ToolProjectionKind, ToolSubagentOperation, ToolSubagentProjection,
-    ToolSubagentStateProjection, TurnId, TurnState, TurnStatus, UniversalCommandEnvelope,
-    UniversalEventKind, UniversalEventSource, UserInput, WorkspaceRef,
+    PlanSource, PlanState, PlanStatus, QuestionState, QuestionStatus, SessionId,
+    SlashCommandDefinition, SlashCommandRequest, SlashCommandResult, ToolActionProjection,
+    ToolCommandProjection, ToolEvent, ToolMcpProjection, ToolProjection, ToolProjectionKind,
+    ToolSubagentOperation, ToolSubagentProjection, ToolSubagentStateProjection, TurnId, TurnState,
+    TurnStatus, UniversalCommandEnvelope, UniversalEventKind, UniversalEventSource, UserInput,
+    WorkspaceRef,
 };
 use agenter_protocol::runner::{AgentInput, AgentUniversalEvent, RunnerCommandResult, RunnerError};
 use serde_json::Value;
@@ -738,6 +739,42 @@ fn universal_event_from_normalized(
                 approval: Box::new(approval_request(event, native.clone())),
             },
         ),
+        NormalizedEvent::ApprovalResolved(event) => (
+            turn_id_from_provider_payload(event.provider_payload.as_ref()),
+            None,
+            UniversalEventKind::ApprovalRequested {
+                approval: Box::new(resolved_approval_request(event, native.clone())),
+            },
+        ),
+        NormalizedEvent::QuestionRequested(event) => (
+            turn_id_from_provider_payload(event.provider_payload.as_ref()),
+            None,
+            UniversalEventKind::QuestionRequested {
+                question: Box::new(question_request(event, native.clone())),
+            },
+        ),
+        NormalizedEvent::QuestionAnswered(event) => (
+            turn_id_from_provider_payload(event.provider_payload.as_ref()),
+            None,
+            UniversalEventKind::QuestionAnswered {
+                question: Box::new(answered_question(event, native.clone())),
+            },
+        ),
+        NormalizedEvent::TurnFailed(turn) => (
+            Some(turn.turn_id),
+            None,
+            UniversalEventKind::TurnFailed { turn: turn.clone() },
+        ),
+        NormalizedEvent::TurnCancelled(turn) => (
+            Some(turn.turn_id),
+            None,
+            UniversalEventKind::TurnCancelled { turn: turn.clone() },
+        ),
+        NormalizedEvent::TurnInterrupted(turn) => (
+            Some(turn.turn_id),
+            None,
+            UniversalEventKind::TurnInterrupted { turn: turn.clone() },
+        ),
         NormalizedEvent::TurnDiffUpdated(event) => {
             let turn_id = turn_id_from_provider_payload(event.provider_payload.as_ref())
                 .or_else(|| event.event_id.as_deref().map(stable_turn_id));
@@ -1269,6 +1306,78 @@ fn approval_request(event: &ApprovalRequestEvent, native: NativeRef) -> Approval
     }
 }
 
+fn resolved_approval_request(
+    event: &agenter_core::ApprovalResolvedEvent,
+    native: NativeRef,
+) -> ApprovalRequest {
+    ApprovalRequest {
+        approval_id: event.approval_id,
+        session_id: event.session_id,
+        turn_id: turn_id_from_provider_payload(event.provider_payload.as_ref()),
+        item_id: None,
+        kind: agenter_core::ApprovalKind::ProviderSpecific,
+        title: "Approval resolved".to_owned(),
+        details: None,
+        options: Vec::new(),
+        status: approval_status_from_decision(&event.decision),
+        risk: None,
+        subject: None,
+        native_request_id: None,
+        native_blocking: true,
+        policy: None,
+        native: Some(native),
+        requested_at: None,
+        resolved_at: Some(event.resolved_at),
+    }
+}
+
+fn approval_status_from_decision(decision: &ApprovalDecision) -> ApprovalStatus {
+    match decision {
+        ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => ApprovalStatus::Approved,
+        ApprovalDecision::Decline => ApprovalStatus::Denied,
+        ApprovalDecision::Cancel => ApprovalStatus::Cancelled,
+        ApprovalDecision::ProviderSpecific { .. } => ApprovalStatus::Denied,
+    }
+}
+
+fn question_request(
+    event: &agenter_core::QuestionRequestedEvent,
+    native: NativeRef,
+) -> QuestionState {
+    QuestionState {
+        question_id: event.question_id,
+        session_id: event.session_id,
+        turn_id: turn_id_from_provider_payload(event.provider_payload.as_ref()),
+        title: event.title.clone(),
+        description: event.description.clone(),
+        fields: event.fields.clone(),
+        status: QuestionStatus::Pending,
+        answer: None,
+        native: Some(native),
+        requested_at: None,
+        answered_at: None,
+    }
+}
+
+fn answered_question(
+    event: &agenter_core::QuestionAnsweredEvent,
+    native: NativeRef,
+) -> QuestionState {
+    QuestionState {
+        question_id: event.question_id,
+        session_id: event.session_id,
+        turn_id: turn_id_from_provider_payload(event.provider_payload.as_ref()),
+        title: "Input requested".to_owned(),
+        description: None,
+        fields: Vec::new(),
+        status: QuestionStatus::Answered,
+        answer: Some(event.answer.clone()),
+        native: Some(native),
+        requested_at: None,
+        answered_at: None,
+    }
+}
+
 fn provider_item_status(event: &NativeNotification) -> ItemStatus {
     match event.status.as_deref() {
         Some("completed" | "complete" | "done" | "success") => ItemStatus::Completed,
@@ -1456,6 +1565,9 @@ fn normalized_event_session_id(event: &NormalizedEvent) -> Option<SessionId> {
         NormalizedEvent::ApprovalResolved(event) => Some(event.session_id),
         NormalizedEvent::QuestionRequested(event) => Some(event.session_id),
         NormalizedEvent::QuestionAnswered(event) => Some(event.session_id),
+        NormalizedEvent::TurnFailed(turn)
+        | NormalizedEvent::TurnCancelled(turn)
+        | NormalizedEvent::TurnInterrupted(turn) => Some(turn.session_id),
         NormalizedEvent::TurnDiffUpdated(event)
         | NormalizedEvent::ItemReasoning(event)
         | NormalizedEvent::ServerRequestResolved(event)
@@ -1481,6 +1593,9 @@ fn normalized_event_native_id(event: &NormalizedEvent) -> Option<String> {
         NormalizedEvent::ApprovalResolved(event) => Some(event.approval_id.to_string()),
         NormalizedEvent::QuestionRequested(event) => Some(event.question_id.to_string()),
         NormalizedEvent::QuestionAnswered(event) => Some(event.answer.question_id.to_string()),
+        NormalizedEvent::TurnFailed(turn)
+        | NormalizedEvent::TurnCancelled(turn)
+        | NormalizedEvent::TurnInterrupted(turn) => Some(turn.turn_id.to_string()),
         NormalizedEvent::TurnDiffUpdated(event)
         | NormalizedEvent::ItemReasoning(event)
         | NormalizedEvent::ServerRequestResolved(event)
@@ -1512,6 +1627,9 @@ fn normalized_event_summary(event: &NormalizedEvent) -> String {
         NormalizedEvent::ApprovalResolved(_) => "approval resolved",
         NormalizedEvent::QuestionRequested(_) => "question requested",
         NormalizedEvent::QuestionAnswered(_) => "question answered",
+        NormalizedEvent::TurnFailed(_) => "turn failed",
+        NormalizedEvent::TurnCancelled(_) => "turn cancelled",
+        NormalizedEvent::TurnInterrupted(_) => "turn interrupted",
         NormalizedEvent::TurnDiffUpdated(_) => "turn diff updated",
         NormalizedEvent::ItemReasoning(_) => "item reasoning",
         NormalizedEvent::ServerRequestResolved(_) => "server request resolved",

@@ -191,7 +191,7 @@ Phases build on earlier layers: fixing the stdio multiplexing bug first avoids c
 
 ### Phase 7 — Client surface parity (incremental product)
 
-18. **`turn/interrupt`** — expose via Control Plane HTTP + runner forwarding (parity with Ctrl+C in Codex TUI).
+18. **`turn/interrupt`** — Codex live turn interrupt is now wired in the runner; control-plane HTTP exposure remains the separate browser-facing follow-up (parity with Ctrl+C in Codex TUI).
 19. Thread metadata / MCP admin / marketplace — backlog only unless product prioritizes remote admin from Agenter shell.
 
 ---

@@ -16,6 +16,7 @@
     getSession,
     listSlashCommands,
     renameSession,
+    interruptSessionTurn,
     executeSlashCommand,
     sendSessionMessage,
     updateSessionSettings
@@ -90,6 +91,7 @@
   let decisionError = '';
   let settingsError = '';
   let submitting = false;
+  let stoppingTurn = false;
   let editingTitle = false;
   let titleDraft = '';
   let renaming = false;
@@ -152,7 +154,8 @@
   $: turnActive = turnActivity?.active ?? false;
   $: visibleItems = items.filter((item) => shouldShowItem(item, verbosity));
   $: shouldExpandThinkingByDefault = verbosity === 'detailed' || verbosity === 'debug';
-  $: sendBusy = submitting || turnActive;
+  $: sendBusy = submitting || stoppingTurn || turnActive;
+  $: sendButtonLabel = turnActive ? 'Stop turn' : 'Send';
   $: slashSuggestions = filterSlashCommands(draft, slashCommands);
   $: parsedSlash = parseSlashCommand(draft, slashCommands);
   $: slashMenuOpen = isSlashDraft(draft) && slashSuggestions.length > 0;
@@ -232,6 +235,7 @@
     decisionError = '';
     settingsError = '';
     editingTitle = false;
+    stoppingTurn = false;
     connectionState = 'Loading history';
     try {
       session = await getSession(sessionId);
@@ -319,6 +323,19 @@
   }
 
   async function submit() {
+    if (stoppingTurn) {
+      return;
+    }
+
+    if (turnActive) {
+      await stopActiveTurn();
+      return;
+    }
+
+    if (submitting) {
+      return;
+    }
+
     const content = draft.trim();
     if (!content) {
       return;
@@ -341,6 +358,27 @@
       pushToast({ severity: 'error', message: sendError });
     } finally {
       submitting = false;
+    }
+  }
+
+  async function stopActiveTurn() {
+    if (!turnActive || stoppingTurn) {
+      return;
+    }
+
+    sendError = '';
+    stoppingTurn = true;
+    try {
+      const result = await interruptSessionTurn(sessionId);
+      if (!result.accepted) {
+        sendError = result.message || 'Could not stop the current turn.';
+        pushToast({ severity: 'warning', message: sendError });
+      }
+    } catch (error) {
+      sendError = apiErrorMessage(error, 'Could not stop the current turn.');
+      pushToast({ severity: 'error', message: sendError });
+    } finally {
+      stoppingTurn = false;
     }
   }
 
@@ -1250,7 +1288,13 @@
       on:input={resizeMessageTextarea}
       on:keydown={handleMessageKeydown}
     ></textarea>
-    <button class:busy={sendBusy} type="submit" disabled={submitting} aria-label={sendBusy ? 'Working' : 'Send'}>
+    <button
+      class:busy={sendBusy}
+      type="submit"
+      disabled={stoppingTurn || (submitting && !turnActive)}
+      aria-label={sendButtonLabel}
+      title={sendButtonLabel}
+    >
       {#if sendBusy}
         <span class="button-spinner" aria-hidden="true"></span>
       {:else}

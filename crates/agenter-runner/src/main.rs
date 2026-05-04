@@ -36,6 +36,7 @@ use agents::codex::{
     PendingCodexApproval, PendingCodexQuestion,
 };
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::watch;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
@@ -50,6 +51,7 @@ const DEFAULT_RUNNER_WS_MAX_MESSAGE_BYTES: usize = 512 * 1024 * 1024;
 struct CodexRunnerRuntime {
     workspace_path: PathBuf,
     sessions: Arc<Mutex<HashMap<SessionId, Arc<Mutex<CodexSessionRuntime>>>>>,
+    turn_interrupt_senders: Arc<Mutex<HashMap<SessionId, watch::Sender<bool>>>>,
 }
 
 #[derive(Clone)]
@@ -61,6 +63,7 @@ struct RunnerOperationReporter {
 struct CodexSessionRuntime {
     server: CodexAppServer,
     live_thread_ids: HashSet<String>,
+    turn_interrupt_rx: watch::Receiver<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -168,7 +171,7 @@ fn provider_cancel_unsupported(provider_label: &'static str) -> RunnerResponseOu
         error: RunnerError {
             code: "provider_cancel_not_supported".to_owned(),
             message: format!(
-                "{provider_label} has no live turn cancellation hook in this runner path; only blocked native approvals can be cancelled"
+                "{provider_label} cannot interrupt the current turn in this runner path."
             ),
         },
     }
@@ -192,12 +195,18 @@ impl CodexRunnerRuntime {
         Self {
             workspace_path,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            turn_interrupt_senders: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     async fn create_session(&self, session_id: SessionId) -> anyhow::Result<String> {
         let mut server = spawn_codex_server(self.workspace_path.clone()).await?;
         let thread_id = server.start_thread(&self.workspace_path).await?;
+        let (turn_interrupt_tx, turn_interrupt_rx) = watch::channel(false);
+        self.turn_interrupt_senders
+            .lock()
+            .await
+            .insert(session_id, turn_interrupt_tx);
         let mut live_thread_ids = HashSet::new();
         live_thread_ids.insert(thread_id.clone());
         self.sessions.lock().await.insert(
@@ -205,6 +214,7 @@ impl CodexRunnerRuntime {
             Arc::new(Mutex::new(CodexSessionRuntime {
                 server,
                 live_thread_ids,
+                turn_interrupt_rx,
             })),
         );
         Ok(thread_id)
@@ -219,6 +229,11 @@ impl CodexRunnerRuntime {
         server
             .resume_thread(external_session_id, &self.workspace_path)
             .await?;
+        let (turn_interrupt_tx, turn_interrupt_rx) = watch::channel(false);
+        self.turn_interrupt_senders
+            .lock()
+            .await
+            .insert(session_id, turn_interrupt_tx);
         let mut live_thread_ids = HashSet::new();
         live_thread_ids.insert(external_session_id.to_owned());
         self.sessions.lock().await.insert(
@@ -226,9 +241,31 @@ impl CodexRunnerRuntime {
             Arc::new(Mutex::new(CodexSessionRuntime {
                 server,
                 live_thread_ids,
+                turn_interrupt_rx,
             })),
         );
         Ok(external_session_id.to_owned())
+    }
+
+    async fn signal_turn_interrupt(&self, session_id: SessionId) -> bool {
+        let Some(sender) = self
+            .turn_interrupt_senders
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+        else {
+            return false;
+        };
+        sender.send(true).is_ok()
+    }
+
+    async fn turn_interrupt_sender(&self, session_id: SessionId) -> Option<watch::Sender<bool>> {
+        self.turn_interrupt_senders
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
     }
 
     async fn discover_sessions(
@@ -339,86 +376,102 @@ impl CodexRunnerRuntime {
         pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingCodexApproval>>>,
         pending_questions: Arc<Mutex<HashMap<QuestionId, PendingCodexQuestion>>>,
     ) -> anyhow::Result<()> {
-        let session_runtime = self
-            .ensure_session_runtime(request.session_id, request.external_session_id.clone())
-            .await?;
-        let mut session_runtime = session_runtime.lock().await;
-        let thread_action = {
-            codex_turn_thread_action(
-                request.external_session_id.as_deref(),
-                &session_runtime.live_thread_ids,
-            )
-        };
-        let existing_thread_id = match thread_action {
-            CodexTurnThreadAction::UseLive(thread_id) => {
-                session_runtime.server.set_active_thread(thread_id.clone());
-                Some(thread_id)
-            }
-            CodexTurnThreadAction::ResumeExisting(thread_id) => {
-                match session_runtime
-                    .server
-                    .resume_thread(&thread_id, &self.workspace_path)
-                    .await
-                {
-                    Ok(()) => {
-                        session_runtime.live_thread_ids.insert(thread_id.clone());
-                    }
-                    Err(error) if is_codex_no_rollout_resume_error(error.as_ref()) => {
-                        tracing::warn!(
-                            session_id = %request.session_id,
-                            provider_thread_id = %thread_id,
-                            "codex resume reported no rollout; treating thread as a pre-first-turn live thread"
-                        );
-                        session_runtime.server.set_active_thread(thread_id.clone());
-                        session_runtime.live_thread_ids.insert(thread_id.clone());
-                    }
-                    Err(error) => return Err(error),
-                }
-                Some(thread_id)
-            }
-            CodexTurnThreadAction::StartNew => {
-                let thread_id = session_runtime
-                    .server
-                    .start_thread(&self.workspace_path)
-                    .await?;
-                session_runtime.server.set_active_thread(thread_id.clone());
-                session_runtime.live_thread_ids.insert(thread_id);
-                None
-            }
-        };
-        let result = run_codex_turn_on_server(
-            &mut session_runtime.server,
-            request.clone(),
-            event_sender.clone(),
-            pending_approvals.clone(),
-            pending_questions.clone(),
-        )
-        .await;
-        if let (Err(error), Some(thread_id)) = (&result, existing_thread_id.as_deref()) {
-            if is_codex_thread_not_found_error(error.as_ref()) {
-                tracing::warn!(
-                    session_id = %request.session_id,
-                    provider_thread_id = %thread_id,
-                    "codex turn/start reported missing thread after resume; retrying resume once"
-                );
-                session_runtime
-                    .server
-                    .resume_thread(thread_id, &self.workspace_path)
-                    .await?;
-                return run_codex_turn_on_server(
-                    &mut session_runtime.server,
-                    request,
-                    event_sender,
-                    pending_approvals,
-                    pending_questions,
+        let session_id = request.session_id;
+        let result = async {
+            let session_runtime = self
+                .ensure_session_runtime(session_id, request.external_session_id.clone())
+                .await?;
+            let mut session_runtime = session_runtime.lock().await;
+            let thread_action = {
+                codex_turn_thread_action(
+                    request.external_session_id.as_deref(),
+                    &session_runtime.live_thread_ids,
                 )
-                .await;
+            };
+            let existing_thread_id = match thread_action {
+                CodexTurnThreadAction::UseLive(thread_id) => {
+                    session_runtime.server.set_active_thread(thread_id.clone());
+                    Some(thread_id)
+                }
+                CodexTurnThreadAction::ResumeExisting(thread_id) => {
+                    match session_runtime
+                        .server
+                        .resume_thread(&thread_id, &self.workspace_path)
+                        .await
+                    {
+                        Ok(()) => {
+                            session_runtime.live_thread_ids.insert(thread_id.clone());
+                        }
+                        Err(error) if is_codex_no_rollout_resume_error(error.as_ref()) => {
+                            tracing::warn!(
+                                session_id = %session_id,
+                                provider_thread_id = %thread_id,
+                                "codex resume reported no rollout; treating thread as a pre-first-turn live thread"
+                            );
+                            session_runtime.server.set_active_thread(thread_id.clone());
+                            session_runtime.live_thread_ids.insert(thread_id.clone());
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    Some(thread_id)
+                }
+                CodexTurnThreadAction::StartNew => {
+                    let thread_id = session_runtime
+                        .server
+                        .start_thread(&self.workspace_path)
+                        .await?;
+                    session_runtime.server.set_active_thread(thread_id.clone());
+                    session_runtime.live_thread_ids.insert(thread_id);
+                    None
+                }
+            };
+            let interrupt_rx = session_runtime.turn_interrupt_rx.clone();
+            let Some(turn_interrupt_tx) = self.turn_interrupt_sender(session_id).await else {
+                return Err(anyhow::anyhow!(
+                    "codex turn interrupt signal was not available for session {session_id}"
+                ));
+            };
+            let result = run_codex_turn_on_server(
+                &mut session_runtime.server,
+                request.clone(),
+                event_sender.clone(),
+                pending_approvals.clone(),
+                pending_questions.clone(),
+                turn_interrupt_tx.clone(),
+                interrupt_rx.clone(),
+            )
+            .await;
+            if let (Err(error), Some(thread_id)) = (&result, existing_thread_id.as_deref()) {
+                if is_codex_thread_not_found_error(error.as_ref()) {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        provider_thread_id = %thread_id,
+                        "codex turn/start reported missing thread after resume; retrying resume once"
+                    );
+                    session_runtime
+                        .server
+                        .resume_thread(thread_id, &self.workspace_path)
+                        .await?;
+                    return run_codex_turn_on_server(
+                        &mut session_runtime.server,
+                        request,
+                        event_sender,
+                        pending_approvals,
+                        pending_questions,
+                        turn_interrupt_tx,
+                        interrupt_rx.clone(),
+                    )
+                    .await;
+                }
             }
+            result
         }
+        .await;
         result
     }
 
     async fn shutdown_session(&self, session_id: SessionId) -> bool {
+        self.turn_interrupt_senders.lock().await.remove(&session_id);
         self.sessions.lock().await.remove(&session_id).is_some()
     }
 
@@ -951,13 +1004,15 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                         .await?;
                     }
                     RunnerCommand::InterruptSession { session_id } => {
+                        let interrupt_signaled =
+                            codex_runtime.signal_turn_interrupt(session_id).await;
                         let cancelled = cancel_pending_provider_approvals_for_session(
                             session_id,
                             pending_approvals.clone(),
                             "Codex",
                         )
                         .await;
-                        let outcome = if cancelled > 0 {
+                        let outcome = if interrupt_signaled || cancelled > 0 {
                             RunnerResponseOutcome::Ok {
                                 result: RunnerCommandResult::Accepted,
                             }
@@ -1067,6 +1122,7 @@ async fn run_acp_runner(
                 file_changes: true,
                 command_execution: true,
                 session_resume: true,
+                interrupt: true,
                 model_selection: true,
                 reasoning_effort: true,
                 collaboration_modes: true,
@@ -1784,6 +1840,10 @@ async fn run_acp_runner(
                         .await?;
                     }
                     RunnerCommand::InterruptSession { session_id } => {
+                        let mut interrupt_signaled = false;
+                        if let Some(runtime) = &codex_runtime {
+                            interrupt_signaled = runtime.signal_turn_interrupt(session_id).await;
+                        }
                         let acp_cancelled = cancel_pending_provider_approvals_for_session(
                             session_id,
                             pending_approvals.clone(),
@@ -1796,7 +1856,7 @@ async fn run_acp_runner(
                             "Codex",
                         )
                         .await;
-                        let outcome = if acp_cancelled + codex_cancelled > 0 {
+                        let outcome = if interrupt_signaled || acp_cancelled + codex_cancelled > 0 {
                             RunnerResponseOutcome::Ok {
                                 result: RunnerCommandResult::Accepted,
                             }
@@ -2234,6 +2294,7 @@ fn codex_hello(token: String, workspace_path: PathBuf) -> RunnerHello {
         "codex-app-server",
         "codex workspace",
         true,
+        true,
     )
 }
 
@@ -2260,6 +2321,7 @@ fn acp_hello(
                 file_changes: true,
                 command_execution: true,
                 session_resume: true,
+                interrupt: true,
                 model_selection: true,
                 reasoning_effort: true,
                 collaboration_modes: true,
@@ -2308,6 +2370,7 @@ fn provider_hello(
     transport: &str,
     fallback_name: &str,
     session_resume: bool,
+    interrupt: bool,
 ) -> RunnerHello {
     let runner_id = configured_runner_id(&provider_id, &workspace_path);
     let workspace_id = configured_workspace_id(&provider_id, &workspace_path);
@@ -2324,6 +2387,7 @@ fn provider_hello(
                     file_changes: true,
                     command_execution: true,
                     session_resume,
+                    interrupt,
                     model_selection: session_resume,
                     reasoning_effort: session_resume,
                     collaboration_modes: session_resume,
@@ -2584,6 +2648,13 @@ mod tests {
             .transports
             .iter()
             .any(|transport| transport == "acp-stdio"));
+        let codex = hello
+            .capabilities
+            .agent_providers
+            .iter()
+            .find(|provider| provider.provider_id.as_str() == "codex")
+            .expect("codex provider");
+        assert!(codex.capabilities.interrupt);
     }
 
     #[tokio::test]

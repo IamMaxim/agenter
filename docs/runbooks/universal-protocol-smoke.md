@@ -199,7 +199,7 @@ Manual checks:
 - Conflicting duplicate approval: retry with the same key but a different semantic decision. Expected state: `idempotency_conflict` or `approval_conflicting_decision`.
 - Question/user input: answer a question and retry with the same key. Expected state: stored response replay, not a second native response.
 - Cancel while approval is pending: expected state is `cancelled` when a blocked native request is answered with cancel; otherwise a typed `provider_cancel_not_supported` error and no false `turn.cancelled`.
-- Cancel while a provider turn is running without a blocked native approval: expected state is a typed `provider_cancel_not_supported` error unless that provider explicitly advertises and implements a live interrupt hook. ACP currently must not advertise generic interrupt support.
+- Cancel while a provider turn is running without a blocked native approval: Codex should now complete with `turn.interrupted` after a live `turn/interrupt` delivery; ACP and other providers should still return a typed `provider_cancel_not_supported` error unless they explicitly advertise and implement a live interrupt hook.
 - Harness death while approval is pending: expected state is `approval.orphaned` only when runner/harness evidence says ownership is lost, not on transient WebSocket disconnect.
 
 ## Chaos Checks
@@ -211,7 +211,7 @@ Run these against fake runner first, then one live provider when locally availab
 - Runner WebSocket reconnect after unacked event: runner WAL replay must be acked once and deduped by runner sequence.
 - Duplicate runner event replay: no second browser-visible universal event for the same accepted runner sequence.
 - Runner reconnect during native permission: pending native waiter should accept the eventual answer exactly once when the runner process and provider runtime survive. This remains a Stage 10 risk until reconnect-stable runtime ownership is covered by an automated chaos test.
-- Cancel while updates are still arriving: final state must be one of `turn.cancelled`, `turn.interrupted`, `turn.failed`, or a typed unsupported-cancel error; do not report inert success.
+- Cancel while updates are still arriving: final state must be one of `turn.cancelled`, `turn.interrupted`, `turn.failed`, or a typed unsupported-cancel error; Codex should use `turn.interrupted` when the live hook is available. Do not report inert success.
 - Harness crash during tool: pending approvals become `orphaned` and the turn becomes `failed` or `detached` based on runner evidence.
 
 ## Cleanup

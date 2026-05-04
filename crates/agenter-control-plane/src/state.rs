@@ -3505,6 +3505,24 @@ fn universal_projection_universal_event(
         NormalizedEvent::ApprovalResolved(resolved) => UniversalEventKind::ApprovalRequested {
             approval: Box::new(source_resolved_approval_request(resolved)),
         },
+        NormalizedEvent::QuestionRequested(request) => UniversalEventKind::QuestionRequested {
+            question: Box::new(source_question_request(request, ts)),
+        },
+        NormalizedEvent::QuestionAnswered(answered) => UniversalEventKind::QuestionAnswered {
+            question: Box::new(source_answered_question(answered, ts)),
+        },
+        NormalizedEvent::TurnFailed(turn) => {
+            turn_id = Some(turn.turn_id);
+            UniversalEventKind::TurnFailed { turn: turn.clone() }
+        }
+        NormalizedEvent::TurnCancelled(turn) => {
+            turn_id = Some(turn.turn_id);
+            UniversalEventKind::TurnCancelled { turn: turn.clone() }
+        }
+        NormalizedEvent::TurnInterrupted(turn) => {
+            turn_id = Some(turn.turn_id);
+            UniversalEventKind::TurnInterrupted { turn: turn.clone() }
+        }
         NormalizedEvent::NativeNotification(native_notification)
         | NormalizedEvent::TurnDiffUpdated(native_notification)
         | NormalizedEvent::ItemReasoning(native_notification)
@@ -3889,6 +3907,60 @@ fn source_approval_request(
     }
 }
 
+fn source_question_request(
+    request: &agenter_core::QuestionRequestedEvent,
+    requested_at: DateTime<Utc>,
+) -> QuestionState {
+    QuestionState {
+        question_id: request.question_id,
+        session_id: request.session_id,
+        turn_id: None,
+        title: request.title.clone(),
+        description: request.description.clone(),
+        fields: request.fields.clone(),
+        status: QuestionStatus::Pending,
+        answer: None,
+        native: Some(NativeRef {
+            protocol: "uap.universal_projection".to_owned(),
+            method: Some("question_requested".to_owned()),
+            kind: Some("universal_projection".to_owned()),
+            native_id: safe_native_request_id(request.provider_payload.as_ref()),
+            summary: Some(request.title.clone()),
+            hash: None,
+            pointer: None,
+        }),
+        requested_at: Some(requested_at),
+        answered_at: None,
+    }
+}
+
+fn source_answered_question(
+    answered: &agenter_core::QuestionAnsweredEvent,
+    answered_at: DateTime<Utc>,
+) -> QuestionState {
+    QuestionState {
+        question_id: answered.question_id,
+        session_id: answered.session_id,
+        turn_id: None,
+        title: "Input requested".to_owned(),
+        description: None,
+        fields: Vec::new(),
+        status: QuestionStatus::Answered,
+        answer: Some(answered.answer.clone()),
+        native: Some(NativeRef {
+            protocol: "uap.universal_projection".to_owned(),
+            method: Some("question_answered".to_owned()),
+            kind: Some("universal_projection".to_owned()),
+            native_id: safe_native_request_id(answered.provider_payload.as_ref()),
+            summary: Some("Question answered".to_owned()),
+            hash: None,
+            pointer: None,
+        }),
+        requested_at: None,
+        answered_at: Some(answered_at),
+    }
+}
+
 fn approval_decision_universal_status(decision: &ApprovalDecision) -> UniversalApprovalStatus {
     match decision {
         ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => {
@@ -4127,6 +4199,9 @@ fn normalized_event_name(event: &NormalizedEvent) -> &'static str {
         NormalizedEvent::ApprovalResolved(_) => "approval_resolved",
         NormalizedEvent::QuestionRequested(_) => "question_requested",
         NormalizedEvent::QuestionAnswered(_) => "question_answered",
+        NormalizedEvent::TurnFailed(_) => "turn_failed",
+        NormalizedEvent::TurnCancelled(_) => "turn_cancelled",
+        NormalizedEvent::TurnInterrupted(_) => "turn_interrupted",
         NormalizedEvent::TurnDiffUpdated(_) => "turn_diff_updated",
         NormalizedEvent::ItemReasoning(_) => "item_reasoning",
         NormalizedEvent::ServerRequestResolved(_) => "server_request_resolved",

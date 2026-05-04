@@ -284,6 +284,15 @@ export async function executeSlashCommand(
   };
 }
 
+export async function interruptSessionTurn(sessionId: string): Promise<SlashCommandResult> {
+  return executeSlashCommand(sessionId, {
+    command_id: 'runner.interrupt',
+    arguments: {},
+    raw_input: '/interrupt',
+    confirmed: true
+  });
+}
+
 export async function decideApproval(
   approvalId: string,
   decision: ApprovalDecision

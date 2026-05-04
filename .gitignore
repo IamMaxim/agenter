@@ -2,4 +2,7 @@
 /.superpowers/
 /web/node_modules/
 /web/dist/
-/tmp/
+/tmp/agenter-logs/
+/tmp/workspace/
+**/.DS_Store
+/.agenter/

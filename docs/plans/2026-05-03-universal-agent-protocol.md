@@ -494,7 +494,7 @@ Steps:
 - [x] Persist every approval request and status transition.
 - [x] Keep question/user-input flows separate from danger approvals.
 - [x] Implement policy engine decisions `allow`, `ask`, `deny`, and `rewrite` for command/file/network/tool requests where available.
-- [ ] Wire `CancelTurn` to Codex interrupt/cancel behavior and ACP `session/cancel`.
+- [x] Wire `CancelTurn` to Codex interrupt/cancel behavior; ACP `session/cancel` remains a later capability-gated follow-up.
 - [x] On cancel, respond to blocked native approvals/questions with a native cancelled/declined outcome where required by the harness protocol.
 - [x] Mark approvals orphaned when runner/harness ownership is lost.
 - [x] Add tests for approval duplicate same decision, conflicting duplicate, runner reconnect during approval, cancel while awaiting approval, question answer idempotency, and orphaning on harness death.
@@ -517,8 +517,8 @@ Stage 7 notes:
 - Listing pending approvals marks them `presented` and persists that transition. Beginning resolution persists `resolving`; runner-acknowledged resolution persists the final approved/denied/cancelled projection through the existing Stage 3 idempotent route.
 - Question/user-input requests remain `QuestionRequested` / `QuestionAnswered` and do not become danger approvals.
 - The policy surface is intentionally conservative: command/file/tool/provider approval requests currently evaluate to typed `ask` decisions with coarse risk classification; `allow`, `deny`, and `rewrite` are modeled for future rules but not auto-applied to native requests yet.
-- `/interrupt` / `CancelTurn` no longer returns inert success when there is no live cancellation hook. The runner answers matching blocked provider approvals with native cancel where present; otherwise it returns a clear `provider_cancel_not_supported` error. Full Codex turn interrupt and ACP `session/cancel` still require live runtime handles outside the current provider-specific command loops.
-- ACP provider advertisements no longer claim generic interrupt support. `CapabilitySet.approvals.cancel_turn` is therefore only advertised when a provider has an actual interrupt capability; individual blocked approval cards may still offer a cancel option because that maps to answering the native blocked request with a cancelled/declined outcome.
+- `/interrupt` / `CancelTurn` now delivers a real live interrupt for Codex turns and still answers matching blocked provider approvals with native cancel where present. Unsupported live-turn cancel on ACP and other providers continues to return a clear `provider_cancel_not_supported` error.
+- Codex provider advertisements now claim live interrupt support. ACP provider advertisements still do not claim generic interrupt support; `CapabilitySet.approvals.cancel_turn` is therefore only advertised when a provider has an actual interrupt capability, while individual blocked approval cards may still offer a cancel option because that maps to answering the native blocked request with a cancelled/declined outcome.
 - Approvals are marked `orphaned` when explicit runner/harness evidence moves the session to stopped, failed, or archived. Transient runner WebSocket disconnect still does not orphan approvals.
 
 Verification:
@@ -780,6 +780,6 @@ Controller validation before scheduling the next stage:
 - Runner acks/replays events through a local WAL.
 - Codex native adapter and ACP adapter both emit universal turns/items/content/plans/approvals while preserving safe native references. Raw full provider payload persistence remains out of scope without a future explicit policy ADR.
 - Approval decisions and user-input answers are idempotent and native blocked requests are answered exactly once.
-- Cancel/interrupt changes real native state only for supported provider hooks or blocked native approval cancellation. Unsupported live-turn cancel returns a typed `provider_cancel_not_supported` error and must not be advertised as a generic capability.
+- Cancel/interrupt changes real native state only for supported provider hooks or blocked native approval cancellation. Codex now has a supported live-turn interrupt hook; unsupported live-turn cancel on other providers returns a typed `provider_cancel_not_supported` error and must not be advertised as a generic capability.
 - Frontend renders from universal capabilities and snapshot state, with source fallback only for migration safety.
 - Full Rust and frontend verification gates pass, or any environment limitation is recorded in this plan with the exact failed command and next action.

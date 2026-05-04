@@ -5,6 +5,7 @@ import {
   decideApproval,
   executeSlashCommand,
   getWorkspaceProviderSessionRefreshStatus,
+  interruptSessionTurn,
   listSlashCommands,
   refreshWorkspaceProviderSessions,
   sendSessionMessage
@@ -42,6 +43,43 @@ describe('session APIs', () => {
           decision: 'decline',
           option_id: 'deny_with_feedback',
           feedback: 'Needs a safer command.'
+        })
+      })
+    );
+  });
+
+  test('interruptSessionTurn posts the runner interrupt slash command', async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: () =>
+        Promise.resolve(
+          JSON.stringify({
+            accepted: true,
+            message: 'Interrupt requested.',
+            session: null,
+            provider_payload: null
+          })
+        )
+    });
+    vi.stubGlobal('fetch', fetch);
+
+    await expect(interruptSessionTurn('session 1')).resolves.toEqual({
+      accepted: true,
+      message: 'Interrupt requested.',
+      session: undefined,
+      provider_payload: null
+    });
+
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/sessions/session%201/slash-commands',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          command_id: 'runner.interrupt',
+          arguments: {},
+          raw_input: '/interrupt',
+          confirmed: true
         })
       })
     );

@@ -60,6 +60,7 @@ version = "0.1.0"
 dependencies = [
  "agenter-core",
  "base64",
+ "chrono",
  "serde",
  "serde_json",
  "sha2",
@@ -73,7 +74,9 @@ dependencies = [
  "agenter-core",
  "agenter-protocol",
  "anyhow",
+ "chrono",
  "futures-util",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
