@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` for implementation. Assign one stage per worker unless a stage explicitly says it depends on another stage. Workers are not alone in this codebase: do not revert unrelated edits, and adjust to concurrent changes made by other workers.
 
-Status: ready for implementation
+Status: implemented, automated verification passed, live provider smoke not run
 Date: 2026-05-04
 Reference: local `tmp/codex` app-server protocol/TUI snapshot at `637f7dd6d7`
 
@@ -14,7 +14,51 @@ Reference: local `tmp/codex` app-server protocol/TUI snapshot at `637f7dd6d7`
 
 ---
 
-## Current Evidence
+## Implementation Status
+
+Completed on 2026-05-04:
+
+- Stage 0 inventory completed. Legacy `execCommandApproval` and `applyPatchApproval` are classified as supported because current Agenter already handles them.
+- Stage 1 added a checked-in Codex protocol coverage matrix and fixture-backed drift tests. Server request and notification coverage is exhaustive against `crates/agenter-runner/tests/fixtures/codex_app_server_protocol_methods.rs`; selected client request coverage verifies classified client methods still exist upstream.
+- Stage 2 added provider-specific capability details while preserving existing boolean capability fields. Browser snapshots merge provider details without clearing control-plane-owned capability flags.
+- Stage 3 added an explicit Codex turn driver state machine and terminal pending approval/question cleanup.
+- Stage 4 replaced the broad unsupported request fallback with a classified server-request dispatcher.
+- Stage 5 promoted high-value Codex notification families to stable typed native categories/titles/statuses.
+- Stage 6 renders provider capability gaps, auth-refresh errors, and promoted native notifications through replay/live snapshot materialization while keeping unclassified native noise debug-only.
+- Stage 7 added conservative Codex provider commands: `codex.rate_limits`, `codex.mcp_status`, `codex.mcp_reload`, `codex.rename`, and `codex.context_window`.
+- Follow-up parity pass added Codex subagent tool projection for `collabAgentToolCall`, plus provider commands for turn listing, loaded threads, skills, plugins, plugin detail, apps, config, config requirements, MCP resource reads, and background terminal cleanup.
+
+Verification completed:
+
+- `cargo fmt --all -- --check`
+- `cargo test -p agenter-runner codex_`
+- `cargo test -p agenter-runner codex_protocol_coverage`
+- `cargo test -p agenter-runner codex_turn`
+- `cargo test -p agenter-runner codex_server_request`
+- `cargo test -p agenter-runner codex_provider_command`
+- `cargo test -p agenter-core capabilities`
+- `cargo test -p agenter-protocol capabilities`
+- `cargo test -p agenter-control-plane capabilities`
+- `cargo test -p agenter-control-plane snapshot`
+- `cargo test -p agenter-control-plane event`
+- `cargo test -p agenter-control-plane question`
+- `cargo test -p agenter-control-plane approval`
+- `web/`: `npm run check`
+- `web/`: `npm run lint`
+- `web/`: `npm run test`
+- `web/`: `npm run build`
+- `web/`: `npm run test -- sessionSnapshot universalEvents`
+
+Not run:
+
+- Manual live Codex app-server smoke. This turn used automated unit/snapshot/projection gates only; live provider behavior still needs a local authenticated Codex run.
+
+Remaining decisions:
+
+- Keep `item/tool/call` degraded until a remote executor design is approved.
+- Keep account login/logout, plugin install/uninstall, filesystem mutation, arbitrary MCP tool execution, realtime audio, and one-off terminal control out of the browser command surface.
+
+## Original Evidence
 
 Already implemented in the current checkout:
 
@@ -333,6 +377,16 @@ pub enum ProviderCapabilityStatus {
   - `codex.mcp_reload` -> `config/mcpServer/reload`
   - `codex.rename` -> `thread/name/set`
   - `codex.context_window` -> `thread/contextWindow/inspect`
+  - `codex.loaded_threads` -> `thread/loaded/list`
+  - `codex.turns` -> `thread/turns/list`
+  - `codex.skills` -> `skills/list`
+  - `codex.plugins` -> `plugin/list`
+  - `codex.plugin_read` -> `plugin/read`
+  - `codex.apps` -> `app/list`
+  - `codex.config` -> `config/read`
+  - `codex.config_requirements` -> `configRequirements/read`
+  - `codex.mcp_resource_read` -> `mcpServer/resource/read`
+  - `codex.background_terminals_clean` -> `thread/backgroundTerminals/clean`
 - [ ] Gate commands by provider-specific capabilities from Stage 2.
 - [ ] Keep dangerous or broad operations out of this stage:
   - filesystem write/remove/copy

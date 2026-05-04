@@ -229,6 +229,21 @@ export interface CapabilitySet {
   integration: {
     mcp_elicitation?: boolean;
   };
+  provider_details?: ProviderCapabilityDetail[];
+}
+
+export type ProviderCapabilityStatus =
+  | 'supported'
+  | 'degraded'
+  | 'unsupported'
+  | 'not_applicable'
+  | string;
+
+export interface ProviderCapabilityDetail {
+  key: string;
+  status: ProviderCapabilityStatus;
+  methods: string[];
+  reason?: string | null;
 }
 
 export type TurnStatus =
@@ -236,6 +251,7 @@ export type TurnStatus =
   | 'running'
   | 'waiting_for_input'
   | 'waiting_for_approval'
+  | 'interrupting'
   | 'completed'
   | 'failed'
   | 'cancelled'
@@ -356,6 +372,7 @@ export type ApprovalKind = 'command' | 'file_change' | 'tool' | 'provider_specif
 export type ApprovalOptionKind =
   | 'approve_once'
   | 'approve_always'
+  | 'persist_approval_rule'
   | 'deny'
   | 'deny_with_feedback'
   | 'cancel_turn'
@@ -369,6 +386,14 @@ export interface ApprovalOption {
   description?: string | null;
   scope?: string | null;
   native_option_id?: string | null;
+  policy_rule?: ApprovalPolicyRulePreview | null;
+}
+
+export interface ApprovalPolicyRulePreview {
+  kind: ApprovalKind;
+  matcher: Record<string, unknown>;
+  decision: ApprovalDecision;
+  label: string;
 }
 
 export interface ApprovalRequest {
@@ -481,11 +506,22 @@ export interface SessionSnapshot {
 export type UniversalEventKind =
   | { type: 'session.created'; data: { session: SessionInfo } }
   | { type: 'session.status_changed'; data: { status: SessionStatus; reason?: string | null } }
+  | { type: 'session.metadata_changed'; data: { title?: string | null } }
   | { type: 'turn.started' | 'turn.status_changed' | 'turn.completed' | 'turn.failed' | 'turn.cancelled' | 'turn.interrupted' | 'turn.detached'; data: { turn: TurnState } }
   | { type: 'item.created'; data: { item: ItemState } }
   | { type: 'content.delta'; data: { block_id: string; kind?: ContentBlockKind | null; delta: string } }
   | { type: 'content.completed'; data: { block_id: string; kind?: ContentBlockKind | null; text?: string | null } }
   | { type: 'approval.requested'; data: { approval: ApprovalRequest } }
+  | {
+      type: 'approval.resolved';
+      data: {
+        approval_id: string;
+        status: ApprovalStatus;
+        resolved_at: string;
+        resolved_by_user_id?: string | null;
+        native?: NativeRef | null;
+      };
+    }
   | { type: 'question.requested'; data: { question: QuestionState } }
   | { type: 'question.answered'; data: { question: QuestionState } }
   | { type: 'plan.updated'; data: { plan: PlanState } }
@@ -562,4 +598,17 @@ export interface ApprovalDecision {
   decision: ApprovalDecisionName;
   option_id?: string;
   feedback?: string;
+}
+
+export interface ApprovalPolicyRule {
+  rule_id: string;
+  workspace_id: string;
+  provider_id: string;
+  kind: ApprovalKind;
+  label: string;
+  matcher: Record<string, unknown>;
+  decision: ApprovalDecision;
+  disabled_at?: string | null;
+  created_at: string;
+  updated_at: string;
 }

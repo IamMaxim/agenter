@@ -160,6 +160,13 @@ pub(super) async fn decide_approval(
         }
     }
 
+    if let Some(option_id) = decision_request.option_id.as_deref() {
+        if option_id.starts_with("persist_rule:") {
+            persist_approval_rule_option(&state, user.user_id, session_id, approval_id, option_id)
+                .await;
+        }
+    }
+
     let request_id = agenter_protocol::RequestId::from(Uuid::new_v4().to_string());
     let command = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
         agenter_protocol::runner::RunnerCommandEnvelope {
@@ -209,6 +216,55 @@ pub(super) async fn decide_approval(
     {
         Ok(envelope) => Json(envelope).into_response(),
         Err(status) => status.into_response(),
+    }
+}
+
+async fn persist_approval_rule_option(
+    state: &crate::state::AppState,
+    user_id: agenter_core::UserId,
+    session_id: SessionId,
+    approval_id: agenter_core::ApprovalId,
+    option_id: &str,
+) {
+    let Some(pool) = state.db_pool() else {
+        tracing::warn!(%approval_id, "persistent approval rule ignored without database");
+        return;
+    };
+    let Some(session) = state.session(user_id, session_id).await else {
+        tracing::warn!(%approval_id, %session_id, "persistent approval rule ignored for missing session");
+        return;
+    };
+    let Some(request) = state.approval_request_event(approval_id).await else {
+        tracing::warn!(%approval_id, "persistent approval rule ignored for missing pending request");
+        return;
+    };
+    let Some(preview) = request
+        .options
+        .iter()
+        .find(|option| option.option_id == option_id)
+        .and_then(|option| option.policy_rule.clone())
+    else {
+        tracing::warn!(%approval_id, option_id, "persistent approval rule option missing preview");
+        return;
+    };
+
+    if let Err(error) = agenter_db::create_approval_policy_rule(
+        pool,
+        agenter_db::NewApprovalPolicyRule {
+            owner_user_id: user_id,
+            workspace_id: session.workspace.workspace_id,
+            provider_id: &session.provider_id,
+            kind: preview.kind,
+            label: &preview.label,
+            matcher: &preview.matcher,
+            decision: &preview.decision,
+            source_approval_id: Some(approval_id),
+            created_by_user_id: Some(user_id),
+        },
+    )
+    .await
+    {
+        tracing::warn!(%approval_id, %error, "failed to persist approval policy rule");
     }
 }
 

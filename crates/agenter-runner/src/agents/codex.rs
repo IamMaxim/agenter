@@ -13,6 +13,10 @@ use crate::agents::codex_approval_context::{
     presentation_for_command_execution_approval, sparse_file_change_fallback_details,
     CodexApprovalItemCache,
 };
+use crate::agents::codex_protocol_coverage::{
+    CodexProtocolDirection, CodexProtocolSupport, CODEX_PROTOCOL_COVERAGE,
+};
+use crate::agents::codex_turn_state::{CodexTurnDriver, CodexTurnStateTransition};
 use agenter_core::{
     AgentCollaborationMode, AgentErrorEvent, AgentMessageDeltaEvent, AgentModelOption,
     AgentOptions, AgentProviderId, AgentQuestionAnswer, AgentQuestionChoice, AgentQuestionField,
@@ -109,6 +113,15 @@ struct CodexPendingRequestDelivery {
     response: CodexPendingRequestResponse,
 }
 
+struct CodexPendingRequestState<'a> {
+    pending_server_requests: &'a mut PendingCodexServerRequests,
+    pending_approvals:
+        &'a std::sync::Arc<tokio::sync::Mutex<HashMap<ApprovalId, PendingCodexApproval>>>,
+    pending_questions:
+        &'a std::sync::Arc<tokio::sync::Mutex<HashMap<QuestionId, PendingCodexQuestion>>>,
+    turn_driver: &'a mut CodexTurnDriver,
+}
+
 #[derive(Debug)]
 enum CodexPendingRequestResponse {
     Approval {
@@ -152,6 +165,13 @@ impl PendingCodexServerRequests {
     fn remove(&mut self, native_request_id: &Value) -> Option<PendingCodexServerRequest> {
         self.by_native_request_id
             .remove(&codex_request_id_value_key(native_request_id))
+    }
+
+    fn drain(&mut self) -> Vec<PendingCodexServerRequest> {
+        self.by_native_request_id
+            .drain()
+            .map(|(_, request)| request)
+            .collect()
     }
 }
 
@@ -612,7 +632,7 @@ impl CodexAppServer {
         request: &CodexTurnRequest,
         turn_interrupt_tx: watch::Sender<bool>,
         mut interrupt_rx: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         self.active_session_id = Some(request.session_id);
         let Some(thread_id) = self.thread_id.clone() else {
             return Err(anyhow!(
@@ -632,8 +652,10 @@ impl CodexAppServer {
         let turn_start_id = self
             .send_request("turn/start", codex_turn_start_params(&thread_id, request))
             .await?;
+        let mut startup_interrupted = false;
         if *interrupt_rx.borrow() {
             self.interrupt_startup_turn(&thread_id).await?;
+            startup_interrupted = true;
             let _ = turn_interrupt_tx.send(false);
         }
         let response = tokio::select! {
@@ -642,6 +664,7 @@ impl CodexAppServer {
                 let interrupted = changed.is_ok() && *interrupt_rx.borrow_and_update();
                 if interrupted {
                     self.interrupt_startup_turn(&thread_id).await?;
+                    startup_interrupted = true;
                     let _ = turn_interrupt_tx.send(false);
                 }
                 self.read_response(&turn_start_id, "turn/start").await
@@ -650,7 +673,7 @@ impl CodexAppServer {
         if let Some(turn_id) = codex_turn_id(&response) {
             self.turn_id = Some(turn_id.to_owned());
         }
-        Ok(())
+        Ok(startup_interrupted)
     }
 
     pub async fn next_message(&mut self) -> anyhow::Result<Option<Value>> {
@@ -1079,6 +1102,84 @@ pub fn codex_provider_slash_commands() -> Vec<SlashCommandDefinition> {
         ),
         codex_slash_command("codex.fork", "fork", "Fork the current Codex thread."),
         codex_slash_command(
+            "codex.rate_limits",
+            "rate-limits",
+            "Read Codex account rate limits.",
+        ),
+        codex_slash_command(
+            "codex.mcp_status",
+            "mcp-status",
+            "List Codex MCP server status.",
+        ),
+        codex_slash_command(
+            "codex.mcp_reload",
+            "mcp-reload",
+            "Reload Codex MCP server configuration.",
+        ),
+        codex_slash_command("codex.rename", "rename", "Rename the current Codex thread.")
+            .with_argument(
+                "name",
+                SlashCommandArgumentKind::Rest,
+                true,
+                "New thread name",
+            ),
+        codex_slash_command(
+            "codex.context_window",
+            "context-window",
+            "Inspect Codex context window usage.",
+        ),
+        codex_slash_command(
+            "codex.loaded_threads",
+            "loaded-threads",
+            "List native Codex threads currently loaded by the app-server.",
+        ),
+        codex_slash_command(
+            "codex.turns",
+            "turns",
+            "List native Codex turns for this thread.",
+        ),
+        codex_slash_command(
+            "codex.skills",
+            "skills",
+            "List Codex skills available to this workspace.",
+        ),
+        codex_slash_command("codex.plugins", "plugins", "List Codex plugins."),
+        codex_slash_command(
+            "codex.plugin_read",
+            "plugin-read",
+            "Read Codex plugin details.",
+        )
+        .with_argument(
+            "pluginName",
+            SlashCommandArgumentKind::String,
+            true,
+            "Plugin name",
+        ),
+        codex_slash_command("codex.apps", "apps", "List Codex app connectors."),
+        codex_slash_command("codex.config", "config", "Read effective Codex config."),
+        codex_slash_command(
+            "codex.config_requirements",
+            "config-requirements",
+            "Read Codex config requirements.",
+        ),
+        codex_slash_command(
+            "codex.mcp_resource_read",
+            "mcp-resource",
+            "Read an MCP resource.",
+        )
+        .with_argument(
+            "server",
+            SlashCommandArgumentKind::String,
+            true,
+            "MCP server name",
+        )
+        .with_argument(
+            "uri",
+            SlashCommandArgumentKind::Rest,
+            true,
+            "MCP resource URI",
+        ),
+        codex_slash_command(
             "codex.archive",
             "archive",
             "Archive the current Codex thread.",
@@ -1100,6 +1201,12 @@ pub fn codex_provider_slash_commands() -> Vec<SlashCommandDefinition> {
             true,
             "Number of turns",
         ),
+        codex_slash_command(
+            "codex.background_terminals_clean",
+            "clean-terminals",
+            "Clean Codex background terminals for this thread.",
+        )
+        .danger(SlashCommandDangerLevel::Dangerous),
         codex_slash_command(
             "codex.shell",
             "shell",
@@ -1160,6 +1267,84 @@ fn codex_provider_command_request(
                 "persistExtendedHistory": true
             }),
         )),
+        "codex.rate_limits" => Ok(("account/rateLimits/read", Value::Null)),
+        "codex.mcp_status" => Ok((
+            "mcpServerStatus/list",
+            json!({
+                "cursor": null,
+                "limit": null,
+                "detail": "full"
+            }),
+        )),
+        "codex.mcp_reload" => Ok(("config/mcpServer/reload", Value::Null)),
+        "codex.rename" => Ok((
+            "thread/name/set",
+            json!({
+                "threadId": thread_id,
+                "name": string_argument(&request.arguments, "name")?
+            }),
+        )),
+        "codex.context_window" => Ok((
+            "thread/contextWindow/inspect",
+            json!({
+                "threadId": thread_id,
+                "includeFullText": false
+            }),
+        )),
+        "codex.loaded_threads" => Ok((
+            "thread/loaded/list",
+            json!({
+                "cursor": null,
+                "limit": null
+            }),
+        )),
+        "codex.turns" => Ok((
+            "thread/turns/list",
+            json!({
+                "threadId": thread_id,
+                "cursor": null,
+                "limit": null
+            }),
+        )),
+        "codex.skills" => Ok((
+            "skills/list",
+            json!({
+                "cwds": [workspace_path],
+                "forceReload": false,
+                "perCwdExtraUserRoots": null
+            }),
+        )),
+        "codex.plugins" => Ok((
+            "plugin/list",
+            json!({
+                "cwds": [workspace_path]
+            }),
+        )),
+        "codex.plugin_read" => Ok((
+            "plugin/read",
+            json!({
+                "marketplacePath": null,
+                "remoteMarketplaceName": null,
+                "pluginName": string_argument(&request.arguments, "pluginName")?
+            }),
+        )),
+        "codex.apps" => Ok(("app/list", json!({"cursor": null, "limit": null}))),
+        "codex.config" => Ok((
+            "config/read",
+            json!({
+                "includeLayers": true,
+                "cwd": workspace_path
+            }),
+        )),
+        "codex.config_requirements" => Ok(("configRequirements/read", Value::Null)),
+        "codex.mcp_resource_read" => Ok((
+            "mcpServer/resource/read",
+            json!({
+                "threadId": thread_id,
+                "server": string_argument(&request.arguments, "server")?,
+                "uri": string_argument(&request.arguments, "uri")?
+            }),
+        )),
         "codex.archive" => Ok(("thread/archive", json!({"threadId": thread_id}))),
         "codex.unarchive" => Ok(("thread/unarchive", json!({"threadId": thread_id}))),
         "codex.rollback" => Ok((
@@ -1167,6 +1352,12 @@ fn codex_provider_command_request(
             json!({
                 "threadId": thread_id,
                 "numTurns": number_argument(&request.arguments, "numTurns")?
+            }),
+        )),
+        "codex.background_terminals_clean" => Ok((
+            "thread/backgroundTerminals/clean",
+            json!({
+                "threadId": thread_id
             }),
         )),
         "codex.shell" => Ok((
@@ -1186,9 +1377,24 @@ fn codex_provider_command_message(command_id: &str) -> &'static str {
         "codex.review" => "Codex review started.",
         "codex.steer" => "Codex turn steering submitted.",
         "codex.fork" => "Codex thread forked.",
+        "codex.rate_limits" => "Codex rate limits read.",
+        "codex.mcp_status" => "Codex MCP status read.",
+        "codex.mcp_reload" => "Codex MCP configuration reload requested.",
+        "codex.rename" => "Codex thread renamed.",
+        "codex.context_window" => "Codex context window inspected.",
+        "codex.loaded_threads" => "Codex loaded threads listed.",
+        "codex.turns" => "Codex turns listed.",
+        "codex.skills" => "Codex skills listed.",
+        "codex.plugins" => "Codex plugins listed.",
+        "codex.plugin_read" => "Codex plugin details read.",
+        "codex.apps" => "Codex app connectors listed.",
+        "codex.config" => "Codex config read.",
+        "codex.config_requirements" => "Codex config requirements read.",
+        "codex.mcp_resource_read" => "Codex MCP resource read.",
         "codex.archive" => "Codex thread archived.",
         "codex.unarchive" => "Codex thread unarchived.",
         "codex.rollback" => "Codex rollback completed.",
+        "codex.background_terminals_clean" => "Codex background terminals cleanup requested.",
         "codex.shell" => "Codex shell command submitted.",
         _ => "Codex provider command executed.",
     }
@@ -1302,6 +1508,7 @@ pub async fn run_codex_turn_on_server(
 ) -> anyhow::Result<()> {
     let mut codex_approval_ctx = CodexApprovalItemCache::default();
     let mut pending_server_requests = PendingCodexServerRequests::default();
+    let mut turn_driver = CodexTurnDriver::new(request.session_id);
     let (pending_delivery_tx, mut pending_delivery_rx) =
         mpsc::unbounded_channel::<CodexPendingRequestDelivery>();
     while server.thread_id.is_none() {
@@ -1315,17 +1522,31 @@ pub async fn run_codex_turn_on_server(
         }
     }
 
-    server
+    turn_driver.observe_targets(server.thread_id.as_deref(), server.turn_id.as_deref());
+    turn_driver.turn_start_requested(None);
+    let startup_interrupted = server
         .send_turn(&request, turn_interrupt_tx.clone(), interrupt_rx.clone())
         .await?;
+    turn_driver.observe_targets(server.thread_id.as_deref(), server.turn_id.as_deref());
+    if startup_interrupted {
+        turn_driver.interrupt_requested(None);
+    }
     let mut scope = CodexTurnScope {
         thread_id: server.thread_id.clone(),
         turn_id: server.turn_id.clone(),
     };
     if *interrupt_rx.borrow() {
+        let transition = turn_driver.interrupt_requested(None);
         if let Err(error) = server.interrupt_turn().await {
             tracing::warn!(%error, "failed to interrupt active codex turn");
         }
+        send_codex_transition_turn_event(
+            &event_sender,
+            Some("turn/interrupt"),
+            request.session_id,
+            &turn_driver,
+            transition,
+        );
         let _ = turn_interrupt_tx.send(false);
     }
     loop {
@@ -1336,18 +1557,29 @@ pub async fn run_codex_turn_on_server(
                     request.session_id,
                     delivery,
                     &event_sender,
-                    &mut pending_server_requests,
-                    &pending_approvals,
-                    &pending_questions,
+                    CodexPendingRequestState {
+                        pending_server_requests: &mut pending_server_requests,
+                        pending_approvals: &pending_approvals,
+                        pending_questions: &pending_questions,
+                        turn_driver: &mut turn_driver,
+                    },
                 )
                 .await?;
                 continue;
             }
             changed = interrupt_rx.changed() => {
                 if changed.is_ok() && *interrupt_rx.borrow_and_update() {
+                    let transition = turn_driver.interrupt_requested(None);
                     if let Err(error) = server.interrupt_turn().await {
                         tracing::warn!(%error, "failed to interrupt active codex turn");
                     }
+                    send_codex_transition_turn_event(
+                        &event_sender,
+                        Some("turn/interrupt"),
+                        request.session_id,
+                        &turn_driver,
+                        transition,
+                    );
                     let _ = turn_interrupt_tx.send(false);
                 }
                 continue;
@@ -1358,57 +1590,12 @@ pub async fn run_codex_turn_on_server(
             break;
         };
         scope.observe(&message);
+        turn_driver.observe_targets(message_thread_id(&message), message_turn_id(&message));
         codex_approval_ctx.observe_jsonrpc_message(&message);
         let is_server_request = codex_rpc_is_codex_server_to_client_request(&message);
         let is_server_response = codex_rpc_is_codex_server_to_client_response(&message);
 
         if is_server_request {
-            if jsonrpc_method(&message) == Some("account/chatgptAuthTokens/refresh") {
-                let Some(native_request_id) = message.get("id").cloned() else {
-                    continue;
-                };
-                send_codex_event(
-                    &event_sender,
-                    jsonrpc_method(&message),
-                    NormalizedEvent::Error(AgentErrorEvent {
-                        session_id: Some(request.session_id),
-                        code: Some("codex_auth_refresh_required".to_owned()),
-                        message: CODEX_AUTH_REFRESH_OPERATOR_MESSAGE.to_owned(),
-                        provider_payload: Some(message.clone()),
-                    }),
-                );
-                server
-                    .send_jsonrpc_application_error_response(
-                        native_request_id,
-                        -32002,
-                        "Remote runner cannot refresh Codex auth tokens; authenticate on the runner host.",
-                        Some(json!({ "agenter.reason": "auth_refresh_unreachable_remotely" })),
-                    )
-                    .await?;
-                continue;
-            }
-
-            if jsonrpc_method(&message) == Some("item/tool/call") {
-                let Some(native_request_id) = message.get("id").cloned() else {
-                    continue;
-                };
-                send_codex_event(
-                    &event_sender,
-                    jsonrpc_method(&message),
-                    NormalizedEvent::Error(AgentErrorEvent {
-                        session_id: Some(request.session_id),
-                        code: Some("codex_dynamic_tool_unsupported".to_owned()),
-                        message: "Codex requested a dynamic tool call that Agenter cannot execute remotely."
-                            .to_owned(),
-                        provider_payload: Some(message.clone()),
-                    }),
-                );
-                server
-                    .send_unsupported_request_response(native_request_id, "item/tool/call")
-                    .await?;
-                continue;
-            }
-
             if let Some((approval_id, native_request_id, approval_kind, event)) =
                 normalize_codex_approval_request(
                     request.session_id,
@@ -1422,14 +1609,20 @@ pub async fn run_codex_turn_on_server(
                     PendingCodexApproval::new(request.session_id, sender),
                 );
                 pending_server_requests.insert_approval(&native_request_id, approval_id);
-                send_codex_event(
+                let transition = turn_driver.approval_requested(Some(&message));
+                send_codex_transition_status_event(
                     &event_sender,
                     jsonrpc_method(&message),
-                    session_status_event(
-                        request.session_id,
-                        SessionStatus::WaitingForApproval,
-                        Some("Codex is waiting for approval.".to_owned()),
-                    ),
+                    request.session_id,
+                    transition,
+                    "Codex is waiting for approval.",
+                );
+                send_codex_transition_turn_event(
+                    &event_sender,
+                    jsonrpc_method(&message),
+                    request.session_id,
+                    &turn_driver,
+                    transition,
                 );
                 tracing::info!(
                     session_id = %request.session_id,
@@ -1463,14 +1656,20 @@ pub async fn run_codex_turn_on_server(
                     .await
                     .insert(question_id, PendingCodexQuestion { response: sender });
                 pending_server_requests.insert_question(&native_request_id, question_id);
-                send_codex_event(
+                let transition = turn_driver.input_requested(Some(&message));
+                send_codex_transition_status_event(
                     &event_sender,
                     jsonrpc_method(&message),
-                    session_status_event(
-                        request.session_id,
-                        SessionStatus::WaitingForInput,
-                        Some("Codex is waiting for input.".to_owned()),
-                    ),
+                    request.session_id,
+                    transition,
+                    "Codex is waiting for input.",
+                );
+                send_codex_transition_turn_event(
+                    &event_sender,
+                    jsonrpc_method(&message),
+                    request.session_id,
+                    &turn_driver,
+                    transition,
                 );
                 tracing::info!(
                     session_id = %request.session_id,
@@ -1492,30 +1691,15 @@ pub async fn run_codex_turn_on_server(
                 );
                 continue;
             }
-            if let Some((native_request_id, method)) = unsupported_codex_server_request(&message) {
-                tracing::warn!(
-                    session_id = %request.session_id,
-                    method,
-                    request_id = ?native_request_id,
-                    provider_thread_id = message_thread_id(&message),
-                    provider_turn_id = message_turn_id(&message),
-                    "unsupported codex server request observed in turn loop"
-                );
-                let event_method = jsonrpc_method(&message);
-                for event in normalize_codex_message(request.session_id, &message) {
-                    send_codex_event(&event_sender, event_method, event);
-                }
-                if let Err(err) = server
-                    .send_unsupported_request_response(native_request_id.clone(), method)
-                    .await
-                {
-                    tracing::warn!(
-                        ?err,
-                        method,
-                        request_id = ?native_request_id,
-                        "failed to send unsupported codex request response"
-                    );
-                }
+            if let Some(dispatch) = classify_codex_server_request(&message) {
+                handle_classified_codex_server_request(
+                    server,
+                    request.session_id,
+                    &message,
+                    dispatch,
+                    &event_sender,
+                )
+                .await?;
                 continue;
             }
         }
@@ -1539,6 +1723,7 @@ pub async fn run_codex_turn_on_server(
                 &mut pending_server_requests,
                 &pending_approvals,
                 &pending_questions,
+                &mut turn_driver,
             )
             .await;
         }
@@ -1567,12 +1752,54 @@ pub async fn run_codex_turn_on_server(
             continue;
         }
 
-        let completed = jsonrpc_method(&message) == Some("turn/completed");
         let event_method = jsonrpc_method(&message);
-        for event in normalize_codex_message_for_scope(request.session_id, &message, &scope) {
+        match event_method {
+            Some("turn/started") => {
+                let transition = turn_driver.turn_started(Some(&message));
+                send_codex_transition_status_event(
+                    &event_sender,
+                    event_method,
+                    request.session_id,
+                    transition,
+                    "Codex turn started.",
+                );
+                send_codex_transition_turn_event(
+                    &event_sender,
+                    event_method,
+                    request.session_id,
+                    &turn_driver,
+                    transition,
+                );
+            }
+            Some("turn/completed") => {}
+            _ => {}
+        }
+        for event in normalize_codex_message_for_scope_suppressing_turn_status(
+            request.session_id,
+            &message,
+            &scope,
+        ) {
             send_codex_event(&event_sender, event_method, event);
         }
-        if completed {
+        if event_method == Some("turn/completed") {
+            let transition = turn_driver
+                .terminal_completed(codex_turn_completed_status(&message), Some(&message));
+            send_codex_transition_status_event(
+                &event_sender,
+                event_method,
+                request.session_id,
+                transition,
+                &codex_turn_completed_status_reason(&message),
+            );
+            cleanup_codex_terminal_pending_requests(
+                request.session_id,
+                &message,
+                &event_sender,
+                &mut pending_server_requests,
+                &pending_approvals,
+                &pending_questions,
+            )
+            .await;
             tracing::info!(session_id = %request.session_id, "codex turn completed");
             return Ok(());
         }
@@ -1596,6 +1823,68 @@ fn send_codex_event(
     event: NormalizedEvent,
 ) {
     event_sender.send(codex_adapter_event(method, event)).ok();
+}
+
+fn codex_transition_status_event(
+    session_id: SessionId,
+    transition: CodexTurnStateTransition,
+    reason: &str,
+) -> NormalizedEvent {
+    let status = transition
+        .current
+        .session_status()
+        .unwrap_or(SessionStatus::Degraded);
+    session_status_event(session_id, status, Some(reason.to_owned()))
+}
+
+fn codex_transition_turn_event(
+    session_id: SessionId,
+    turn_driver: &CodexTurnDriver,
+    transition: CodexTurnStateTransition,
+) -> Option<NormalizedEvent> {
+    if transition.previous == transition.current {
+        return None;
+    }
+    let turn_id = turn_driver.provider_turn_id().map(stable_turn_id)?;
+    let status = transition.current.turn_status()?;
+    Some(NormalizedEvent::TurnStatusChanged(TurnState {
+        turn_id,
+        session_id,
+        status,
+        started_at: None,
+        completed_at: None,
+        model: None,
+        mode: None,
+    }))
+}
+
+fn send_codex_transition_turn_event(
+    event_sender: &mpsc::UnboundedSender<AdapterEvent>,
+    method: Option<&str>,
+    session_id: SessionId,
+    turn_driver: &CodexTurnDriver,
+    transition: CodexTurnStateTransition,
+) {
+    if let Some(event) = codex_transition_turn_event(session_id, turn_driver, transition) {
+        send_codex_event(event_sender, method, event);
+    }
+}
+
+fn send_codex_transition_status_event(
+    event_sender: &mpsc::UnboundedSender<AdapterEvent>,
+    method: Option<&str>,
+    session_id: SessionId,
+    transition: CodexTurnStateTransition,
+    reason: &str,
+) {
+    if transition.previous.session_status() == transition.current.session_status() {
+        return;
+    }
+    send_codex_event(
+        event_sender,
+        method,
+        codex_transition_status_event(session_id, transition, reason),
+    );
 }
 
 fn spawn_codex_approval_delivery_task(
@@ -1649,22 +1938,18 @@ async fn handle_codex_pending_request_delivery(
     session_id: SessionId,
     delivery: CodexPendingRequestDelivery,
     event_sender: &mpsc::UnboundedSender<AdapterEvent>,
-    pending_server_requests: &mut PendingCodexServerRequests,
-    pending_approvals: &std::sync::Arc<
-        tokio::sync::Mutex<HashMap<ApprovalId, PendingCodexApproval>>,
-    >,
-    pending_questions: &std::sync::Arc<
-        tokio::sync::Mutex<HashMap<QuestionId, PendingCodexQuestion>>,
-    >,
+    state: CodexPendingRequestState<'_>,
 ) -> anyhow::Result<()> {
-    pending_server_requests.remove(&delivery.native_request_id);
+    state
+        .pending_server_requests
+        .remove(&delivery.native_request_id);
     match delivery.response {
         CodexPendingRequestResponse::Approval {
             approval_id,
             approval_kind,
             answer,
         } => {
-            pending_approvals.lock().await.remove(&approval_id);
+            state.pending_approvals.lock().await.remove(&approval_id);
             tracing::info!(
                 session_id = %session_id,
                 %approval_id,
@@ -1692,14 +1977,18 @@ async fn handle_codex_pending_request_delivery(
                     provider_payload: None,
                 }),
             );
+            let transition = state.turn_driver.browser_answered(None);
             send_codex_event(
                 event_sender,
                 Some("approval/answered"),
-                session_status_event(
-                    session_id,
-                    SessionStatus::Running,
-                    Some("Approval answered.".to_owned()),
-                ),
+                codex_transition_status_event(session_id, transition, "Approval answered."),
+            );
+            send_codex_transition_turn_event(
+                event_sender,
+                Some("approval/answered"),
+                session_id,
+                state.turn_driver,
+                transition,
             );
         }
         CodexPendingRequestResponse::Question {
@@ -1707,7 +1996,7 @@ async fn handle_codex_pending_request_delivery(
             kind,
             answer,
         } => {
-            pending_questions.lock().await.remove(&question_id);
+            state.pending_questions.lock().await.remove(&question_id);
             tracing::info!(
                 session_id = %session_id,
                 %question_id,
@@ -1728,14 +2017,18 @@ async fn handle_codex_pending_request_delivery(
                     provider_payload: None,
                 }),
             );
+            let transition = state.turn_driver.browser_answered(None);
             send_codex_event(
                 event_sender,
                 Some("question/answered"),
-                session_status_event(
-                    session_id,
-                    SessionStatus::Running,
-                    Some("Input answered.".to_owned()),
-                ),
+                codex_transition_status_event(session_id, transition, "Input answered."),
+            );
+            send_codex_transition_turn_event(
+                event_sender,
+                Some("question/answered"),
+                session_id,
+                state.turn_driver,
+                transition,
             );
         }
     }
@@ -1753,6 +2046,7 @@ async fn handle_codex_server_request_resolved(
     pending_questions: &std::sync::Arc<
         tokio::sync::Mutex<HashMap<QuestionId, PendingCodexQuestion>>,
     >,
+    turn_driver: &mut CodexTurnDriver,
 ) {
     let Some(native_request_id) = message.pointer("/params/requestId") else {
         return;
@@ -1760,6 +2054,7 @@ async fn handle_codex_server_request_resolved(
     let Some(pending) = pending_server_requests.remove(native_request_id) else {
         return;
     };
+    let transition = turn_driver.request_resolved(Some(message));
     match pending {
         PendingCodexServerRequest::Approval { approval_id } => {
             pending_approvals.lock().await.remove(&approval_id);
@@ -1796,12 +2091,68 @@ async fn handle_codex_server_request_resolved(
     send_codex_event(
         event_sender,
         jsonrpc_method(message),
-        session_status_event(
-            session_id,
-            SessionStatus::Running,
-            Some("Codex resolved a pending request.".to_owned()),
-        ),
+        codex_transition_status_event(session_id, transition, "Codex resolved a pending request."),
     );
+    send_codex_transition_turn_event(
+        event_sender,
+        jsonrpc_method(message),
+        session_id,
+        turn_driver,
+        transition,
+    );
+}
+
+async fn cleanup_codex_terminal_pending_requests(
+    session_id: SessionId,
+    message: &Value,
+    event_sender: &mpsc::UnboundedSender<AdapterEvent>,
+    pending_server_requests: &mut PendingCodexServerRequests,
+    pending_approvals: &std::sync::Arc<
+        tokio::sync::Mutex<HashMap<ApprovalId, PendingCodexApproval>>,
+    >,
+    pending_questions: &std::sync::Arc<
+        tokio::sync::Mutex<HashMap<QuestionId, PendingCodexQuestion>>,
+    >,
+) {
+    let pending = pending_server_requests.drain();
+    if pending.is_empty() {
+        return;
+    }
+    for request in pending {
+        match request {
+            PendingCodexServerRequest::Approval { approval_id } => {
+                pending_approvals.lock().await.remove(&approval_id);
+                send_codex_event(
+                    event_sender,
+                    jsonrpc_method(message),
+                    NormalizedEvent::ApprovalResolved(ApprovalResolvedEvent {
+                        session_id,
+                        approval_id,
+                        decision: ApprovalDecision::Cancel,
+                        resolved_by_user_id: None,
+                        resolved_at: Utc::now(),
+                        provider_payload: Some(message.clone()),
+                    }),
+                );
+            }
+            PendingCodexServerRequest::Question { question_id } => {
+                pending_questions.lock().await.remove(&question_id);
+                send_codex_event(
+                    event_sender,
+                    jsonrpc_method(message),
+                    NormalizedEvent::QuestionAnswered(QuestionAnsweredEvent {
+                        session_id,
+                        question_id,
+                        answer: AgentQuestionAnswer {
+                            question_id,
+                            answers: Default::default(),
+                        },
+                        provider_payload: Some(message.clone()),
+                    }),
+                );
+            }
+        }
+    }
 }
 
 pub fn codex_agent_options_from_responses(models: &Value, modes: &Value) -> AgentOptions {
@@ -1982,6 +2333,43 @@ fn normalize_codex_message_for_scope(
     normalize_codex_message_inner(session_id, message)
 }
 
+fn normalize_codex_message_for_scope_suppressing_turn_status(
+    session_id: SessionId,
+    message: &Value,
+    scope: &CodexTurnScope,
+) -> Vec<NormalizedEvent> {
+    let mut events = normalize_codex_message_for_scope(session_id, message, scope);
+    if matches!(
+        jsonrpc_method(message),
+        Some("turn/started" | "turn/completed")
+    ) {
+        events.retain(|event| !matches!(event, NormalizedEvent::SessionStatusChanged(_)));
+    }
+    events
+}
+
+fn codex_turn_completed_status(message: &Value) -> Option<&str> {
+    string_at(message, &["/params/turn/status", "/params/status"])
+}
+
+fn codex_turn_completed_status_reason(message: &Value) -> String {
+    match codex_turn_completed_status(message) {
+        Some("interrupted") => "Codex turn interrupted.".to_owned(),
+        Some("cancelled" | "canceled") => "Codex turn cancelled.".to_owned(),
+        Some("failed") => string_at(
+            message,
+            &[
+                "/params/turn/error/message",
+                "/params/error/message",
+                "/params/message",
+            ],
+        )
+        .unwrap_or("Codex turn failed")
+        .to_owned(),
+        _ => "Codex turn completed.".to_owned(),
+    }
+}
+
 fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<NormalizedEvent> {
     if let Some(events) = normalize_codex_non_jsonrpc_message(session_id, message) {
         return events;
@@ -1998,6 +2386,9 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
         }
         "turn/started" => turn_started(session_id, message),
         "thread/status/changed" => thread_status_changed(session_id, message),
+        "thread/archived" | "thread/unarchived" | "thread/closed" | "thread/name/updated" => {
+            thread_lifecycle_notification(session_id, message, method)
+        }
         "thread/tokenUsage/updated" => vec![token_usage_updated(session_id, message)],
         "account/rateLimits/updated" => vec![rate_limits_updated(session_id, message)],
         "thread/compacted" => vec![NormalizedEvent::NativeNotification(native_notification(
@@ -2045,7 +2436,7 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
                 "item/mcpToolCall/progress",
                 native_notification_category("item/mcpToolCall/progress"),
                 native_notification_title("item/mcpToolCall/progress"),
-                None,
+                native_notification_status("item/mcpToolCall/progress"),
             ))]
         }
         method if method.starts_with("mcpServer/") => {
@@ -2055,7 +2446,7 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
                 method,
                 native_notification_category(method),
                 native_notification_title(method),
-                None,
+                native_notification_status(method),
             ))]
         }
         "turn/plan/updated" => turn_plan_updated(session_id, message).into_iter().collect(),
@@ -2088,8 +2479,7 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
         "item/started" => item_started(session_id, message).into_iter().collect(),
         "item/completed" => item_completed(session_id, message).into_iter().collect(),
         "turn/completed" => {
-            let status = string_at(message, &["/params/turn/status", "/params/status"])
-                .unwrap_or("completed");
+            let status = codex_turn_completed_status(message).unwrap_or("completed");
             let turn_id = string_at(message, &["/params/turn/id", "/params/turnId"])
                 .map(stable_turn_id)
                 .unwrap_or_else(|| stable_turn_id("codex-turn"));
@@ -2195,7 +2585,7 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
             method,
             native_notification_category(method),
             native_notification_title(method),
-            None,
+            native_notification_status(method),
         ))],
     }
 }
@@ -2474,13 +2864,242 @@ fn codex_question_kind(message: &Value) -> Option<CodexQuestionKind> {
     }
 }
 
-fn unsupported_codex_server_request(message: &Value) -> Option<(Value, &str)> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CodexServerRequestDispatch {
+    Supported {
+        native_request_id: Value,
+        method: String,
+    },
+    AuthRefresh {
+        native_request_id: Value,
+        method: String,
+    },
+    CapabilityGap {
+        native_request_id: Value,
+        method: String,
+    },
+    Unknown {
+        native_request_id: Value,
+        method: String,
+    },
+}
+
+fn classify_codex_server_request(message: &Value) -> Option<CodexServerRequestDispatch> {
     if !codex_rpc_is_codex_server_to_client_request(message) {
         return None;
     }
     let native_request_id = message.get("id")?.clone();
     let method = jsonrpc_method(message)?;
-    Some((native_request_id, method))
+    match codex_server_request_support(method) {
+        Some(CodexProtocolSupport::Supported) => Some(CodexServerRequestDispatch::Supported {
+            native_request_id,
+            method: method.to_owned(),
+        }),
+        Some(CodexProtocolSupport::Degraded) if method == "account/chatgptAuthTokens/refresh" => {
+            Some(CodexServerRequestDispatch::AuthRefresh {
+                native_request_id,
+                method: method.to_owned(),
+            })
+        }
+        Some(
+            CodexProtocolSupport::Degraded
+            | CodexProtocolSupport::Unsupported
+            | CodexProtocolSupport::Deferred
+            | CodexProtocolSupport::Ignored
+            | CodexProtocolSupport::NotApplicable,
+        ) => Some(CodexServerRequestDispatch::CapabilityGap {
+            native_request_id,
+            method: method.to_owned(),
+        }),
+        None => Some(CodexServerRequestDispatch::Unknown {
+            native_request_id,
+            method: method.to_owned(),
+        }),
+    }
+}
+
+fn codex_server_request_support(method: &str) -> Option<CodexProtocolSupport> {
+    CODEX_PROTOCOL_COVERAGE
+        .iter()
+        .find(|entry| {
+            entry.direction == CodexProtocolDirection::ServerRequest && entry.method == method
+        })
+        .map(|entry| entry.support)
+}
+
+async fn handle_classified_codex_server_request(
+    server: &mut CodexAppServer,
+    session_id: SessionId,
+    message: &Value,
+    dispatch: CodexServerRequestDispatch,
+    event_sender: &mpsc::UnboundedSender<AdapterEvent>,
+) -> anyhow::Result<()> {
+    match dispatch {
+        CodexServerRequestDispatch::Supported {
+            native_request_id,
+            method,
+        } => {
+            tracing::error!(
+                session_id = %session_id,
+                method,
+                request_id = ?native_request_id,
+                provider_thread_id = message_thread_id(message),
+                provider_turn_id = message_turn_id(message),
+                "supported codex server request reached fallback dispatcher"
+            );
+            send_codex_event(
+                event_sender,
+                Some(&method),
+                NormalizedEvent::Error(AgentErrorEvent {
+                    session_id: Some(session_id),
+                    code: Some("codex_adapter_supported_request_unhandled".to_owned()),
+                    message: format!(
+                        "Codex server request `{method}` is classified as supported but was not handled by the adapter."
+                    ),
+                    provider_payload: Some(codex_server_request_event_payload(
+                        &method,
+                        &native_request_id,
+                        message,
+                    )),
+                }),
+            );
+            server
+                .send_jsonrpc_application_error_response(
+                    native_request_id,
+                    -32003,
+                    "Agenter adapter failed to handle a supported Codex server request.",
+                    Some(json!({ "agenter.reason": "supported_request_unhandled", "method": method })),
+                )
+                .await?;
+        }
+        CodexServerRequestDispatch::AuthRefresh {
+            native_request_id,
+            method,
+        } => {
+            send_codex_event(
+                event_sender,
+                Some(&method),
+                NormalizedEvent::Error(AgentErrorEvent {
+                    session_id: Some(session_id),
+                    code: Some("codex_auth_refresh_required".to_owned()),
+                    message: CODEX_AUTH_REFRESH_OPERATOR_MESSAGE.to_owned(),
+                    provider_payload: Some(codex_server_request_event_payload(
+                        &method,
+                        &native_request_id,
+                        message,
+                    )),
+                }),
+            );
+            server
+                .send_jsonrpc_application_error_response(
+                    native_request_id,
+                    -32002,
+                    "Remote runner cannot refresh Codex auth tokens; authenticate on the runner host.",
+                    Some(json!({ "agenter.reason": "auth_refresh_unreachable_remotely" })),
+                )
+                .await?;
+        }
+        CodexServerRequestDispatch::CapabilityGap {
+            native_request_id,
+            method,
+        } => {
+            tracing::warn!(
+                session_id = %session_id,
+                method,
+                request_id = ?native_request_id,
+                provider_thread_id = message_thread_id(message),
+                provider_turn_id = message_turn_id(message),
+                "codex server request capability gap observed in turn loop"
+            );
+            send_codex_event(
+                event_sender,
+                Some(&method),
+                codex_capability_gap_event(session_id, &method, &native_request_id, message),
+            );
+            server
+                .send_unsupported_request_response(native_request_id, &method)
+                .await?;
+        }
+        CodexServerRequestDispatch::Unknown {
+            native_request_id,
+            method,
+        } => {
+            tracing::warn!(
+                session_id = %session_id,
+                method,
+                request_id = ?native_request_id,
+                provider_thread_id = message_thread_id(message),
+                provider_turn_id = message_turn_id(message),
+                "unknown codex server request observed in turn loop"
+            );
+            send_codex_event(
+                event_sender,
+                Some(&method),
+                codex_unknown_server_request_event(
+                    session_id,
+                    &method,
+                    &native_request_id,
+                    message,
+                ),
+            );
+            server
+                .send_unsupported_request_response(native_request_id, &method)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+fn codex_capability_gap_event(
+    session_id: SessionId,
+    method: &str,
+    native_request_id: &Value,
+    message: &Value,
+) -> NormalizedEvent {
+    NormalizedEvent::Error(AgentErrorEvent {
+        session_id: Some(session_id),
+        code: Some("codex_capability_gap".to_owned()),
+        message: format!(
+            "Codex server request `{method}` is classified but not supported by Agenter."
+        ),
+        provider_payload: Some(codex_server_request_event_payload(
+            method,
+            native_request_id,
+            message,
+        )),
+    })
+}
+
+fn codex_unknown_server_request_event(
+    session_id: SessionId,
+    method: &str,
+    native_request_id: &Value,
+    message: &Value,
+) -> NormalizedEvent {
+    NormalizedEvent::Error(AgentErrorEvent {
+        session_id: Some(session_id),
+        code: Some("codex_unknown_server_request".to_owned()),
+        message: format!("Codex emitted an unknown server request `{method}`."),
+        provider_payload: Some(codex_server_request_event_payload(
+            method,
+            native_request_id,
+            message,
+        )),
+    })
+}
+
+fn codex_server_request_event_payload(
+    method: &str,
+    native_request_id: &Value,
+    message: &Value,
+) -> Value {
+    json!({
+        "method": method,
+        "request_id": native_request_id,
+        "thread_id": message_thread_id(message),
+        "turn_id": message_turn_id(message),
+        "provider_payload": message,
+    })
 }
 
 fn unsupported_request_response(native_request_id: Value, method: &str) -> Value {
@@ -2893,6 +3512,41 @@ fn thread_status_changed(session_id: SessionId, message: &Value) -> Vec<Normaliz
         status: Some(provider_status.to_owned()),
         provider_payload: Some(message.clone()),
     }));
+    events
+}
+
+fn thread_lifecycle_notification(
+    session_id: SessionId,
+    message: &Value,
+    method: &str,
+) -> Vec<NormalizedEvent> {
+    let mut events = Vec::new();
+    match method {
+        "thread/archived" => events.push(session_status_event(
+            session_id,
+            SessionStatus::Archived,
+            Some("Codex thread archived.".to_owned()),
+        )),
+        "thread/unarchived" => events.push(session_status_event(
+            session_id,
+            SessionStatus::Idle,
+            Some("Codex thread unarchived.".to_owned()),
+        )),
+        "thread/closed" => events.push(session_status_event(
+            session_id,
+            SessionStatus::Stopped,
+            Some("Codex thread closed.".to_owned()),
+        )),
+        _ => {}
+    }
+    events.push(NormalizedEvent::NativeNotification(native_notification(
+        session_id,
+        message,
+        method,
+        native_notification_category(method),
+        native_notification_title(method),
+        native_notification_status(method),
+    )));
     events
 }
 
@@ -3741,9 +4395,15 @@ fn should_ignore_item_event(message: &Value) -> bool {
 
 fn native_notification_category(method: &str) -> &'static str {
     match method {
-        "error" | "warning" | "guardianWarning" | "deprecationNotice" | "configWarning" => {
-            "warning"
+        "item/autoApprovalReview/started" | "item/autoApprovalReview/completed" => {
+            "auto_approval_review"
         }
+        "guardianWarning" => "guardian",
+        "item/commandExecution/terminalInteraction" => "terminal_interaction",
+        "account/rateLimits/updated" => "rate_limits",
+        "error" | "warning" | "deprecationNotice" | "configWarning" => "warning",
+        "fs/changed" => "filesystem",
+        "windowsSandbox/setupCompleted" => "sandbox",
         method if method.starts_with("thread/realtime/") => "realtime",
         method if method.starts_with("thread/") => "thread",
         method if method.starts_with("turn/") => "turn",
@@ -3762,12 +4422,33 @@ fn native_notification_category(method: &str) -> &'static str {
 
 fn native_notification_title(method: &str) -> String {
     match method {
+        "thread/started" => "Thread started".to_owned(),
+        "thread/archived" => "Thread archived".to_owned(),
+        "thread/unarchived" => "Thread unarchived".to_owned(),
+        "thread/closed" => "Thread closed".to_owned(),
+        "thread/name/updated" => "Thread name updated".to_owned(),
+        "thread/contextWindow/updated" => "Thread context window updated".to_owned(),
+        "hook/started" => "Hook started".to_owned(),
+        "hook/completed" => "Hook completed".to_owned(),
+        "item/autoApprovalReview/started" => "Auto approval review started".to_owned(),
+        "item/autoApprovalReview/completed" => "Auto approval review completed".to_owned(),
+        "item/commandExecution/terminalInteraction" => "Terminal interaction".to_owned(),
+        "item/mcpToolCall/progress" => "MCP tool call progress".to_owned(),
+        "mcpServer/oauthLogin/completed" => "MCP OAuth login completed".to_owned(),
+        "mcpServer/startupStatus/updated" => "MCP server startup status updated".to_owned(),
+        "account/updated" => "Account updated".to_owned(),
+        "account/rateLimits/updated" => "Rate limits updated".to_owned(),
         "model/rerouted" => "Model rerouted".to_owned(),
         "model/verification" => "Model verification".to_owned(),
         "warning" => "Warning".to_owned(),
         "guardianWarning" => "Guardian warning".to_owned(),
         "deprecationNotice" => "Deprecation notice".to_owned(),
         "configWarning" => "Configuration warning".to_owned(),
+        "fuzzyFileSearch/sessionUpdated" => "Fuzzy file search updated".to_owned(),
+        "fuzzyFileSearch/sessionCompleted" => "Fuzzy file search completed".to_owned(),
+        "fs/changed" => "Filesystem changed".to_owned(),
+        "windows/worldWritableWarning" => "World-writable path warning".to_owned(),
+        "windowsSandbox/setupCompleted" => "Windows sandbox setup completed".to_owned(),
         "item/fileChange/outputDelta" => "File change output".to_owned(),
         "item/fileChange/patchUpdated" => "File patch updated".to_owned(),
         _ => method
@@ -3786,6 +4467,37 @@ fn native_notification_title(method: &str) -> String {
             })
             .collect::<Vec<_>>()
             .join(" "),
+    }
+}
+
+fn native_notification_status(method: &str) -> Option<&'static str> {
+    match method {
+        "thread/started" | "hook/started" | "item/autoApprovalReview/started" => Some("started"),
+        "thread/archived" => Some("archived"),
+        "thread/unarchived" => Some("unarchived"),
+        "thread/closed" => Some("closed"),
+        "thread/name/updated"
+        | "thread/contextWindow/updated"
+        | "mcpServer/startupStatus/updated"
+        | "account/updated"
+        | "account/rateLimits/updated"
+        | "fuzzyFileSearch/sessionUpdated"
+        | "fs/changed" => Some("updated"),
+        "hook/completed"
+        | "item/autoApprovalReview/completed"
+        | "mcpServer/oauthLogin/completed"
+        | "fuzzyFileSearch/sessionCompleted"
+        | "windowsSandbox/setupCompleted" => Some("completed"),
+        "guardianWarning"
+        | "warning"
+        | "deprecationNotice"
+        | "configWarning"
+        | "windows/worldWritableWarning" => Some("warning"),
+        "item/commandExecution/terminalInteraction" => Some("interactive"),
+        "item/mcpToolCall/progress" => Some("progress"),
+        "model/rerouted" => Some("rerouted"),
+        "model/verification" => Some("verification"),
+        _ => None,
     }
 }
 
@@ -4491,6 +5203,164 @@ mod tests {
     }
 
     #[test]
+    fn codex_notification_high_value_methods_map_to_stable_native_categories_titles_statuses() {
+        let cases = [
+            ("thread/started", "thread", "Thread started", "started"),
+            ("thread/archived", "thread", "Thread archived", "archived"),
+            (
+                "thread/unarchived",
+                "thread",
+                "Thread unarchived",
+                "unarchived",
+            ),
+            ("thread/closed", "thread", "Thread closed", "closed"),
+            (
+                "thread/name/updated",
+                "thread",
+                "Thread name updated",
+                "updated",
+            ),
+            (
+                "thread/contextWindow/updated",
+                "thread",
+                "Thread context window updated",
+                "updated",
+            ),
+            ("hook/started", "hook", "Hook started", "started"),
+            ("hook/completed", "hook", "Hook completed", "completed"),
+            (
+                "item/autoApprovalReview/started",
+                "auto_approval_review",
+                "Auto approval review started",
+                "started",
+            ),
+            (
+                "item/autoApprovalReview/completed",
+                "auto_approval_review",
+                "Auto approval review completed",
+                "completed",
+            ),
+            ("guardianWarning", "guardian", "Guardian warning", "warning"),
+            (
+                "item/commandExecution/terminalInteraction",
+                "terminal_interaction",
+                "Terminal interaction",
+                "interactive",
+            ),
+            (
+                "item/mcpToolCall/progress",
+                "mcp",
+                "MCP tool call progress",
+                "progress",
+            ),
+            (
+                "mcpServer/oauthLogin/completed",
+                "mcp",
+                "MCP OAuth login completed",
+                "completed",
+            ),
+            (
+                "mcpServer/startupStatus/updated",
+                "mcp",
+                "MCP server startup status updated",
+                "updated",
+            ),
+            ("account/updated", "account", "Account updated", "updated"),
+            (
+                "account/rateLimits/updated",
+                "rate_limits",
+                "Rate limits updated",
+                "updated",
+            ),
+            ("model/rerouted", "model", "Model rerouted", "rerouted"),
+            (
+                "model/verification",
+                "model",
+                "Model verification",
+                "verification",
+            ),
+            ("warning", "warning", "Warning", "warning"),
+            (
+                "deprecationNotice",
+                "warning",
+                "Deprecation notice",
+                "warning",
+            ),
+            (
+                "configWarning",
+                "warning",
+                "Configuration warning",
+                "warning",
+            ),
+            (
+                "fuzzyFileSearch/sessionUpdated",
+                "search",
+                "Fuzzy file search updated",
+                "updated",
+            ),
+            (
+                "fuzzyFileSearch/sessionCompleted",
+                "search",
+                "Fuzzy file search completed",
+                "completed",
+            ),
+            ("fs/changed", "filesystem", "Filesystem changed", "updated"),
+            (
+                "windows/worldWritableWarning",
+                "environment",
+                "World-writable path warning",
+                "warning",
+            ),
+            (
+                "windowsSandbox/setupCompleted",
+                "sandbox",
+                "Windows sandbox setup completed",
+                "completed",
+            ),
+        ];
+
+        for (method, category, title, status) in cases {
+            let message = json!({
+                "method": method,
+                "params": {
+                    "id": "event-1",
+                    "message": "provider detail",
+                    "rateLimits": {
+                        "limitId": "codex",
+                        "planType": "pro",
+                        "primary": {"usedPercent": 10},
+                        "secondary": {"usedPercent": 20}
+                    }
+                }
+            });
+
+            let events = normalize_codex_message(SessionId::nil(), &message);
+
+            let event = events
+                .iter()
+                .find_map(|event| match event {
+                    NormalizedEvent::NativeNotification(notification)
+                    | NormalizedEvent::TurnDiffUpdated(notification)
+                    | NormalizedEvent::ItemReasoning(notification)
+                    | NormalizedEvent::ServerRequestResolved(notification)
+                    | NormalizedEvent::McpToolCallProgress(notification)
+                    | NormalizedEvent::ThreadRealtimeEvent(notification) => Some(notification),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("method {method} did not emit native notification"));
+            assert_eq!(event.method, method);
+            assert_eq!(event.category, category, "method {method}");
+            assert_eq!(event.title, title, "method {method}");
+            assert_eq!(event.status.as_deref(), Some(status), "method {method}");
+            assert_eq!(
+                event.provider_payload.as_ref(),
+                Some(&message),
+                "method {method}"
+            );
+        }
+    }
+
+    #[test]
     fn normalizes_turn_diff_updated_as_turn_diff_event() {
         let message = json!({
             "method": "turn/diff/updated",
@@ -4567,7 +5437,7 @@ mod tests {
             panic!("expected mcp tool call progress event");
         };
         assert_eq!(event.method, "item/mcpToolCall/progress");
-        assert_eq!(event.title, "Item McpToolCall Progress");
+        assert_eq!(event.title, "MCP tool call progress");
     }
 
     #[test]
@@ -4591,7 +5461,36 @@ mod tests {
     }
 
     #[test]
-    fn builds_error_response_for_unsupported_codex_server_request() {
+    fn classifies_supported_codex_server_request_without_fallback_event() {
+        let message = json!({
+            "id": "approval-1",
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1"
+            }
+        });
+
+        assert_eq!(
+            classify_codex_server_request(&message),
+            Some(CodexServerRequestDispatch::Supported {
+                native_request_id: json!("approval-1"),
+                method: "item/commandExecution/requestApproval".to_owned(),
+            })
+        );
+        assert!(matches!(
+            normalize_codex_approval_request(SessionId::nil(), &message, None),
+            Some((
+                _,
+                _,
+                CodexApprovalKind::Command,
+                NormalizedEvent::ApprovalRequested(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn builds_capability_gap_for_degraded_codex_server_request_tool_call() {
         let message = json!({
             "id": "tool-call-1",
             "method": "item/tool/call",
@@ -4602,19 +5501,126 @@ mod tests {
             }
         });
 
-        let Some((native_request_id, method)) = unsupported_codex_server_request(&message) else {
-            panic!("expected unsupported server request");
+        let Some(CodexServerRequestDispatch::CapabilityGap {
+            native_request_id,
+            method,
+        }) = classify_codex_server_request(&message)
+        else {
+            panic!("expected capability-gap server request");
         };
 
         assert_eq!(native_request_id, json!("tool-call-1"));
         assert_eq!(method, "item/tool/call");
+        let NormalizedEvent::Error(event) =
+            codex_capability_gap_event(SessionId::nil(), &method, &native_request_id, &message)
+        else {
+            panic!("expected capability gap error event");
+        };
+        assert_eq!(event.code.as_deref(), Some("codex_capability_gap"));
+        let payload = event.provider_payload.expect("provider payload");
+        assert_eq!(payload["method"], "item/tool/call");
+        assert_eq!(payload["request_id"], "tool-call-1");
+        assert_eq!(payload["thread_id"], "thread-1");
+        assert_eq!(payload["turn_id"], "turn-1");
+        assert_eq!(payload["provider_payload"], message);
         assert_eq!(
-            unsupported_request_response(native_request_id, method),
+            unsupported_request_response(native_request_id, &method),
             json!({
                 "id": "tool-call-1",
                 "error": {
                     "code": -32601,
                     "message": "unsupported Codex server request method: item/tool/call"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn builds_auth_refresh_codex_server_request_dispatch_with_operator_guidance() {
+        let message = json!({
+            "id": "auth-refresh-1",
+            "method": "account/chatgptAuthTokens/refresh",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1"
+            }
+        });
+
+        let Some(CodexServerRequestDispatch::AuthRefresh {
+            native_request_id,
+            method,
+        }) = classify_codex_server_request(&message)
+        else {
+            panic!("expected auth refresh dispatch");
+        };
+
+        assert_eq!(native_request_id, json!("auth-refresh-1"));
+        assert_eq!(method, "account/chatgptAuthTokens/refresh");
+        let event = NormalizedEvent::Error(AgentErrorEvent {
+            session_id: Some(SessionId::nil()),
+            code: Some("codex_auth_refresh_required".to_owned()),
+            message: CODEX_AUTH_REFRESH_OPERATOR_MESSAGE.to_owned(),
+            provider_payload: Some(codex_server_request_event_payload(
+                &method,
+                &native_request_id,
+                &message,
+            )),
+        });
+        let NormalizedEvent::Error(event) = event else {
+            panic!("expected auth refresh error event");
+        };
+        assert_eq!(event.code.as_deref(), Some("codex_auth_refresh_required"));
+        assert!(event.message.contains("runner host"));
+        let payload = event.provider_payload.expect("provider payload");
+        assert_eq!(payload["method"], "account/chatgptAuthTokens/refresh");
+        assert_eq!(payload["request_id"], "auth-refresh-1");
+        assert_eq!(payload["provider_payload"], message);
+    }
+
+    #[test]
+    fn builds_unknown_codex_server_request_dispatch() {
+        let message = json!({
+            "id": 99,
+            "method": "experimental/serverRequest",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "payload": true
+            }
+        });
+
+        let Some(CodexServerRequestDispatch::Unknown {
+            native_request_id,
+            method,
+        }) = classify_codex_server_request(&message)
+        else {
+            panic!("expected unknown server request dispatch");
+        };
+
+        assert_eq!(native_request_id, json!(99));
+        assert_eq!(method, "experimental/serverRequest");
+        let NormalizedEvent::Error(event) = codex_unknown_server_request_event(
+            SessionId::nil(),
+            &method,
+            &native_request_id,
+            &message,
+        ) else {
+            panic!("expected unknown server request error event");
+        };
+        assert_eq!(event.code.as_deref(), Some("codex_unknown_server_request"));
+        let payload = event.provider_payload.expect("provider payload");
+        assert_eq!(payload["method"], "experimental/serverRequest");
+        assert_eq!(payload["request_id"], 99);
+        assert_eq!(payload["thread_id"], "thread-1");
+        assert_eq!(payload["turn_id"], "turn-1");
+        assert_eq!(payload["provider_payload"], message);
+        assert_eq!(
+            unsupported_request_response(native_request_id, &method),
+            json!({
+                "id": 99,
+                "error": {
+                    "code": -32601,
+                    "message": "unsupported Codex server request method: experimental/serverRequest"
                 }
             })
         );
@@ -4912,7 +5918,14 @@ mod tests {
                     "turns": [
                         {
                             "items": [
-                                {"type": "userMessage", "id": "user-1", "text": "hello"},
+                                {
+                                    "type": "userMessage",
+                                    "id": "user-1",
+                                    "content": [
+                                        {"type": "text", "text": "hello"},
+                                        {"type": "text", "text": " from content parts"}
+                                    ]
+                                },
                                 {"type": "agentMessage", "id": "agent-1", "text": "hi"},
                                 {
                                     "type": "commandExecution",
@@ -5009,7 +6022,7 @@ mod tests {
             vec![
                 DiscoveredSessionHistoryItem::UserMessage {
                     message_id: Some("user-1".to_owned()),
-                    content: "hello".to_owned(),
+                    content: "hello from content parts".to_owned(),
                 },
                 DiscoveredSessionHistoryItem::AgentMessage {
                     message_id: "agent-1".to_owned(),
@@ -5335,10 +6348,33 @@ mod tests {
             .find(|command| command.id == "codex.compact")
             .expect("compact command");
         assert_eq!(compact.danger_level, SlashCommandDangerLevel::Safe);
+
+        for id in [
+            "codex.rate_limits",
+            "codex.mcp_status",
+            "codex.mcp_reload",
+            "codex.rename",
+            "codex.context_window",
+            "codex.loaded_threads",
+            "codex.turns",
+            "codex.skills",
+            "codex.plugins",
+            "codex.plugin_read",
+            "codex.apps",
+            "codex.config",
+            "codex.config_requirements",
+            "codex.mcp_resource_read",
+        ] {
+            let command = commands
+                .iter()
+                .find(|command| command.id == id)
+                .unwrap_or_else(|| panic!("missing {id} command"));
+            assert_eq!(command.danger_level, SlashCommandDangerLevel::Safe);
+        }
     }
 
     #[test]
-    fn maps_codex_provider_slash_commands_to_jsonrpc_requests() {
+    fn maps_codex_provider_commands_to_jsonrpc_requests() {
         let workspace = PathBuf::from("/work/agenter");
         let compact = SlashCommandRequest {
             command_id: "codex.compact".to_owned(),
@@ -5382,6 +6418,240 @@ mod tests {
                 .expect("shell maps");
         assert_eq!(method, "thread/shellCommand");
         assert_eq!(params["command"], "pwd | cat");
+
+        let rate_limits = SlashCommandRequest {
+            command_id: "codex.rate_limits".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
+            arguments: json!({}),
+            raw_input: "/rate-limits".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &rate_limits, Some("turn-1"), &workspace)
+                .expect("rate limits maps");
+        assert_eq!(method, "account/rateLimits/read");
+        assert_eq!(params, Value::Null);
+
+        let mcp_status = SlashCommandRequest {
+            command_id: "codex.mcp_status".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
+            arguments: json!({}),
+            raw_input: "/mcp-status".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &mcp_status, Some("turn-1"), &workspace)
+                .expect("mcp status maps");
+        assert_eq!(method, "mcpServerStatus/list");
+        assert_eq!(
+            params,
+            json!({"cursor": null, "limit": null, "detail": "full"})
+        );
+
+        let mcp_reload = SlashCommandRequest {
+            command_id: "codex.mcp_reload".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
+            arguments: json!({}),
+            raw_input: "/mcp-reload".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &mcp_reload, Some("turn-1"), &workspace)
+                .expect("mcp reload maps");
+        assert_eq!(method, "config/mcpServer/reload");
+        assert_eq!(params, Value::Null);
+
+        let rename = SlashCommandRequest {
+            command_id: "codex.rename".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
+            arguments: json!({"name": "New title"}),
+            raw_input: "/rename New title".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &rename, Some("turn-1"), &workspace)
+                .expect("rename maps");
+        assert_eq!(method, "thread/name/set");
+        assert_eq!(params, json!({"threadId": "thread-1", "name": "New title"}));
+
+        let context_window = SlashCommandRequest {
+            command_id: "codex.context_window".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
+            arguments: json!({}),
+            raw_input: "/context-window".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &context_window, Some("turn-1"), &workspace)
+                .expect("context window maps");
+        assert_eq!(method, "thread/contextWindow/inspect");
+        assert_eq!(
+            params,
+            json!({"threadId": "thread-1", "includeFullText": false})
+        );
+
+        let loaded_threads = SlashCommandRequest {
+            command_id: "codex.loaded_threads".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
+            arguments: json!({}),
+            raw_input: "/loaded-threads".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &loaded_threads, Some("turn-1"), &workspace)
+                .expect("loaded threads maps");
+        assert_eq!(method, "thread/loaded/list");
+        assert_eq!(params, json!({"cursor": null, "limit": null}));
+
+        let turns = SlashCommandRequest {
+            command_id: "codex.turns".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
+            arguments: json!({}),
+            raw_input: "/turns".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &turns, Some("turn-1"), &workspace)
+                .expect("turns maps");
+        assert_eq!(method, "thread/turns/list");
+        assert_eq!(
+            params,
+            json!({"threadId": "thread-1", "cursor": null, "limit": null})
+        );
+
+        let skills = SlashCommandRequest {
+            command_id: "codex.skills".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
+            arguments: json!({}),
+            raw_input: "/skills".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &skills, Some("turn-1"), &workspace)
+                .expect("skills maps");
+        assert_eq!(method, "skills/list");
+        assert_eq!(params["cwds"], json!(["/work/agenter"]));
+        assert_eq!(params["forceReload"], false);
+
+        let plugins = SlashCommandRequest {
+            command_id: "codex.plugins".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
+            arguments: json!({}),
+            raw_input: "/plugins".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &plugins, Some("turn-1"), &workspace)
+                .expect("plugins maps");
+        assert_eq!(method, "plugin/list");
+        assert_eq!(params, json!({"cwds": ["/work/agenter"]}));
+
+        let plugin_read = SlashCommandRequest {
+            command_id: "codex.plugin_read".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
+            arguments: json!({"pluginName": "github"}),
+            raw_input: "/plugin-read github".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &plugin_read, Some("turn-1"), &workspace)
+                .expect("plugin read maps");
+        assert_eq!(method, "plugin/read");
+        assert_eq!(params["pluginName"], "github");
+
+        let apps = SlashCommandRequest {
+            command_id: "codex.apps".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
+            arguments: json!({}),
+            raw_input: "/apps".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &apps, Some("turn-1"), &workspace)
+                .expect("apps maps");
+        assert_eq!(method, "app/list");
+        assert_eq!(params, json!({"cursor": null, "limit": null}));
+
+        let config = SlashCommandRequest {
+            command_id: "codex.config".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
+            arguments: json!({}),
+            raw_input: "/config".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &config, Some("turn-1"), &workspace)
+                .expect("config maps");
+        assert_eq!(method, "config/read");
+        assert_eq!(
+            params,
+            json!({"includeLayers": true, "cwd": "/work/agenter"})
+        );
+
+        let config_requirements = SlashCommandRequest {
+            command_id: "codex.config_requirements".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
+            arguments: json!({}),
+            raw_input: "/config-requirements".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) = codex_provider_command_request(
+            "thread-1",
+            &config_requirements,
+            Some("turn-1"),
+            &workspace,
+        )
+        .expect("config requirements maps");
+        assert_eq!(method, "configRequirements/read");
+        assert_eq!(params, Value::Null);
+
+        let mcp_resource = SlashCommandRequest {
+            command_id: "codex.mcp_resource_read".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
+            arguments: json!({"server": "docs", "uri": "docs://readme"}),
+            raw_input: "/mcp-resource docs docs://readme".to_owned(),
+            confirmed: false,
+        };
+        let (method, params) =
+            codex_provider_command_request("thread-1", &mcp_resource, Some("turn-1"), &workspace)
+                .expect("mcp resource maps");
+        assert_eq!(method, "mcpServer/resource/read");
+        assert_eq!(
+            params,
+            json!({"threadId": "thread-1", "server": "docs", "uri": "docs://readme"})
+        );
+
+        let clean_terminals = SlashCommandRequest {
+            command_id: "codex.background_terminals_clean".to_owned(),
+            universal_command_id: None,
+            idempotency_key: None,
+            arguments: json!({}),
+            raw_input: "/clean-terminals".to_owned(),
+            confirmed: true,
+        };
+        let (method, params) = codex_provider_command_request(
+            "thread-1",
+            &clean_terminals,
+            Some("turn-1"),
+            &workspace,
+        )
+        .expect("clean terminals maps");
+        assert_eq!(method, "thread/backgroundTerminals/clean");
+        assert_eq!(params, json!({"threadId": "thread-1"}));
     }
 
     #[test]
@@ -5556,7 +6826,7 @@ mod tests {
         assert!(!codex_rpc_is_codex_server_to_client_request(
             &json!({"id": 2, "result": {}})
         ));
-        assert!(unsupported_codex_server_request(&json!({"id": 2, "result": {}})).is_none());
+        assert!(classify_codex_server_request(&json!({"id": 2, "result": {}})).is_none());
         assert!(codex_rpc_is_codex_server_to_client_request(
             &json!({"id": 2, "method": "item/tool/requestUserInput", "params": {}})
         ));
@@ -5661,6 +6931,94 @@ mod tests {
     }
 
     #[test]
+    fn live_codex_turn_started_suppresses_normalized_status_for_driver_status() {
+        let session_id = SessionId::new();
+        let message = json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "inProgress"
+                }
+            }
+        });
+        let scope = CodexTurnScope {
+            thread_id: Some("thread-1".to_owned()),
+            turn_id: Some("turn-1".to_owned()),
+        };
+
+        let events =
+            normalize_codex_message_for_scope_suppressing_turn_status(session_id, &message, &scope);
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], NormalizedEvent::NativeNotification(_)));
+
+        let mut driver = CodexTurnDriver::new(session_id);
+        driver.turn_start_requested(None);
+        let status_event = codex_transition_status_event(
+            session_id,
+            driver.turn_started(Some(&message)),
+            "Codex turn started.",
+        );
+
+        assert!(matches!(
+            status_event,
+            NormalizedEvent::SessionStatusChanged(status)
+                if status.session_id == session_id
+                    && status.status == SessionStatus::Running
+                    && status.reason.as_deref() == Some("Codex turn started.")
+        ));
+    }
+
+    #[test]
+    fn live_codex_turn_completed_suppresses_normalized_status_for_driver_status() {
+        let session_id = SessionId::new();
+        let message = json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "failed",
+                    "error": {
+                        "message": "request failed"
+                    }
+                }
+            }
+        });
+        let scope = CodexTurnScope {
+            thread_id: Some("thread-1".to_owned()),
+            turn_id: Some("turn-1".to_owned()),
+        };
+
+        let events =
+            normalize_codex_message_for_scope_suppressing_turn_status(session_id, &message, &scope);
+
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, NormalizedEvent::SessionStatusChanged(_))));
+
+        let mut driver = CodexTurnDriver::new(session_id);
+        driver.turn_start_requested(None);
+        driver.turn_started(None);
+        let status_event = codex_transition_status_event(
+            session_id,
+            driver.terminal_completed(codex_turn_completed_status(&message), Some(&message)),
+            &codex_turn_completed_status_reason(&message),
+        );
+
+        assert!(matches!(
+            status_event,
+            NormalizedEvent::SessionStatusChanged(status)
+                if status.session_id == session_id
+                    && status.status == SessionStatus::Failed
+                    && status.reason.as_deref() == Some("request failed")
+        ));
+    }
+
+    #[test]
     fn pending_codex_server_requests_match_numeric_and_string_request_ids() {
         let approval_id = ApprovalId::new();
         let question_id = QuestionId::new();
@@ -5678,6 +7036,56 @@ mod tests {
             Some(PendingCodexServerRequest::Question { question_id: id }) if id == question_id
         ));
         assert!(pending.remove(&json!(7)).is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_removes_pending_approvals_and_questions() {
+        let session_id = SessionId::new();
+        let approval_id = ApprovalId::new();
+        let question_id = QuestionId::new();
+        let mut pending_server_requests = PendingCodexServerRequests::default();
+        pending_server_requests.insert_approval(&json!(7), approval_id);
+        pending_server_requests.insert_question(&json!("question-1"), question_id);
+
+        let (approval_sender, _approval_receiver) = oneshot::channel();
+        let (question_sender, _question_receiver) = oneshot::channel();
+        let pending_approvals = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            approval_id,
+            PendingCodexApproval::new(session_id, approval_sender),
+        )])));
+        let pending_questions = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            question_id,
+            PendingCodexQuestion {
+                response: question_sender,
+            },
+        )])));
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+        let terminal = json!({
+            "method": "turn/completed",
+            "params": {
+                "turn": {
+                    "id": "turn-1",
+                    "status": "interrupted"
+                }
+            }
+        });
+
+        cleanup_codex_terminal_pending_requests(
+            session_id,
+            &terminal,
+            &event_sender,
+            &mut pending_server_requests,
+            &pending_approvals,
+            &pending_questions,
+        )
+        .await;
+
+        assert!(pending_server_requests.drain().is_empty());
+        assert!(pending_approvals.lock().await.is_empty());
+        assert!(pending_questions.lock().await.is_empty());
+        assert!(event_receiver.recv().await.is_some());
+        assert!(event_receiver.recv().await.is_some());
+        assert!(event_receiver.try_recv().is_err());
     }
 
     #[test]

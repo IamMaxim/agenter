@@ -127,7 +127,7 @@ Steps:
 
 - [x] Add ID wrappers for `TurnId`, `ItemId`, `PlanId`, `DiffId`, `ArtifactId`, and `CommandId`.
 - [x] Add `UniversalEventEnvelope` with `event_id`, global `seq`, `session_id`, optional `turn_id`, optional `item_id`, `ts`, `source`, optional safe `native`, and `event`.
-- [x] Add `UniversalEventKind` using dot-compatible serialized names such as `session.created`, `turn.started`, `item.created`, `content.delta`, `approval.requested`, `plan.updated`, `diff.updated`, `artifact.created`, `usage.updated`, and `native.unknown`.
+- [x] Add `UniversalEventKind` using dot-compatible serialized names such as `session.created`, `turn.started`, `item.created`, `content.delta`, `approval.requested`, `approval.resolved`, `plan.updated`, `diff.updated`, `artifact.created`, `usage.updated`, and `native.unknown`.
 - [x] Add `NativeRef` with protocol, method/type/id, and redacted summary, hash, or pointer data by default.
 - [x] Add `UniversalCommandEnvelope { command_id, idempotency_key, session_id, turn_id, command }`.
 - [x] Add command variants for start/load/close session, start/cancel turn, send user input, resolve approval, set mode, set model, request diff, revert change, subscribe, and get snapshot.
@@ -205,7 +205,7 @@ Stage 2 notes:
 - Runtime browser delivery uses universal snapshot/replay frames only.
 - normalized event dual-write is explicitly universal projection-only: provider payloads are not copied into universal `native_json`; only safe native IDs/summaries are projected where available.
 - Universal snapshot writes now lock the parent `agent_sessions` row before assigning/reducing a session event, and snapshot storage rejects `latest_seq` regressions.
-- Durable approval resolution updates `pending_approvals.universal_status`; source `ApprovalResolved` events project into universal approval state without raw provider payload persistence.
+- Durable approval resolution updates `pending_approvals.universal_status`; source `ApprovalResolved` events project into `approval.resolved` lifecycle updates without raw provider payload persistence.
 - Forced discovered-history refresh clears the session's universal projection (`agent_events`, `session_snapshots`, and recent turn cache) before rewriting imported history. This is not canonical native history deletion.
 - `agent_events.event_id` is a control-plane UUID. Native stable event/request IDs belong in `NativeRef`; non-UUID envelope event IDs fail with a clear error.
 - A narrow compile-only test update was required in `crates/agenter-control-plane/src/api.rs` to ignore the Stage 1 `BrowserServerMessage::SessionSnapshot` test frame while waiting for Stage 3 browser replay wiring.
@@ -752,6 +752,12 @@ Stage 10 runner WAL follow-up:
 - `SessionsDiscovered`, `OperationUpdated`, health, and runner error events are delivered as retryable operation/control messages without runner WAL sequence numbers.
 - Runner WAL acknowledgements now persist a small cursor instead of rewriting the record log on every ack; source non-replayable discovery records are dropped during WAL startup repair.
 - This closes the observed runner CPU spike where a retained loaded-history `SessionsDiscovered` record made every small ack reserialize a large WAL file.
+
+Stage 10 browser replay follow-up:
+
+- Incomplete snapshot messages (`include_snapshot=true`, `has_more=true`) now still seed frontend row ordering from the bounded replay events before materializing the current snapshot.
+- This keeps approval and question rows in their historical transcript positions after page reload instead of giving them synthetic snapshot-tail order.
+- Added a focused `sessionSnapshot.test.ts` regression for an approval row interleaved between assistant rows in an incomplete snapshot replay.
 
 ## Scheduling And Validation Rules
 

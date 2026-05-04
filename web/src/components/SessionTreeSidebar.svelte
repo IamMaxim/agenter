@@ -137,6 +137,8 @@
         return 'needs approval';
       case 'waiting_for_input':
         return 'waiting';
+      case 'interrupting':
+        return 'stopping';
       case 'failed':
       case 'degraded':
         return 'error';
@@ -154,7 +156,7 @@
   }
 
   function statusTone(status: SessionStatus | string) {
-    if (status === 'running' || status === 'starting') {
+    if (status === 'running' || status === 'starting' || status === 'interrupting') {
       return 'running';
     }
     if (status === 'waiting_for_approval' || status === 'waiting_for_input') {
@@ -263,7 +265,7 @@
     }
   }
 
-  async function reloadRunnerWorkspaceSessions(group: SessionTreeGroup) {
+  async function reloadRunnerWorkspaceSessions(group: SessionTreeGroup, force = false) {
     const providers = getGroupProviderIds(group);
     const providerIds = providers.length > 0 ? providers : [FALLBACK_REFRESH_PROVIDER];
     const startedProviderCount = providerIds.length;
@@ -278,7 +280,7 @@
             ts: new Date().toISOString(),
             level: 'info',
             status: 'queued',
-            message: `Queued ${providerId} refresh.`
+            message: force ? `Queued ${providerId} force reload.` : `Queued ${providerId} refresh.`
           }
         ],
         updated_at: new Date().toISOString()
@@ -288,7 +290,7 @@
 
     const refreshResults = await Promise.allSettled(
       providerIds.map((providerId) =>
-        refreshWorkspaceProviderSessions(group.workspace.workspace_id, providerId)
+        refreshWorkspaceProviderSessions(group.workspace.workspace_id, providerId, { force })
       )
     );
     refreshResults.forEach((result, index) => {
@@ -301,7 +303,7 @@
               ts: new Date().toISOString(),
               level: 'info',
               status: result.value.status,
-              message: `${providerIds[index]} refresh accepted.`
+              message: force ? `${providerIds[index]} force reload accepted.` : `${providerIds[index]} refresh accepted.`
             }
           ],
           updated_at: new Date().toISOString()
@@ -372,12 +374,12 @@
         pushToast({
           severity: 'info',
           message:
-            `Reloaded sessions from ${providerIds[0]}: discovered ${summary.discovered_count}, refreshed ${summary.refreshed_cache_count}, skipped ${summary.skipped_failed_count}.`
+            `${force ? 'Force reloaded' : 'Reloaded'} sessions from ${providerIds[0]}: discovered ${summary.discovered_count}, refreshed ${summary.refreshed_cache_count}, skipped ${summary.skipped_failed_count}.`
         });
       } else {
         pushToast({
           severity: 'info',
-          message: `Reloaded sessions across ${startedProviderCount} providers: discovered ${summary.discovered_count}, refreshed ${summary.refreshed_cache_count}, skipped ${summary.skipped_failed_count}.`
+          message: `${force ? 'Force reloaded' : 'Reloaded'} sessions across ${startedProviderCount} providers: discovered ${summary.discovered_count}, refreshed ${summary.refreshed_cache_count}, skipped ${summary.skipped_failed_count}.`
         });
       }
     } else if (failedProviderIds.length === startedProviderCount) {
@@ -746,6 +748,14 @@
                 on:click={() => void reloadRunnerWorkspaceSessions(group)}
               >
                 Reload sessions
+              </button>
+              <button
+                class="runner-context-menu-item"
+                type="button"
+                role="menuitem"
+                on:click={() => void reloadRunnerWorkspaceSessions(group, true)}
+              >
+                Force reload sessions
               </button>
             </div>
           {/if}

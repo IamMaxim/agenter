@@ -6,6 +6,7 @@
   import PlanCard from '../components/PlanCard.svelte';
   import SubagentEventRow from '../components/SubagentEventRow.svelte';
   import { ApiError } from '../api/http';
+  import { disableApprovalRule, listApprovalRules } from '../api/approvalRules';
   import { connectSessionEvents, type BrowserEventSocket } from '../api/events';
   import {
     answerQuestion,
@@ -31,6 +32,7 @@
     BrowserServerMessage,
     ApprovalDecisionName,
     ApprovalDecision,
+    ApprovalPolicyRule,
     SessionInfo,
     SessionUsageWindow,
     SlashCommandDefinition,
@@ -50,6 +52,11 @@
     type ChatItem,
     type ChatState
   } from '../lib/chatEvents';
+  import {
+    buildChatDebugExport,
+    summarizeChatDebugState,
+    type ChatDebugWsEntry
+  } from '../lib/chatDebugExport';
   import {
     applyUniversalClientMessage,
     createUniversalClientState,
@@ -90,6 +97,7 @@
   let sendError = '';
   let decisionError = '';
   let settingsError = '';
+  let approvalRulesError = '';
   let submitting = false;
   let stoppingTurn = false;
   let editingTitle = false;
@@ -109,11 +117,15 @@
   const VERBOSITY_OPTIONS: VerbosityMode[] = ['compact', 'normal', 'detailed', 'debug'];
   const DEFAULT_VERBOSITY: VerbosityMode = 'debug';
   const VERBOSITY_STORAGE_KEY = 'agenter.chat.verbosity.v1';
+  const CHAT_DEBUG_WS_LIMIT = 500;
   let verbosity: VerbosityMode = DEFAULT_VERBOSITY;
   let dismissedPlanIds: Set<string> = new Set();
   let eventStream: HTMLDivElement | undefined;
   const EVENT_STREAM_BOTTOM_EPSILON_PX = 8;
   let sessionMetaSignature = '';
+  let approvalRules: ApprovalPolicyRule[] = [];
+  let loadingApprovalRules = false;
+  let debugWsMessages: ChatDebugWsEntry[] = [];
 
   function emitSessionMeta() {
     if (!session) {
@@ -202,6 +214,7 @@
     verbosity = readVerbosityFromStorage();
     window.addEventListener('pointerdown', closeComposerMenuOnOutsideClick);
     window.addEventListener('keydown', closeComposerMenuOnEscape);
+    window.__agenterExportChatDebug = exportChatDebugState;
     void reloadAndConnect();
   });
 
@@ -209,6 +222,9 @@
     closedByRoute = true;
     window.removeEventListener('pointerdown', closeComposerMenuOnOutsideClick);
     window.removeEventListener('keydown', closeComposerMenuOnEscape);
+    if (window.__agenterExportChatDebug === exportChatDebugState) {
+      delete window.__agenterExportChatDebug;
+    }
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
     }
@@ -234,6 +250,9 @@
     sendError = '';
     decisionError = '';
     settingsError = '';
+    approvalRulesError = '';
+    approvalRules = [];
+    debugWsMessages = [];
     editingTitle = false;
     stoppingTurn = false;
     connectionState = 'Loading history';
@@ -245,6 +264,7 @@
       titleDraft = session.title ?? '';
       void loadAgentSettings(generation);
       void loadSlashCommands(generation);
+      void loadApprovalRules(generation);
       universalState = { ...createUniversalClientState(), latestSeq: replayCursor };
       await tick();
       scrollEventStreamToBottom();
@@ -283,6 +303,7 @@
             if (universalState.snapshot?.info) {
               session = universalState.snapshot.info;
               titleDraft = session.title ?? '';
+              void loadApprovalRules(generation);
             }
             void tick().then(() => {
               if (shouldScrollToBottom) {
@@ -301,6 +322,7 @@
           }
           pushToast({ severity: 'error', message: message.message });
         }
+        recordDebugWsMessage(message);
       },
       onClose: () => {
         if (suppressNextReconnect) {
@@ -320,6 +342,38 @@
         pushToast({ severity: 'error', message: 'Browser event stream encountered an error.' });
       }
     });
+  }
+
+  async function loadApprovalRules(generation = connectionGeneration) {
+    if (!session?.workspace_id || !session.provider_id) {
+      approvalRules = [];
+      return;
+    }
+    loadingApprovalRules = true;
+    approvalRulesError = '';
+    try {
+      const rules = await listApprovalRules(session.workspace_id, session.provider_id);
+      if (generation === connectionGeneration) {
+        approvalRules = rules;
+      }
+    } catch {
+      if (generation === connectionGeneration) {
+        approvalRulesError = 'Could not load approval rules.';
+      }
+    } finally {
+      if (generation === connectionGeneration) {
+        loadingApprovalRules = false;
+      }
+    }
+  }
+
+  async function revokeApprovalRule(ruleId: string) {
+    try {
+      await disableApprovalRule(ruleId);
+      approvalRules = approvalRules.filter((rule) => rule.rule_id !== ruleId);
+    } catch {
+      approvalRulesError = 'Could not revoke approval rule.';
+    }
   }
 
   async function submit() {
@@ -476,6 +530,48 @@
     openComposerMenu = null;
     verbosity = level;
     writeVerbosityToStorage(level);
+  }
+
+  function recordDebugWsMessage(message: BrowserServerMessage) {
+    const entry: ChatDebugWsEntry = {
+      receivedAt: new Date().toISOString(),
+      message,
+      stateAfter: summarizeChatDebugState({
+        chatState,
+        visibleItems,
+        universalState
+      })
+    };
+    debugWsMessages = [...debugWsMessages, entry].slice(-CHAT_DEBUG_WS_LIMIT);
+  }
+
+  function buildCurrentChatDebugExport() {
+    return buildChatDebugExport({
+      activeSessionId,
+      connectionState,
+      session,
+      verbosity,
+      chatState,
+      visibleItems,
+      universalState,
+      wsMessages: debugWsMessages
+    });
+  }
+
+  function exportChatDebugState() {
+    const exported = buildCurrentChatDebugExport();
+    const text = JSON.stringify(exported, null, 2);
+    void navigator.clipboard?.writeText(text).then(
+      () => pushToast({ severity: 'info', message: 'Chat debug export copied to clipboard.' }),
+      () => pushToast({ severity: 'warning', message: 'Chat debug export returned in console helper; clipboard unavailable.' })
+    );
+    return exported;
+  }
+
+  function handleExportChatDebug() {
+    const exported = exportChatDebugState();
+    // Keep a direct console handle for large payloads when clipboard access is blocked.
+    console.debug('[agenter] chat-debug-export', exported);
   }
 
   async function submitSlashCommand(confirmed = false) {
@@ -886,7 +982,7 @@
   }
 
   function statusTone(status: string | undefined): string {
-    if (status === 'running' || status === 'starting') {
+    if (status === 'running' || status === 'starting' || status === 'interrupting') {
       return 'running';
     }
     if (status === 'waiting_for_approval' || status === 'waiting_for_input') {
@@ -912,6 +1008,8 @@
         return 'needs approval';
       case 'waiting_for_input':
         return 'waiting';
+      case 'interrupting':
+        return 'stopping';
       case 'failed':
       case 'degraded':
         return 'error';
@@ -1048,11 +1146,46 @@
         <span>·</span>
         <span>{connectionState}</span>
       </div>
+      {#if session}
+        <details class="approval-rules-panel">
+          <summary>
+            Approval rules
+            {#if loadingApprovalRules}
+              <span class="muted">loading</span>
+            {:else}
+              <span class="muted">{approvalRules.length}</span>
+            {/if}
+          </summary>
+          {#if approvalRulesError}
+            <p class="error-text">{approvalRulesError}</p>
+          {:else if approvalRules.length === 0}
+            <p class="muted">No persistent approval rules.</p>
+          {:else}
+            <div class="approval-rule-list">
+              {#each approvalRules as rule}
+                <div class="approval-rule-row">
+                  <span>{rule.label}</span>
+                  <button class="secondary compact" type="button" on:click={() => revokeApprovalRule(rule.rule_id)}>
+                    Revoke
+                  </button>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </details>
+      {/if}
     </div>
-    <span class:done={sessionStatusTone === 'done'} class:error={sessionStatusTone === 'error'} class:idle={sessionStatusTone === 'idle'} class:running={sessionStatusTone === 'running'} class:waiting={sessionStatusTone === 'waiting'} class="status-pill">
-      <span class="status-dot" aria-hidden="true"></span>
-      {sessionStatusLabel}
-    </span>
+    <div class="chat-header-actions">
+      {#if verbosity === 'debug'}
+        <button class="secondary compact chat-debug-export" type="button" on:click={handleExportChatDebug}>
+          Export debug
+        </button>
+      {/if}
+      <span class:done={sessionStatusTone === 'done'} class:error={sessionStatusTone === 'error'} class:idle={sessionStatusTone === 'idle'} class:running={sessionStatusTone === 'running'} class:waiting={sessionStatusTone === 'waiting'} class="status-pill">
+        <span class="status-dot" aria-hidden="true"></span>
+        {sessionStatusLabel}
+      </span>
+    </div>
   </header>
 
   <div class="event-stream" bind:this={eventStream}>

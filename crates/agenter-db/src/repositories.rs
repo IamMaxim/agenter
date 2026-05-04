@@ -10,7 +10,7 @@ use sqlx::{postgres::PgRow, PgPool, Postgres, Result, Row, Transaction};
 use uuid::Uuid;
 
 use crate::models::{
-    AgentEvent, AgentSession, AgentSessionWithWorkspace, BrowserAuthSession,
+    AgentEvent, AgentSession, AgentSessionWithWorkspace, ApprovalPolicyRule, BrowserAuthSession,
     CommandIdempotencyRecord, CommandIdempotencyStatus, ConnectorAccount, ConnectorLinkCode,
     OidcLoginState, OidcProvider, PendingApproval, Runner, StoredSessionSnapshot,
     UniversalAppendOutcome, User, Workspace,
@@ -25,6 +25,19 @@ pub struct UpsertOidcProvider<'a> {
     pub client_secret_ciphertext: Option<&'a str>,
     pub scopes: &'a [String],
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewApprovalPolicyRule<'a> {
+    pub owner_user_id: UserId,
+    pub workspace_id: WorkspaceId,
+    pub provider_id: &'a AgentProviderId,
+    pub kind: ApprovalKind,
+    pub label: &'a str,
+    pub matcher: &'a serde_json::Value,
+    pub decision: &'a ApprovalDecision,
+    pub source_approval_id: Option<ApprovalId>,
+    pub created_by_user_id: Option<UserId>,
 }
 
 pub async fn create_user(pool: &PgPool, email: &str, display_name: Option<&str>) -> Result<User> {
@@ -794,6 +807,43 @@ pub async fn find_session_for_user(
         .transpose()
 }
 
+pub async fn find_session_by_id(
+    pool: &PgPool,
+    session_id: SessionId,
+) -> Result<Option<AgentSessionWithWorkspace>> {
+    let row = sqlx::query(
+        "select
+            s.session_id,
+            s.owner_user_id,
+            s.runner_id,
+            s.workspace_id,
+            s.provider_id,
+            s.external_session_id,
+            s.status,
+            s.title,
+            s.usage_snapshot,
+            s.turn_settings,
+            s.created_at,
+            s.updated_at,
+            w.workspace_id as w_workspace_id,
+            w.runner_id as w_runner_id,
+            w.path as w_path,
+            w.display_name as w_display_name,
+            w.created_at as w_created_at,
+            w.updated_at as w_updated_at
+         from agent_sessions s
+         join workspaces w on w.workspace_id = s.workspace_id
+         where s.session_id = $1",
+    )
+    .bind(session_id.as_uuid())
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref()
+        .map(session_with_workspace_from_row)
+        .transpose()
+}
+
 pub async fn update_session_turn_settings(
     pool: &PgPool,
     owner_user_id: UserId,
@@ -881,6 +931,27 @@ pub async fn update_session_status_by_id(
     )
     .bind(session_id.as_uuid())
     .bind(session_status_to_db(&status))
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(session_from_row).transpose()
+}
+
+pub async fn update_session_title_by_id(
+    pool: &PgPool,
+    session_id: SessionId,
+    title: Option<&str>,
+) -> Result<Option<AgentSession>> {
+    let row = sqlx::query(
+        "update agent_sessions
+         set title = $2,
+             updated_at = now()
+         where session_id = $1
+         returning session_id, owner_user_id, runner_id, workspace_id, provider_id,
+             external_session_id, status, title, usage_snapshot, turn_settings, created_at, updated_at",
+    )
+    .bind(session_id.as_uuid())
+    .bind(title)
     .fetch_optional(pool)
     .await?;
 
@@ -1013,12 +1084,31 @@ where
     let mut tx = pool.begin().await?;
     lock_session_for_projection_tx(&mut tx, envelope.session_id).await?;
     let event = insert_universal_event_tx(&mut tx, workspace_id, &envelope, command_id).await?;
-    if let UniversalEventKind::ApprovalRequested { approval } = &event.event {
-        if is_resolved_universal_approval_status(&approval.status) {
-            resolve_pending_approval_from_universal_tx(&mut tx, approval).await?;
-        } else {
-            materialize_pending_approval_tx(&mut tx, approval).await?;
+    match &event.event {
+        UniversalEventKind::ApprovalRequested { approval } => {
+            if is_resolved_universal_approval_status(&approval.status) {
+                resolve_pending_approval_from_universal_tx(&mut tx, approval).await?;
+            } else {
+                materialize_pending_approval_tx(&mut tx, approval).await?;
+            }
         }
+        UniversalEventKind::ApprovalResolved {
+            approval_id,
+            status,
+            resolved_at,
+            native,
+            ..
+        } => {
+            resolve_existing_pending_approval_tx(
+                &mut tx,
+                *approval_id,
+                status,
+                *resolved_at,
+                native.as_ref(),
+            )
+            .await?;
+        }
+        _ => {}
     }
     let mut snapshot = load_session_snapshot_for_update_tx(&mut tx, event.session_id).await?;
     reduce(&mut snapshot, &event.envelope());
@@ -1260,6 +1350,95 @@ pub async fn resolve_approval(
     .await?;
 
     row.as_ref().map(approval_from_row).transpose()
+}
+
+pub async fn create_approval_policy_rule(
+    pool: &PgPool,
+    rule: NewApprovalPolicyRule<'_>,
+) -> Result<ApprovalPolicyRule> {
+    let decision_json = serde_json::to_value(rule.decision).map_err(sqlx::Error::decode)?;
+    let row = sqlx::query(
+        "insert into approval_policy_rules (
+            owner_user_id, workspace_id, provider_id, kind, label, matcher, decision,
+            source_approval_id, created_by_user_id
+         )
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         on conflict (owner_user_id, workspace_id, provider_id, kind, matcher)
+             where disabled_at is null
+         do update set
+            label = excluded.label,
+            decision = excluded.decision,
+            source_approval_id = coalesce(excluded.source_approval_id, approval_policy_rules.source_approval_id),
+            created_by_user_id = coalesce(excluded.created_by_user_id, approval_policy_rules.created_by_user_id),
+            updated_at = now()
+         returning rule_id, owner_user_id, workspace_id, provider_id, kind, label, matcher,
+            decision, source_approval_id, created_by_user_id, disabled_by_user_id,
+            disabled_at, created_at, updated_at",
+    )
+    .bind(rule.owner_user_id.as_uuid())
+    .bind(rule.workspace_id.as_uuid())
+    .bind(rule.provider_id.as_str())
+    .bind(approval_kind_to_db(&rule.kind))
+    .bind(rule.label)
+    .bind(rule.matcher)
+    .bind(decision_json)
+    .bind(rule.source_approval_id.map(ApprovalId::as_uuid))
+    .bind(rule.created_by_user_id.map(UserId::as_uuid))
+    .fetch_one(pool)
+    .await?;
+
+    approval_policy_rule_from_row(&row)
+}
+
+pub async fn list_active_approval_policy_rules(
+    pool: &PgPool,
+    owner_user_id: UserId,
+    workspace_id: WorkspaceId,
+    provider_id: &AgentProviderId,
+) -> Result<Vec<ApprovalPolicyRule>> {
+    let rows = sqlx::query(
+        "select rule_id, owner_user_id, workspace_id, provider_id, kind, label, matcher,
+            decision, source_approval_id, created_by_user_id, disabled_by_user_id,
+            disabled_at, created_at, updated_at
+         from approval_policy_rules
+         where owner_user_id = $1
+            and workspace_id = $2
+            and provider_id = $3
+            and disabled_at is null
+         order by created_at desc, rule_id",
+    )
+    .bind(owner_user_id.as_uuid())
+    .bind(workspace_id.as_uuid())
+    .bind(provider_id.as_str())
+    .fetch_all(pool)
+    .await?;
+
+    rows.iter().map(approval_policy_rule_from_row).collect()
+}
+
+pub async fn disable_approval_policy_rule(
+    pool: &PgPool,
+    owner_user_id: UserId,
+    rule_id: Uuid,
+    disabled_by_user_id: UserId,
+) -> Result<Option<ApprovalPolicyRule>> {
+    let row = sqlx::query(
+        "update approval_policy_rules
+         set disabled_at = coalesce(disabled_at, now()),
+             disabled_by_user_id = coalesce(disabled_by_user_id, $3),
+             updated_at = now()
+         where rule_id = $1 and owner_user_id = $2
+         returning rule_id, owner_user_id, workspace_id, provider_id, kind, label, matcher,
+            decision, source_approval_id, created_by_user_id, disabled_by_user_id,
+            disabled_at, created_at, updated_at",
+    )
+    .bind(rule_id)
+    .bind(owner_user_id.as_uuid())
+    .bind(disabled_by_user_id.as_uuid())
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(approval_policy_rule_from_row).transpose()
 }
 
 pub async fn create_connector_link_code(
@@ -1652,6 +1831,40 @@ async fn resolve_pending_approval_from_universal_tx(
     Ok(())
 }
 
+async fn resolve_existing_pending_approval_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    approval_id: ApprovalId,
+    status: &UniversalApprovalStatus,
+    resolved_at: chrono::DateTime<chrono::Utc>,
+    native: Option<&agenter_core::NativeRef>,
+) -> Result<()> {
+    let native_json = native
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(sqlx::Error::decode)?;
+    let native_request_id = native.and_then(|native| native.native_id.as_deref());
+    let native_summary = native.and_then(|native| native.summary.as_deref());
+    sqlx::query(
+        "update pending_approvals
+         set universal_status = $2,
+             native_request_id = coalesce($3, native_request_id),
+             native_summary = coalesce($4, native_summary),
+             native_json = coalesce($5, native_json),
+             resolved_at = $6,
+             updated_at = now()
+         where approval_id = $1",
+    )
+    .bind(approval_id.as_uuid())
+    .bind(universal_approval_status_to_db(status))
+    .bind(native_request_id)
+    .bind(native_summary)
+    .bind(native_json)
+    .bind(resolved_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 fn user_from_row(row: &PgRow) -> Result<User> {
     Ok(User {
         user_id: UserId::from_uuid(row.try_get("user_id")?),
@@ -1823,6 +2036,33 @@ fn approval_from_row(row: &PgRow) -> Result<PendingApproval> {
     })
 }
 
+fn approval_policy_rule_from_row(row: &PgRow) -> Result<ApprovalPolicyRule> {
+    let kind: String = row.try_get("kind")?;
+    let decision_json: serde_json::Value = row.try_get("decision")?;
+    Ok(ApprovalPolicyRule {
+        rule_id: row.try_get("rule_id")?,
+        owner_user_id: UserId::from_uuid(row.try_get("owner_user_id")?),
+        workspace_id: WorkspaceId::from_uuid(row.try_get("workspace_id")?),
+        provider_id: AgentProviderId::from(row.try_get::<String, _>("provider_id")?),
+        kind: approval_kind_from_db(&kind)?,
+        label: row.try_get("label")?,
+        matcher: row.try_get("matcher")?,
+        decision: serde_json::from_value(decision_json).map_err(sqlx::Error::decode)?,
+        source_approval_id: row
+            .try_get::<Option<Uuid>, _>("source_approval_id")?
+            .map(ApprovalId::from_uuid),
+        created_by_user_id: row
+            .try_get::<Option<Uuid>, _>("created_by_user_id")?
+            .map(UserId::from_uuid),
+        disabled_by_user_id: row
+            .try_get::<Option<Uuid>, _>("disabled_by_user_id")?
+            .map(UserId::from_uuid),
+        disabled_at: row.try_get("disabled_at")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 fn oidc_provider_from_row(row: &PgRow) -> Result<OidcProvider> {
     Ok(OidcProvider {
         provider_id: row.try_get("oidc_provider_id")?,
@@ -1960,6 +2200,7 @@ fn universal_event_type(event: &UniversalEventKind) -> &'static str {
     match event {
         UniversalEventKind::SessionCreated { .. } => "session.created",
         UniversalEventKind::SessionStatusChanged { .. } => "session.status_changed",
+        UniversalEventKind::SessionMetadataChanged { .. } => "session.metadata_changed",
         UniversalEventKind::TurnStarted { .. } => "turn.started",
         UniversalEventKind::TurnStatusChanged { .. } => "turn.status_changed",
         UniversalEventKind::TurnCompleted { .. } => "turn.completed",
@@ -1971,6 +2212,7 @@ fn universal_event_type(event: &UniversalEventKind) -> &'static str {
         UniversalEventKind::ContentDelta { .. } => "content.delta",
         UniversalEventKind::ContentCompleted { .. } => "content.completed",
         UniversalEventKind::ApprovalRequested { .. } => "approval.requested",
+        UniversalEventKind::ApprovalResolved { .. } => "approval.resolved",
         UniversalEventKind::QuestionRequested { .. } => "question.requested",
         UniversalEventKind::QuestionAnswered { .. } => "question.answered",
         UniversalEventKind::PlanUpdated { .. } => "plan.updated",

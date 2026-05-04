@@ -1,10 +1,12 @@
 import type {
+  ApprovalRequest,
   ArtifactState,
   ContentBlock,
   ContentBlockKind,
   DiffState,
   ItemState,
   PlanState,
+  QuestionState,
   SessionSnapshot,
   TurnState,
   UniversalEventEnvelope
@@ -77,6 +79,19 @@ export function applyUniversalEvent(snapshot: SessionSnapshot, envelope: Univers
     case 'session.created':
       next.info = envelope.event.data.session;
       break;
+    case 'session.status_changed':
+      if (next.info) {
+        next.info = { ...next.info, status: envelope.event.data.status };
+      }
+      break;
+    case 'session.metadata_changed':
+      if (next.info) {
+        next.info = {
+          ...next.info,
+          title: envelope.event.data.title ?? undefined
+        };
+      }
+      break;
     case 'turn.started':
     case 'turn.status_changed':
     case 'turn.completed':
@@ -108,21 +123,29 @@ export function applyUniversalEvent(snapshot: SessionSnapshot, envelope: Univers
       );
       break;
     case 'approval.requested':
-      next.approvals[envelope.event.data.approval.approval_id] = {
-        ...envelope.event.data.approval,
-        options: [...envelope.event.data.approval.options]
-      };
+      next.approvals[envelope.event.data.approval.approval_id] = mergeApproval(
+        next.approvals[envelope.event.data.approval.approval_id],
+        envelope.event.data.approval
+      );
       break;
+    case 'approval.resolved': {
+      const existing = next.approvals[envelope.event.data.approval_id];
+      if (existing) {
+        next.approvals[envelope.event.data.approval_id] = {
+          ...cloneApproval(existing),
+          status: envelope.event.data.status,
+          resolved_at: envelope.event.data.resolved_at,
+          native: envelope.event.data.native ?? existing.native
+        };
+      }
+      break;
+    }
     case 'question.requested':
     case 'question.answered':
-      next.questions[envelope.event.data.question.question_id] = {
-        ...envelope.event.data.question,
-        fields: envelope.event.data.question.fields.map((field) => ({
-          ...field,
-          choices: [...field.choices],
-          default_answers: [...field.default_answers]
-        }))
-      };
+      next.questions[envelope.event.data.question.question_id] = mergeQuestion(
+        next.questions[envelope.event.data.question.question_id],
+        envelope.event.data.question
+      );
       break;
     case 'plan.updated':
       next.plans[envelope.event.data.plan.plan_id] = mergePlan(
@@ -141,10 +164,102 @@ export function applyUniversalEvent(snapshot: SessionSnapshot, envelope: Univers
         next.info = { ...next.info, usage: envelope.event.data.usage };
       }
       break;
+    case 'error.reported':
+      next.artifacts[`error:${envelope.event_id}`] = {
+        artifact_id: `error:${envelope.event_id}`,
+        session_id: envelope.session_id,
+        turn_id: envelope.turn_id ?? null,
+        kind: 'error',
+        title: errorEventTitle(envelope.event.data.code, envelope.native?.method),
+        uri: envelope.event.data.message,
+        mime_type: null,
+        created_at: envelope.ts
+      };
+      break;
+    case 'native.unknown':
+      next.artifacts[`native:${envelope.event_id}`] = {
+        artifact_id: `native:${envelope.event_id}`,
+        session_id: envelope.session_id,
+        turn_id: envelope.turn_id ?? null,
+        kind: isPromotedNativeMethod(envelope.native?.method) ? 'native' : 'native_raw',
+        title: nativeEventTitle(envelope.native?.method, envelope.event.data.summary),
+        uri: nativeEventDetail(envelope.native?.method, envelope.event.data.summary),
+        mime_type: null,
+        created_at: envelope.ts
+      };
+      break;
     default:
       break;
   }
   return next;
+}
+
+function errorEventTitle(code: string | null | undefined, method: string | null | undefined): string {
+  if (code === 'codex_auth_refresh_required') return 'Codex auth refresh required';
+  if (code === 'codex_capability_gap') return 'Codex capability gap';
+  if (code === 'codex_unknown_server_request') return 'Unknown Codex server request';
+  return method ? nativeEventTitle(method, code ?? undefined) : (code ?? 'Provider error');
+}
+
+function nativeEventTitle(method: string | null | undefined, fallback: string | null | undefined): string {
+  switch (method) {
+    case 'thread/started': return 'Thread started';
+    case 'thread/archived': return 'Thread archived';
+    case 'thread/unarchived': return 'Thread unarchived';
+    case 'thread/closed': return 'Thread closed';
+    case 'thread/name/updated': return 'Thread name updated';
+    case 'thread/contextWindow/updated': return 'Thread context window updated';
+    case 'hook/started': return 'Hook started';
+    case 'hook/completed': return 'Hook completed';
+    case 'item/autoApprovalReview/started': return 'Auto approval review started';
+    case 'item/autoApprovalReview/completed': return 'Auto approval review completed';
+    case 'guardianWarning': return 'Guardian warning';
+    case 'item/commandExecution/terminalInteraction': return 'Terminal interaction';
+    case 'item/mcpToolCall/progress': return 'MCP tool call progress';
+    case 'mcpServer/oauthLogin/completed': return 'MCP OAuth login completed';
+    case 'mcpServer/startupStatus/updated': return 'MCP server startup status updated';
+    case 'account/updated': return 'Account updated';
+    case 'account/rateLimits/updated': return 'Rate limits updated';
+    case 'model/rerouted': return 'Model rerouted';
+    case 'model/verification': return 'Model verification';
+    case 'warning': return 'Warning';
+    case 'deprecationNotice': return 'Deprecation notice';
+    case 'configWarning': return 'Configuration warning';
+    case 'fuzzyFileSearch/sessionUpdated': return 'Fuzzy file search updated';
+    case 'fuzzyFileSearch/sessionCompleted': return 'Fuzzy file search completed';
+    case 'fs/changed': return 'Filesystem changed';
+    case 'windows/worldWritableWarning': return 'World-writable path warning';
+    case 'windowsSandbox/setupCompleted': return 'Windows sandbox setup completed';
+    default: return fallback ?? method ?? 'Provider event';
+  }
+}
+
+function nativeEventDetail(method: string | null | undefined, summary: string | null | undefined): string | undefined {
+  if (!method || summary === method || summary === 'native notification') {
+    return summary ?? undefined;
+  }
+  return summary ? `${method}\n${summary}` : method;
+}
+
+function isPromotedNativeMethod(method: string | null | undefined): boolean {
+  return Boolean(
+    method &&
+      (method.startsWith('thread/') ||
+        method.startsWith('hook/') ||
+        method.startsWith('item/autoApprovalReview/') ||
+        method === 'item/commandExecution/terminalInteraction' ||
+        method.startsWith('item/mcpToolCall/') ||
+        method.startsWith('mcpServer/') ||
+        method.startsWith('account/') ||
+        method.startsWith('model/') ||
+        method.startsWith('fuzzyFileSearch/') ||
+        method.startsWith('fs/') ||
+        method.startsWith('windows') ||
+        method === 'guardianWarning' ||
+        method === 'warning' ||
+        method === 'deprecationNotice' ||
+        method === 'configWarning')
+  );
 }
 
 export function universalEventKey(event: Pick<UniversalEventEnvelope, 'seq' | 'event_id'>): string {
@@ -159,9 +274,96 @@ export function compareSeq(left: string | null | undefined, right: string | null
 
 function upsertTurn(snapshot: SessionSnapshot, turn: TurnState) {
   snapshot.turns[turn.turn_id] = turn;
-  const active = turn.status === 'running' || turn.status === 'waiting_for_approval' || turn.status === 'waiting_for_input';
+  const active =
+    turn.status === 'running' ||
+    turn.status === 'waiting_for_approval' ||
+    turn.status === 'waiting_for_input' ||
+    turn.status === 'interrupting';
   const without = snapshot.active_turns.filter((turnId) => turnId !== turn.turn_id);
   snapshot.active_turns = active ? [...without, turn.turn_id] : without;
+}
+
+function mergeApproval(
+  existing: ApprovalRequest | undefined,
+  incoming: ApprovalRequest
+): ApprovalRequest {
+  if (!existing) {
+    return cloneApproval(incoming);
+  }
+  const incomingIsTerminal = terminalApprovalStatus(incoming.status);
+  const shouldReplaceStatus = !terminalApprovalStatus(existing.status) || incomingIsTerminal;
+  const hasRequestDetails = incoming.title !== 'Approval resolved';
+  return {
+    ...existing,
+    turn_id: incoming.turn_id ?? existing.turn_id,
+    item_id: incoming.item_id ?? existing.item_id,
+    kind: hasRequestDetails ? incoming.kind : existing.kind,
+    title: hasRequestDetails ? incoming.title : existing.title,
+    details: incoming.details ?? existing.details,
+    options: incoming.options.length > 0 ? incoming.options.map((option) => ({ ...option })) : [...existing.options],
+    status: shouldReplaceStatus ? incoming.status : existing.status,
+    risk: incoming.risk ?? existing.risk,
+    subject: incoming.subject ?? existing.subject,
+    native_request_id: incoming.native_request_id ?? existing.native_request_id,
+    native_blocking: incoming.native_blocking ?? existing.native_blocking,
+    policy: incoming.policy ?? existing.policy,
+    native: incoming.native ?? existing.native,
+    requested_at: incoming.requested_at ?? existing.requested_at,
+    resolved_at: incoming.resolved_at ?? existing.resolved_at
+  };
+}
+
+function cloneApproval(approval: ApprovalRequest): ApprovalRequest {
+  return {
+    ...approval,
+    options: approval.options.map((option) => ({ ...option }))
+  };
+}
+
+function terminalApprovalStatus(status: string): boolean {
+  return ['approved', 'denied', 'cancelled', 'expired', 'orphaned'].includes(status);
+}
+
+function mergeQuestion(existing: QuestionState | undefined, incoming: QuestionState): QuestionState {
+  if (!existing) {
+    return cloneQuestion(incoming);
+  }
+  const hasRequestDetails = incoming.title !== 'Input requested';
+  return {
+    ...existing,
+    turn_id: incoming.turn_id ?? existing.turn_id,
+    title: hasRequestDetails ? incoming.title : existing.title,
+    description: incoming.description ?? existing.description,
+    fields: incoming.fields.length > 0 ? cloneQuestionFields(incoming) : cloneQuestionFields(existing),
+    status: incoming.status,
+    answer: incoming.answer ?? existing.answer,
+    native: incoming.native ?? existing.native,
+    requested_at: incoming.requested_at ?? existing.requested_at,
+    answered_at: incoming.answered_at ?? existing.answered_at
+  };
+}
+
+function cloneQuestion(question: QuestionState): QuestionState {
+  return {
+    ...question,
+    fields: cloneQuestionFields(question),
+    answer: question.answer
+      ? {
+          ...question.answer,
+          answers: Object.fromEntries(
+            Object.entries(question.answer.answers).map(([key, value]) => [key, [...value]])
+          )
+        }
+      : null
+  };
+}
+
+function cloneQuestionFields(question: QuestionState): QuestionState['fields'] {
+  return question.fields.map((field) => ({
+    ...field,
+    choices: [...field.choices],
+    default_answers: [...field.default_answers]
+  }));
 }
 
 function mergeContentDelta(

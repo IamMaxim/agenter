@@ -26,6 +26,27 @@ codex app-server generate-json-schema --out /tmp/agenter-codex-schema
 find /tmp/agenter-codex-schema -maxdepth 2 -type f | sort
 ```
 
+## Refresh Protocol Coverage Matrix
+
+The checked-in matrix lives in `crates/agenter-runner/src/agents/codex_protocol_coverage.rs` and is compared against the checked-in method fixture at `crates/agenter-runner/tests/fixtures/codex_app_server_protocol_methods.rs`. Tests must pass in a clean Agenter checkout without `tmp/codex`.
+
+When `tmp/codex` changes:
+
+1. Inspect `tmp/codex/codex-rs/app-server-protocol/src/protocol/common.rs`.
+2. Refresh the fixture by copying or extracting the `client_request_definitions!`, `server_request_definitions!`, and `server_notification_definitions!` invocation method lines for the pinned snapshot.
+3. Update each changed matrix entry with `direction`, `method`, `support`, `agenter_surface`, and `notes`.
+4. Treat new server requests and notifications as protocol drift until classified; do not rely on a fallback handler as the coverage record.
+5. Run:
+
+```sh
+cargo test -p agenter-runner codex_protocol_coverage
+cargo test -p agenter-runner codex_
+```
+
+Server request and notification coverage is exhaustive. Full client request coverage is not enforced yet; the Stage 1 guard verifies only that the selected classified client request methods still exist in `client_request_definitions!`.
+
+Interpretation: `supported` means Agenter has a first-class or deliberate current projection, `degraded` means visible but incomplete behavior, `unsupported` means intentionally blocked, `ignored` means deliberately hidden as non-user-facing noise, `not_applicable` means local TUI or runner-host-only behavior, and `deferred` means planned or possible later work without current remote surface.
+
 ## Start App-Server
 
 Raw server command:

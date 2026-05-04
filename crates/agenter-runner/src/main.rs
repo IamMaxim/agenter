@@ -12,8 +12,9 @@ use agenter_core::{
     AgentCapabilities, AgentErrorEvent, AgentMessageDeltaEvent, AgentProviderId, ApprovalDecision,
     ApprovalId, ApprovalKind, ApprovalRequestEvent, CommandCompletedEvent, CommandEvent,
     CommandOutputEvent, CommandOutputStream, FileChangeEvent, FileChangeKind,
-    MessageCompletedEvent, NormalizedEvent, QuestionId, RunnerId, SessionId, SessionStatus,
-    SessionStatusChangedEvent, ToolEvent, UserMessageEvent, WorkspaceId, WorkspaceRef,
+    MessageCompletedEvent, NormalizedEvent, ProviderCapabilityDetail, ProviderCapabilityStatus,
+    QuestionId, RunnerId, SessionId, SessionStatus, SessionStatusChangedEvent, ToolEvent,
+    UserMessageEvent, WorkspaceId, WorkspaceRef,
 };
 use agenter_protocol::runner::{
     AgentInput, AgentProviderAdvertisement, DiscoveredSession, DiscoveredSessionHistoryStatus,
@@ -34,6 +35,9 @@ use agents::codex::{
     codex_provider_slash_commands, is_codex_no_rollout_resume_error,
     is_codex_thread_not_found_error, run_codex_turn_on_server, CodexAppServer, CodexTurnRequest,
     PendingCodexApproval, PendingCodexQuestion,
+};
+use agents::codex_protocol_coverage::{
+    CodexProtocolCoverage, CodexProtocolDirection, CodexProtocolSupport, CODEX_PROTOCOL_COVERAGE,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::watch;
@@ -1116,21 +1120,7 @@ async fn run_acp_runner(
     if include_codex {
         adapter_runtime.register_provider(AdapterProviderRegistration {
             provider_id: AgentProviderId::from(AgentProviderId::CODEX),
-            capabilities: AgentCapabilities {
-                streaming: true,
-                approvals: true,
-                file_changes: true,
-                command_execution: true,
-                session_resume: true,
-                interrupt: true,
-                model_selection: true,
-                reasoning_effort: true,
-                collaboration_modes: true,
-                tool_user_input: true,
-                mcp_elicitation: true,
-                ..AgentCapabilities::default()
-            }
-            .into(),
+            capabilities: codex_agent_capabilities(true, true).into(),
         });
     }
     let mut session_profiles = HashMap::<SessionId, AgentProviderId>::new();
@@ -2246,6 +2236,227 @@ fn runner_error(code: &str, error: anyhow::Error) -> RunnerError {
     }
 }
 
+fn codex_agent_capabilities(session_resume: bool, interrupt: bool) -> AgentCapabilities {
+    AgentCapabilities {
+        streaming: true,
+        approvals: true,
+        file_changes: true,
+        command_execution: true,
+        session_resume,
+        interrupt,
+        model_selection: session_resume,
+        reasoning_effort: session_resume,
+        collaboration_modes: session_resume,
+        tool_user_input: session_resume,
+        mcp_elicitation: session_resume,
+        provider_details: codex_provider_capability_details(),
+        ..AgentCapabilities::default()
+    }
+}
+
+fn codex_provider_capability_details() -> Vec<ProviderCapabilityDetail> {
+    const FAMILIES: &[CodexCapabilityFamily] = &[
+        CodexCapabilityFamily {
+            key: "thread_lifecycle_history",
+            reason: "Core thread start, resume, fork, archive, history read, and selected metadata commands are supported; advanced metadata and memory operations remain deferred.",
+            matches: |entry| {
+                entry.method.starts_with("thread/")
+                    && !entry.method.starts_with("thread/realtime/")
+                    && !matches!(
+                        entry.method,
+                        "turn/start" | "turn/steer" | "turn/interrupt"
+                    )
+            },
+        },
+        CodexCapabilityFamily {
+            key: "turn_control",
+            reason: "Turn start, steer, interrupt, lifecycle notifications, plans, and diffs are supported.",
+            matches: |entry| {
+                entry.method.starts_with("turn/")
+                    || matches!(
+                        entry.method,
+                        "review/start"
+                            | "item/agentMessage/delta"
+                            | "item/plan/delta"
+                            | "item/reasoning/summaryTextDelta"
+                            | "item/reasoning/summaryPartAdded"
+                            | "item/reasoning/textDelta"
+                    )
+            },
+        },
+        CodexCapabilityFamily {
+            key: "approvals_questions",
+            reason: "Codex approval and input server requests are routed through Agenter; dynamic tools and account refresh are visible capability gaps.",
+            matches: |entry| {
+                entry.direction == CodexProtocolDirection::ServerRequest
+                    || entry.method == "serverRequest/resolved"
+                    || entry.method.contains("Approval")
+                    || entry.method.contains("requestApproval")
+                    || entry.method.contains("requestUserInput")
+                    || entry.method.contains("elicitation")
+            },
+        },
+        CodexCapabilityFamily {
+            key: "dynamic_tools",
+            reason: "Dynamic client-side tool execution is visible but not executed remotely.",
+            matches: |entry| entry.method.starts_with("item/tool/"),
+        },
+        CodexCapabilityFamily {
+            key: "mcp",
+            reason: "MCP elicitation is supported; status, progress, OAuth, and reload surfaces are still partial.",
+            matches: |entry| entry.method.starts_with("mcpServer/")
+                || entry.method.starts_with("item/mcpToolCall/")
+                || entry.method == "mcpServerStatus/list"
+                || entry.method == "config/mcpServer/reload",
+        },
+        CodexCapabilityFamily {
+            key: "realtime",
+            reason: "Codex realtime sessions are not exposed by the remote runner yet.",
+            matches: |entry| entry.method.starts_with("thread/realtime/"),
+        },
+        CodexCapabilityFamily {
+            key: "fuzzy_search",
+            reason: "Fuzzy file search is a local TUI affordance, not a remote runner surface.",
+            matches: |entry| entry.method.starts_with("fuzzyFileSearch/"),
+        },
+        CodexCapabilityFamily {
+            key: "usage_account",
+            reason: "Usage and rate-limit reads are surfaced; provider login, logout, account mutation, and billing nudges remain runner-host-local or out of scope.",
+            matches: |entry| entry.method.starts_with("account/"),
+        },
+        CodexCapabilityFamily {
+            key: "filesystem",
+            reason: "File-change projection is supported; direct remote filesystem mutation and watch APIs need an approved design.",
+            matches: |entry| {
+                entry.method.starts_with("fs/")
+                    || entry.method.starts_with("item/fileChange/")
+                    || entry.method == "applyPatchApproval"
+            },
+        },
+        CodexCapabilityFamily {
+            key: "config",
+            reason: "Config warnings are visible; remote config mutation/import commands are not exposed yet.",
+            matches: |entry| {
+                entry.method.starts_with("config/")
+                    || entry.method.starts_with("externalAgentConfig/")
+                    || entry.method == "configWarning"
+            },
+        },
+        CodexCapabilityFamily {
+            key: "plugins_marketplace_skills",
+            reason: "Plugin, marketplace, app, and skills inventory is not exposed as a supported remote management surface; mutation is unsupported.",
+            matches: |entry| {
+                entry.method.starts_with("plugin/")
+                    || entry.method.starts_with("marketplace/")
+                    || entry.method.starts_with("app/")
+                    || entry.method.starts_with("skills/")
+            },
+        },
+        CodexCapabilityFamily {
+            key: "command_exec",
+            reason: "Turn-owned command execution is supported; one-off terminal sessions are not exposed remotely.",
+            matches: |entry| {
+                entry.method.starts_with("command/exec")
+                    || entry.method.starts_with("item/commandExecution/")
+                    || entry.method == "execCommandApproval"
+            },
+        },
+        CodexCapabilityFamily {
+            key: "device_keys",
+            reason: "Device-key operations are not exposed through Agenter's remote browser surface.",
+            matches: |entry| entry.method.starts_with("device/key/"),
+        },
+        CodexCapabilityFamily {
+            key: "feedback",
+            reason: "Provider feedback upload and billing nudges are outside Agenter's remote runner scope.",
+            matches: |entry| {
+                entry.method == "feedback/upload"
+                    || entry.method == "account/sendAddCreditsNudgeEmail"
+            },
+        },
+        CodexCapabilityFamily {
+            key: "server_requests",
+            reason: "Approval and input server requests are supported; dynamic tools and account refresh are degraded.",
+            matches: |entry| entry.direction == CodexProtocolDirection::ServerRequest,
+        },
+        CodexCapabilityFamily {
+            key: "notifications",
+            reason: "High-value Codex notifications are projected; remaining notifications are native, deferred, or local-only.",
+            matches: |entry| entry.direction == CodexProtocolDirection::ServerNotification,
+        },
+        CodexCapabilityFamily {
+            key: "deprecated_apis",
+            reason: "Deprecated Codex APIs are only retained where needed for legacy approvals or compatibility.",
+            matches: |entry| {
+                matches!(
+                    entry.method,
+                    "getConversationSummary"
+                        | "gitDiffToRemote"
+                        | "getAuthStatus"
+                        | "fuzzyFileSearch"
+                        | "applyPatchApproval"
+                        | "execCommandApproval"
+                        | "thread/compacted"
+                )
+            },
+        },
+    ];
+
+    FAMILIES.iter().map(codex_capability_detail).collect()
+}
+
+struct CodexCapabilityFamily {
+    key: &'static str,
+    reason: &'static str,
+    matches: fn(&CodexProtocolCoverage) -> bool,
+}
+
+fn codex_capability_detail(family: &CodexCapabilityFamily) -> ProviderCapabilityDetail {
+    let entries = CODEX_PROTOCOL_COVERAGE
+        .iter()
+        .filter(|entry| (family.matches)(entry))
+        .collect::<Vec<_>>();
+    ProviderCapabilityDetail {
+        key: family.key.to_owned(),
+        status: provider_capability_status(&entries),
+        methods: entries
+            .iter()
+            .map(|entry| entry.method.to_owned())
+            .collect::<Vec<_>>(),
+        reason: Some(family.reason.to_owned()),
+    }
+}
+
+fn provider_capability_status(entries: &[&CodexProtocolCoverage]) -> ProviderCapabilityStatus {
+    let mut has_supported = false;
+    let mut has_degraded = false;
+    let mut has_unsupported = false;
+    let mut has_not_applicable = false;
+
+    for entry in entries {
+        match entry.support {
+            CodexProtocolSupport::Supported => has_supported = true,
+            CodexProtocolSupport::Degraded => has_degraded = true,
+            CodexProtocolSupport::Unsupported | CodexProtocolSupport::Deferred => {
+                has_unsupported = true;
+            }
+            CodexProtocolSupport::Ignored | CodexProtocolSupport::NotApplicable => {
+                has_not_applicable = true;
+            }
+        }
+    }
+
+    if has_degraded || (has_supported && (has_unsupported || has_not_applicable)) {
+        ProviderCapabilityStatus::Degraded
+    } else if has_supported {
+        ProviderCapabilityStatus::Supported
+    } else if has_unsupported {
+        ProviderCapabilityStatus::Unsupported
+    } else {
+        ProviderCapabilityStatus::NotApplicable
+    }
+}
+
 fn fake_hello(token: String) -> RunnerHello {
     let runner_id = fake_runner_id();
     RunnerHello {
@@ -2255,18 +2466,7 @@ fn fake_hello(token: String) -> RunnerHello {
         capabilities: RunnerCapabilities {
             agent_providers: vec![AgentProviderAdvertisement {
                 provider_id: AgentProviderId::from(AgentProviderId::CODEX),
-                capabilities: AgentCapabilities {
-                    streaming: true,
-                    approvals: true,
-                    file_changes: true,
-                    command_execution: true,
-                    model_selection: true,
-                    reasoning_effort: true,
-                    collaboration_modes: true,
-                    tool_user_input: true,
-                    mcp_elicitation: true,
-                    ..AgentCapabilities::default()
-                },
+                capabilities: codex_agent_capabilities(false, false),
             }],
             transports: vec!["fake".to_owned()],
             workspace_discovery: false,
@@ -2315,20 +2515,7 @@ fn acp_hello(
     if include_codex {
         agent_providers.push(AgentProviderAdvertisement {
             provider_id: AgentProviderId::from(AgentProviderId::CODEX),
-            capabilities: AgentCapabilities {
-                streaming: true,
-                approvals: true,
-                file_changes: true,
-                command_execution: true,
-                session_resume: true,
-                interrupt: true,
-                model_selection: true,
-                reasoning_effort: true,
-                collaboration_modes: true,
-                tool_user_input: true,
-                mcp_elicitation: true,
-                ..AgentCapabilities::default()
-            },
+            capabilities: codex_agent_capabilities(true, true),
         });
     }
     agent_providers.extend(profiles.iter().map(|profile| AgentProviderAdvertisement {
@@ -2381,20 +2568,7 @@ fn provider_hello(
         capabilities: RunnerCapabilities {
             agent_providers: vec![AgentProviderAdvertisement {
                 provider_id,
-                capabilities: AgentCapabilities {
-                    streaming: true,
-                    approvals: true,
-                    file_changes: true,
-                    command_execution: true,
-                    session_resume,
-                    interrupt,
-                    model_selection: session_resume,
-                    reasoning_effort: session_resume,
-                    collaboration_modes: session_resume,
-                    tool_user_input: session_resume,
-                    mcp_elicitation: session_resume,
-                    ..AgentCapabilities::default()
-                },
+                capabilities: codex_agent_capabilities(session_resume, interrupt),
             }],
             transports: vec![transport.to_owned()],
             workspace_discovery: false,
@@ -2622,7 +2796,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_hello_advertises_codex_and_acp_providers() {
+    fn unified_hello_advertises_codex_capabilities_and_acp_providers() {
         let workspace = PathBuf::from("/tmp/agenter-workspace");
         let hello = acp_hello(
             "token".to_owned(),
@@ -2655,6 +2829,29 @@ mod tests {
             .find(|provider| provider.provider_id.as_str() == "codex")
             .expect("codex provider");
         assert!(codex.capabilities.interrupt);
+        assert!(codex.capabilities.model_selection);
+        assert!(codex.capabilities.reasoning_effort);
+        assert!(codex.capabilities.collaboration_modes);
+        assert!(codex
+            .capabilities
+            .provider_details
+            .iter()
+            .any(|detail| detail.key == "dynamic_tools"
+                && detail.status == ProviderCapabilityStatus::Degraded
+                && detail
+                    .methods
+                    .iter()
+                    .any(|method| method == "item/tool/call")));
+        assert!(codex
+            .capabilities
+            .provider_details
+            .iter()
+            .any(|detail| detail.key == "usage_account"
+                && detail.status == ProviderCapabilityStatus::Degraded
+                && detail
+                    .methods
+                    .iter()
+                    .any(|method| method == "account/rateLimits/read")));
     }
 
     #[tokio::test]

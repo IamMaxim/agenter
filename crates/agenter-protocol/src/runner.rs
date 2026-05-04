@@ -479,14 +479,15 @@ pub enum RunnerHealthStatus {
 mod tests {
     use agenter_core::{
         AgentCapabilities, AgentProviderId, AgentQuestionAnswer, AgentReasoningEffort,
-        AgentTurnSettings, ApprovalDecision, ApprovalId, QuestionId, RunnerId, SessionId,
-        UserMessageEvent, WorkspaceId, WorkspaceRef,
+        AgentTurnSettings, ApprovalDecision, ApprovalId, ProviderCapabilityDetail,
+        ProviderCapabilityStatus, QuestionId, RunnerId, SessionId, UserMessageEvent, WorkspaceId,
+        WorkspaceRef,
     };
 
     use super::*;
 
     #[test]
-    fn round_trips_runner_hello() {
+    fn round_trips_runner_hello_capabilities() {
         let message = RunnerClientMessage::Hello(RunnerHello {
             runner_id: RunnerId::nil(),
             protocol_version: PROTOCOL_VERSION.to_owned(),
@@ -497,6 +498,12 @@ mod tests {
                     capabilities: AgentCapabilities {
                         streaming: true,
                         approvals: true,
+                        provider_details: vec![ProviderCapabilityDetail {
+                            key: "dynamic_tools".to_owned(),
+                            status: ProviderCapabilityStatus::Degraded,
+                            methods: vec!["item/tool/call".to_owned()],
+                            reason: Some("Visible but not executed remotely.".to_owned()),
+                        }],
                         ..AgentCapabilities::default()
                     },
                 }],
@@ -525,6 +532,11 @@ mod tests {
         assert_eq!(
             json["capabilities"]["agent_providers"][0]["provider_id"],
             "codex"
+        );
+        assert_eq!(
+            json["capabilities"]["agent_providers"][0]["capabilities"]["provider_details"][0]
+                ["status"],
+            "degraded"
         );
         assert_eq!(decoded, message);
     }

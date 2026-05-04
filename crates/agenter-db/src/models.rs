@@ -159,6 +159,24 @@ pub struct PendingApproval {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalPolicyRule {
+    pub rule_id: uuid::Uuid,
+    pub owner_user_id: UserId,
+    pub workspace_id: WorkspaceId,
+    pub provider_id: AgentProviderId,
+    pub kind: ApprovalKind,
+    pub label: String,
+    pub matcher: serde_json::Value,
+    pub decision: ApprovalDecision,
+    pub source_approval_id: Option<ApprovalId>,
+    pub created_by_user_id: Option<UserId>,
+    pub disabled_by_user_id: Option<UserId>,
+    pub disabled_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OidcProvider {
     pub provider_id: String,

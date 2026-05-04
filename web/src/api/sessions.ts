@@ -118,11 +118,15 @@ export async function listSessions(): Promise<SessionInfo[]> {
 
 export async function refreshWorkspaceProviderSessions(
   workspaceId: string,
-  providerId: string
+  providerId: string,
+  options: { force?: boolean } = {}
 ): Promise<WorkspaceSessionRefreshAccepted> {
   const value = await requestJson<unknown>(
     `/api/workspaces/${encodeURIComponent(workspaceId)}/providers/${encodeURIComponent(providerId)}/sessions/refresh`,
-    { method: 'POST' }
+    {
+      method: 'POST',
+      body: options.force ? JSON.stringify({ force: true }) : undefined
+    }
   );
   if (typeof value !== 'object' || value === null) {
     throw new Error('Refresh sessions returned malformed data.');

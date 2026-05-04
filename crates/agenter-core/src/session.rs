@@ -85,6 +85,27 @@ pub struct AgentCapabilities {
     pub tool_user_input: bool,
     #[serde(default)]
     pub mcp_elicitation: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_details: Vec<ProviderCapabilityDetail>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderCapabilityDetail {
+    pub key: String,
+    pub status: ProviderCapabilityStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCapabilityStatus {
+    Supported,
+    Degraded,
+    Unsupported,
+    NotApplicable,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -103,6 +124,8 @@ pub struct CapabilitySet {
     pub modes: ModeCapabilities,
     #[serde(default)]
     pub integration: IntegrationCapabilities,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_details: Vec<ProviderCapabilityDetail>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -216,6 +239,7 @@ impl From<AgentCapabilities> for CapabilitySet {
             integration: IntegrationCapabilities {
                 mcp_elicitation: value.mcp_elicitation,
             },
+            provider_details: value.provider_details,
         }
     }
 }
@@ -487,6 +511,7 @@ pub enum TurnStatus {
     Running,
     WaitingForInput,
     WaitingForApproval,
+    Interrupting,
     Completed,
     Failed,
     Cancelled,
@@ -496,7 +521,9 @@ pub enum TurnStatus {
 
 #[cfg(test)]
 mod tests {
-    use crate::{AgentCapabilities, CapabilitySet};
+    use crate::{
+        AgentCapabilities, CapabilitySet, ProviderCapabilityDetail, ProviderCapabilityStatus,
+    };
 
     #[test]
     fn converts_source_agent_capabilities_to_nested_capability_set() {
@@ -514,6 +541,12 @@ mod tests {
             collaboration_modes: true,
             tool_user_input: true,
             mcp_elicitation: true,
+            provider_details: vec![ProviderCapabilityDetail {
+                key: "dynamic_tools".to_owned(),
+                status: ProviderCapabilityStatus::Degraded,
+                methods: vec!["item/tool/call".to_owned()],
+                reason: Some("Visible but not executed remotely.".to_owned()),
+            }],
         });
 
         assert!(capabilities.protocol.streaming);
@@ -527,6 +560,15 @@ mod tests {
         assert!(capabilities.modes.model_selection);
         assert!(capabilities.modes.reasoning_effort);
         assert!(capabilities.integration.mcp_elicitation);
+        assert_eq!(
+            capabilities.provider_details,
+            vec![ProviderCapabilityDetail {
+                key: "dynamic_tools".to_owned(),
+                status: ProviderCapabilityStatus::Degraded,
+                methods: vec!["item/tool/call".to_owned()],
+                reason: Some("Visible but not executed remotely.".to_owned()),
+            }]
+        );
     }
 
     #[test]
@@ -540,5 +582,28 @@ mod tests {
         assert!(capabilities.approvals.enabled);
         assert!(!capabilities.approvals.cancel_turn);
         assert!(!capabilities.protocol.interrupt);
+    }
+
+    #[test]
+    fn capabilities_serialize_legacy_booleans_and_provider_details() {
+        let capabilities = AgentCapabilities {
+            approvals: true,
+            provider_details: vec![ProviderCapabilityDetail {
+                key: "realtime".to_owned(),
+                status: ProviderCapabilityStatus::Unsupported,
+                methods: vec!["thread/realtime/started".to_owned()],
+                reason: None,
+            }],
+            ..AgentCapabilities::default()
+        };
+
+        let json = serde_json::to_value(&capabilities).expect("serialize capabilities");
+        assert_eq!(json["approvals"], true);
+        assert_eq!(json["provider_details"][0]["key"], "realtime");
+        assert_eq!(json["provider_details"][0]["status"], "unsupported");
+
+        let decoded: AgentCapabilities =
+            serde_json::from_value(json).expect("deserialize capabilities");
+        assert_eq!(decoded, capabilities);
     }
 }

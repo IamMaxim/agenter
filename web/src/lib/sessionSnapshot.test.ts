@@ -536,6 +536,50 @@ describe('universal session snapshot client reducer', () => {
     expect(hasCapabilitySignal(undefined)).toBe(false);
     expect(hasCapabilitySignal(snapshot({ capabilities: undefined }).capabilities)).toBe(false);
     expect(hasCapabilitySignal(baseCapabilities)).toBe(true);
+    expect(
+      hasCapabilitySignal({
+        protocol: {},
+        content: {},
+        tools: {},
+        approvals: {},
+        plan: {},
+        modes: {},
+        integration: {},
+        provider_details: [
+          {
+            key: 'dynamic_tools',
+            status: 'degraded',
+            methods: ['item/tool/call'],
+            reason: null
+          }
+        ]
+      })
+    ).toBe(false);
+    expect(
+      hasCapabilitySignal({
+        protocol: {},
+        content: {},
+        tools: {},
+        approvals: {},
+        plan: {},
+        modes: {},
+        integration: {},
+        provider_details: [
+          {
+            key: 'realtime',
+            status: 'unsupported',
+            methods: ['thread/realtime/started'],
+            reason: null
+          }
+        ]
+      })
+    ).toBe(false);
+    expect(
+      hasCapabilitySignal({
+        protocol: 'bad',
+        provider_details: 'bad'
+      } as unknown as CapabilitySet)
+    ).toBe(false);
   });
 
   test('renders terminal approval snapshot states without canonical options', () => {
@@ -800,6 +844,208 @@ describe('universal session snapshot client reducer', () => {
     ]);
   });
 
+  test('uses bounded replay order for approvals in incomplete snapshot messages', () => {
+    let state = createUniversalClientState();
+    state = applyUniversalClientMessage(state, {
+      type: 'session_snapshot',
+      snapshot: snapshot({
+        latest_seq: '5',
+        items: {
+          'assistant-before': {
+            item_id: 'assistant-before',
+            session_id: 's1',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ block_id: 'assistant-before-block', kind: 'text', text: 'before' }]
+          },
+          'assistant-after': {
+            item_id: 'assistant-after',
+            session_id: 's1',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ block_id: 'assistant-after-block', kind: 'text', text: 'after' }]
+          }
+        },
+        approvals: {
+          ap1: {
+            approval_id: 'ap1',
+            session_id: 's1',
+            kind: 'command',
+            title: 'Run command',
+            options: [{ option_id: 'approve_once', kind: 'approve_once', label: 'Approve once' }],
+            status: 'approved'
+          }
+        }
+      }),
+      latest_seq: '3',
+      has_more: true,
+      events: [
+        {
+          ...universalEvent('1', 'evt-assistant-before'),
+          item_id: 'assistant-before',
+          event: {
+            type: 'content.delta',
+            data: { block_id: 'assistant-before-block', kind: 'text', delta: 'before' }
+          }
+        },
+        {
+          ...universalEvent('2', 'evt-approval'),
+          event: {
+            type: 'approval.requested',
+            data: {
+              approval: {
+                approval_id: 'ap1',
+                session_id: 's1',
+                kind: 'command',
+                title: 'Run command',
+                options: [{ option_id: 'approve_once', kind: 'approve_once', label: 'Approve once' }],
+                status: 'approved'
+              }
+            }
+          }
+        },
+        {
+          ...universalEvent('3', 'evt-assistant-after'),
+          item_id: 'assistant-after',
+          event: {
+            type: 'content.delta',
+            data: { block_id: 'assistant-after-block', kind: 'text', delta: 'after' }
+          }
+        }
+      ]
+    });
+
+    expect(state.snapshotIncomplete).toBe(true);
+    expect(state.chat.items.map((item) => item.id)).toEqual([
+      'agent:assistant-before',
+      'approval:ap1',
+      'agent:assistant-after'
+    ]);
+    expect(state.rowOrder.get('approval:ap1')?.seq).toBe('2');
+  });
+
+  test('reanchors resolved approvals by request time when bounded replay only has resolution event', () => {
+    let state = createUniversalClientState();
+    state = applyUniversalClientMessage(state, {
+      type: 'session_snapshot',
+      snapshot: snapshot({
+        latest_seq: '10',
+        items: {
+          'assistant-before': {
+            item_id: 'assistant-before',
+            session_id: 's1',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ block_id: 'assistant-before-block', kind: 'text', text: 'before' }]
+          },
+          'assistant-after': {
+            item_id: 'assistant-after',
+            session_id: 's1',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ block_id: 'assistant-after-block', kind: 'text', text: 'after' }]
+          }
+        },
+        approvals: {
+          ap1: {
+            approval_id: 'ap1',
+            session_id: 's1',
+            kind: 'command',
+            title: 'Run command',
+            options: [{ option_id: 'approve_once', kind: 'approve_once', label: 'Approve once' }],
+            status: 'approved',
+            requested_at: '2026-05-04T12:00:02Z',
+            resolved_at: '2026-05-04T12:00:10Z'
+          }
+        }
+      }),
+      latest_seq: '10',
+      has_more: true,
+      events: [
+        {
+          ...universalEvent('1', 'evt-assistant-before'),
+          ts: '2026-05-04T12:00:01Z',
+          item_id: 'assistant-before',
+          event: {
+            type: 'content.delta',
+            data: { block_id: 'assistant-before-block', kind: 'text', delta: 'before' }
+          }
+        },
+        {
+          ...universalEvent('3', 'evt-assistant-after'),
+          ts: '2026-05-04T12:00:03Z',
+          item_id: 'assistant-after',
+          event: {
+            type: 'content.delta',
+            data: { block_id: 'assistant-after-block', kind: 'text', delta: 'after' }
+          }
+        },
+        {
+          ...universalEvent('10', 'evt-approval-resolved'),
+          ts: '2026-05-04T12:00:10Z',
+          event: {
+            type: 'approval.requested',
+            data: {
+              approval: {
+                approval_id: 'ap1',
+                session_id: 's1',
+                kind: 'provider_specific',
+                title: 'Approval resolved',
+                options: [],
+                status: 'approved',
+                resolved_at: '2026-05-04T12:00:10Z'
+              }
+            }
+          }
+        }
+      ]
+    });
+
+    expect(state.snapshotIncomplete).toBe(true);
+    expect(state.chat.items.map((item) => item.id)).toEqual([
+      'agent:assistant-before',
+      'approval:ap1',
+      'agent:assistant-after'
+    ]);
+    expect(state.rowOrder.get('approval:ap1')).toMatchObject({
+      seq: '3',
+      ts: '2026-05-04T12:00:02Z'
+    });
+  });
+
+  test('orders snapshot-only approval and question rows by request timestamp', () => {
+    const state = materializeSnapshotChatState(
+      snapshot({
+        latest_seq: '8',
+        approvals: {
+          ap1: {
+            approval_id: 'ap1',
+            session_id: 's1',
+            kind: 'command',
+            title: 'Run command',
+            options: [{ option_id: 'approve_once', kind: 'approve_once', label: 'Approve once' }],
+            status: 'approved',
+            requested_at: '2026-05-04T12:00:03Z',
+            resolved_at: '2026-05-04T12:00:05Z'
+          }
+        },
+        questions: {
+          q1: {
+            question_id: 'q1',
+            session_id: 's1',
+            title: 'Pick target',
+            fields: [],
+            status: 'answered',
+            requested_at: '2026-05-04T12:00:01Z',
+            answered_at: '2026-05-04T12:00:04Z'
+          }
+        }
+      })
+    );
+
+    expect(state.items.map((item) => item.id)).toEqual(['question:q1', 'approval:ap1']);
+  });
+
   test('places snapshot-only rows before replayed rows when synthetic ordering is needed', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
@@ -841,6 +1087,96 @@ describe('universal session snapshot client reducer', () => {
     ]);
     expect(state.rowOrder.get('plan:p1')?.seq).toBe('4');
     expect(state.rowOrder.get('agent:assistant-item')?.seq).toBe('5');
+  });
+
+  test('renders provider error events as expandable error rows', () => {
+    let state = createUniversalClientState();
+    state = applyUniversalClientMessage(state, {
+      type: 'universal_event',
+      ...universalEvent('6', 'evt-capability-gap'),
+      native: {
+        protocol: 'codex-app-server',
+        method: 'item/tool/call',
+        type: 'codex',
+        native_id: null,
+        summary: 'error reported',
+        hash: null,
+        pointer: null
+      },
+      event: {
+        type: 'error.reported',
+        data: {
+          code: 'codex_capability_gap',
+          message: 'Codex server request `item/tool/call` is classified but not supported by Agenter.'
+        }
+      }
+    });
+
+    expect(state.chat.items).toMatchObject([
+      {
+        id: 'event:artifact:error:evt-capability-gap',
+        kind: 'error',
+        title: 'Codex capability gap',
+        detail: 'Codex server request `item/tool/call` is classified but not supported by Agenter.'
+      }
+    ]);
+  });
+
+  test('renders promoted native Codex notifications and hides raw native noise outside debug', () => {
+    let state = createUniversalClientState();
+    state = applyUniversalClientMessage(state, {
+      type: 'universal_event',
+      ...universalEvent('7', 'evt-guardian'),
+      native: {
+        protocol: 'codex-app-server',
+        method: 'guardianWarning',
+        type: 'codex',
+        native_id: null,
+        summary: 'native notification',
+        hash: null,
+        pointer: null
+      },
+      event: {
+        type: 'native.unknown',
+        data: { summary: 'native notification' }
+      }
+    });
+    state = applyUniversalClientMessage(state, {
+      type: 'universal_event',
+      ...universalEvent('8', 'evt-raw-native'),
+      native: {
+        protocol: 'codex-app-server',
+        method: 'raw/unclassified',
+        type: 'codex',
+        native_id: null,
+        summary: 'native notification',
+        hash: null,
+        pointer: null
+      },
+      event: {
+        type: 'native.unknown',
+        data: { summary: 'native notification' }
+      }
+    });
+
+    expect(state.chat.items).toMatchObject([
+      {
+        id: 'event:artifact:native:evt-guardian',
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        displayLevel: 'normal',
+        title: 'Guardian warning',
+        status: 'native'
+      },
+      {
+        id: 'event:artifact:native:evt-raw-native',
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        displayLevel: 'raw',
+        title: 'native notification',
+        status: 'native'
+      }
+    ]);
   });
 
 });

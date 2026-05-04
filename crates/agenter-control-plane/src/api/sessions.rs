@@ -64,6 +64,12 @@ struct RefreshAcceptedResponse {
     status: &'static str,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct RefreshSessionsRequest {
+    #[serde(default)]
+    force: bool,
+}
+
 pub(super) fn router() -> Router<crate::state::AppState> {
     Router::new()
         .route("/", get(list_sessions).post(create_session))
@@ -489,6 +495,7 @@ pub(super) async fn refresh_workspace_provider_sessions(
     State(state): State<crate::state::AppState>,
     headers: HeaderMap,
     Path((workspace_id, provider_id)): Path<(WorkspaceId, String)>,
+    body: Option<Json<RefreshSessionsRequest>>,
 ) -> Response {
     let Some(user) = super::authenticated_user_from_headers(&state, &headers).await else {
         tracing::debug!(%workspace_id, provider_id, "session refresh rejected missing or invalid session");
@@ -525,6 +532,7 @@ pub(super) async fn refresh_workspace_provider_sessions(
             runner_id,
             request_id.clone(),
             command,
+            body.map(|Json(request)| request.force).unwrap_or(false),
             super::RUNNER_COMMAND_RESPONSE_TIMEOUT,
         )
         .await

@@ -97,6 +97,14 @@ pub struct ApprovalPolicyMetadata {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ApprovalPolicyRulePreview {
+    pub kind: ApprovalKind,
+    pub matcher: serde_json::Value,
+    pub decision: ApprovalDecision,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ApprovalRequest {
     pub approval_id: ApprovalId,
     pub session_id: SessionId,
@@ -140,6 +148,8 @@ pub struct ApprovalOption {
     pub scope: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_option_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_rule: Option<ApprovalPolicyRulePreview>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -147,6 +157,7 @@ pub struct ApprovalOption {
 pub enum ApprovalOptionKind {
     ApproveOnce,
     ApproveAlways,
+    PersistApprovalRule,
     Deny,
     DenyWithFeedback,
     CancelTurn,
@@ -163,6 +174,7 @@ impl ApprovalOption {
             description: None,
             scope: Some("turn".to_owned()),
             native_option_id: Some("accept".to_owned()),
+            policy_rule: None,
         }
     }
 
@@ -175,6 +187,7 @@ impl ApprovalOption {
             description: None,
             scope: Some("session".to_owned()),
             native_option_id: Some("accept_for_session".to_owned()),
+            policy_rule: None,
         }
     }
 
@@ -187,6 +200,7 @@ impl ApprovalOption {
             description: None,
             scope: None,
             native_option_id: Some("decline".to_owned()),
+            policy_rule: None,
         }
     }
 
@@ -199,6 +213,7 @@ impl ApprovalOption {
             description: None,
             scope: None,
             native_option_id: Some("decline".to_owned()),
+            policy_rule: None,
         }
     }
 
@@ -211,6 +226,7 @@ impl ApprovalOption {
             description: None,
             scope: Some("turn".to_owned()),
             native_option_id: Some("cancel".to_owned()),
+            policy_rule: None,
         }
     }
 

@@ -30,6 +30,7 @@ pub enum NormalizedEvent {
     ApprovalResolved(ApprovalResolvedEvent),
     QuestionRequested(QuestionRequestedEvent),
     QuestionAnswered(QuestionAnsweredEvent),
+    TurnStatusChanged(TurnState),
     TurnFailed(TurnState),
     TurnCancelled(TurnState),
     TurnInterrupted(TurnState),
@@ -439,6 +440,11 @@ pub enum UniversalEventKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    #[serde(rename = "session.metadata_changed")]
+    SessionMetadataChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
     #[serde(rename = "turn.started")]
     TurnStarted { turn: TurnState },
     #[serde(rename = "turn.status_changed")]
@@ -472,6 +478,16 @@ pub enum UniversalEventKind {
     },
     #[serde(rename = "approval.requested")]
     ApprovalRequested { approval: Box<ApprovalRequest> },
+    #[serde(rename = "approval.resolved")]
+    ApprovalResolved {
+        approval_id: ApprovalId,
+        status: crate::ApprovalStatus,
+        resolved_at: DateTime<Utc>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resolved_by_user_id: Option<UserId>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        native: Option<NativeRef>,
+    },
     #[serde(rename = "question.requested")]
     QuestionRequested { question: Box<QuestionState> },
     #[serde(rename = "question.answered")]
@@ -999,6 +1015,7 @@ mod tests {
             collaboration_modes: true,
             tool_user_input: true,
             mcp_elicitation: true,
+            provider_details: Vec::new(),
         };
         let capabilities_json = serde_json::to_value(capabilities).expect("serialize caps");
         assert_eq!(capabilities_json["session_history"], true);
@@ -1240,6 +1257,7 @@ mod tests {
                 description: None,
                 scope: None,
                 native_option_id: None,
+                policy_rule: None,
             }],
             status: crate::ApprovalStatus::Pending,
             risk: Some("medium".to_owned()),
@@ -1330,6 +1348,7 @@ mod tests {
             description: Some("Provider-specific safe option label".to_owned()),
             scope: Some("session".to_owned()),
             native_option_id: Some("allow_for_session".to_owned()),
+            policy_rule: None,
         };
 
         let json = serde_json::to_value(option).expect("serialize option");

@@ -272,10 +272,15 @@ function defaultOptionId(decision: ApprovalDecisionName): string {
 }
 
 function approvalDecisionFromOption(option: ApprovalOption): ApprovalDecisionName | undefined {
+  if (option.option_id.startsWith('persist_rule:')) {
+    return 'accept_for_session';
+  }
   switch (option.option_id) {
     case 'approve_once':
       return 'accept';
     case 'approve_always':
+    case 'persist_rule':
+    case 'persist_approval_rule':
       return 'accept_for_session';
     case 'deny':
     case 'deny_with_feedback':

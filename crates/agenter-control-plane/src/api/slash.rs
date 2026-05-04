@@ -1196,6 +1196,7 @@ async fn refresh_workspace_provider_sessions_for_user(
             runner_id,
             request_id.clone(),
             command,
+            false,
             super::RUNNER_COMMAND_RESPONSE_TIMEOUT,
         )
         .await

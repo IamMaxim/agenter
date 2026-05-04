@@ -5,6 +5,7 @@ import {
   effortsForSelectedModel,
   normalizeAgentOptions,
   normalizeRunners,
+  normalizeSessionSnapshot,
   normalizeSessions,
   normalizeTurnSettings,
   normalizeWorkspaces
@@ -133,5 +134,30 @@ describe('frontend API normalizers', () => {
     expect(normalizeTurnSettings({ model: 123, reasoning_effort: 'mega', collaboration_mode: 'plan' })).toEqual({
       collaboration_mode: 'plan'
     });
+  });
+
+  test('preserves provider capability details in session snapshots', () => {
+    const snapshot = normalizeSessionSnapshot({
+      session_id: 'session-1',
+      capabilities: {
+        provider_details: [
+          {
+            key: 'dynamic_tools',
+            status: 'degraded',
+            methods: ['item/tool/call', 42],
+            reason: 'Visible but not executed remotely.'
+          }
+        ]
+      }
+    });
+
+    expect(snapshot.capabilities?.provider_details).toEqual([
+      {
+        key: 'dynamic_tools',
+        status: 'degraded',
+        methods: ['item/tool/call'],
+        reason: 'Visible but not executed remotely.'
+      }
+    ]);
   });
 });

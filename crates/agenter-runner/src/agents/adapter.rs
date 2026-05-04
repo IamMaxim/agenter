@@ -272,6 +272,7 @@ impl AdapterEvent {
             UniversalEventKind::ApprovalRequested { approval } => {
                 approval.turn_id = Some(turn_id);
             }
+            UniversalEventKind::ApprovalResolved { .. } => {}
             UniversalEventKind::QuestionRequested { question }
             | UniversalEventKind::QuestionAnswered { question } => {
                 question.turn_id = Some(turn_id);
@@ -287,6 +288,7 @@ impl AdapterEvent {
             }
             UniversalEventKind::SessionCreated { .. }
             | UniversalEventKind::SessionStatusChanged { .. }
+            | UniversalEventKind::SessionMetadataChanged { .. }
             | UniversalEventKind::ContentDelta { .. }
             | UniversalEventKind::ContentCompleted { .. }
             | UniversalEventKind::UsageUpdated { .. }
@@ -508,6 +510,14 @@ fn universal_event_from_normalized(
             None,
             UniversalEventKind::SessionCreated {
                 session: Box::new(info.clone()),
+            },
+        ),
+        NormalizedEvent::SessionStatusChanged(event) => (
+            None,
+            None,
+            UniversalEventKind::SessionStatusChanged {
+                status: event.status.clone(),
+                reason: event.reason.clone(),
             },
         ),
         NormalizedEvent::AgentMessageDelta(event) => {
@@ -742,8 +752,12 @@ fn universal_event_from_normalized(
         NormalizedEvent::ApprovalResolved(event) => (
             turn_id_from_provider_payload(event.provider_payload.as_ref()),
             None,
-            UniversalEventKind::ApprovalRequested {
-                approval: Box::new(resolved_approval_request(event, native.clone())),
+            UniversalEventKind::ApprovalResolved {
+                approval_id: event.approval_id,
+                status: approval_status_from_decision(&event.decision),
+                resolved_at: event.resolved_at,
+                resolved_by_user_id: event.resolved_by_user_id,
+                native: Some(native.clone()),
             },
         ),
         NormalizedEvent::QuestionRequested(event) => (
@@ -759,6 +773,11 @@ fn universal_event_from_normalized(
             UniversalEventKind::QuestionAnswered {
                 question: Box::new(answered_question(event, native.clone())),
             },
+        ),
+        NormalizedEvent::TurnStatusChanged(turn) => (
+            Some(turn.turn_id),
+            None,
+            UniversalEventKind::TurnStatusChanged { turn: turn.clone() },
         ),
         NormalizedEvent::TurnFailed(turn) => (
             Some(turn.turn_id),
@@ -815,6 +834,13 @@ fn universal_event_from_normalized(
                 },
             )
         }
+        NormalizedEvent::NativeNotification(event) if event.method == "thread/name/updated" => (
+            None,
+            None,
+            UniversalEventKind::SessionMetadataChanged {
+                title: thread_title_from_provider_payload(event.provider_payload.as_ref()),
+            },
+        ),
         NormalizedEvent::NativeNotification(event) if event.category == "compaction" => {
             let turn_id = turn_id_from_provider_payload(event.provider_payload.as_ref())
                 .or_else(|| event.event_id.as_deref().map(stable_turn_id));
@@ -880,16 +906,9 @@ fn universal_event_from_normalized(
         NormalizedEvent::Error(event) if event.session_id.is_some() => (
             None,
             None,
-            UniversalEventKind::TurnFailed {
-                turn: turn_state(
-                    event.session_id.expect("checked above"),
-                    stable_turn_id(&format!(
-                        "error:{}:{}",
-                        event.session_id.expect("checked above"),
-                        event.code.as_deref().unwrap_or("provider")
-                    )),
-                    TurnStatus::Failed,
-                ),
+            UniversalEventKind::ErrorReported {
+                code: event.code.clone(),
+                message: event.message.clone(),
             },
         ),
         _ => (
@@ -960,6 +979,20 @@ fn provider_method(payload: Option<&Value>) -> Option<&str> {
     payload
         .and_then(|payload| payload.get("method"))
         .and_then(Value::as_str)
+}
+
+fn thread_title_from_provider_payload(payload: Option<&Value>) -> Option<String> {
+    let payload = payload?;
+    string_at_value(
+        payload,
+        &[
+            "/params/threadName",
+            "/params/thread_name",
+            "/params/name",
+            "/params/title",
+        ],
+    )
+    .map(str::to_owned)
 }
 
 fn text_block_id(message_id: &str) -> String {
@@ -1306,31 +1339,6 @@ fn approval_request(event: &ApprovalRequestEvent, native: NativeRef) -> Approval
     }
 }
 
-fn resolved_approval_request(
-    event: &agenter_core::ApprovalResolvedEvent,
-    native: NativeRef,
-) -> ApprovalRequest {
-    ApprovalRequest {
-        approval_id: event.approval_id,
-        session_id: event.session_id,
-        turn_id: turn_id_from_provider_payload(event.provider_payload.as_ref()),
-        item_id: None,
-        kind: agenter_core::ApprovalKind::ProviderSpecific,
-        title: "Approval resolved".to_owned(),
-        details: None,
-        options: Vec::new(),
-        status: approval_status_from_decision(&event.decision),
-        risk: None,
-        subject: None,
-        native_request_id: None,
-        native_blocking: true,
-        policy: None,
-        native: Some(native),
-        requested_at: None,
-        resolved_at: Some(event.resolved_at),
-    }
-}
-
 fn approval_status_from_decision(decision: &ApprovalDecision) -> ApprovalStatus {
     match decision {
         ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => ApprovalStatus::Approved,
@@ -1565,7 +1573,8 @@ fn normalized_event_session_id(event: &NormalizedEvent) -> Option<SessionId> {
         NormalizedEvent::ApprovalResolved(event) => Some(event.session_id),
         NormalizedEvent::QuestionRequested(event) => Some(event.session_id),
         NormalizedEvent::QuestionAnswered(event) => Some(event.session_id),
-        NormalizedEvent::TurnFailed(turn)
+        NormalizedEvent::TurnStatusChanged(turn)
+        | NormalizedEvent::TurnFailed(turn)
         | NormalizedEvent::TurnCancelled(turn)
         | NormalizedEvent::TurnInterrupted(turn) => Some(turn.session_id),
         NormalizedEvent::TurnDiffUpdated(event)
@@ -1593,7 +1602,8 @@ fn normalized_event_native_id(event: &NormalizedEvent) -> Option<String> {
         NormalizedEvent::ApprovalResolved(event) => Some(event.approval_id.to_string()),
         NormalizedEvent::QuestionRequested(event) => Some(event.question_id.to_string()),
         NormalizedEvent::QuestionAnswered(event) => Some(event.answer.question_id.to_string()),
-        NormalizedEvent::TurnFailed(turn)
+        NormalizedEvent::TurnStatusChanged(turn)
+        | NormalizedEvent::TurnFailed(turn)
         | NormalizedEvent::TurnCancelled(turn)
         | NormalizedEvent::TurnInterrupted(turn) => Some(turn.turn_id.to_string()),
         NormalizedEvent::TurnDiffUpdated(event)
@@ -1627,6 +1637,7 @@ fn normalized_event_summary(event: &NormalizedEvent) -> String {
         NormalizedEvent::ApprovalResolved(_) => "approval resolved",
         NormalizedEvent::QuestionRequested(_) => "question requested",
         NormalizedEvent::QuestionAnswered(_) => "question answered",
+        NormalizedEvent::TurnStatusChanged(_) => "turn status changed",
         NormalizedEvent::TurnFailed(_) => "turn failed",
         NormalizedEvent::TurnCancelled(_) => "turn cancelled",
         NormalizedEvent::TurnInterrupted(_) => "turn interrupted",

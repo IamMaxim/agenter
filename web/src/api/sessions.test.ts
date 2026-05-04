@@ -109,6 +109,33 @@ describe('session APIs', () => {
     );
   });
 
+  test('force refreshes provider sessions for a workspace', async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: () =>
+        Promise.resolve(
+          JSON.stringify({
+            refresh_id: 'refresh-1',
+            status: 'queued'
+          })
+        )
+    });
+    vi.stubGlobal('fetch', fetch);
+
+    await expect(refreshWorkspaceProviderSessions('workspace 1', 'codex', { force: true })).resolves.toEqual({
+      refresh_id: 'refresh-1',
+      status: 'queued'
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/workspaces/workspace%201/providers/codex/sessions/refresh',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ force: true })
+      })
+    );
+  });
+
   test('loads provider session refresh status', async () => {
     const fetch = vi.fn().mockResolvedValue({
       ok: true,

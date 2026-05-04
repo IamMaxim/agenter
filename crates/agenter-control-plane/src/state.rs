@@ -6,14 +6,15 @@ use std::{
 
 use agenter_core::{
     AgentProviderId, AgentQuestionAnswer, AgentTurnSettings, ApprovalDecision, ApprovalId,
-    ApprovalKind, ApprovalOption, ApprovalRequest, ApprovalResolutionState,
-    ApprovalStatus as UniversalApprovalStatus, CommandAction, CommandOutputStream, ContentBlock,
-    ContentBlockKind, ItemRole, ItemState, ItemStatus, NativeNotification, NativeRef,
+    ApprovalOption, ApprovalRequest, ApprovalResolutionState,
+    ApprovalStatus as UniversalApprovalStatus, CapabilitySet, CommandAction, CommandOutputStream,
+    ContentBlock, ContentBlockKind, ItemRole, ItemState, ItemStatus, NativeNotification, NativeRef,
     NormalizedEvent, QuestionId, QuestionState, QuestionStatus, RunnerId, SessionId, SessionInfo,
     SessionSnapshot, SessionStatus, SessionUsageContext, SessionUsageSnapshot, SessionUsageWindow,
-    ToolActionProjection, ToolCommandProjection, ToolProjection, ToolProjectionKind, TurnStatus,
-    UniversalCommandEnvelope, UniversalEventEnvelope, UniversalEventKind, UniversalEventSource,
-    UniversalSeq, UserId, WorkspaceId, WorkspaceRef,
+    ToolActionProjection, ToolCommandProjection, ToolEvent, ToolMcpProjection, ToolProjection,
+    ToolProjectionKind, ToolSubagentOperation, ToolSubagentProjection, ToolSubagentStateProjection,
+    TurnStatus, UniversalCommandEnvelope, UniversalEventEnvelope, UniversalEventKind,
+    UniversalEventSource, UniversalSeq, UserId, WorkspaceId, WorkspaceRef,
 };
 use agenter_protocol::{
     browser::BrowserSessionSnapshot,
@@ -64,6 +65,7 @@ struct AppStateInner {
     runner_command_operations: Mutex<HashMap<RequestId, RunnerCommandOperation>>,
     refresh_summaries: Mutex<HashMap<RequestId, WorkspaceSessionRefreshSummary>>,
     refresh_jobs: Mutex<HashMap<RequestId, WorkspaceSessionRefreshJob>>,
+    refresh_force_reload_requests: Mutex<HashSet<RequestId>>,
     universal_command_idempotency: Mutex<HashMap<String, UniversalCommandIdempotencyEntry>>,
     runner_event_acks: Mutex<HashMap<RunnerId, u64>>,
     seen_runner_events: Mutex<HashSet<(RunnerId, u64)>>,
@@ -161,6 +163,15 @@ fn enrich_approval_event(event: &mut NormalizedEvent) {
     }
     if request.options.is_empty() {
         request.options = ApprovalOption::canonical_defaults();
+    }
+    let existing_policy_options = request
+        .options
+        .iter()
+        .any(|option| option.policy_rule.is_some());
+    if !existing_policy_options {
+        request
+            .options
+            .extend(PolicyEngine.persistent_rule_options(request));
     }
     if request.subject.is_none() {
         request.subject = request
@@ -403,6 +414,7 @@ pub enum RunnerCommandWaitError {
 pub enum SessionImportMode {
     Automatic,
     Forced,
+    ForceReload,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
@@ -478,6 +490,7 @@ impl AppState {
                 runner_command_operations: Mutex::new(HashMap::new()),
                 refresh_summaries: Mutex::new(HashMap::new()),
                 refresh_jobs: Mutex::new(HashMap::new()),
+                refresh_force_reload_requests: Mutex::new(HashSet::new()),
                 universal_command_idempotency: Mutex::new(HashMap::new()),
                 runner_event_acks: Mutex::new(HashMap::new()),
                 seen_runner_events: Mutex::new(HashSet::new()),
@@ -514,6 +527,7 @@ impl AppState {
                 runner_command_operations: Mutex::new(HashMap::new()),
                 refresh_summaries: Mutex::new(HashMap::new()),
                 refresh_jobs: Mutex::new(HashMap::new()),
+                refresh_force_reload_requests: Mutex::new(HashSet::new()),
                 universal_command_idempotency: Mutex::new(HashMap::new()),
                 runner_event_acks: Mutex::new(HashMap::new()),
                 seen_runner_events: Mutex::new(HashSet::new()),
@@ -562,6 +576,7 @@ impl AppState {
                 runner_command_operations: Mutex::new(HashMap::new()),
                 refresh_summaries: Mutex::new(HashMap::new()),
                 refresh_jobs: Mutex::new(HashMap::new()),
+                refresh_force_reload_requests: Mutex::new(HashSet::new()),
                 universal_command_idempotency: Mutex::new(HashMap::new()),
                 runner_event_acks: Mutex::new(HashMap::new()),
                 seen_runner_events: Mutex::new(HashSet::new()),
@@ -585,6 +600,7 @@ impl AppState {
                 runner_command_operations: Mutex::new(HashMap::new()),
                 refresh_summaries: Mutex::new(HashMap::new()),
                 refresh_jobs: Mutex::new(HashMap::new()),
+                refresh_force_reload_requests: Mutex::new(HashSet::new()),
                 universal_command_idempotency: Mutex::new(HashMap::new()),
                 runner_event_acks: Mutex::new(HashMap::new()),
                 seen_runner_events: Mutex::new(HashSet::new()),
@@ -953,6 +969,7 @@ impl AppState {
         runner_id: RunnerId,
         request_id: RequestId,
         message: RunnerServerMessage,
+        force_reload: bool,
         wait_for: Duration,
     ) -> Result<(), RunnerCommandWaitError> {
         if !self
@@ -963,6 +980,13 @@ impl AppState {
             .contains_key(&runner_id)
         {
             return Err(RunnerCommandWaitError::NotConnected);
+        }
+        if force_reload {
+            self.inner
+                .refresh_force_reload_requests
+                .lock()
+                .await
+                .insert(request_id.clone());
         }
         self.upsert_refresh_job(
             request_id.clone(),
@@ -1446,6 +1470,40 @@ impl AppState {
             .cloned()
     }
 
+    async fn session_by_id(&self, session_id: SessionId) -> Option<RegisteredSession> {
+        if let Some(pool) = &self.inner.db_pool {
+            let session = agenter_db::find_session_by_id(pool, session_id)
+                .await
+                .ok()??;
+            return Some(RegisteredSession {
+                session_id: session.session.session_id,
+                owner_user_id: session.session.owner_user_id,
+                runner_id: session.session.runner_id,
+                workspace: WorkspaceRef {
+                    workspace_id: session.workspace.workspace_id,
+                    runner_id: session.workspace.runner_id,
+                    path: session.workspace.path,
+                    display_name: session.workspace.display_name,
+                },
+                provider_id: session.session.provider_id,
+                status: session.session.status,
+                title: session.session.title,
+                external_session_id: session.session.external_session_id,
+                turn_settings: session.session.turn_settings,
+                usage: session.session.usage_snapshot,
+                created_at: session.session.created_at,
+                updated_at: session.session.updated_at,
+            });
+        }
+        self.inner
+            .registry
+            .lock()
+            .await
+            .sessions
+            .get(&session_id)
+            .cloned()
+    }
+
     pub async fn subscribe_session(
         &self,
         session_id: SessionId,
@@ -1485,7 +1543,7 @@ impl AppState {
 
         let Some(pool) = &self.inner.db_pool else {
             let sessions = self.inner.sessions.lock().await;
-            let (snapshot, events, latest_seq, has_more) =
+            let (mut snapshot, events, latest_seq, has_more) =
                 if let Some(events) = sessions.get(&session_id) {
                     let replay = events
                         .universal_cache
@@ -1516,7 +1574,9 @@ impl AppState {
                             .latest_seq
                             .or_else(|| events.universal_cache.last().map(|event| event.seq))
                     };
-                    (events.snapshot.clone(), replay, latest_seq, has_more)
+                    let mut snapshot = events.snapshot.clone();
+                    snapshot.session_id = session_id;
+                    (snapshot, replay, latest_seq, has_more)
                 } else {
                     (
                         SessionSnapshot {
@@ -1528,6 +1588,7 @@ impl AppState {
                         false,
                     )
                 };
+            self.hydrate_snapshot_capabilities(&mut snapshot).await;
             return Some(BrowserSessionSnapshot {
                 request_id: None,
                 snapshot,
@@ -1537,7 +1598,7 @@ impl AppState {
             });
         };
 
-        let snapshot = agenter_db::load_session_snapshot(pool, session_id)
+        let mut snapshot = agenter_db::load_session_snapshot(pool, session_id)
             .await
             .map_err(|error| {
                 tracing::warn!(%session_id, %error, "failed to load universal session snapshot");
@@ -1548,6 +1609,7 @@ impl AppState {
                 session_id,
                 ..SessionSnapshot::default()
             });
+        self.hydrate_snapshot_capabilities(&mut snapshot).await;
         let replay = agenter_db::list_universal_events_after(
             pool,
             session_id,
@@ -1586,6 +1648,35 @@ impl AppState {
             latest_seq,
             has_more,
         })
+    }
+
+    async fn hydrate_snapshot_capabilities(&self, snapshot: &mut SessionSnapshot) {
+        if let Some(provider_capabilities) = self
+            .provider_capabilities_for_session(snapshot.session_id, snapshot.info.as_ref())
+            .await
+        {
+            merge_provider_capabilities(&mut snapshot.capabilities, provider_capabilities);
+        }
+    }
+
+    async fn provider_capabilities_for_session(
+        &self,
+        session_id: SessionId,
+        info: Option<&SessionInfo>,
+    ) -> Option<CapabilitySet> {
+        let registry = self.inner.registry.lock().await;
+        let runner_and_provider = registry
+            .sessions
+            .get(&session_id)
+            .map(|session| (session.runner_id, session.provider_id.clone()))
+            .or_else(|| info.map(|info| (info.runner_id, info.provider_id.clone())))?;
+        let runner = registry.runners.get(&runner_and_provider.0)?;
+        runner
+            .capabilities
+            .agent_providers
+            .iter()
+            .find(|provider| provider.provider_id == runner_and_provider.1)
+            .map(|provider| CapabilitySet::from(provider.capabilities.clone()))
     }
 
     pub async fn begin_universal_command(
@@ -1864,6 +1955,7 @@ impl AppState {
             event,
         };
         let mut orphan_session = None;
+        let mut auto_approval_request = None;
         match &envelope.event {
             NormalizedEvent::ApprovalRequested(request) => {
                 tracing::info!(
@@ -1879,6 +1971,7 @@ impl AppState {
                         status: ApprovalStatus::Pending(Box::new(envelope.clone())),
                     },
                 );
+                auto_approval_request = Some(request.clone());
             }
             NormalizedEvent::ApprovalResolved(resolved) => {
                 tracing::info!(
@@ -1963,6 +2056,9 @@ impl AppState {
         }
 
         let stored = self.store_event(session_id, envelope).await;
+        if let Some(request) = auto_approval_request {
+            self.maybe_auto_resolve_approval(session_id, request).await;
+        }
         if let Some(session_id) = orphan_session {
             self.orphan_pending_approvals_for_session(
                 session_id,
@@ -2058,6 +2154,10 @@ impl AppState {
                     .await;
                 }
             }
+            UniversalEventKind::SessionMetadataChanged { title } => {
+                self.apply_session_title(envelope.session_id, title.clone())
+                    .await;
+            }
             UniversalEventKind::UsageUpdated { usage } => {
                 if let Some(pool) = &self.inner.db_pool {
                     if let Err(error) =
@@ -2092,6 +2192,27 @@ impl AppState {
                     %session_id,
                     %error,
                     "failed to persist session status update"
+                );
+            }
+        }
+    }
+
+    async fn apply_session_title(&self, session_id: SessionId, title: Option<String>) {
+        {
+            let mut registry = self.inner.registry.lock().await;
+            if let Some(session) = registry.sessions.get_mut(&session_id) {
+                session.title = title.clone();
+                session.updated_at = Utc::now();
+            }
+        }
+        if let Some(pool) = &self.inner.db_pool {
+            if let Err(error) =
+                agenter_db::update_session_title_by_id(pool, session_id, title.as_deref()).await
+            {
+                tracing::warn!(
+                    %session_id,
+                    %error,
+                    "failed to persist session title update"
                 );
             }
         }
@@ -2197,6 +2318,23 @@ impl AppState {
         }
     }
 
+    pub async fn approval_request_event(
+        &self,
+        approval_id: ApprovalId,
+    ) -> Option<agenter_core::ApprovalRequestEvent> {
+        let registry = self.inner.registry.lock().await;
+        let approval = registry.approvals.get(&approval_id)?;
+        let envelope = match &approval.status {
+            ApprovalStatus::Pending(envelope) | ApprovalStatus::Presented(envelope) => envelope,
+            ApprovalStatus::Resolving { request, .. } => request,
+            ApprovalStatus::Resolved(_) | ApprovalStatus::Orphaned(_) => return None,
+        };
+        match &envelope.event {
+            NormalizedEvent::ApprovalRequested(request) => Some(request.clone()),
+            _ => None,
+        }
+    }
+
     pub async fn cancel_approval_resolution(&self, approval_id: ApprovalId) {
         let mut registry = self.inner.registry.lock().await;
         let Some(approval) = registry.approvals.get_mut(&approval_id) else {
@@ -2246,6 +2384,110 @@ impl AppState {
 
         self.store_event(session_id, envelope.clone()).await;
         Some(envelope)
+    }
+
+    async fn maybe_auto_resolve_approval(
+        &self,
+        session_id: SessionId,
+        request: agenter_core::ApprovalRequestEvent,
+    ) {
+        let Some(pool) = &self.inner.db_pool else {
+            return;
+        };
+        let Some(session) = self.session_by_id(session_id).await else {
+            return;
+        };
+        let Ok(rules) = agenter_db::list_active_approval_policy_rules(
+            pool,
+            session.owner_user_id,
+            session.workspace.workspace_id,
+            &session.provider_id,
+        )
+        .await
+        else {
+            tracing::warn!(%session_id, approval_id = %request.approval_id, "failed to load approval policy rules");
+            return;
+        };
+        let Some(rule) = PolicyEngine.matching_rule(&request, &rules).cloned() else {
+            return;
+        };
+        tracing::info!(
+            %session_id,
+            approval_id = %request.approval_id,
+            rule_id = %rule.rule_id,
+            "auto-resolving approval from policy rule"
+        );
+        let state = self.clone();
+        tokio::spawn(async move {
+            state
+                .resolve_approval_from_policy(session, request.approval_id, rule.decision)
+                .await;
+        });
+    }
+
+    async fn resolve_approval_from_policy(
+        &self,
+        session: RegisteredSession,
+        approval_id: ApprovalId,
+        decision: ApprovalDecision,
+    ) {
+        if !matches!(
+            self.begin_approval_resolution(approval_id, decision.clone())
+                .await,
+            ApprovalResolutionStart::Started
+        ) {
+            return;
+        }
+        let request_id = RequestId::from(Uuid::new_v4().to_string());
+        let command = RunnerServerMessage::Command(Box::new(
+            agenter_protocol::runner::RunnerCommandEnvelope {
+                request_id: request_id.clone(),
+                command: agenter_protocol::runner::RunnerCommand::AnswerApproval(
+                    agenter_protocol::runner::ApprovalAnswerCommand {
+                        session_id: session.session_id,
+                        approval_id,
+                        decision: decision.clone(),
+                    },
+                ),
+            },
+        ));
+        let operation = self
+            .start_runner_command_operation(
+                session.runner_id,
+                request_id,
+                command,
+                Duration::from_secs(30),
+            )
+            .await;
+        match operation
+            .await
+            .unwrap_or(Err(RunnerCommandWaitError::Closed))
+        {
+            Ok(RunnerResponseOutcome::Ok {
+                result: agenter_protocol::runner::RunnerCommandResult::Accepted,
+            }) => {
+                let resolved =
+                    NormalizedEvent::ApprovalResolved(agenter_core::ApprovalResolvedEvent {
+                        session_id: session.session_id,
+                        approval_id,
+                        decision,
+                        resolved_by_user_id: None,
+                        resolved_at: Utc::now(),
+                        provider_payload: None,
+                    });
+                self.finish_approval_resolution(approval_id, session.session_id, resolved)
+                    .await;
+            }
+            other => {
+                tracing::warn!(
+                    %approval_id,
+                    session_id = %session.session_id,
+                    outcome = ?other,
+                    "policy approval auto-resolution failed"
+                );
+                self.cancel_approval_resolution(approval_id).await;
+            }
+        }
     }
 
     pub async fn question_session(&self, question_id: QuestionId) -> Option<SessionId> {
@@ -2707,17 +2949,27 @@ impl AppState {
                 }
                 continue;
             }
-            if !discovered_events.is_empty() || matches!(mode, SessionImportMode::Forced) {
+            if !discovered_events.is_empty()
+                || matches!(
+                    mode,
+                    SessionImportMode::Forced | SessionImportMode::ForceReload
+                )
+            {
                 let history_fingerprint = discovered_history_fingerprint(
                     &discovered_session.history_status,
                     &discovered_session.history,
                 );
-                if existing_import.as_ref().is_some_and(|existing| {
-                    existing.imported_history_fingerprint == history_fingerprint
-                }) {
+                if !matches!(mode, SessionImportMode::ForceReload)
+                    && existing_import.as_ref().is_some_and(|existing| {
+                        existing.imported_history_fingerprint == history_fingerprint
+                    })
+                {
                     continue;
                 }
-                if matches!(mode, SessionImportMode::Forced) {
+                if matches!(
+                    mode,
+                    SessionImportMode::Forced | SessionImportMode::ForceReload
+                ) {
                     if let Some(pool) = &self.inner.db_pool {
                         let envelopes = discovered_events
                             .iter()
@@ -2812,8 +3064,18 @@ impl AppState {
         discovered: DiscoveredSessions,
     ) -> bool {
         let db_backed = self.inner.db_pool.is_some();
-        let mode = if request_id.is_some() {
-            SessionImportMode::Forced
+        let mode = if let Some(request_id) = &request_id {
+            if self
+                .inner
+                .refresh_force_reload_requests
+                .lock()
+                .await
+                .remove(request_id)
+            {
+                SessionImportMode::ForceReload
+            } else {
+                SessionImportMode::Forced
+            }
         } else {
             SessionImportMode::Automatic
         };
@@ -2986,6 +3248,11 @@ pub fn apply_universal_event_to_snapshot(
                 info.status = status.clone();
             }
         }
+        UniversalEventKind::SessionMetadataChanged { title } => {
+            if let Some(info) = &mut snapshot.info {
+                info.title = title.clone();
+            }
+        }
         UniversalEventKind::TurnStarted { turn }
         | UniversalEventKind::TurnStatusChanged { turn }
         | UniversalEventKind::TurnCompleted { turn }
@@ -3084,6 +3351,21 @@ pub fn apply_universal_event_to_snapshot(
                     turn.status = TurnStatus::WaitingForApproval;
                 }
                 set_active_turn(snapshot, turn_id, true);
+            }
+        }
+        UniversalEventKind::ApprovalResolved {
+            approval_id,
+            status,
+            resolved_at,
+            native,
+            ..
+        } => {
+            if let Some(existing) = snapshot.approvals.get_mut(approval_id) {
+                existing.status = status.clone();
+                existing.resolved_at = Some(*resolved_at);
+                if native.is_some() {
+                    existing.native = native.clone();
+                }
             }
         }
         UniversalEventKind::QuestionRequested { question }
@@ -3215,6 +3497,7 @@ fn is_active_turn_status(status: &TurnStatus) -> bool {
             | TurnStatus::Running
             | TurnStatus::WaitingForInput
             | TurnStatus::WaitingForApproval
+            | TurnStatus::Interrupting
     )
 }
 
@@ -3341,6 +3624,34 @@ fn universal_projection_universal_event(
         NormalizedEvent::SessionStarted(info) => UniversalEventKind::SessionCreated {
             session: Box::new(info.clone()),
         },
+        NormalizedEvent::SessionStatusChanged(status) => UniversalEventKind::SessionStatusChanged {
+            status: status.status.clone(),
+            reason: status.reason.clone(),
+        },
+        NormalizedEvent::UserMessage(message) => {
+            let message_key = message.message_id.as_deref().unwrap_or(event_id.as_str());
+            let user_item_id =
+                universal_projection_item_id(&format!("user:{}:{message_key}", message.session_id));
+            item_id = Some(user_item_id);
+            UniversalEventKind::ItemCreated {
+                item: Box::new(ItemState {
+                    item_id: user_item_id,
+                    session_id: message.session_id,
+                    turn_id: None,
+                    role: ItemRole::User,
+                    status: ItemStatus::Completed,
+                    content: vec![ContentBlock {
+                        block_id: format!("text-{message_key}"),
+                        kind: ContentBlockKind::Text,
+                        text: Some(message.content.clone()),
+                        mime_type: None,
+                        artifact_id: None,
+                    }],
+                    tool: None,
+                    native: None,
+                }),
+            }
+        }
         NormalizedEvent::AgentMessageDelta(message) => {
             turn_id = universal_projection_turn_id_from_payload(message.provider_payload.as_ref())
                 .or_else(|| Some(universal_projection_turn_id(&message.message_id)));
@@ -3477,6 +3788,30 @@ fn universal_projection_universal_event(
                 }),
             }
         }
+        NormalizedEvent::ToolStarted(tool)
+        | NormalizedEvent::ToolUpdated(tool)
+        | NormalizedEvent::ToolCompleted(tool) => {
+            turn_id = universal_projection_turn_id_from_payload(tool.provider_payload.as_ref());
+            let tool_item_id = universal_projection_item_id(&format!(
+                "tool:{}:{}",
+                tool.session_id, tool.tool_call_id
+            ));
+            item_id = Some(tool_item_id);
+            let status = match event {
+                NormalizedEvent::ToolCompleted(_) => {
+                    universal_projection_tool_completed_status(tool)
+                }
+                _ => ItemStatus::Streaming,
+            };
+            UniversalEventKind::ItemCreated {
+                item: Box::new(universal_projection_tool_item(
+                    tool,
+                    tool_item_id,
+                    turn_id,
+                    status,
+                )),
+            }
+        }
         NormalizedEvent::FileChangeProposed(change)
         | NormalizedEvent::FileChangeApplied(change)
         | NormalizedEvent::FileChangeRejected(change) => {
@@ -3502,8 +3837,20 @@ fn universal_projection_universal_event(
         NormalizedEvent::ApprovalRequested(request) => UniversalEventKind::ApprovalRequested {
             approval: Box::new(source_approval_request(request, ts)),
         },
-        NormalizedEvent::ApprovalResolved(resolved) => UniversalEventKind::ApprovalRequested {
-            approval: Box::new(source_resolved_approval_request(resolved)),
+        NormalizedEvent::ApprovalResolved(resolved) => UniversalEventKind::ApprovalResolved {
+            approval_id: resolved.approval_id,
+            status: approval_decision_universal_status(&resolved.decision),
+            resolved_at: resolved.resolved_at,
+            resolved_by_user_id: resolved.resolved_by_user_id,
+            native: Some(NativeRef {
+                protocol: "uap.universal_projection".to_owned(),
+                method: Some("approval_resolved".to_owned()),
+                kind: Some("universal_projection".to_owned()),
+                native_id: safe_native_request_id(resolved.provider_payload.as_ref()),
+                summary: Some("Approval resolved".to_owned()),
+                hash: None,
+                pointer: None,
+            }),
         },
         NormalizedEvent::QuestionRequested(request) => UniversalEventKind::QuestionRequested {
             question: Box::new(source_question_request(request, ts)),
@@ -3511,6 +3858,10 @@ fn universal_projection_universal_event(
         NormalizedEvent::QuestionAnswered(answered) => UniversalEventKind::QuestionAnswered {
             question: Box::new(source_answered_question(answered, ts)),
         },
+        NormalizedEvent::TurnStatusChanged(turn) => {
+            turn_id = Some(turn.turn_id);
+            UniversalEventKind::TurnStatusChanged { turn: turn.clone() }
+        }
         NormalizedEvent::TurnFailed(turn) => {
             turn_id = Some(turn.turn_id);
             UniversalEventKind::TurnFailed { turn: turn.clone() }
@@ -3550,6 +3901,12 @@ fn universal_projection_universal_event(
                         native_notification.session_id,
                         started_turn_id,
                         TurnStatus::Running,
+                    ),
+                }
+            } else if native_notification.method == "thread/name/updated" {
+                UniversalEventKind::SessionMetadataChanged {
+                    title: universal_projection_thread_title(
+                        native_notification.provider_payload.as_ref(),
                     ),
                 }
             } else if matches!(event, NormalizedEvent::TurnDiffUpdated(_)) {
@@ -3634,38 +3991,6 @@ fn runner_universal_event_envelope(
     }
 }
 
-fn source_resolved_approval_request(
-    resolved: &agenter_core::ApprovalResolvedEvent,
-) -> ApprovalRequest {
-    ApprovalRequest {
-        approval_id: resolved.approval_id,
-        session_id: resolved.session_id,
-        turn_id: None,
-        item_id: None,
-        kind: ApprovalKind::ProviderSpecific,
-        title: "Approval resolved".to_owned(),
-        details: None,
-        options: Vec::new(),
-        status: approval_decision_universal_status(&resolved.decision),
-        risk: None,
-        subject: None,
-        native_request_id: safe_native_request_id(resolved.provider_payload.as_ref()),
-        native_blocking: true,
-        policy: None,
-        native: Some(NativeRef {
-            protocol: "uap.universal_projection".to_owned(),
-            method: Some("approval_resolved".to_owned()),
-            kind: Some("universal_projection".to_owned()),
-            native_id: safe_native_request_id(resolved.provider_payload.as_ref()),
-            summary: Some("Approval resolved".to_owned()),
-            hash: None,
-            pointer: None,
-        }),
-        requested_at: None,
-        resolved_at: Some(resolved.resolved_at),
-    }
-}
-
 fn universal_projection_command_tool_projection(
     event: &agenter_core::CommandEvent,
 ) -> ToolProjection {
@@ -3725,6 +4050,225 @@ fn universal_projection_command_action_projection(action: &CommandAction) -> Too
             .or_else(|| action.command.clone()),
         path: action.path.clone(),
     }
+}
+
+fn universal_projection_tool_item(
+    event: &ToolEvent,
+    item_id: agenter_core::ItemId,
+    turn_id: Option<agenter_core::TurnId>,
+    status: ItemStatus,
+) -> ItemState {
+    let projection = universal_projection_tool_projection(event, status.clone());
+    let title = projection.title.clone();
+    ItemState {
+        item_id,
+        session_id: event.session_id,
+        turn_id,
+        role: ItemRole::Tool,
+        status,
+        content: vec![ContentBlock {
+            block_id: format!("tool-{}", event.tool_call_id),
+            kind: ContentBlockKind::ToolCall,
+            text: Some(title),
+            mime_type: None,
+            artifact_id: None,
+        }],
+        tool: Some(projection),
+        native: universal_projection_tool_native_ref(event),
+    }
+}
+
+fn universal_projection_tool_projection(event: &ToolEvent, status: ItemStatus) -> ToolProjection {
+    if let Some(subagent) = universal_projection_subagent_tool(event) {
+        let title = universal_projection_subagent_title(&subagent);
+        return ToolProjection {
+            kind: ToolProjectionKind::Subagent,
+            name: event.name.clone(),
+            title,
+            status,
+            detail: None,
+            input_summary: event.input.as_ref().map(compact_json_summary),
+            output_summary: event.output.as_ref().map(compact_json_summary),
+            command: None,
+            subagent: Some(subagent),
+            mcp: None,
+        };
+    }
+
+    let mcp = universal_projection_mcp_tool(event);
+    ToolProjection {
+        kind: if mcp.is_some() {
+            ToolProjectionKind::Mcp
+        } else {
+            ToolProjectionKind::Tool
+        },
+        name: event.name.clone(),
+        title: event
+            .title
+            .clone()
+            .unwrap_or_else(|| event.name.replace('_', " ")),
+        status,
+        detail: None,
+        input_summary: event.input.as_ref().map(compact_json_summary),
+        output_summary: event.output.as_ref().map(compact_json_summary),
+        command: None,
+        subagent: None,
+        mcp,
+    }
+}
+
+fn universal_projection_subagent_tool(event: &ToolEvent) -> Option<ToolSubagentProjection> {
+    let item = event.provider_payload.as_ref()?.pointer("/params/item")?;
+    if item.get("type")?.as_str()? != "collabAgentToolCall" {
+        return None;
+    }
+
+    Some(ToolSubagentProjection {
+        operation: match item.get("tool").and_then(Value::as_str) {
+            Some("wait") => ToolSubagentOperation::Wait,
+            Some("closeAgent") => ToolSubagentOperation::Close,
+            _ => ToolSubagentOperation::Spawn,
+        },
+        agent_ids: string_array_at(item, "/receiverThreadIds"),
+        model: item
+            .get("model")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        reasoning_effort: item
+            .get("reasoningEffort")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        prompt: item
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        states: subagent_states_from_item(item),
+    })
+}
+
+fn universal_projection_subagent_title(subagent: &ToolSubagentProjection) -> String {
+    match subagent.operation {
+        ToolSubagentOperation::Wait => "Wait for subagent".to_owned(),
+        ToolSubagentOperation::Close => "Close subagent".to_owned(),
+        ToolSubagentOperation::Spawn => {
+            if subagent.agent_ids.is_empty() {
+                "Spawn subagent".to_owned()
+            } else {
+                format!("Spawned {} subagent(s)", subagent.agent_ids.len())
+            }
+        }
+    }
+}
+
+fn subagent_states_from_item(item: &Value) -> Vec<ToolSubagentStateProjection> {
+    let Some(states) = item.get("agentsStates").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+
+    states
+        .iter()
+        .map(|(agent_id, state)| ToolSubagentStateProjection {
+            agent_id: agent_id.clone(),
+            status: state
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+            message: state
+                .get("message")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+        })
+        .collect()
+}
+
+fn universal_projection_mcp_tool(event: &ToolEvent) -> Option<ToolMcpProjection> {
+    let item = event.provider_payload.as_ref()?.pointer("/params/item")?;
+    if item.get("type").and_then(Value::as_str) != Some("mcpToolCall") {
+        return None;
+    }
+    Some(ToolMcpProjection {
+        server: item
+            .get("server")
+            .or_else(|| item.get("serverName"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        tool: item
+            .get("tool")
+            .or_else(|| item.get("toolName"))
+            .and_then(Value::as_str)
+            .unwrap_or(&event.name)
+            .to_owned(),
+        arguments_summary: item.get("arguments").map(compact_json_summary),
+        result_summary: item
+            .get("result")
+            .or_else(|| item.get("output"))
+            .map(compact_json_summary),
+    })
+}
+
+fn universal_projection_tool_native_ref(event: &ToolEvent) -> Option<NativeRef> {
+    let payload = event.provider_payload.as_ref()?;
+    Some(NativeRef {
+        protocol: "codex.app_server".to_owned(),
+        method: universal_projection_payload_method(Some(payload)).map(ToOwned::to_owned),
+        kind: payload
+            .pointer("/params/item/type")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| Some("tool".to_owned())),
+        native_id: payload
+            .pointer("/params/item/id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| Some(event.tool_call_id.clone())),
+        summary: event
+            .title
+            .clone()
+            .or_else(|| Some(event.name.replace('_', " "))),
+        hash: None,
+        pointer: None,
+    })
+}
+
+fn universal_projection_tool_completed_status(event: &ToolEvent) -> ItemStatus {
+    match event
+        .provider_payload
+        .as_ref()
+        .and_then(|payload| payload.pointer("/params/item/status"))
+        .and_then(Value::as_str)
+    {
+        Some("failed") => ItemStatus::Failed,
+        Some("inProgress") => ItemStatus::Streaming,
+        _ => ItemStatus::Completed,
+    }
+}
+
+fn string_array_at(value: &Value, pointer: &str) -> Vec<String> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn compact_json_summary(value: &Value) -> String {
+    const MAX_SUMMARY_LEN: usize = 240;
+    let mut summary = match value {
+        Value::String(value) => value.clone(),
+        other => other.to_string(),
+    };
+    if summary.len() > MAX_SUMMARY_LEN {
+        summary.truncate(MAX_SUMMARY_LEN);
+        summary.push_str("...");
+    }
+    summary
 }
 
 fn universal_projection_turn_state(
@@ -3824,6 +4368,20 @@ fn universal_projection_turn_id_from_payload(
 
 fn universal_projection_payload_method(payload: Option<&Value>) -> Option<&str> {
     payload.and_then(|payload| payload.get("method"))?.as_str()
+}
+
+fn universal_projection_thread_title(payload: Option<&Value>) -> Option<String> {
+    let payload = payload?;
+    string_at_value(
+        payload,
+        &[
+            "/params/threadName",
+            "/params/thread_name",
+            "/params/name",
+            "/params/title",
+        ],
+    )
+    .map(str::to_owned)
 }
 
 fn string_at_value<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a str> {
@@ -4199,6 +4757,7 @@ fn normalized_event_name(event: &NormalizedEvent) -> &'static str {
         NormalizedEvent::ApprovalResolved(_) => "approval_resolved",
         NormalizedEvent::QuestionRequested(_) => "question_requested",
         NormalizedEvent::QuestionAnswered(_) => "question_answered",
+        NormalizedEvent::TurnStatusChanged(_) => "turn_status_changed",
         NormalizedEvent::TurnFailed(_) => "turn_failed",
         NormalizedEvent::TurnCancelled(_) => "turn_cancelled",
         NormalizedEvent::TurnInterrupted(_) => "turn_interrupted",
@@ -4315,6 +4874,18 @@ fn db_session_info(session: &agenter_db::models::AgentSession) -> SessionInfo {
         created_at: Some(session.created_at),
         updated_at: Some(session.updated_at),
         usage: usage.map(Box::new),
+    }
+}
+
+fn merge_provider_capabilities(target: &mut CapabilitySet, provider: CapabilitySet) {
+    for detail in provider.provider_details {
+        if !target
+            .provider_details
+            .iter()
+            .any(|existing| existing.key == detail.key)
+        {
+            target.provider_details.push(detail);
+        }
     }
 }
 
@@ -4554,14 +5125,17 @@ fn sort_session_infos(sessions: &mut [SessionInfo]) {
 #[cfg(test)]
 mod tests {
     use agenter_core::{
-        AgentMessageDeltaEvent, AgentProviderId, ApprovalDecision, ApprovalId, ApprovalKind,
-        ApprovalRequestEvent, ApprovalStatus as UniversalApprovalStatus, CommandCompletedEvent,
-        CommandEvent, CommandOutputEvent, ContentBlockKind, ItemId, ItemRole, ItemState,
-        ItemStatus, MessageCompletedEvent, NormalizedEvent, RunnerId, SessionId, SessionInfo,
+        AgentCapabilities, AgentMessageDeltaEvent, AgentProviderId, ApprovalDecision, ApprovalId,
+        ApprovalKind, ApprovalRequestEvent, ApprovalStatus as UniversalApprovalStatus,
+        CommandCompletedEvent, CommandEvent, CommandOutputEvent, ContentBlockKind, ItemId,
+        ItemRole, ItemState, ItemStatus, MessageCompletedEvent, NormalizedEvent,
+        ProviderCapabilityDetail, ProviderCapabilityStatus, RunnerId, SessionId, SessionInfo,
         TurnId, TurnState, TurnStatus, UniversalEventEnvelope, UniversalEventKind,
         UniversalEventSource, UniversalSeq, UserId, UserMessageEvent, WorkspaceId, WorkspaceRef,
     };
-    use agenter_protocol::runner::{RunnerHeartbeatAck, RunnerServerMessage};
+    use agenter_protocol::runner::{
+        AgentProviderAdvertisement, RunnerCapabilities, RunnerHeartbeatAck, RunnerServerMessage,
+    };
 
     use super::*;
 
@@ -4833,6 +5407,107 @@ mod tests {
             .expect("status block");
         assert_eq!(status.kind, ContentBlockKind::CommandOutput);
         assert_eq!(status.text.as_deref(), Some("command completed"));
+    }
+
+    #[test]
+    fn universal_projection_materializes_codex_collab_agent_tool_calls() {
+        let session_id = SessionId::new();
+        let mut snapshot = SessionSnapshot {
+            session_id,
+            ..SessionSnapshot::default()
+        };
+        let events = [
+            universal_projection_universal_event(
+                session_id,
+                "event-1".to_owned(),
+                &NormalizedEvent::ToolStarted(ToolEvent {
+                    session_id,
+                    tool_call_id: "spawn-call-1".to_owned(),
+                    name: "collabAgentToolCall".to_owned(),
+                    title: None,
+                    input: None,
+                    output: None,
+                    provider_payload: Some(serde_json::json!({
+                        "method": "item/started",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {
+                                "type": "collabAgentToolCall",
+                                "id": "spawn-call-1",
+                                "tool": "spawnAgent",
+                                "status": "inProgress",
+                                "senderThreadId": "parent-thread",
+                                "receiverThreadIds": [],
+                                "prompt": "Inspect auth flow",
+                                "model": "gpt-5.3-codex",
+                                "reasoningEffort": "high",
+                                "agentsStates": {}
+                            }
+                        }
+                    })),
+                }),
+            ),
+            universal_projection_universal_event(
+                session_id,
+                "event-2".to_owned(),
+                &NormalizedEvent::ToolCompleted(ToolEvent {
+                    session_id,
+                    tool_call_id: "spawn-call-1".to_owned(),
+                    name: "collabAgentToolCall".to_owned(),
+                    title: None,
+                    input: None,
+                    output: None,
+                    provider_payload: Some(serde_json::json!({
+                        "method": "item/completed",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {
+                                "type": "collabAgentToolCall",
+                                "id": "spawn-call-1",
+                                "tool": "spawnAgent",
+                                "status": "completed",
+                                "senderThreadId": "parent-thread",
+                                "receiverThreadIds": ["child-thread"],
+                                "prompt": "Inspect auth flow",
+                                "model": "gpt-5.3-codex",
+                                "reasoningEffort": "high",
+                                "agentsStates": {
+                                    "child-thread": {
+                                        "status": "running",
+                                        "message": null
+                                    }
+                                }
+                            }
+                        }
+                    })),
+                }),
+            ),
+        ];
+
+        for event in events {
+            apply_universal_event_to_snapshot(&mut snapshot, &event);
+        }
+
+        let item = snapshot.items.values().next().expect("subagent item");
+        assert_eq!(item.status, ItemStatus::Completed);
+        assert_eq!(
+            item.native
+                .as_ref()
+                .and_then(|native| native.kind.as_deref()),
+            Some("collabAgentToolCall")
+        );
+        let tool = item.tool.as_ref().expect("subagent tool projection");
+        assert_eq!(tool.kind, ToolProjectionKind::Subagent);
+        assert_eq!(tool.status, ItemStatus::Completed);
+        assert_eq!(tool.title, "Spawned 1 subagent(s)");
+        let subagent = tool.subagent.as_ref().expect("subagent details");
+        assert_eq!(subagent.operation, ToolSubagentOperation::Spawn);
+        assert_eq!(subagent.agent_ids, vec!["child-thread"]);
+        assert_eq!(subagent.model.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(subagent.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(subagent.prompt.as_deref(), Some("Inspect auth flow"));
+        assert_eq!(subagent.states[0].agent_id, "child-thread");
+        assert_eq!(subagent.states[0].status, "running");
     }
 
     #[test]
@@ -5339,6 +6014,70 @@ mod tests {
     }
 
     #[test]
+    fn universal_projection_projects_approval_resolved_as_lifecycle_update() {
+        let session_id = SessionId::new();
+        let approval_id = ApprovalId::new();
+        let resolved_at = Utc::now();
+
+        let universal = universal_projection_universal_event(
+            session_id,
+            Uuid::new_v4().to_string(),
+            &NormalizedEvent::ApprovalResolved(agenter_core::ApprovalResolvedEvent {
+                session_id,
+                approval_id,
+                decision: ApprovalDecision::Accept,
+                resolved_by_user_id: Some(UserId::new()),
+                resolved_at,
+                provider_payload: Some(serde_json::json!({ "request_id": "native-1" })),
+            }),
+        );
+
+        let UniversalEventKind::ApprovalResolved {
+            approval_id: projected_id,
+            status,
+            resolved_at: projected_resolved_at,
+            ..
+        } = universal.event
+        else {
+            panic!("approval resolution should be a lifecycle update");
+        };
+
+        assert_eq!(projected_id, approval_id);
+        assert_eq!(status, UniversalApprovalStatus::Approved);
+        assert_eq!(projected_resolved_at, resolved_at);
+    }
+
+    #[test]
+    fn universal_snapshot_reducer_ignores_orphan_approval_resolution_state() {
+        let session_id = SessionId::new();
+        let approval_id = ApprovalId::new();
+        let resolved_at = Utc::now();
+        let mut snapshot = SessionSnapshot {
+            session_id,
+            ..SessionSnapshot::default()
+        };
+        let resolved = universal_projection_universal_event(
+            session_id,
+            Uuid::new_v4().to_string(),
+            &NormalizedEvent::ApprovalResolved(agenter_core::ApprovalResolvedEvent {
+                session_id,
+                approval_id,
+                decision: ApprovalDecision::Accept,
+                resolved_by_user_id: Some(UserId::new()),
+                resolved_at,
+                provider_payload: Some(serde_json::json!({ "request_id": "native-1" })),
+            }),
+        );
+
+        apply_universal_event_to_snapshot(&mut snapshot, &resolved);
+
+        assert!(
+            !snapshot.approvals.contains_key(&approval_id),
+            "orphan approval resolution events should remain events, not transcript approval rows"
+        );
+    }
+
+    #[test]
     fn universal_projection_projection_does_not_persist_raw_approval_payload() {
         let session_id = SessionId::new();
         let approval_id = ApprovalId::new();
@@ -5414,6 +6153,72 @@ mod tests {
         let received = received.normalized_event;
         assert!(matches!(received.event, NormalizedEvent::UserMessage(_)));
         assert!(received.event_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn session_snapshot_hydrates_provider_capabilities_from_runner_hello() {
+        let state = AppState::new("dev-token".to_owned(), CookieSecurity::DevelopmentInsecure);
+        let runner_id = RunnerId::new();
+        let workspace = WorkspaceRef {
+            workspace_id: WorkspaceId::new(),
+            runner_id,
+            path: "/tmp/agenter-workspace".to_owned(),
+            display_name: Some("agenter-workspace".to_owned()),
+        };
+        let provider_detail = ProviderCapabilityDetail {
+            key: "dynamic_tools".to_owned(),
+            status: ProviderCapabilityStatus::Degraded,
+            methods: vec!["item/tool/call".to_owned()],
+            reason: Some("Visible but not executed remotely.".to_owned()),
+        };
+        state
+            .register_runner(
+                runner_id,
+                RunnerCapabilities {
+                    agent_providers: vec![AgentProviderAdvertisement {
+                        provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                        capabilities: AgentCapabilities {
+                            approvals: true,
+                            provider_details: vec![provider_detail.clone()],
+                            ..AgentCapabilities::default()
+                        },
+                    }],
+                    transports: vec!["codex-app-server".to_owned()],
+                    workspace_discovery: false,
+                },
+                vec![workspace.clone()],
+            )
+            .await;
+        let session_id = SessionId::new();
+        state
+            .create_session(
+                session_id,
+                UserId::new(),
+                runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        {
+            let mut sessions = state.inner.sessions.lock().await;
+            let events = sessions
+                .entry(session_id)
+                .or_insert_with(SessionEvents::new);
+            events.snapshot.session_id = session_id;
+            events.snapshot.capabilities.protocol.snapshots = true;
+            events.snapshot.capabilities.protocol.after_seq_replay = true;
+        }
+
+        let subscription = state.subscribe_session(session_id, None, true).await;
+        let snapshot = subscription.snapshot.expect("session snapshot").snapshot;
+
+        assert!(snapshot.capabilities.protocol.snapshots);
+        assert!(snapshot.capabilities.protocol.after_seq_replay);
+        assert!(!snapshot.capabilities.approvals.enabled);
+        assert_eq!(
+            snapshot.capabilities.provider_details,
+            vec![provider_detail]
+        );
     }
 
     #[tokio::test]
@@ -6056,6 +6861,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscribe_snapshot_materializes_user_messages_from_universal_projection() {
+        let state = AppState::new("dev-token".to_owned(), CookieSecurity::DevelopmentInsecure);
+        let session_id = SessionId::new();
+
+        state
+            .publish_event(
+                session_id,
+                NormalizedEvent::UserMessage(UserMessageEvent {
+                    session_id,
+                    message_id: Some("user-1".to_owned()),
+                    author_user_id: None,
+                    content: "original prompt".to_owned(),
+                }),
+            )
+            .await;
+
+        let subscription = state.subscribe_session(session_id, None, true).await;
+        let snapshot = subscription.snapshot.expect("snapshot replay").snapshot;
+
+        let user_items = snapshot
+            .items
+            .values()
+            .filter(|item| item.role == ItemRole::User)
+            .collect::<Vec<_>>();
+        assert_eq!(user_items.len(), 1);
+        assert_eq!(user_items[0].status, ItemStatus::Completed);
+        assert_eq!(
+            user_items[0].content[0].text.as_deref(),
+            Some("original prompt")
+        );
+    }
+
+    #[tokio::test]
     async fn subscribe_snapshot_marks_universal_replay_has_more_when_bounded() {
         let state = AppState::new("dev-token".to_owned(), CookieSecurity::DevelopmentInsecure);
         let session_id = SessionId::new();
@@ -6142,10 +6980,16 @@ mod tests {
                         title: Some("New".to_owned()),
                         updated_at: None,
                         history_status: DiscoveredSessionHistoryStatus::Loaded,
-                        history: vec![DiscoveredSessionHistoryItem::AgentMessage {
-                            message_id: "agent-new".to_owned(),
-                            content: "new cache".to_owned(),
-                        }],
+                        history: vec![
+                            DiscoveredSessionHistoryItem::UserMessage {
+                                message_id: Some("user-new".to_owned()),
+                                content: "new user prompt".to_owned(),
+                            },
+                            DiscoveredSessionHistoryItem::AgentMessage {
+                                message_id: "agent-new".to_owned(),
+                                content: "new cache".to_owned(),
+                            },
+                        ],
                     }],
                 },
                 SessionImportMode::Forced,
@@ -6156,6 +7000,104 @@ mod tests {
             .session_history(owner_user_id, session.session_id)
             .await
             .expect("history");
+        assert_eq!(
+            summary,
+            WorkspaceSessionRefreshSummary {
+                discovered_count: 1,
+                refreshed_cache_count: 1,
+                skipped_failed_count: 0,
+            }
+        );
+        assert_eq!(history.len(), 2);
+        assert!(matches!(history[0].event, NormalizedEvent::UserMessage(_)));
+        assert!(matches!(
+            history[1].event,
+            NormalizedEvent::AgentMessageCompleted(_)
+        ));
+
+        let subscription = state
+            .subscribe_session(session.session_id, None, true)
+            .await;
+        let snapshot = subscription.snapshot.expect("snapshot replay").snapshot;
+        let user_items = snapshot
+            .items
+            .values()
+            .filter(|item| item.role == ItemRole::User)
+            .collect::<Vec<_>>();
+        assert_eq!(user_items.len(), 1);
+        assert_eq!(
+            user_items[0].content[0].text.as_deref(),
+            Some("new user prompt")
+        );
+    }
+
+    #[tokio::test]
+    async fn force_reload_import_rebuilds_cache_even_when_history_fingerprint_matches() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let owner_user_id = state
+            .inner
+            .bootstrap_admin
+            .as_ref()
+            .expect("bootstrap admin")
+            .user
+            .user_id;
+        let runner_id = RunnerId::new();
+        let workspace = WorkspaceRef {
+            workspace_id: WorkspaceId::new(),
+            runner_id,
+            path: "/work/agenter".to_owned(),
+            display_name: Some("agenter".to_owned()),
+        };
+        let discovered = DiscoveredSessions {
+            workspace: workspace.clone(),
+            provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+            sessions: vec![agenter_protocol::DiscoveredSession {
+                external_session_id: "codex-thread-1".to_owned(),
+                title: Some("Imported".to_owned()),
+                updated_at: None,
+                history_status: DiscoveredSessionHistoryStatus::Loaded,
+                history: vec![DiscoveredSessionHistoryItem::AgentMessage {
+                    message_id: "agent-new".to_owned(),
+                    content: "rebuilt cache".to_owned(),
+                }],
+            }],
+        };
+
+        state
+            .import_discovered_sessions(runner_id, discovered.clone(), SessionImportMode::Forced)
+            .await;
+        let sessions = state.list_sessions(owner_user_id).await;
+        let session = sessions
+            .iter()
+            .find(|session| session.external_session_id.as_deref() == Some("codex-thread-1"))
+            .expect("imported session")
+            .clone();
+        state
+            .publish_event(
+                session.session_id,
+                NormalizedEvent::UserMessage(UserMessageEvent {
+                    session_id: session.session_id,
+                    message_id: Some("bad-local-cache".to_owned()),
+                    author_user_id: Some(owner_user_id),
+                    content: "bad local cache".to_owned(),
+                }),
+            )
+            .await;
+
+        let summary = state
+            .import_discovered_sessions(runner_id, discovered, SessionImportMode::ForceReload)
+            .await;
+        let history = state
+            .session_history(owner_user_id, session.session_id)
+            .await
+            .expect("history");
+
         assert_eq!(
             summary,
             WorkspaceSessionRefreshSummary {

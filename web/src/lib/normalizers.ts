@@ -2,6 +2,7 @@ import type {
   AgentCollaborationMode,
   AgentModelOption,
   AgentOptions,
+  ApprovalDecision,
   ApprovalKind,
   ApprovalOption,
   ApprovalOptionKind,
@@ -250,6 +251,17 @@ function normalizeUniversalEventKind(value: unknown): UniversalEventKind {
       };
     case 'approval.requested':
       return { type, data: { approval: normalizeApprovalRequest(data.approval) } };
+    case 'approval.resolved':
+      return {
+        type,
+        data: {
+          approval_id: stringOr(data.approval_id, ''),
+          status: stringOr(data.status, 'approved'),
+          resolved_at: stringOr(data.resolved_at, ''),
+          resolved_by_user_id: typeof data.resolved_by_user_id === 'string' ? data.resolved_by_user_id : null,
+          native: normalizeNativeRef(data.native)
+        }
+      };
     case 'question.requested':
     case 'question.answered':
       return { type, data: { question: normalizeQuestionState(data.question) } };
@@ -280,7 +292,20 @@ function normalizeCapabilitySet(value: unknown): CapabilitySet | undefined {
     approvals: boolGroup(record.approvals),
     plan: boolGroup(record.plan),
     modes: boolGroup(record.modes),
-    integration: boolGroup(record.integration)
+    integration: boolGroup(record.integration),
+    provider_details: arrayValue(record.provider_details).map(normalizeProviderCapabilityDetail)
+  };
+}
+
+function normalizeProviderCapabilityDetail(
+  value: unknown
+): NonNullable<CapabilitySet['provider_details']>[number] {
+  const record = objectRecord(value);
+  return {
+    key: stringOr(record.key, ''),
+    status: stringOr(record.status, 'unsupported'),
+    methods: arrayValue(record.methods).filter(isString),
+    reason: typeof record.reason === 'string' ? record.reason : null
   };
 }
 
@@ -376,7 +401,26 @@ function normalizeApprovalOption(value: unknown): ApprovalOption {
     label: stringOr(record.label, stringOr(record.option_id, 'Option')),
     description: typeof record.description === 'string' ? record.description : null,
     scope: typeof record.scope === 'string' ? record.scope : null,
-    native_option_id: typeof record.native_option_id === 'string' ? record.native_option_id : null
+    native_option_id: typeof record.native_option_id === 'string' ? record.native_option_id : null,
+    policy_rule: normalizeApprovalPolicyRulePreview(record.policy_rule)
+  };
+}
+
+function normalizeApprovalPolicyRulePreview(value: unknown): ApprovalOption['policy_rule'] {
+  const record = objectOrNull(value);
+  if (!record) {
+    return null;
+  }
+  const decision = objectRecord(record.decision);
+  return {
+    kind: stringOr(record.kind, 'provider_specific') as ApprovalKind,
+    matcher: objectOrNull(record.matcher) ?? {},
+    decision: {
+      decision: stringOr(decision.decision, 'accept_for_session') as ApprovalDecision['decision'],
+      option_id: typeof decision.option_id === 'string' ? decision.option_id : undefined,
+      feedback: typeof decision.feedback === 'string' ? decision.feedback : undefined
+    },
+    label: stringOr(record.label, 'Remember approval')
   };
 }
 

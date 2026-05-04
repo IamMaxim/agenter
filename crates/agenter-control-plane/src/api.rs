@@ -17,6 +17,7 @@ use crate::{
     },
 };
 
+pub mod approval_rules;
 pub mod approvals;
 pub mod auth;
 pub mod repositories;
@@ -38,6 +39,7 @@ pub fn app(state: AppState) -> Router {
         .nest("/api/runners", runners::router())
         .nest("/api/sessions", sessions_router)
         .nest("/api/approvals", approvals::router())
+        .nest("/api/approval-rules", approval_rules::router())
         .route(
             "/api/workspaces/{workspace_id}/providers/{provider_id}/sessions/refresh",
             post(sessions::refresh_workspace_provider_sessions),

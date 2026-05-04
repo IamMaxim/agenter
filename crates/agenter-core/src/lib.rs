@@ -10,8 +10,8 @@ pub mod workspace;
 
 pub use approval::{
     ApprovalDecision, ApprovalKind, ApprovalOption, ApprovalOptionKind, ApprovalPolicyMetadata,
-    ApprovalRequest, ApprovalRequestEvent, ApprovalResolutionState, ApprovalResolvedEvent,
-    ApprovalRisk, ApprovalStatus, PolicyAction,
+    ApprovalPolicyRulePreview, ApprovalRequest, ApprovalRequestEvent, ApprovalResolutionState,
+    ApprovalResolvedEvent, ApprovalRisk, ApprovalStatus, PolicyAction,
 };
 pub use events::{
     AgentErrorEvent, AgentMessageDeltaEvent, ArtifactKind, ArtifactState, CommandAction,
@@ -33,9 +33,10 @@ pub use session::{
     AgentQuestionAnswer, AgentQuestionChoice, AgentQuestionField, AgentReasoningEffort,
     AgentTurnSettings, ApprovalCapabilities, CapabilitySet, ContentCapabilities,
     IntegrationCapabilities, ModeCapabilities, PlanCapabilities, ProtocolCapabilities,
-    QuestionAnsweredEvent, QuestionRequestedEvent, QuestionState, QuestionStatus, SessionInfo,
-    SessionSnapshot, SessionStatus, SessionUsageContext, SessionUsageSnapshot, SessionUsageWindow,
-    ToolCapabilities, TurnState, TurnStatus,
+    ProviderCapabilityDetail, ProviderCapabilityStatus, QuestionAnsweredEvent,
+    QuestionRequestedEvent, QuestionState, QuestionStatus, SessionInfo, SessionSnapshot,
+    SessionStatus, SessionUsageContext, SessionUsageSnapshot, SessionUsageWindow, ToolCapabilities,
+    TurnState, TurnStatus,
 };
 pub use slash_command::{
     SlashCommandArgument, SlashCommandArgumentKind, SlashCommandDangerLevel,

@@ -91,7 +91,7 @@ export function materializeSnapshotChatState(
     items.push(materializeArtifact(artifact));
   }
 
-  ensureSnapshotRowOrder(items, rowOrder, snapshot.latest_seq);
+  ensureSnapshotRowOrder(items, rowOrder, snapshot);
 
   const sortedItems = sortByUniversalOrder(items, rowOrder);
   const latestPlan = [...sortedItems].reverse().find((item) => item.kind === 'plan');
@@ -102,7 +102,7 @@ export function materializeSnapshotChatState(
     latestPlanId: latestPlan?.id,
     planTurnComplete: !snapshot.active_turns.some((turnId) => {
       const status = snapshot.turns[turnId]?.status;
-      return status === 'running' || status === 'waiting_for_approval' || status === 'waiting_for_input';
+      return status === 'running' || status === 'waiting_for_approval' || status === 'waiting_for_input' || status === 'interrupting';
     })
   };
 }
@@ -111,9 +111,15 @@ export function hasCapabilitySignal(capabilities: CapabilitySet | undefined): bo
   if (!capabilities) {
     return false;
   }
-  return Object.values(capabilities).some((group) =>
-    Object.values(group as Record<string, unknown>).some((value) => value === true)
-  );
+  return Object.entries(capabilities).some(([key, group]) => {
+    if (key === 'provider_details') {
+      return false;
+    }
+    if (!group || typeof group !== 'object' || Array.isArray(group)) {
+      return false;
+    }
+    return Object.values(group as Record<string, unknown>).some((value) => value === true);
+  });
 }
 
 function applySessionSnapshotMessage(
@@ -123,13 +129,18 @@ function applySessionSnapshotMessage(
   let snapshot = cloneSnapshot(message.snapshot);
   if (message.has_more) {
     const rowOrder = new Map(state.rowOrder);
+    const seenUniversalEvents = new Set(state.seenUniversalEvents);
+    for (const event of message.events) {
+      seenUniversalEvents.add(universalEventKey(event));
+      recordRowOrder(rowOrder, event);
+    }
     return {
       chat: materializeSnapshotChatState(snapshot, rowOrder),
       snapshot,
       latestSeq: snapshot.latest_seq ?? undefined,
       usingUniversal: true,
       snapshotIncomplete: true,
-      seenUniversalEvents: new Set(state.seenUniversalEvents),
+      seenUniversalEvents,
       rowOrder
     };
   }
@@ -504,14 +515,23 @@ function materializeDiff(diff: DiffState): Extract<ChatItem, { kind: 'inlineEven
 
 function materializeArtifact(
   artifact: { artifact_id: string; kind: string; title: string; uri?: string | null }
-): Extract<ChatItem, { kind: 'inlineEvent' }> {
+): ChatItem {
+  if (artifact.kind === 'error') {
+    return {
+      id: `event:artifact:${artifact.artifact_id}`,
+      kind: 'error',
+      title: artifact.title,
+      detail: artifact.uri ?? undefined
+    };
+  }
   return {
     id: `event:artifact:${artifact.artifact_id}`,
     kind: 'inlineEvent',
     eventKind: 'event',
+    displayLevel: artifact.kind === 'native_raw' ? 'raw' : 'normal',
     title: artifact.title,
     detail: artifact.uri ?? undefined,
-    status: artifact.kind
+    status: artifact.kind === 'native_raw' ? 'native' : artifact.kind
   };
 }
 
@@ -535,12 +555,18 @@ function snapshotActivity(snapshot: SessionSnapshot): ChatActivity | undefined {
     }
     return {
       status: turn.status,
-      active: turn.status === 'running' || turn.status === 'waiting_for_approval' || turn.status === 'waiting_for_input',
+      active:
+        turn.status === 'running' ||
+        turn.status === 'waiting_for_approval' ||
+        turn.status === 'waiting_for_input' ||
+        turn.status === 'interrupting',
       label:
         turn.status === 'waiting_for_approval'
           ? 'Waiting for approval'
           : turn.status === 'waiting_for_input'
             ? 'Waiting for input'
+            : turn.status === 'interrupting'
+              ? 'Stopping'
             : 'Working'
     };
   }
@@ -550,19 +576,83 @@ function snapshotActivity(snapshot: SessionSnapshot): ChatActivity | undefined {
 function ensureSnapshotRowOrder(
   items: ChatItem[],
   rowOrder: Map<string, RowOrder>,
-  latestSeq?: string | null
+  snapshot: SessionSnapshot
 ) {
-  const snapshotSeq = fallbackRowOrderSeq(latestSeq);
+  const snapshotSeq = fallbackRowOrderSeq(snapshot.latest_seq);
   for (const item of items) {
-    if (rowOrder.has(item.id)) {
+    const existingOrder = rowOrder.get(item.id);
+    const timestampOrder = snapshotTimestampOrder(item, rowOrder, snapshot);
+    if (existingOrder && !shouldReanchorSnapshotRow(item, existingOrder, timestampOrder)) {
       continue;
     }
-    rowOrder.set(item.id, {
-      seq: snapshotSeq,
-      ts: '0001-01-01T00:00:00.000Z',
-      index: rowOrder.size
-    });
+    rowOrder.set(
+      item.id,
+      timestampOrder ?? {
+        seq: snapshotSeq,
+        ts: '0001-01-01T00:00:00.000Z',
+        index: rowOrder.size
+      }
+    );
   }
+}
+
+function snapshotTimestampOrder(
+  item: ChatItem,
+  rowOrder: Map<string, RowOrder>,
+  snapshot: SessionSnapshot
+): RowOrder | undefined {
+  const ts = snapshotItemTimestamp(item, snapshot);
+  if (!ts) {
+    return undefined;
+  }
+  const anchors = [...rowOrder.entries()]
+    .filter(([rowId, order]) => rowId !== item.id && order.ts !== '0001-01-01T00:00:00.000Z')
+    .map(([, order]) => order)
+    .sort((left, right) => {
+      const tsOrder = left.ts.localeCompare(right.ts);
+      if (tsOrder !== 0) {
+        return tsOrder;
+      }
+      return compareSeq(left.seq, right.seq);
+    });
+  const nextAnchor = anchors.find((order) => order.ts >= ts);
+  return {
+    seq: nextAnchor?.seq ?? fallbackRowOrderSeq(snapshot.latest_seq),
+    ts,
+    index: nextAnchor?.index ?? rowOrder.size
+  };
+}
+
+function snapshotItemTimestamp(item: ChatItem, snapshot: SessionSnapshot): string | undefined {
+  if (item.kind === 'approval') {
+    const approval = snapshot.approvals[item.approvalId];
+    return approval?.requested_at ?? approval?.resolved_at ?? undefined;
+  }
+  if (item.kind === 'question') {
+    const question = snapshot.questions[item.questionId];
+    return question?.requested_at ?? question?.answered_at ?? undefined;
+  }
+  if (item.kind === 'plan') {
+    return snapshot.plans[item.id.replace(/^plan:/, '')]?.updated_at ?? undefined;
+  }
+  if (item.kind === 'inlineEvent' && item.id.startsWith('event:diff:')) {
+    return snapshot.diffs[item.id.replace(/^event:diff:/, '')]?.updated_at ?? undefined;
+  }
+  if ((item.kind === 'inlineEvent' || item.kind === 'error') && item.id.startsWith('event:artifact:')) {
+    return snapshot.artifacts[item.id.replace(/^event:artifact:/, '')]?.created_at ?? undefined;
+  }
+  return undefined;
+}
+
+function shouldReanchorSnapshotRow(
+  item: ChatItem,
+  existingOrder: RowOrder,
+  timestampOrder: RowOrder | undefined
+): boolean {
+  if (!timestampOrder || (item.kind !== 'approval' && item.kind !== 'question')) {
+    return false;
+  }
+  return existingOrder.ts === '0001-01-01T00:00:00.000Z' || existingOrder.ts > timestampOrder.ts;
 }
 
 function fallbackRowOrderSeq(latestSeq?: string | null): string {
@@ -636,6 +726,8 @@ function rowIdsForEvent(event: UniversalEventEnvelope): string[] {
       return [`agent:${event.item_id ?? event.event.data.block_id}`];
     case 'approval.requested':
       return [`approval:${event.event.data.approval.approval_id}`];
+    case 'approval.resolved':
+      return [`approval:${event.event.data.approval_id}`];
     case 'question.requested':
     case 'question.answered':
       return [`question:${event.event.data.question.question_id}`];

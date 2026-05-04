@@ -1109,6 +1109,43 @@ button.busy:disabled .button-spinner {
   font-size: 0.76rem;
 }
 
+.approval-rules-panel {
+  width: min(32rem, 100%);
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.approval-rules-panel summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--text);
+}
+
+.approval-rule-list {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 0.45rem;
+}
+
+.approval-rule-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 1.8rem;
+}
+
+.approval-rule-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.error-text {
+  color: var(--danger);
+}
+
 .title-editor {
   display: grid;
   grid-template-columns: minmax(10rem, 1fr) auto auto;
@@ -1120,6 +1157,17 @@ button.busy:disabled .button-spinner {
 .title-editor input {
   min-height: 2rem;
   padding: 0.35rem 0.5rem;
+}
+
+.chat-header-actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.chat-debug-export {
+  white-space: nowrap;
 }
 
 .status-pill {
@@ -2307,8 +2355,14 @@ button.busy:disabled .button-spinner {
   }
 
   .chat-header {
+    align-items: stretch;
+    flex-direction: column;
     min-height: auto;
     padding: 0.75rem 1rem;
+  }
+
+  .chat-header-actions {
+    justify-content: space-between;
   }
 
   .title-editor {
