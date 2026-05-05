@@ -1,6 +1,6 @@
 # Agent Working Guide
 
-This repository is in the documentation/harness stage. Do not scaffold application code until a concrete implementation plan has been written and approved.
+This repository is in the active Rust/Svelte implementation stage. Do not add broad product surface area or new provider architecture until a concrete implementation plan has been written and approved.
 
 ## Startup Checklist
 
@@ -22,7 +22,8 @@ Agenter is intended to become a self-hostable remote control plane for coding ag
 - Rust agent-runner daemon near workspaces and harness processes.
 - Svelte browser UI.
 - Postgres storage.
-- Agent adapters for Codex app-server and Qwen ACP.
+- Shared ACP runner runtime for Qwen, Gemini, and OpenCode.
+- Future provider adapters, including any new Codex adapter, must emit `uap/2` universal events directly.
 - Interaction connectors for browser, Telegram, and Mattermost.
 
 The first implementation target is a minimal useful remote console-chat with a data model that does not block a later agent workbench.
@@ -51,4 +52,3 @@ A task is not complete until:
 - The relevant docs or plan reflect the implemented behavior.
 - Verification from `docs/harness/VERIFICATION.md` has been run, or the reason it could not be run is recorded.
 - Any new unresolved question is written down in the active plan or a decision file.
-

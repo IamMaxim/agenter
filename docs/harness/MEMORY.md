@@ -4,11 +4,11 @@ This file is the project-local memory surface for future agent sessions. Keep it
 
 ## Current State
 
-- The repository has moved beyond documentation-only setup into the initial Rust/Svelte implementation plan.
-- The active implementation plan is `docs/plans/2026-04-30-initial-implementation.md`.
-- The technical spec remains `docs/specs/2026-04-30-remote-agent-control-plane.md`, with the original source discussion in `docs/chatgpt/001_initial.md`.
+- The repository is in active Rust/Svelte implementation, with `uap/2` as the runtime contract.
+- The active implementation plan is `docs/plans/2026-05-05-universal-only-uap2.md`.
+- The active source spec is `docs/specs/2026-05-05-universal-only-uap2.md`, with older source discussions preserved under `docs/chatgpt/`.
 - The Rust workspace, browser UI, fake runner flow, ACP runner stack, and Qwen/Gemini/OpenCode integrations are present.
-- ACP support is now tracked in `docs/acp/`, with the durable spec in `docs/specs/2026-05-02-acp-runner-support.md` and the active implementation plan in `docs/plans/2026-05-02-acp-runner-support.md`.
+- Codex runtime adapter code is intentionally absent after the universal-only reset; a future Codex adapter should be designed as a provider that emits `AgentUniversalEvent` / `uap/2` events directly.
 
 ## Durable Assumptions
 
@@ -18,7 +18,7 @@ This file is the project-local memory surface for future agent sessions. Keep it
 - Browser is the full-fidelity interface.
 - Telegram and Mattermost are constrained projections and should avoid full transcript backfill.
 - Native agents are the preferred source of truth for conversation history.
-- The control plane still stores registry metadata, connector bindings, pending approvals, delivery state, and lightweight event cache.
+- The control plane still stores registry metadata, connector bindings, pending approvals, delivery state, universal event log/snapshots, and lightweight event cache.
 - Auth must support password and OIDC from the beginning.
 - Messenger identity should be linked through authenticated browser login.
 

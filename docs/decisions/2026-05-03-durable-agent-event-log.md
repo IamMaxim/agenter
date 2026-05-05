@@ -11,7 +11,7 @@ The first product scope still excludes audit-grade full transcript storage. A du
 
 ## Decision
 
-Add an append-only `agent_events` log as the durable `uap/1` browser replay and control-plane projection log. Each universal event receives a monotonic global database `seq` from the `agent_events` sequence and stores the normalized event payload, source, optional command correlation, optional turn and item IDs, and safe native reference data.
+Add an append-only `agent_events` log as the durable browser replay and control-plane projection log. Under the current `uap/2` contract, each universal event receives a monotonic global database `seq` from the `agent_events` sequence and stores the universal event envelope payload, source, optional command correlation, optional turn and item IDs, and safe native reference data.
 
 `seq` is global across `agent_events`, not per session. In Rust it is represented as a 64-bit integer type (`i64` for SQLx/Postgres `bigint`, or `u64` where the domain type guarantees non-negative values). On JSON wires it is serialized as a string to avoid JavaScript integer precision loss. Browser `after_seq` uses this global cursor, filtered by the subscribed session.
 

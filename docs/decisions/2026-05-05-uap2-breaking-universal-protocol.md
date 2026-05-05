@@ -36,7 +36,7 @@ universal discovery events whose `session_id` is filled after registration.
 
 ## Consequences
 
-Frontend clients must reject or normalize to `uap/2`; old `uap/1` frames are
+Frontend clients must reject or convert to `uap/2`; old `uap/1` frames are
 not part of the active public contract.
 
 Control-plane replay no longer uses `latest_seq` / `has_more` on

@@ -10,7 +10,7 @@ The native provider emits `account/rateLimits/updated` events with `primary` and
 
 Map provider `primary` to the 5h usage window and provider `secondary` to the weekly usage window.
 
-The control plane stores only the latest normalized `SessionUsageSnapshot` on the app session record. Provider-native payloads remain in event cache for debugging.
+The control plane stores only the latest universal `SessionUsageSnapshot` on the app session record. Provider-native details remain limited to safe native references and provider notifications unless a later ADR expands that storage policy.
 
 ## Consequences
 

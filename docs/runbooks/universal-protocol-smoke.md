@@ -96,7 +96,7 @@ Expected messages:
 ```text
 ack
 session_snapshot
-universal_event or app_event for subsequent live events
+universal_event for subsequent live events
 ```
 
 ## DB-Backed Path

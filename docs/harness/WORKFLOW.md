@@ -90,8 +90,7 @@ When context grows, update the plan instead of relying on chat history.
 
 - Build protocol spikes before committing to adapter APIs.
 - Keep control-plane types separate from provider-native payloads.
-- Normalize events at the runner boundary, but preserve provider-specific payloads where useful for debugging.
+- Reduce provider-native messages to `uap/2` universal events at the runner boundary, preserving safe native references where useful for debugging.
 - Treat connector rendering as a projection of app events, not as business logic.
 - Keep auth and authorization checks in the control plane.
 - Keep workspace file access in the runner.
-

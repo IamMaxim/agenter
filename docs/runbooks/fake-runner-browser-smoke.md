@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Prove the development-only fake runner can connect to the control plane, receive an `agent_send_input` command, emit normalized app events, and make those events available to browser WebSocket subscribers.
+Prove the development-only fake runner can connect to the control plane, receive a runner command, emit `uap/2` universal events, and make those events available to browser WebSocket subscribers.
 
 ## Prerequisites
 
@@ -24,7 +24,7 @@ Expected output shape:
 test http::tests::smoke_routes_runner_events_to_subscribed_browser ... ok
 ```
 
-The test starts the Axum app on an ephemeral local port, connects a runner WebSocket, sends `runner_hello`, asserts the handshake does not send unsolicited work, creates a browser session through the runner `CreateSession` command, connects a browser WebSocket, subscribes to that session, emits a runner event, and asserts that the browser receives an `app_event`.
+The test starts the Axum app on an ephemeral local port, connects a runner WebSocket, sends `runner_hello`, asserts the handshake does not send unsolicited work, creates a browser session through the runner `CreateSession` command, connects a browser WebSocket, subscribes to that session, emits a runner event, and asserts that the browser receives a `universal_event`.
 
 ## Manual Smoke
 
@@ -68,7 +68,7 @@ printf '%s\n' '{"type":"subscribe_session","request_id":"sub-1","session_id":"11
   | websocat ws://127.0.0.1:7777/api/browser/ws
 ```
 
-Expected messages include an `ack` followed by cached or live `app_event` messages such as `user_message`, `agent_message_delta`, and `agent_message_completed`.
+Expected messages include an `ack`, a `session_snapshot` when requested, and live `universal_event` messages such as `item.created`, `content.delta`, and `content.completed`.
 
 ## Cleanup
 

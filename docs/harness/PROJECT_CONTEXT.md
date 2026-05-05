@@ -1,6 +1,6 @@
 # Project Context
 
-Last updated: 2026-04-30
+Last updated: 2026-05-05
 
 ## Product Goal
 
@@ -23,17 +23,17 @@ The control plane owns:
 - workspace metadata;
 - connector routing;
 - public REST and realtime APIs;
-- normalized event fan-out;
+- universal event fan-out;
 - pending approval state;
-- lightweight event cache.
+- `uap/2` session snapshots and lightweight event cache.
 
 The runner owns:
 
 - local workspace access;
 - persistent agent harness processes;
-- Qwen ACP integration;
+- Qwen/Gemini/OpenCode ACP integration;
 - native protocol supervision;
-- event normalization before forwarding to the control plane.
+- universal event reduction before forwarding to the control plane.
 
 The runner should connect outbound to the control plane over a secure bidirectional channel so a home machine behind NAT can participate without exposing harness internals.
 
@@ -53,7 +53,7 @@ ACP:
 
 - integrate through local ACP CLIs (`qwen --acp`, `gemini --acp`, and `opencode acp`);
 - keep provider auth and runtime local to the workspace;
-- map provider turns/items/messages into normalized events for control-plane replay.
+- map provider turns/items/messages into `uap/2` universal events for control-plane replay.
 
 Qwen:
 
@@ -136,6 +136,7 @@ These need protocol spikes or explicit decisions before implementation hardens:
 
 - exact ACP session semantics and approval payloads;
 - exact Qwen ACP session history/resume support;
+- future Codex adapter design on top of direct `uap/2` event emission;
 - runner protocol authentication and token rotation;
 - database migration tool choice;
 - frontend app shape: SvelteKit versus Svelte SPA;

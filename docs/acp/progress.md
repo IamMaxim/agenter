@@ -23,7 +23,7 @@ Evidence collected:
 Implementation evidence:
 
 - `cargo test -p agenter-runner acp` passed for ACP provider profiles, capability mapping, provider fallback events, permission mapping, and workspace path containment.
-- `cargo test -p agenter-control-plane create_acp_session_waits_for_runner_and_stores_external_id` passed for non-Codex runner-backed session creation.
+- `cargo test -p agenter-control-plane create_acp_session_waits_for_runner_and_stores_external_id` passed for ACP runner-backed session creation.
 - `cargo check --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace` passed after the shared ACP runtime landed.
 - Fresh Qwen and OpenCode initialize probes answered with the same capability shapes recorded in `provider-matrix.md`; OpenCode still requires outside-sandbox access to its local state database for live probes.
 - Follow-up ACP hardening added separate initialize-derived handling for `loadSession`, `sessionCapabilities.list`, `sessionCapabilities.resume`, and `sessionCapabilities.fork`.

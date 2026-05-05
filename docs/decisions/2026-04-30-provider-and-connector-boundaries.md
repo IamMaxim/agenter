@@ -9,11 +9,11 @@ Agenter needs extensible agent providers and extensible interaction interfaces. 
 
 ## Decision
 
-Keep agent provider protocols separate from interaction connectors. Runners normalize native provider events into a common app event model. Connectors render and route app events as projections. Rendering is separated from connector transport so browser, Telegram, and Mattermost can represent the same event differently without changing provider adapters.
+Keep agent provider protocols separate from interaction connectors. Runners reduce native provider events into the shared `uap/2` universal event model. Connectors render and route universal events as projections. Rendering is separated from connector transport so browser, Telegram, and Mattermost can represent the same event differently without changing provider adapters.
 
 ## Consequences
 
-Adding a provider should not require changes to connector business logic. Adding a connector should not require provider-specific protocol handling except for rendering provider metadata already preserved in normalized events. This increases upfront typing and module boundaries, but keeps the system scalable.
+Adding a provider should not require changes to connector business logic. Adding a connector should not require provider-specific protocol handling except for rendering provider metadata already preserved as safe native references or provider notifications on universal events. This increases upfront typing and module boundaries, but keeps the system scalable.
 
 ## Alternatives Considered
 
