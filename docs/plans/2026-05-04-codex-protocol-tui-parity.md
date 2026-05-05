@@ -27,10 +27,16 @@ Completed on 2026-05-04:
 - Stage 6 renders provider capability gaps, auth-refresh errors, and promoted native notifications through replay/live snapshot materialization while keeping unclassified native noise debug-only.
 - Stage 7 added conservative Codex provider commands: `codex.rate_limits`, `codex.mcp_status`, `codex.mcp_reload`, `codex.rename`, and `codex.context_window`.
 - Follow-up parity pass added Codex subagent tool projection for `collabAgentToolCall`, plus provider commands for turn listing, loaded threads, skills, plugins, plugin detail, apps, config, config requirements, MCP resource reads, and background terminal cleanup.
+- 2026-05-05 follow-up added `provider.notification` as the typed UAP surface for known Codex provider notifications that are visible but not first-class state. True protocol drift remains `native.unknown`.
+- 2026-05-05 follow-up promoted `thread/contextWindow/updated` into `usage.updated`, `item/fileChange/patchUpdated` into populated `diff.updated`, `item/fileChange/outputDelta` into file content deltas, and `item/commandExecution/terminalInteraction` into terminal-input content deltas.
+- 2026-05-05 frontend follow-up made browser UAP handling exhaustive for current known event types. Frontend policy is State + Debug: apply all UAP events to state, render meaningful transcript rows, keep state-only/noisy events out of normal transcript rows, and preserve debug/raw visibility.
+- 2026-05-05 frontend follow-up fixed live `usage.updated` handling when session info is absent, row ordering for reducer-created error/provider/native artifact rows, and semantic projection for `terminal_input`, `reasoning`, `image`, `warning`, `provider_status`, and `native` content blocks.
+- 2026-05-05 follow-up promoted Codex usage notifications at the runner adapter boundary: `thread/tokenUsage/updated`, `thread/contextWindow/updated`, and `account/rateLimits/updated` now emit typed `usage.updated` instead of generic `provider.notification`.
 
 Verification completed:
 
 - `cargo fmt --all -- --check`
+- `cargo check --workspace`
 - `cargo test -p agenter-runner codex_`
 - `cargo test -p agenter-runner codex_protocol_coverage`
 - `cargo test -p agenter-runner codex_turn`
@@ -43,11 +49,13 @@ Verification completed:
 - `cargo test -p agenter-control-plane event`
 - `cargo test -p agenter-control-plane question`
 - `cargo test -p agenter-control-plane approval`
+- `web/`: `npm run test -- normalizers sessionSnapshot universalEvents`
 - `web/`: `npm run check`
 - `web/`: `npm run lint`
 - `web/`: `npm run test`
 - `web/`: `npm run build`
 - `web/`: `npm run test -- sessionSnapshot universalEvents`
+- `web/`: `npm run test -- normalizers universalEvents sessionSnapshot`
 
 Not run:
 

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{ApprovalId, ItemId, NativeRef, SessionId, TurnId, UserId};
+use crate::{ApprovalId, ItemId, NativeRef, QuestionId, SessionId, TurnId, UserId};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
@@ -53,6 +53,81 @@ pub enum ApprovalStatus {
     Cancelled,
     Expired,
     Orphaned,
+    Detached,
+}
+
+impl ApprovalStatus {
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Approved
+                | Self::Denied
+                | Self::Cancelled
+                | Self::Expired
+                | Self::Orphaned
+                | Self::Detached
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentObligationKind {
+    Approval,
+    Question,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentObligationStatus {
+    Pending,
+    Presented,
+    Resolving,
+    DeliveredToRunner,
+    AcceptedByNative,
+    Resolved,
+    Orphaned,
+    Expired,
+    Detached,
+}
+
+impl AgentObligationStatus {
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Resolved | Self::Orphaned | Self::Expired | Self::Detached
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AgentObligation {
+    pub obligation_id: String,
+    pub session_id: SessionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+    pub kind: AgentObligationKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<ApprovalId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_id: Option<QuestionId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_request_id: Option<String>,
+    pub status: AgentObligationStatus,
+    #[serde(default)]
+    pub delivery_generation: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_command_id: Option<crate::CommandId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

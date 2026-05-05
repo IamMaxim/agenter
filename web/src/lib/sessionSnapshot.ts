@@ -8,6 +8,7 @@ import type {
   PlanState,
   QuestionState,
   SessionSnapshot,
+  SessionUsageSnapshot,
   UniversalEventEnvelope
 } from '../api/types';
 import {
@@ -23,6 +24,7 @@ export interface UniversalClientState {
   chat: ChatState;
   snapshot?: SessionSnapshot;
   latestSeq?: string;
+  latestUsage?: SessionUsageSnapshot | null;
   usingUniversal: boolean;
   snapshotIncomplete: boolean;
   seenUniversalEvents: Set<string>;
@@ -39,6 +41,7 @@ export function createUniversalClientState(): UniversalClientState {
   return {
     chat: createChatState(),
     latestSeq: undefined,
+    latestUsage: null,
     snapshot: undefined,
     usingUniversal: false,
     snapshotIncomplete: false,
@@ -138,6 +141,7 @@ function applySessionSnapshotMessage(
       chat: materializeSnapshotChatState(snapshot, rowOrder),
       snapshot,
       latestSeq: snapshot.latest_seq ?? undefined,
+      latestUsage: snapshot.info?.usage ?? state.latestUsage ?? null,
       usingUniversal: true,
       snapshotIncomplete: true,
       seenUniversalEvents,
@@ -168,6 +172,7 @@ function applySessionSnapshotMessage(
     chat: materializeSnapshotChatState(snapshot, rowOrder),
     snapshot,
     latestSeq,
+    latestUsage: snapshot.info?.usage ?? state.latestUsage ?? null,
     usingUniversal: true,
     snapshotIncomplete: false,
     seenUniversalEvents,
@@ -198,6 +203,10 @@ function applyLiveUniversalEvent(
     chat: materializeSnapshotChatState(snapshot, rowOrder),
     snapshot,
     latestSeq: compareSeq(event.seq, state.latestSeq) > 0 ? event.seq : state.latestSeq,
+    latestUsage:
+      event.event.type === 'usage.updated'
+        ? event.event.data.usage
+        : snapshot.info?.usage ?? state.latestUsage ?? null,
     usingUniversal: true,
     snapshotIncomplete: false,
     seenUniversalEvents,
@@ -221,6 +230,7 @@ function emptySnapshot(sessionId: string, latestSeq?: string): SessionSnapshot {
 }
 
 function materializeQuestion(question: QuestionState): Extract<ChatItem, { kind: 'question' }> {
+  const terminal = terminalQuestionStatus(question.status);
   return {
     id: `question:${question.question_id}`,
     kind: 'question',
@@ -237,7 +247,9 @@ function materializeQuestion(question: QuestionState): Extract<ChatItem, { kind:
       choices: field.choices ?? [],
       default_answers: field.default_answers ?? []
     })),
-    answered: question.status === 'answered'
+    answered: question.status === 'answered',
+    status: question.status,
+    resolvedState: terminal ? question.status : undefined
   };
 }
 
@@ -252,7 +264,7 @@ function materializeItem(item: ItemState): ChatItem | undefined {
       markdown: true
     };
   }
-  if (item.role === 'assistant') {
+  if (item.role === 'assistant' && !hasSemanticEventContent(item.content)) {
     return {
       id: `agent:${item.item_id}`,
       kind: 'assistant',
@@ -274,14 +286,71 @@ function materializeItem(item: ItemState): ChatItem | undefined {
   const isNativeFileChange =
     isFileChangeMethod(nativeMethod) ||
     item.content.some((block) => isFileDiffBlock(block.kind));
-  if (first?.kind === 'command_output') {
+  if (item.content.some((block) => block.kind === 'warning')) {
+    return {
+      id: `event:item:${item.item_id}`,
+      kind: 'inlineEvent',
+      eventKind: 'event',
+      title: item.native?.summary ?? 'Warning',
+      detail: content || undefined,
+      status: item.status,
+      source: item.native?.protocol ?? undefined
+    };
+  }
+  if (item.content.some((block) => block.kind === 'provider_status')) {
+    return {
+      id: `event:item:${item.item_id}`,
+      kind: 'inlineEvent',
+      eventKind: 'event',
+      title: item.native?.summary ?? 'Provider status',
+      detail: content || undefined,
+      status: item.status,
+      source: item.native?.protocol ?? undefined
+    };
+  }
+  if (item.content.some((block) => block.kind === 'reasoning')) {
+    return {
+      id: `event:item:${item.item_id}`,
+      kind: 'inlineEvent',
+      eventKind: 'tool',
+      displayLevel: 'thinking',
+      title: item.native?.summary ?? 'Reasoning',
+      detail: content || undefined,
+      status: item.status,
+      source: item.native?.protocol ?? undefined
+    };
+  }
+  if (item.content.some((block) => block.kind === 'image')) {
+    return {
+      id: `event:item:${item.item_id}`,
+      kind: 'inlineEvent',
+      eventKind: 'event',
+      title: item.native?.summary ?? 'Image',
+      detail: imageDetail(item.content) || content || undefined,
+      status: item.status,
+      source: item.native?.protocol ?? undefined
+    };
+  }
+  if (item.content.some((block) => block.kind === 'native')) {
+    return {
+      id: `event:item:${item.item_id}`,
+      kind: 'inlineEvent',
+      eventKind: 'event',
+      displayLevel: 'raw',
+      title: item.native?.summary ?? item.native?.method ?? 'Native event',
+      detail: content || undefined,
+      status: item.status,
+      source: item.native?.protocol ?? undefined
+    };
+  }
+  if (first?.kind === 'command_output' || first?.kind === 'terminal_input') {
     return {
       id: `event:item:${item.item_id}`,
       kind: 'inlineEvent',
       eventKind: 'command',
       title: item.native?.summary ?? item.native?.method ?? 'Command output',
       detail: undefined,
-      output: content,
+      output: commandOutputText(item.content),
       status: item.status,
       source: item.native?.protocol ?? undefined
     };
@@ -439,8 +508,8 @@ function commandProjectionDetail(command: NonNullable<ItemState['tool']>['comman
 
 function commandOutputText(blocks: ContentBlock[]): string {
   return blocks
-    .filter((block) => block.kind === 'command_output' && !block.block_id.endsWith('-status'))
-    .map((block) => block.text ?? '')
+    .filter((block) => (block.kind === 'command_output' || block.kind === 'terminal_input') && !block.block_id.endsWith('-status'))
+    .map((block) => (block.kind === 'terminal_input' ? `$ ${block.text ?? ''}` : block.text ?? ''))
     .filter(Boolean)
     .join('');
 }
@@ -496,7 +565,11 @@ function materializeApproval(approval: ApprovalRequest): Extract<ChatItem, { kin
 }
 
 function terminalApprovalStatus(status: string): boolean {
-  return ['approved', 'denied', 'cancelled', 'expired', 'orphaned'].includes(status);
+  return ['approved', 'denied', 'cancelled', 'expired', 'orphaned', 'detached'].includes(status);
+}
+
+function terminalQuestionStatus(status: string): boolean {
+  return ['answered', 'cancelled', 'expired', 'orphaned', 'detached'].includes(status);
 }
 
 function materializeDiff(diff: DiffState): Extract<ChatItem, { kind: 'inlineEvent' }> {
@@ -540,6 +613,24 @@ function itemText(blocks: ContentBlock[]): string {
     .map((block) => block.text ?? '')
     .filter(Boolean)
     .join('');
+}
+
+function hasSemanticEventContent(blocks: ContentBlock[]): boolean {
+  return blocks.some((block) =>
+    block.kind === 'reasoning' ||
+    block.kind === 'image' ||
+    block.kind === 'native' ||
+    block.kind === 'warning' ||
+    block.kind === 'provider_status'
+  );
+}
+
+function imageDetail(blocks: ContentBlock[]): string | undefined {
+  const parts = blocks
+    .filter((block) => block.kind === 'image')
+    .flatMap((block) => [block.artifact_id ?? undefined, block.text ?? undefined])
+    .filter((part): part is string => Boolean(part));
+  return parts.length > 0 ? parts.join('\n') : undefined;
 }
 
 function planEntryMarkdown(entry: { label: string; status: string }): string {
@@ -723,7 +814,7 @@ function rowIdsForEvent(event: UniversalEventEnvelope): string[] {
       return [rowIdForItem(event.event.data.item)];
     case 'content.delta':
     case 'content.completed':
-      return [`agent:${event.item_id ?? event.event.data.block_id}`];
+      return [rowIdForContentEvent(event.item_id, event.event.data.block_id, event.event.data.kind)];
     case 'approval.requested':
       return [`approval:${event.event.data.approval.approval_id}`];
     case 'approval.resolved':
@@ -737,6 +828,12 @@ function rowIdsForEvent(event: UniversalEventEnvelope): string[] {
       return [`event:diff:${event.event.data.diff.diff_id}`];
     case 'artifact.created':
       return [`event:artifact:${event.event.data.artifact.artifact_id}`];
+    case 'error.reported':
+      return [`event:artifact:error:${event.event_id}`];
+    case 'provider.notification':
+      return [`event:artifact:provider:${event.event_id}`];
+    case 'native.unknown':
+      return [`event:artifact:native:${event.event_id}`];
     default:
       return [];
   }
@@ -746,11 +843,33 @@ function rowIdForItem(item: ItemState): string {
   if (item.role === 'user') {
     return `user:${item.item_id}`;
   }
-  if (item.role === 'assistant') {
+  if (item.role === 'assistant' && !hasSemanticEventContent(item.content)) {
     return `agent:${item.item_id}`;
   }
   if (item.tool?.kind === 'subagent') {
     return `subagent:${item.item_id}`;
   }
   return `event:item:${item.item_id}`;
+}
+
+function rowIdForContentEvent(
+  envelopeItemId: string | null | undefined,
+  blockId: string,
+  blockKind: string | null | undefined
+): string {
+  const itemId = envelopeItemId ?? blockId;
+  const kind = blockKind ?? 'text';
+  if (kind === 'text') {
+    return `agent:${itemId}`;
+  }
+  if (kind === 'tool_call' || kind === 'tool_result' || kind === 'command_output' || kind === 'terminal_input') {
+    return `event:item:${itemId}`;
+  }
+  if (kind === 'file_diff' || kind.startsWith('file_diff')) {
+    return `event:item:${itemId}`;
+  }
+  if (kind === 'reasoning' || kind === 'image' || kind === 'native' || kind === 'warning' || kind === 'provider_status') {
+    return `event:item:${itemId}`;
+  }
+  return `event:item:${itemId}`;
 }

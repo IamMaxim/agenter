@@ -96,9 +96,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let connection_id = state
         .connect_runner(runner.runner_id, outbound_sender)
         .await;
-    state
-        .seed_runner_event_ack(runner.runner_id, hello.acked_runner_event_seq)
+    let derived_acked_runner_event_seq = state
+        .seed_runner_event_ack_from_hello(runner.runner_id, hello.acked_runner_event_seq)
         .await;
+    if derived_acked_runner_event_seq != hello.acked_runner_event_seq {
+        tracing::info!(
+            runner_id = %runner.runner_id,
+            runner_supplied_acked_runner_event_seq = ?hello.acked_runner_event_seq,
+            durable_acked_runner_event_seq = ?derived_acked_runner_event_seq,
+            "runner event ack cursor derived from durable receipts"
+        );
+    }
     let (discovery_import_sender, mut discovery_import_receiver) =
         mpsc::unbounded_channel::<DiscoveryImportCompletion>();
 
@@ -146,7 +154,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 if !duplicate {
                                     match envelope.event {
                                         RunnerEvent::AgentEvent(agent_event) => {
-                                            match state.accept_runner_agent_event(*agent_event).await {
+                                            match state
+                                                .accept_runner_agent_event_with_receipt(
+                                                    runner.runner_id,
+                                                    runner_event_seq,
+                                                    *agent_event,
+                                                )
+                                                .await
+                                            {
                                                 Ok(_) => {
                                                     accepted = true;
                                                 }

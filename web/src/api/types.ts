@@ -163,7 +163,14 @@ export interface AgentQuestionAnswer {
   answers: Record<string, string[]>;
 }
 
-export type QuestionStatus = 'pending' | 'answered' | 'cancelled' | string;
+export type QuestionStatus =
+  | 'pending'
+  | 'answered'
+  | 'cancelled'
+  | 'expired'
+  | 'orphaned'
+  | 'detached'
+  | string;
 
 export interface QuestionState {
   question_id: string;
@@ -181,6 +188,8 @@ export interface QuestionState {
 
 export type UniversalSeq = string;
 export type UniversalEventSource = 'control_plane' | 'runner' | 'browser' | 'connector' | 'native' | string;
+export const UAP_PROTOCOL_VERSION = 'uap/1' as const;
+export type UapProtocolVersion = typeof UAP_PROTOCOL_VERSION;
 
 export interface NativeRef {
   protocol: string;
@@ -277,9 +286,12 @@ export type ContentBlockKind =
   | 'tool_call'
   | 'tool_result'
   | 'command_output'
+  | 'terminal_input'
   | 'file_diff'
   | 'image'
   | 'native'
+  | 'warning'
+  | 'provider_status'
   | string;
 
 export interface ContentBlock {
@@ -367,6 +379,7 @@ export type ApprovalStatus =
   | 'cancelled'
   | 'expired'
   | 'orphaned'
+  | 'detached'
   | string;
 export type ApprovalKind = 'command' | 'file_change' | 'tool' | 'provider_specific' | string;
 export type ApprovalOptionKind =
@@ -475,6 +488,17 @@ export interface DiffState {
   updated_at?: string | null;
 }
 
+export type ProviderNotificationSeverity = 'debug' | 'info' | 'warning' | 'error' | string;
+
+export interface ProviderNotification {
+  category: string;
+  title: string;
+  detail?: string | null;
+  status?: string | null;
+  severity?: ProviderNotificationSeverity | null;
+  subject?: string | null;
+}
+
 export type ArtifactKind = 'file' | 'image' | 'plan' | 'diff' | 'link' | 'native' | string;
 
 export interface ArtifactState {
@@ -529,9 +553,11 @@ export type UniversalEventKind =
   | { type: 'artifact.created'; data: { artifact: ArtifactState } }
   | { type: 'usage.updated'; data: { usage: SessionUsageSnapshot } }
   | { type: 'error.reported'; data: { code?: string | null; message: string } }
+  | { type: 'provider.notification'; data: { notification: ProviderNotification } }
   | { type: 'native.unknown'; data: { summary?: string | null } };
 
 export interface UniversalEventEnvelope {
+  protocol_version: UapProtocolVersion;
   event_id: string;
   seq: UniversalSeq;
   session_id: string;
@@ -545,6 +571,7 @@ export interface UniversalEventEnvelope {
 
 export interface BrowserSessionSnapshot {
   type: 'session_snapshot';
+  protocol_version: UapProtocolVersion;
   request_id?: string;
   snapshot: SessionSnapshot;
   events: UniversalEventEnvelope[];
@@ -563,6 +590,7 @@ export type UniversalCommand =
   | { type: string; [key: string]: unknown };
 
 export interface UniversalCommandEnvelope {
+  protocol_version: UapProtocolVersion;
   command_id: string;
   idempotency_key: string;
   session_id?: string | null;

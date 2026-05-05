@@ -419,6 +419,19 @@ pub enum QuestionStatus {
     Pending,
     Answered,
     Cancelled,
+    Expired,
+    Orphaned,
+    Detached,
+}
+
+impl QuestionStatus {
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Answered | Self::Cancelled | Self::Expired | Self::Orphaned | Self::Detached
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

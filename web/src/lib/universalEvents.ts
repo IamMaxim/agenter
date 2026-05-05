@@ -8,6 +8,7 @@ import type {
   PlanState,
   QuestionState,
   SessionSnapshot,
+  SessionInfo,
   TurnState,
   UniversalEventEnvelope
 } from '../api/types';
@@ -160,9 +161,7 @@ export function applyUniversalEvent(snapshot: SessionSnapshot, envelope: Univers
       next.artifacts[envelope.event.data.artifact.artifact_id] = cloneArtifact(envelope.event.data.artifact);
       break;
     case 'usage.updated':
-      if (next.info) {
-        next.info = { ...next.info, usage: envelope.event.data.usage };
-      }
+      next.info = { ...(next.info ?? minimalSessionInfo(envelope.session_id)), usage: envelope.event.data.usage };
       break;
     case 'error.reported':
       next.artifacts[`error:${envelope.event_id}`] = {
@@ -172,6 +171,18 @@ export function applyUniversalEvent(snapshot: SessionSnapshot, envelope: Univers
         kind: 'error',
         title: errorEventTitle(envelope.event.data.code, envelope.native?.method),
         uri: envelope.event.data.message,
+        mime_type: null,
+        created_at: envelope.ts
+      };
+      break;
+    case 'provider.notification':
+      next.artifacts[`provider:${envelope.event_id}`] = {
+        artifact_id: `provider:${envelope.event_id}`,
+        session_id: envelope.session_id,
+        turn_id: envelope.turn_id ?? null,
+        kind: 'native',
+        title: envelope.event.data.notification.title,
+        uri: providerNotificationDetail(envelope.event.data.notification),
         mime_type: null,
         created_at: envelope.ts
       };
@@ -192,6 +203,21 @@ export function applyUniversalEvent(snapshot: SessionSnapshot, envelope: Univers
       break;
   }
   return next;
+}
+
+function providerNotificationDetail(notification: {
+  category: string;
+  detail?: string | null;
+  status?: string | null;
+  severity?: string | null;
+  subject?: string | null;
+}): string | undefined {
+  const parts = [
+    notification.detail,
+    notification.status ? `status: ${notification.status}` : undefined,
+    notification.subject ? `subject: ${notification.subject}` : undefined
+  ].filter((part): part is string => Boolean(part));
+  return parts.length > 0 ? parts.join('\n') : notification.category;
 }
 
 function errorEventTitle(code: string | null | undefined, method: string | null | undefined): string {
@@ -377,6 +403,9 @@ function mergeContentDelta(
   const block = findOrCreateBlock(item, blockId, kind);
   block.text = `${block.text ?? ''}${delta}`;
   item.status = 'streaming';
+  if (item.tool) {
+    item.tool = { ...item.tool, status: 'streaming' };
+  }
 }
 
 function mergeContentCompleted(
@@ -392,6 +421,9 @@ function mergeContentCompleted(
     block.text = text;
   }
   item.status = 'completed';
+  if (item.tool) {
+    item.tool = { ...item.tool, status: 'completed' };
+  }
 }
 
 function findOrCreateItemForBlock(
@@ -413,7 +445,13 @@ function findOrCreateItemForBlock(
   if (existing) {
     return existing;
   }
-  const role = kind === 'command_output' || kind === 'tool_call' || kind === 'tool_result' ? 'tool' : 'assistant';
+  const role =
+    kind === 'command_output' ||
+    kind === 'terminal_input' ||
+    kind === 'tool_call' ||
+    kind === 'tool_result'
+      ? 'tool'
+      : 'assistant';
   const item: ItemState = {
     item_id: resolvedItemId,
     session_id: snapshot.session_id,
@@ -484,4 +522,20 @@ function cloneDiff(diff: DiffState): DiffState {
 
 function cloneArtifact(artifact: ArtifactState): ArtifactState {
   return { ...artifact };
+}
+
+function minimalSessionInfo(sessionId: string): SessionInfo {
+  return {
+    session_id: sessionId,
+    owner_user_id: '',
+    runner_id: '',
+    workspace_id: '',
+    provider_id: 'unknown',
+    status: 'degraded',
+    external_session_id: null,
+    title: null,
+    created_at: null,
+    updated_at: null,
+    usage: null
+  };
 }

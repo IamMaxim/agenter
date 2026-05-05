@@ -8,10 +8,13 @@ use std::{
 use crate::agents::approval_state::PendingProviderApproval;
 use agenter_core::{
     AgentCapabilities, AgentErrorEvent, AgentMessageDeltaEvent, AgentProviderId, ApprovalDecision,
-    ApprovalId, ApprovalKind, ApprovalRequestEvent, CommandCompletedEvent, CommandEvent,
-    CommandOutputEvent, CommandOutputStream, FileChangeEvent, FileChangeKind,
-    MessageCompletedEvent, NativeNotification, NormalizedEvent, PlanEntry, PlanEntryStatus,
-    PlanEvent, SessionId, SessionStatus, SessionStatusChangedEvent, ToolEvent,
+    ApprovalId, ApprovalKind, ApprovalRequest, ApprovalRequestEvent, ApprovalStatus,
+    CommandCompletedEvent, CommandEvent, CommandOutputEvent, CommandOutputStream, ContentBlock,
+    ContentBlockKind, FileChangeEvent, FileChangeKind, ItemId, ItemRole, ItemState, ItemStatus,
+    MessageCompletedEvent, NativeNotification, NativeRef, NormalizedEvent, PlanEntry,
+    PlanEntryStatus, PlanEvent, PlanId, PlanSource, PlanState, PlanStatus, SessionId,
+    SessionStatus, SessionStatusChangedEvent, ToolEvent, ToolProjection, ToolProjectionKind,
+    UniversalEventKind, UniversalPlanEntry,
 };
 use anyhow::{anyhow, Context};
 use serde_json::{json, Value};
@@ -367,7 +370,7 @@ impl AcpRunnerRuntime {
         &self,
         request: AcpTurnRequest,
         profile: AcpProviderProfile,
-        event_sender: mpsc::UnboundedSender<NormalizedEvent>,
+        event_sender: mpsc::UnboundedSender<crate::agents::adapter::AdapterEvent>,
         pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingAcpApproval>>>,
     ) -> anyhow::Result<()> {
         let mut session = {
@@ -399,22 +402,26 @@ impl AcpRunnerRuntime {
             .await?;
         while let Some(message) = session.client.next_message().await? {
             if is_response_to(&message, &prompt_request_id) {
-                event_sender
-                    .send(normalize_acp_prompt_response(
+                send_acp_event(
+                    &event_sender,
+                    session.profile.provider_id.clone(),
+                    Some("session/prompt"),
+                    normalize_acp_prompt_response(
                         request.session_id,
                         session.profile.provider_id.clone(),
                         &message,
-                    ))
-                    .ok();
-                event_sender
-                    .send(NormalizedEvent::SessionStatusChanged(
-                        SessionStatusChangedEvent {
-                            session_id: request.session_id,
-                            status: SessionStatus::Idle,
-                            reason: Some(format!("{} prompt completed.", session.profile.title)),
-                        },
-                    ))
-                    .ok();
+                    ),
+                );
+                send_acp_event(
+                    &event_sender,
+                    session.profile.provider_id.clone(),
+                    Some("session/prompt"),
+                    NormalizedEvent::SessionStatusChanged(SessionStatusChangedEvent {
+                        session_id: request.session_id,
+                        status: SessionStatus::Idle,
+                        reason: Some(format!("{} prompt completed.", session.profile.title)),
+                    }),
+                );
                 self.sessions
                     .lock()
                     .await
@@ -441,7 +448,12 @@ impl AcpRunnerRuntime {
                 session.profile.provider_id.clone(),
                 &message,
             ) {
-                event_sender.send(event).ok();
+                send_acp_event(
+                    &event_sender,
+                    session.profile.provider_id.clone(),
+                    jsonrpc_method(&message),
+                    event,
+                );
             }
         }
         Err(anyhow!("ACP provider exited before prompt completed"))
@@ -452,43 +464,50 @@ impl AcpRunnerRuntime {
         session_id: SessionId,
         provider_id: AgentProviderId,
         message: &Value,
-        event_sender: mpsc::UnboundedSender<NormalizedEvent>,
+        event_sender: mpsc::UnboundedSender<crate::agents::adapter::AdapterEvent>,
         pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingAcpApproval>>>,
     ) -> anyhow::Result<Value> {
         match jsonrpc_method(message).unwrap_or_default() {
             "session/request_permission" => {
                 let (approval_id, event) =
-                    normalize_acp_permission_request(session_id, provider_id, message)
+                    normalize_acp_permission_request(session_id, provider_id.clone(), message)
                         .ok_or_else(|| anyhow!("invalid ACP permission request"))?;
                 let (sender, receiver) = oneshot::channel();
                 pending_approvals
                     .lock()
                     .await
                     .insert(approval_id, PendingAcpApproval::new(session_id, sender));
-                event_sender
-                    .send(NormalizedEvent::SessionStatusChanged(
-                        SessionStatusChangedEvent {
-                            session_id,
-                            status: SessionStatus::WaitingForApproval,
-                            reason: Some("ACP provider is waiting for approval.".to_owned()),
-                        },
-                    ))
-                    .ok();
-                event_sender.send(event).ok();
+                send_acp_event(
+                    &event_sender,
+                    provider_id.clone(),
+                    Some("session/request_permission"),
+                    NormalizedEvent::SessionStatusChanged(SessionStatusChangedEvent {
+                        session_id,
+                        status: SessionStatus::WaitingForApproval,
+                        reason: Some("ACP provider is waiting for approval.".to_owned()),
+                    }),
+                );
+                send_acp_event(
+                    &event_sender,
+                    provider_id.clone(),
+                    Some("session/request_permission"),
+                    event,
+                );
                 let answer = receiver
                     .await
                     .map_err(|_| anyhow!("ACP approval waiter was dropped"))?;
                 let response = acp_permission_response(message, answer.decision);
                 answer.acknowledged.send(Ok(())).ok();
-                event_sender
-                    .send(NormalizedEvent::SessionStatusChanged(
-                        SessionStatusChangedEvent {
-                            session_id,
-                            status: SessionStatus::Running,
-                            reason: Some("Approval answered.".to_owned()),
-                        },
-                    ))
-                    .ok();
+                send_acp_event(
+                    &event_sender,
+                    provider_id,
+                    Some("session/request_permission"),
+                    NormalizedEvent::SessionStatusChanged(SessionStatusChangedEvent {
+                        session_id,
+                        status: SessionStatus::Running,
+                        reason: Some("Approval answered.".to_owned()),
+                    }),
+                );
                 Ok(response)
             }
             "fs/read_text_file" => {
@@ -501,20 +520,23 @@ impl AcpRunnerRuntime {
                 let path = AcpWorkspaceFileService::new(self.workspace_path.clone())
                     .write_text_file(message)
                     .await?;
-                event_sender
-                    .send(NormalizedEvent::FileChangeApplied(FileChangeEvent {
+                send_acp_event(
+                    &event_sender,
+                    provider_id,
+                    Some("fs/write_text_file"),
+                    NormalizedEvent::FileChangeApplied(FileChangeEvent {
                         session_id,
                         path,
                         change_kind: FileChangeKind::Modify,
                         diff: None,
                         provider_payload: Some(message.clone()),
-                    }))
-                    .ok();
+                    }),
+                );
                 Ok(json!({}))
             }
             "terminal/create" => {
                 self.terminals
-                    .create_terminal(session_id, message, event_sender)
+                    .create_terminal(session_id, provider_id, message, event_sender)
                     .await
             }
             "terminal/output" => self.terminals.output(message).await,
@@ -789,6 +811,317 @@ pub fn normalize_acp_message(
     }
 }
 
+fn acp_stable_uuid(namespace: &str, value: &str) -> Uuid {
+    Uuid::parse_str(value).unwrap_or_else(|_| {
+        Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("agenter:acp:{namespace}:{value}").as_bytes(),
+        )
+    })
+}
+
+fn acp_stable_item_id(provider_id: &AgentProviderId, session_id: SessionId, value: &str) -> ItemId {
+    ItemId::from_uuid(acp_stable_uuid(
+        "item",
+        &format!("{provider_id}:{session_id}:{value}"),
+    ))
+}
+
+fn acp_stable_plan_id(provider_id: &AgentProviderId, session_id: SessionId, value: &str) -> PlanId {
+    PlanId::from_uuid(acp_stable_uuid(
+        "plan",
+        &format!("{provider_id}:{session_id}:{value}"),
+    ))
+}
+
+fn acp_native_ref(
+    provider_id: &AgentProviderId,
+    method: Option<&str>,
+    native_id: Option<String>,
+    summary: &str,
+) -> NativeRef {
+    NativeRef {
+        protocol: "acp-stdio".to_owned(),
+        method: method.map(str::to_owned),
+        kind: Some(provider_id.to_string()),
+        native_id,
+        summary: Some(summary.to_owned()),
+        hash: None,
+        pointer: None,
+    }
+}
+
+fn acp_universal_events_from_normalized(
+    provider_id: AgentProviderId,
+    method: Option<&str>,
+    event: NormalizedEvent,
+) -> Vec<crate::agents::adapter::AdapterEvent> {
+    match acp_universal_event_from_normalized(&provider_id, method, event) {
+        Ok(event) => vec![event],
+        Err(event) => crate::agents::adapter::normalized_events_to_adapter_events(
+            provider_id,
+            "acp-stdio",
+            method,
+            vec![*event],
+        ),
+    }
+}
+
+fn send_acp_event(
+    event_sender: &mpsc::UnboundedSender<crate::agents::adapter::AdapterEvent>,
+    provider_id: AgentProviderId,
+    method: Option<&str>,
+    event: NormalizedEvent,
+) {
+    for event in acp_universal_events_from_normalized(provider_id.clone(), method, event) {
+        event_sender.send(event).ok();
+    }
+}
+
+fn acp_universal_event_from_normalized(
+    provider_id: &AgentProviderId,
+    method: Option<&str>,
+    event: NormalizedEvent,
+) -> Result<crate::agents::adapter::AdapterEvent, Box<NormalizedEvent>> {
+    let session_id = acp_normalized_session_id(&event).ok_or_else(|| Box::new(event.clone()))?;
+    let summary = acp_universal_summary(provider_id, &event);
+    let native = acp_native_ref(
+        provider_id,
+        method,
+        acp_normalized_native_id(&event),
+        &summary,
+    );
+    let (turn_id, item_id, universal) = match &event {
+        NormalizedEvent::AgentMessageDelta(event) => {
+            let item_id = acp_stable_item_id(provider_id, event.session_id, &event.message_id);
+            (
+                None,
+                Some(item_id),
+                UniversalEventKind::ContentDelta {
+                    block_id: format!("acp-text-{}", event.message_id),
+                    kind: Some(ContentBlockKind::Text),
+                    delta: event.delta.clone(),
+                },
+            )
+        }
+        NormalizedEvent::AgentMessageCompleted(event) => {
+            let item_id = acp_stable_item_id(provider_id, event.session_id, &event.message_id);
+            (
+                None,
+                Some(item_id),
+                UniversalEventKind::ContentCompleted {
+                    block_id: format!("acp-text-{}", event.message_id),
+                    kind: Some(ContentBlockKind::Text),
+                    text: event.content.clone(),
+                },
+            )
+        }
+        NormalizedEvent::PlanUpdated(event) => {
+            let plan_id = acp_stable_plan_id(
+                provider_id,
+                event.session_id,
+                event.plan_id.as_deref().unwrap_or("active"),
+            );
+            (
+                None,
+                None,
+                UniversalEventKind::PlanUpdated {
+                    plan: PlanState {
+                        plan_id,
+                        session_id: event.session_id,
+                        turn_id: None,
+                        status: PlanStatus::Draft,
+                        title: event.title.clone(),
+                        content: event.content.clone(),
+                        entries: event
+                            .entries
+                            .iter()
+                            .enumerate()
+                            .map(|(index, entry)| UniversalPlanEntry {
+                                entry_id: format!("entry-{index}"),
+                                label: entry.label.clone(),
+                                status: entry.status.clone(),
+                            })
+                            .collect(),
+                        artifact_refs: Vec::new(),
+                        source: PlanSource::NativeStructured,
+                        partial: event.append,
+                        updated_at: None,
+                    },
+                },
+            )
+        }
+        NormalizedEvent::ToolStarted(event) | NormalizedEvent::ToolUpdated(event) => {
+            let item_id = acp_stable_item_id(provider_id, event.session_id, &event.tool_call_id);
+            (
+                None,
+                Some(item_id),
+                UniversalEventKind::ItemCreated {
+                    item: Box::new(acp_tool_item(
+                        event,
+                        item_id,
+                        ItemStatus::Streaming,
+                        native.clone(),
+                    )),
+                },
+            )
+        }
+        NormalizedEvent::ToolCompleted(event) => {
+            let item_id = acp_stable_item_id(provider_id, event.session_id, &event.tool_call_id);
+            (
+                None,
+                Some(item_id),
+                UniversalEventKind::ItemCreated {
+                    item: Box::new(acp_tool_item(
+                        event,
+                        item_id,
+                        ItemStatus::Completed,
+                        native.clone(),
+                    )),
+                },
+            )
+        }
+        NormalizedEvent::ApprovalRequested(event) => (
+            None,
+            None,
+            UniversalEventKind::ApprovalRequested {
+                approval: Box::new(ApprovalRequest {
+                    approval_id: event.approval_id,
+                    session_id: event.session_id,
+                    turn_id: event.turn_id,
+                    item_id: event.item_id,
+                    kind: event.kind.clone(),
+                    title: event.title.clone(),
+                    details: event.details.clone(),
+                    options: event.options.clone(),
+                    status: ApprovalStatus::Pending,
+                    risk: event.risk.clone(),
+                    subject: event.subject.clone().or_else(|| event.details.clone()),
+                    native_request_id: event.native_request_id.clone(),
+                    native_blocking: event.native_blocking,
+                    policy: event.policy.clone(),
+                    native: Some(native.clone()),
+                    requested_at: None,
+                    resolved_at: None,
+                }),
+            },
+        ),
+        NormalizedEvent::Error(event) if event.session_id.is_some() => (
+            None,
+            None,
+            UniversalEventKind::ErrorReported {
+                code: event.code.clone(),
+                message: event.message.clone(),
+            },
+        ),
+        NormalizedEvent::NativeNotification(_) => return Err(Box::new(event)),
+        _ => return Err(Box::new(event)),
+    };
+    Ok(crate::agents::adapter::AdapterEvent::from_universal(
+        session_id,
+        turn_id,
+        item_id,
+        Some(native),
+        universal,
+    ))
+}
+
+fn acp_tool_item(
+    event: &ToolEvent,
+    item_id: ItemId,
+    status: ItemStatus,
+    native: NativeRef,
+) -> ItemState {
+    ItemState {
+        item_id,
+        session_id: event.session_id,
+        turn_id: None,
+        role: ItemRole::Tool,
+        status: status.clone(),
+        content: vec![ContentBlock {
+            block_id: format!("acp-tool-{}", event.tool_call_id),
+            kind: if status == ItemStatus::Completed {
+                ContentBlockKind::ToolResult
+            } else {
+                ContentBlockKind::ToolCall
+            },
+            text: event.title.clone().or_else(|| Some(event.name.clone())),
+            mime_type: None,
+            artifact_id: None,
+        }],
+        tool: Some(ToolProjection {
+            kind: ToolProjectionKind::Tool,
+            name: event.name.clone(),
+            title: event.title.clone().unwrap_or_else(|| event.name.clone()),
+            status,
+            detail: event
+                .output
+                .as_ref()
+                .or(event.input.as_ref())
+                .and_then(|value| serde_json::to_string_pretty(value).ok()),
+            input_summary: event
+                .input
+                .as_ref()
+                .and_then(|value| serde_json::to_string_pretty(value).ok()),
+            output_summary: event
+                .output
+                .as_ref()
+                .and_then(|value| serde_json::to_string_pretty(value).ok()),
+            command: None,
+            subagent: None,
+            mcp: None,
+        }),
+        native: Some(native),
+    }
+}
+
+fn acp_normalized_session_id(event: &NormalizedEvent) -> Option<SessionId> {
+    match event {
+        NormalizedEvent::AgentMessageDelta(event) => Some(event.session_id),
+        NormalizedEvent::AgentMessageCompleted(event) => Some(event.session_id),
+        NormalizedEvent::PlanUpdated(event) => Some(event.session_id),
+        NormalizedEvent::ToolStarted(event)
+        | NormalizedEvent::ToolUpdated(event)
+        | NormalizedEvent::ToolCompleted(event) => Some(event.session_id),
+        NormalizedEvent::ApprovalRequested(event) => Some(event.session_id),
+        NormalizedEvent::Error(event) => event.session_id,
+        NormalizedEvent::NativeNotification(event) => Some(event.session_id),
+        _ => None,
+    }
+}
+
+fn acp_normalized_native_id(event: &NormalizedEvent) -> Option<String> {
+    match event {
+        NormalizedEvent::AgentMessageDelta(event) => Some(event.message_id.clone()),
+        NormalizedEvent::AgentMessageCompleted(event) => Some(event.message_id.clone()),
+        NormalizedEvent::PlanUpdated(event) => event.plan_id.clone(),
+        NormalizedEvent::ToolStarted(event)
+        | NormalizedEvent::ToolUpdated(event)
+        | NormalizedEvent::ToolCompleted(event) => Some(event.tool_call_id.clone()),
+        NormalizedEvent::ApprovalRequested(event) => Some(event.approval_id.to_string()),
+        NormalizedEvent::NativeNotification(event) => event.event_id.clone(),
+        _ => None,
+    }
+}
+
+fn acp_universal_summary(provider_id: &AgentProviderId, event: &NormalizedEvent) -> String {
+    let prefix = provider_id.to_string();
+    match event {
+        NormalizedEvent::AgentMessageDelta(_) => format!("{prefix} assistant message delta"),
+        NormalizedEvent::AgentMessageCompleted(_) => {
+            format!("{prefix} assistant message completed")
+        }
+        NormalizedEvent::PlanUpdated(_) => format!("{prefix} plan update"),
+        NormalizedEvent::ToolStarted(_) | NormalizedEvent::ToolUpdated(_) => {
+            format!("{prefix} tool update")
+        }
+        NormalizedEvent::ToolCompleted(_) => format!("{prefix} tool completed"),
+        NormalizedEvent::ApprovalRequested(_) => format!("{prefix} permission requested"),
+        NormalizedEvent::Error(_) => format!("{prefix} error"),
+        _ => format!("{prefix} native event"),
+    }
+}
+
 #[allow(dead_code)]
 pub mod acp_codec {
     use serde_json::Value;
@@ -808,9 +1141,7 @@ pub mod acp_reducer {
     use serde_json::Value;
     use uuid::Uuid;
 
-    use crate::agents::adapter::{
-        normalized_events_to_adapter_events, AdapterEvent, AdapterUniversalEvent,
-    };
+    use crate::agents::adapter::{AdapterEvent, AdapterUniversalEvent};
 
     #[derive(Clone, Debug)]
     pub struct AcpReducerState {
@@ -928,12 +1259,12 @@ pub mod acp_reducer {
         message: &Value,
     ) -> Vec<AdapterEvent> {
         let method = super::acp_codec::method(message);
-        normalized_events_to_adapter_events(
-            provider_id.clone(),
-            "acp-stdio",
-            method,
-            super::normalize_acp_message(session_id, provider_id, message),
-        )
+        super::normalize_acp_message(session_id, provider_id.clone(), message)
+            .into_iter()
+            .flat_map(|event| {
+                super::acp_universal_events_from_normalized(provider_id.clone(), method, event)
+            })
+            .collect()
     }
 }
 
@@ -1156,8 +1487,9 @@ impl AcpTerminalService {
     async fn create_terminal(
         &self,
         session_id: SessionId,
+        provider_id: AgentProviderId,
         message: &Value,
-        event_sender: mpsc::UnboundedSender<NormalizedEvent>,
+        event_sender: mpsc::UnboundedSender<crate::agents::adapter::AdapterEvent>,
     ) -> anyhow::Result<Value> {
         let command = string_at(message, &["/params/command", "/params/cmd"])
             .ok_or_else(|| anyhow!("ACP terminal/create missing command"))?
@@ -1171,8 +1503,11 @@ impl AcpTerminalService {
                 started_at: Instant::now(),
             },
         );
-        event_sender
-            .send(NormalizedEvent::CommandStarted(CommandEvent {
+        send_acp_event(
+            &event_sender,
+            provider_id.clone(),
+            Some("terminal/create"),
+            NormalizedEvent::CommandStarted(CommandEvent {
                 session_id,
                 command_id: terminal_id.clone(),
                 command: command.clone(),
@@ -1181,8 +1516,8 @@ impl AcpTerminalService {
                 process_id: None,
                 actions: Vec::new(),
                 provider_payload: Some(message.clone()),
-            }))
-            .ok();
+            }),
+        );
 
         let terminals = self.terminals.clone();
         let terminal_id_for_task = terminal_id.clone();
@@ -1214,26 +1549,32 @@ impl AcpTerminalService {
                 }
             };
             if !text.is_empty() {
-                event_sender
-                    .send(NormalizedEvent::CommandOutputDelta(CommandOutputEvent {
+                send_acp_event(
+                    &event_sender,
+                    provider_id.clone(),
+                    Some("terminal/output"),
+                    NormalizedEvent::CommandOutputDelta(CommandOutputEvent {
                         session_id,
                         command_id: terminal_id_for_task.clone(),
                         stream: CommandOutputStream::Stdout,
                         delta: text,
                         provider_payload: None,
-                    }))
-                    .ok();
+                    }),
+                );
             }
-            event_sender
-                .send(NormalizedEvent::CommandCompleted(CommandCompletedEvent {
+            send_acp_event(
+                &event_sender,
+                provider_id,
+                Some("terminal/wait_for_exit"),
+                NormalizedEvent::CommandCompleted(CommandCompletedEvent {
                     session_id,
                     command_id: terminal_id_for_task,
                     exit_code: Some(exit_code),
                     duration_ms,
                     success: exit_code == 0,
                     provider_payload: None,
-                }))
-                .ok();
+                }),
+            );
         });
 
         Ok(json!({ "terminalId": terminal_id }))
@@ -1622,7 +1963,10 @@ mod tests {
         assert_eq!(native.method.as_deref(), Some("session/update"));
         assert_eq!(native.kind.as_deref(), Some(AgentProviderId::QWEN));
         assert_eq!(native.native_id.as_deref(), Some("chunk-1"));
-        assert_eq!(native.summary.as_deref(), Some("assistant message delta"));
+        assert_eq!(
+            native.summary.as_deref(),
+            Some("qwen assistant message delta")
+        );
         let agenter_core::UniversalEventKind::ContentDelta {
             block_id,
             kind,
@@ -1631,7 +1975,7 @@ mod tests {
         else {
             panic!("expected universal content delta");
         };
-        assert_eq!(block_id, "text-chunk-1");
+        assert_eq!(block_id, "acp-text-chunk-1");
         assert_eq!(kind, &Some(agenter_core::ContentBlockKind::Text));
         assert_eq!(delta, "hello");
     }
@@ -1670,7 +2014,7 @@ mod tests {
                 _ => None,
             })
             .expect("message delta");
-        assert_eq!(content.0, "text-msg-1");
+        assert_eq!(content.0, "acp-text-msg-1");
         assert_eq!(content.1, &Some(agenter_core::ContentBlockKind::Text));
         assert_eq!(content.2, "hello");
         let tool = semantic
@@ -1755,6 +2099,7 @@ mod tests {
                 .iter()
                 .flat_map(|message| reducer.reduce_native_message(message))
                 .collect::<Vec<_>>();
+            let expected_plan_summary = format!("{provider} plan update");
 
             assert!(semantic.iter().all(|event| {
                 event.universal.session_id == Some(session_id)
@@ -1763,12 +2108,22 @@ mod tests {
             assert!(semantic.iter().any(|event| matches!(
                 event.universal.event,
                 agenter_core::UniversalEventKind::PlanUpdated { .. }
-            )));
+            ) && event
+                .universal
+                .native
+                .as_ref()
+                .and_then(|native| native.summary.as_deref())
+                == Some(expected_plan_summary.as_str())));
             assert!(semantic.iter().any(|event| matches!(
                 event.universal.event,
                 agenter_core::UniversalEventKind::ItemCreated { .. }
                     | agenter_core::UniversalEventKind::ContentDelta { .. }
-            )));
+            ) && event
+                .universal
+                .native
+                .as_ref()
+                .and_then(|native| native.summary.as_deref())
+                .is_some_and(|summary| summary.starts_with(provider))));
 
             let permission = messages
                 .as_array()
@@ -1779,12 +2134,14 @@ mod tests {
             let (_approval_id, source) =
                 normalize_acp_permission_request(session_id, provider_id.clone(), permission)
                     .expect("permission should normalize");
-            let approval = crate::agents::adapter::AdapterEvent::from_normalized_event(
+            let approval = acp_universal_events_from_normalized(
                 provider_id,
-                "acp-stdio",
                 Some("session/request_permission"),
                 source,
             )
+            .into_iter()
+            .next()
+            .expect("permission universal event")
             .with_turn_id(turn_id);
             let agenter_core::UniversalEventKind::ApprovalRequested { approval } =
                 approval.universal.event

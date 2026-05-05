@@ -13,8 +13,8 @@ use agenter_core::{
     ApprovalId, ApprovalKind, ApprovalRequestEvent, CommandCompletedEvent, CommandEvent,
     CommandOutputEvent, CommandOutputStream, FileChangeEvent, FileChangeKind,
     MessageCompletedEvent, NormalizedEvent, ProviderCapabilityDetail, ProviderCapabilityStatus,
-    QuestionId, RunnerId, SessionId, SessionStatus, SessionStatusChangedEvent, ToolEvent,
-    UserMessageEvent, WorkspaceId, WorkspaceRef,
+    QuestionId, RunnerId, SessionId, SessionStatus, ToolEvent, UserMessageEvent, WorkspaceId,
+    WorkspaceRef,
 };
 use agenter_protocol::runner::{
     AgentInput, AgentProviderAdvertisement, DiscoveredSession, DiscoveredSessionHistoryStatus,
@@ -42,6 +42,7 @@ use agents::codex_protocol_coverage::{
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::watch;
 use tokio::sync::{mpsc, Mutex};
+use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 use wal::{RunnerWal, RunnerWalRecord};
@@ -647,24 +648,15 @@ async fn run_codex_runner() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or(env::current_dir()?);
     let workspace_path = workspace_path.canonicalize().unwrap_or(workspace_path);
-    tracing::info!(url = %url, workspace = %workspace_path.display(), "connecting codex runner to control plane");
-    let (socket, _) = connect_async(&url).await?;
-    let (mut sender, mut receiver) = socket.split();
-    let mut server_message_reassembler =
-        RunnerTransportChunkReassembler::new(runner_ws_max_message_bytes());
-    let mut hello = codex_hello(token, workspace_path.clone());
-    let wal = RunnerWal::open(runner_wal_path(hello.runner_id, &workspace_path)).await?;
-    let acked = wal.acked_seq().await;
-    hello.acked_runner_event_seq = (acked > 0).then_some(acked);
-    hello.replay_from_runner_event_seq = wal
-        .unacked()
-        .await
-        .first()
-        .map(|record| record.runner_event_seq);
-    let advertised_workspace = hello.workspaces.first().cloned();
-    tracing::info!(runner_id = %hello.runner_id, "sending codex runner hello");
-    send_runner_message(&mut sender, RunnerClientMessage::Hello(hello)).await?;
-    replay_unacked_wal(&mut sender, &wal).await?;
+    let hello_template = codex_hello(token, workspace_path.clone());
+    let wal = RunnerWal::open(runner_wal_path(hello_template.runner_id, &workspace_path)).await?;
+    tracing::info!(
+        url = %url,
+        runner_id = %hello_template.runner_id,
+        workspace = %workspace_path.display(),
+        "starting reconnect-stable codex runner"
+    );
+    let advertised_workspace = hello_template.workspaces.first().cloned();
 
     let pending_approvals: Arc<Mutex<HashMap<ApprovalId, PendingCodexApproval>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -674,7 +666,7 @@ async fn run_codex_runner() -> anyhow::Result<()> {
     let (background_event_sender, mut background_event_receiver) =
         mpsc::unbounded_channel::<(Option<RequestId>, RunnerEvent)>();
     let codex_runtime = CodexRunnerRuntime::new(workspace_path.clone());
-    if let Some(workspace) = advertised_workspace {
+    if let Some(workspace) = advertised_workspace.clone() {
         let runtime = codex_runtime.clone();
         let sender = background_event_sender.clone();
         tokio::spawn(async move {
@@ -706,19 +698,58 @@ async fn run_codex_runner() -> anyhow::Result<()> {
     }
 
     loop {
+        tracing::info!(url = %url, runner_id = %hello_template.runner_id, "connecting codex runner to control plane");
+        let (socket, _) = match connect_async(&url).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                tracing::warn!(%error, "codex runner websocket connect failed; retrying");
+                sleep(runner_reconnect_delay()).await;
+                continue;
+            }
+        };
+        let (mut sender, mut receiver) = socket.split();
+        let mut server_message_reassembler =
+            RunnerTransportChunkReassembler::new(runner_ws_max_message_bytes());
+        let mut hello = hello_template.clone();
+        let acked = wal.acked_seq().await;
+        hello.acked_runner_event_seq = (acked > 0).then_some(acked);
+        hello.replay_from_runner_event_seq = wal
+            .unacked()
+            .await
+            .first()
+            .map(|record| record.runner_event_seq);
+        tracing::info!(runner_id = %hello.runner_id, "sending codex runner hello");
+        if let Err(error) =
+            send_runner_message(&mut sender, RunnerClientMessage::Hello(hello)).await
+        {
+            tracing::warn!(%error, "failed to send codex runner hello; reconnecting");
+            sleep(runner_reconnect_delay()).await;
+            continue;
+        }
+        if let Err(error) = replay_unacked_wal(&mut sender, &wal).await {
+            tracing::warn!(%error, "failed to replay codex runner WAL; reconnecting");
+            sleep(runner_reconnect_delay()).await;
+            continue;
+        }
+
+        let transport_result: anyhow::Result<()> = async {
+            loop {
         tokio::select! {
             background = background_event_receiver.recv() => {
                 let Some((request_id, event)) = background else {
                     continue;
                 };
-                send_wal_event(
+                if let Err(error) = send_wal_event(
                     &mut sender,
                     &wal,
                     request_id,
                     None,
                     event,
                 )
-                .await?;
+                .await {
+                    tracing::warn!(%error, "failed to send codex background event; reconnecting");
+                    break;
+                }
             }
             event = codex_event_receiver.recv() => {
                 let Some(event) = event else {
@@ -728,14 +759,17 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                     continue;
                 };
                 let session_id = agent_event.session_id;
-                send_wal_event(
+                if let Err(error) = send_wal_event(
                     &mut sender,
                     &wal,
                     None,
                     Some(session_id),
                     RunnerEvent::AgentEvent(Box::new(agent_event)),
                 )
-                .await?;
+                .await {
+                    tracing::warn!(%error, "failed to send codex agent event; reconnecting");
+                    break;
+                }
             }
             message = receiver.next() => {
                 let Some(message) = message else {
@@ -1059,8 +1093,20 @@ async fn run_codex_runner() -> anyhow::Result<()> {
                 }
             }
         }
+            }
+
+            #[allow(unreachable_code)]
+            Ok(())
+        }
+        .await;
+        if let Err(error) = transport_result {
+            tracing::warn!(%error, "codex runner transport session failed; reconnecting");
+        }
+
+        sleep(runner_reconnect_delay()).await;
     }
 
+    #[allow(unreachable_code)]
     Ok(())
 }
 
@@ -1081,30 +1127,17 @@ async fn run_acp_runner(
         .map(PathBuf::from)
         .unwrap_or(env::current_dir()?);
     let workspace_path = workspace_path.canonicalize().unwrap_or(workspace_path);
+    let hello_template = acp_hello(token, workspace_path.clone(), &profiles, include_codex);
+    let wal = RunnerWal::open(runner_wal_path(hello_template.runner_id, &workspace_path)).await?;
+    let advertised_workspace = hello_template.workspaces.first().cloned();
     tracing::info!(
         url = %url,
+        runner_id = %hello_template.runner_id,
         workspace = %workspace_path.display(),
         provider_count = profiles.len(),
         include_codex,
-        "connecting multi-provider runner to control plane"
+        "starting reconnect-stable multi-provider runner"
     );
-    let (socket, _) = connect_async(&url).await?;
-    let (mut sender, mut receiver) = socket.split();
-    let mut server_message_reassembler =
-        RunnerTransportChunkReassembler::new(runner_ws_max_message_bytes());
-    let mut hello = acp_hello(token, workspace_path.clone(), &profiles, include_codex);
-    let wal = RunnerWal::open(runner_wal_path(hello.runner_id, &workspace_path)).await?;
-    let acked = wal.acked_seq().await;
-    hello.acked_runner_event_seq = (acked > 0).then_some(acked);
-    hello.replay_from_runner_event_seq = wal
-        .unacked()
-        .await
-        .first()
-        .map(|record| record.runner_event_seq);
-    let advertised_workspace = hello.workspaces.first().cloned();
-    tracing::info!(runner_id = %hello.runner_id, "sending ACP runner hello");
-    send_runner_message(&mut sender, RunnerClientMessage::Hello(hello)).await?;
-    replay_unacked_wal(&mut sender, &wal).await?;
 
     let profiles_by_id = profiles
         .into_iter()
@@ -1130,7 +1163,7 @@ async fn run_acp_runner(
         Arc::new(Mutex::new(HashMap::new()));
     let pending_codex_questions: Arc<Mutex<HashMap<QuestionId, PendingCodexQuestion>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    let (acp_event_sender, mut acp_event_receiver) = mpsc::unbounded_channel::<NormalizedEvent>();
+    let (acp_event_sender, mut acp_event_receiver) = mpsc::unbounded_channel::<AdapterEvent>();
     let (codex_event_sender, mut codex_event_receiver) = mpsc::unbounded_channel::<AdapterEvent>();
     let (background_event_sender, mut background_event_receiver) =
         mpsc::unbounded_channel::<(Option<RequestId>, RunnerEvent)>();
@@ -1138,40 +1171,78 @@ async fn run_acp_runner(
     let codex_runtime = include_codex.then(|| CodexRunnerRuntime::new(workspace_path.clone()));
 
     loop {
+        tracing::info!(url = %url, runner_id = %hello_template.runner_id, "connecting multi-provider runner to control plane");
+        let (socket, _) = match connect_async(&url).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                tracing::warn!(%error, "multi-provider runner websocket connect failed; retrying");
+                sleep(runner_reconnect_delay()).await;
+                continue;
+            }
+        };
+        let (mut sender, mut receiver) = socket.split();
+        let mut server_message_reassembler =
+            RunnerTransportChunkReassembler::new(runner_ws_max_message_bytes());
+        let mut hello = hello_template.clone();
+        let acked = wal.acked_seq().await;
+        hello.acked_runner_event_seq = (acked > 0).then_some(acked);
+        hello.replay_from_runner_event_seq = wal
+            .unacked()
+            .await
+            .first()
+            .map(|record| record.runner_event_seq);
+        tracing::info!(runner_id = %hello.runner_id, "sending ACP runner hello");
+        if let Err(error) =
+            send_runner_message(&mut sender, RunnerClientMessage::Hello(hello)).await
+        {
+            tracing::warn!(%error, "failed to send multi-provider runner hello; reconnecting");
+            sleep(runner_reconnect_delay()).await;
+            continue;
+        }
+        if let Err(error) = replay_unacked_wal(&mut sender, &wal).await {
+            tracing::warn!(%error, "failed to replay multi-provider runner WAL; reconnecting");
+            sleep(runner_reconnect_delay()).await;
+            continue;
+        }
+
+        let transport_result: anyhow::Result<()> = async {
+            loop {
         tokio::select! {
             background = background_event_receiver.recv() => {
                 let Some((request_id, event)) = background else {
                     continue;
                 };
-                send_wal_event(
+                if let Err(error) = send_wal_event(
                     &mut sender,
                     &wal,
                     request_id,
                     None,
                     event,
                 )
-                .await?;
+                .await {
+                    tracing::warn!(%error, "failed to send multi-provider background event; reconnecting");
+                    break;
+                }
             }
             event = acp_event_receiver.recv() => {
-                let Some(event) = event else {
+                let Some(adapter_event) = event else {
                     continue;
                 };
-                let provider_id = normalized_event_provider_id(&event)
-                    .unwrap_or_else(|| AgentProviderId::from("adapter"));
-                let adapter_event =
-                    AdapterEvent::from_normalized_event(provider_id, "runner-adapter", None, event);
                 let Some(agent_event) = adapter_event.universal_projection_for_wal() else {
                     continue;
                 };
                 let session_id = agent_event.session_id;
-                send_wal_event(
+                if let Err(error) = send_wal_event(
                     &mut sender,
                     &wal,
                     None,
                     Some(session_id),
                     RunnerEvent::AgentEvent(Box::new(agent_event)),
                 )
-                .await?;
+                .await {
+                    tracing::warn!(%error, "failed to send ACP agent event; reconnecting");
+                    break;
+                }
             }
             event = codex_event_receiver.recv() => {
                 let Some(event) = event else {
@@ -1181,14 +1252,17 @@ async fn run_acp_runner(
                     continue;
                 };
                 let session_id = agent_event.session_id;
-                send_wal_event(
+                if let Err(error) = send_wal_event(
                     &mut sender,
                     &wal,
                     None,
                     Some(session_id),
                     RunnerEvent::AgentEvent(Box::new(agent_event)),
                 )
-                .await?;
+                .await {
+                    tracing::warn!(%error, "failed to send Codex agent event from multi-provider runner; reconnecting");
+                    break;
+                }
             }
             message = receiver.next() => {
                 let Some(message) = message else {
@@ -1644,17 +1718,26 @@ async fn run_acp_runner(
                         tokio::spawn(async move {
                             if let Err(error) = runtime.run_turn(request, profile, event_sender.clone(), pending).await {
                                 tracing::error!(%session_id, %error, "ACP turn failed");
-                                event_sender.send(NormalizedEvent::SessionStatusChanged(SessionStatusChangedEvent {
-                                    session_id,
-                                    status: SessionStatus::Failed,
-                                    reason: Some(error.to_string()),
-                                })).ok();
-                                event_sender.send(NormalizedEvent::Error(AgentErrorEvent {
-                                    session_id: Some(session_id),
-                                    code: Some("acp_adapter_error".to_owned()),
-                                    message: error.to_string(),
-                                    provider_payload: None,
-                                })).ok();
+                                event_sender
+                                    .send(AdapterEvent::session_status(
+                                        AgentProviderId::from("acp"),
+                                        "acp-stdio",
+                                        None,
+                                        session_id,
+                                        SessionStatus::Failed,
+                                        Some(error.to_string()),
+                                    ))
+                                    .ok();
+                                event_sender
+                                    .send(AdapterEvent::error(
+                                        AgentProviderId::from("acp"),
+                                        "acp-stdio",
+                                        None,
+                                        session_id,
+                                        Some("acp_adapter_error".to_owned()),
+                                        error.to_string(),
+                                    ))
+                                    .ok();
                             }
                         });
                     }
@@ -1869,11 +1952,14 @@ async fn run_acp_runner(
                         }
                         adapter_runtime.unbind_session(command.session_id);
                         acp_event_sender
-                            .send(NormalizedEvent::SessionStatusChanged(SessionStatusChangedEvent {
-                                session_id: command.session_id,
-                                status: SessionStatus::Stopped,
-                                reason: Some("ACP session runtime stopped.".to_owned()),
-                            }))
+                            .send(AdapterEvent::session_status(
+                                AgentProviderId::from("acp"),
+                                "acp-stdio",
+                                None,
+                                command.session_id,
+                                SessionStatus::Stopped,
+                                Some("ACP session runtime stopped.".to_owned()),
+                            ))
                             .ok();
                         send_runner_message(
                             &mut sender,
@@ -1889,11 +1975,23 @@ async fn run_acp_runner(
                 }
             }
         }
+            }
+
+            #[allow(unreachable_code)]
+            Ok(())
+        }
+        .await;
+
+        if let Some(ref workspace) = advertised_workspace {
+            tracing::debug!(workspace = %workspace.path, "ACP runner closed");
+        }
+        if let Err(error) = transport_result {
+            tracing::warn!(%error, "multi-provider runner transport session failed; reconnecting");
+        }
+        sleep(runner_reconnect_delay()).await;
     }
 
-    if let Some(workspace) = advertised_workspace {
-        tracing::debug!(workspace = %workspace.path, "ACP runner closed");
-    }
+    #[allow(unreachable_code)]
     Ok(())
 }
 
@@ -2219,6 +2317,10 @@ fn runner_ws_max_message_bytes() -> usize {
         "AGENTER_RUNNER_WS_MAX_MESSAGE_BYTES",
         DEFAULT_RUNNER_WS_MAX_MESSAGE_BYTES,
     )
+}
+
+fn runner_reconnect_delay() -> Duration {
+    Duration::from_secs(env_usize("AGENTER_RUNNER_RECONNECT_SECONDS", 2) as u64)
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -2624,18 +2726,6 @@ fn agent_input_text(input: &AgentInput) -> String {
     match input {
         AgentInput::Text { text } => text.clone(),
         AgentInput::UserMessage { payload } => payload.content.clone(),
-    }
-}
-
-fn normalized_event_provider_id(event: &NormalizedEvent) -> Option<AgentProviderId> {
-    match event {
-        NormalizedEvent::TurnDiffUpdated(event)
-        | NormalizedEvent::ItemReasoning(event)
-        | NormalizedEvent::ServerRequestResolved(event)
-        | NormalizedEvent::McpToolCallProgress(event)
-        | NormalizedEvent::ThreadRealtimeEvent(event)
-        | NormalizedEvent::NativeNotification(event) => Some(event.provider_id.clone()),
-        _ => None,
     }
 }
 

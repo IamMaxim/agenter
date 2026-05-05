@@ -21,20 +21,24 @@ use agenter_core::{
     AgentCollaborationMode, AgentErrorEvent, AgentMessageDeltaEvent, AgentModelOption,
     AgentOptions, AgentProviderId, AgentQuestionAnswer, AgentQuestionChoice, AgentQuestionField,
     AgentReasoningEffort, AgentTurnSettings, ApprovalDecision, ApprovalId, ApprovalKind,
-    ApprovalRequestEvent, ApprovalResolvedEvent, CommandCompletedEvent, CommandEvent,
-    CommandOutputEvent, CommandOutputStream, FileChangeEvent, FileChangeKind,
-    MessageCompletedEvent, NativeNotification, NormalizedEvent, PlanEntry, PlanEntryStatus,
-    PlanEvent, QuestionAnsweredEvent, QuestionId, QuestionRequestedEvent, SessionId, SessionStatus,
-    SessionStatusChangedEvent, SlashCommandArgument, SlashCommandArgumentKind,
-    SlashCommandDangerLevel, SlashCommandDefinition, SlashCommandRequest, SlashCommandResult,
-    SlashCommandTarget, TurnId, TurnState, TurnStatus,
+    ApprovalRequest, ApprovalRequestEvent, ApprovalResolvedEvent, ApprovalStatus,
+    CommandCompletedEvent, CommandEvent, CommandOutputEvent, CommandOutputStream, ContentBlock,
+    ContentBlockKind, DiffState, FileChangeEvent, FileChangeKind, ItemId, ItemRole, ItemState,
+    ItemStatus, MessageCompletedEvent, NativeNotification, NativeRef, NormalizedEvent, PlanEntry,
+    PlanEntryStatus, PlanEvent, PlanId, PlanSource, PlanState, PlanStatus, ProviderNotification,
+    ProviderNotificationSeverity, QuestionAnsweredEvent, QuestionId, QuestionRequestedEvent,
+    SessionId, SessionStatus, SessionStatusChangedEvent, SessionUsageContext, SessionUsageSnapshot,
+    SessionUsageWindow, SlashCommandArgument, SlashCommandArgumentKind, SlashCommandDangerLevel,
+    SlashCommandDefinition, SlashCommandRequest, SlashCommandResult, SlashCommandTarget,
+    ToolCommandProjection, ToolProjection, ToolProjectionKind, TurnId, TurnState, TurnStatus,
+    UniversalEventKind, UniversalPlanEntry,
 };
 use agenter_protocol::{
     DiscoveredCommandAction, DiscoveredFileChangeStatus, DiscoveredSessionHistoryItem,
     DiscoveredToolStatus,
 };
 use anyhow::{anyhow, Context};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -98,6 +102,18 @@ fn stable_uuid(namespace: &str, value: &str) -> Uuid {
 
 fn stable_turn_id(value: &str) -> TurnId {
     TurnId::from_uuid(stable_uuid("turn", value))
+}
+
+fn stable_item_id(value: &str) -> ItemId {
+    ItemId::from_uuid(stable_uuid("item", value))
+}
+
+fn stable_plan_id(value: &str) -> PlanId {
+    PlanId::from_uuid(stable_uuid("plan", value))
+}
+
+fn stable_diff_id(value: &str) -> agenter_core::DiffId {
+    agenter_core::DiffId::from_uuid(stable_uuid("diff", value))
 }
 
 pub type PendingCodexApproval = PendingProviderApproval;
@@ -384,11 +400,7 @@ impl CodexScopeLogContext {
         let actual_thread_id = message_thread_id(message).map(str::to_owned);
         let actual_turn_id = message_turn_id(message).map(str::to_owned);
         let scope_match = codex_message_belongs_to_scope(message, scope);
-        let reason = if !scope_match {
-            Some("thread_id_mismatch".to_owned())
-        } else {
-            None
-        };
+        let reason = codex_scope_mismatch_reason(message, scope).map(str::to_owned);
         Self {
             expected_thread_id,
             expected_turn_id,
@@ -396,6 +408,14 @@ impl CodexScopeLogContext {
             actual_turn_id,
             scope_match,
             reason,
+        }
+    }
+
+    fn reason_static(&self) -> &'static str {
+        match self.reason.as_deref() {
+            Some("turn_id_mismatch") => "turn_id_mismatch",
+            Some("thread_id_mismatch") => "thread_id_mismatch",
+            _ => "scope_mismatch",
         }
     }
 }
@@ -1584,10 +1604,37 @@ pub async fn run_codex_turn_on_server(
                 }
                 continue;
             }
-            message = server.next_message() => message?,
+            message = server.next_message() => {
+                match message {
+                    Ok(message) => message,
+                    Err(error) => {
+                        finish_codex_turn_failed(
+                            request.session_id,
+                            &event_sender,
+                            &mut turn_driver,
+                            &mut pending_server_requests,
+                            &pending_approvals,
+                            &pending_questions,
+                            &format!("Codex app-server read failed before a terminal turn event: {error}"),
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                }
+            },
         };
         let Some(message) = message else {
-            break;
+            finish_codex_turn_detached(
+                request.session_id,
+                &event_sender,
+                &mut turn_driver,
+                &mut pending_server_requests,
+                &pending_approvals,
+                &pending_questions,
+                "Codex app-server stream ended before a terminal turn event.",
+            )
+            .await;
+            return Ok(());
         };
         scope.observe(&message);
         turn_driver.observe_targets(message_thread_id(&message), message_turn_id(&message));
@@ -1733,7 +1780,7 @@ pub async fn run_codex_turn_on_server(
             server.record_wire_message(
                 "internal",
                 "scope_dropped",
-                Some("thread_id_mismatch"),
+                Some(scope_context.reason_static()),
                 &message,
                 Some(scope_context.clone()),
             );
@@ -1805,16 +1852,18 @@ pub async fn run_codex_turn_on_server(
         }
     }
 
-    Ok(())
+    // All loop exits above return after emitting a terminal turn state.
 }
 
 fn codex_adapter_event(method: Option<&str>, event: NormalizedEvent) -> AdapterEvent {
-    AdapterEvent::from_normalized_event(
-        AgentProviderId::from(AgentProviderId::CODEX),
-        "codex-app-server",
-        method,
-        event,
-    )
+    codex_universal_event_from_normalized(method, event).unwrap_or_else(|event| {
+        AdapterEvent::from_normalized_event(
+            AgentProviderId::from(AgentProviderId::CODEX),
+            "codex-app-server",
+            method,
+            *event,
+        )
+    })
 }
 
 fn send_codex_event(
@@ -1823,6 +1872,765 @@ fn send_codex_event(
     event: NormalizedEvent,
 ) {
     event_sender.send(codex_adapter_event(method, event)).ok();
+}
+
+fn codex_native_ref(method: Option<&str>, native_id: Option<String>, summary: &str) -> NativeRef {
+    NativeRef {
+        protocol: "codex-app-server".to_owned(),
+        method: method.map(str::to_owned),
+        kind: Some(AgentProviderId::CODEX.to_owned()),
+        native_id,
+        summary: Some(summary.to_owned()),
+        hash: None,
+        pointer: None,
+    }
+}
+
+fn codex_turn_id_from_payload(payload: Option<&Value>) -> Option<TurnId> {
+    let payload = payload?;
+    string_at(
+        payload,
+        &[
+            "/params/turn/id",
+            "/params/turnId",
+            "/params/item/turnId",
+            "/params/item/turn/id",
+            "/result/turn/id",
+            "/result/turnId",
+            "/turnId",
+        ],
+    )
+    .map(stable_turn_id)
+}
+
+fn codex_universal_event_from_normalized(
+    method: Option<&str>,
+    event: NormalizedEvent,
+) -> Result<AdapterEvent, Box<NormalizedEvent>> {
+    let native_id = codex_normalized_native_id(&event);
+    let summary = codex_universal_summary(method, &event);
+    let native = codex_native_ref(method, native_id, summary);
+    let session_id = codex_normalized_session_id(&event);
+    let Some(session_id) = session_id else {
+        return Err(Box::new(event));
+    };
+    if let NormalizedEvent::NativeNotification(notification) = &event {
+        if let Some(usage) = codex_usage_snapshot_from_native_notification(notification) {
+            return Ok(AdapterEvent::from_universal(
+                session_id,
+                codex_turn_id_from_payload(notification.provider_payload.as_ref()),
+                None,
+                Some(native),
+                UniversalEventKind::UsageUpdated {
+                    usage: Box::new(usage),
+                },
+            ));
+        }
+    }
+    let (turn_id, item_id, universal) = match &event {
+        NormalizedEvent::SessionStatusChanged(event) => (
+            None,
+            None,
+            UniversalEventKind::SessionStatusChanged {
+                status: event.status.clone(),
+                reason: event.reason.clone(),
+            },
+        ),
+        NormalizedEvent::AgentMessageDelta(event) => {
+            let turn_id = codex_turn_id_from_payload(event.provider_payload.as_ref());
+            let item_id = stable_item_id(&format!(
+                "codex:assistant:{}:{}",
+                event.session_id, event.message_id
+            ));
+            (
+                turn_id,
+                Some(item_id),
+                UniversalEventKind::ContentDelta {
+                    block_id: format!("codex-text-{}", event.message_id),
+                    kind: Some(ContentBlockKind::Text),
+                    delta: event.delta.clone(),
+                },
+            )
+        }
+        NormalizedEvent::AgentMessageCompleted(event) => {
+            let turn_id = codex_turn_id_from_payload(event.provider_payload.as_ref());
+            if method == Some("turn/completed") {
+                let turn_id = turn_id.unwrap_or_else(|| stable_turn_id(&event.message_id));
+                return Ok(AdapterEvent::from_universal(
+                    session_id,
+                    Some(turn_id),
+                    None,
+                    Some(native),
+                    UniversalEventKind::TurnCompleted {
+                        turn: TurnState {
+                            turn_id,
+                            session_id,
+                            status: TurnStatus::Completed,
+                            started_at: None,
+                            completed_at: None,
+                            model: None,
+                            mode: None,
+                        },
+                    },
+                ));
+            }
+            (
+                turn_id,
+                Some(stable_item_id(&format!(
+                    "codex:assistant:{}:{}",
+                    event.session_id, event.message_id
+                ))),
+                UniversalEventKind::ContentCompleted {
+                    block_id: format!("codex-text-{}", event.message_id),
+                    kind: Some(ContentBlockKind::Text),
+                    text: event.content.clone(),
+                },
+            )
+        }
+        NormalizedEvent::PlanUpdated(event) => {
+            let turn_id = codex_turn_id_from_payload(event.provider_payload.as_ref());
+            let plan_id = stable_plan_id(&format!(
+                "codex:plan:{}:{}",
+                event.session_id,
+                event.plan_id.as_deref().unwrap_or("active")
+            ));
+            (
+                turn_id,
+                None,
+                UniversalEventKind::PlanUpdated {
+                    plan: PlanState {
+                        plan_id,
+                        session_id: event.session_id,
+                        turn_id,
+                        status: codex_plan_status(event.provider_payload.as_ref()),
+                        title: event.title.clone(),
+                        content: event.content.clone(),
+                        entries: event
+                            .entries
+                            .iter()
+                            .enumerate()
+                            .map(|(index, entry)| UniversalPlanEntry {
+                                entry_id: format!("entry-{index}"),
+                                label: entry.label.clone(),
+                                status: entry.status.clone(),
+                            })
+                            .collect(),
+                        artifact_refs: Vec::new(),
+                        source: PlanSource::NativeStructured,
+                        partial: event.append
+                            || codex_payload_bool(
+                                event.provider_payload.as_ref(),
+                                &[
+                                    "/params/partial",
+                                    "/params/isPartial",
+                                    "/params/update/partial",
+                                    "/params/update/isPartial",
+                                ],
+                            ),
+                        updated_at: None,
+                    },
+                },
+            )
+        }
+        NormalizedEvent::CommandStarted(event) => codex_command_item_event(
+            event.session_id,
+            codex_turn_id_from_payload(event.provider_payload.as_ref()),
+            &event.command_id,
+            &event.command,
+            event.cwd.clone(),
+            ItemStatus::Streaming,
+            native.clone(),
+        ),
+        NormalizedEvent::CommandOutputDelta(event) => {
+            let turn_id = codex_turn_id_from_payload(event.provider_payload.as_ref());
+            (
+                turn_id,
+                Some(stable_item_id(&format!(
+                    "codex:command:{}:{}",
+                    event.session_id, event.command_id
+                ))),
+                UniversalEventKind::ContentDelta {
+                    block_id: codex_command_output_block_id(&event.command_id, &event.stream),
+                    kind: Some(ContentBlockKind::CommandOutput),
+                    delta: event.delta.clone(),
+                },
+            )
+        }
+        NormalizedEvent::CommandCompleted(event) => {
+            let turn_id = codex_turn_id_from_payload(event.provider_payload.as_ref());
+            (
+                turn_id,
+                Some(stable_item_id(&format!(
+                    "codex:command:{}:{}",
+                    event.session_id, event.command_id
+                ))),
+                UniversalEventKind::ContentCompleted {
+                    block_id: format!("codex-command-{}-status", event.command_id),
+                    kind: Some(ContentBlockKind::CommandOutput),
+                    text: Some(if event.success {
+                        "command completed".to_owned()
+                    } else {
+                        "command failed".to_owned()
+                    }),
+                },
+            )
+        }
+        NormalizedEvent::TurnDiffUpdated(event) => {
+            let turn_id = codex_turn_id_from_payload(event.provider_payload.as_ref())
+                .or_else(|| event.event_id.as_deref().map(stable_turn_id));
+            (
+                turn_id,
+                None,
+                UniversalEventKind::DiffUpdated {
+                    diff: DiffState {
+                        diff_id: stable_diff_id(&format!(
+                            "codex:diff:{}:{}",
+                            event.session_id,
+                            event.event_id.as_deref().unwrap_or(&event.method)
+                        )),
+                        session_id: event.session_id,
+                        turn_id,
+                        title: Some(event.title.clone()),
+                        files: Vec::new(),
+                        updated_at: None,
+                    },
+                },
+            )
+        }
+        NormalizedEvent::ApprovalRequested(event) => {
+            let turn_id = codex_turn_id_from_payload(event.provider_payload.as_ref());
+            (
+                turn_id,
+                None,
+                UniversalEventKind::ApprovalRequested {
+                    approval: Box::new(ApprovalRequest {
+                        approval_id: event.approval_id,
+                        session_id: event.session_id,
+                        turn_id,
+                        item_id: event.item_id,
+                        kind: event.kind.clone(),
+                        title: event.title.clone(),
+                        details: event.details.clone(),
+                        options: event.options.clone(),
+                        status: ApprovalStatus::Pending,
+                        risk: event.risk.clone(),
+                        subject: event.subject.clone().or_else(|| event.details.clone()),
+                        native_request_id: event.native_request_id.clone(),
+                        native_blocking: event.native_blocking,
+                        policy: event.policy.clone(),
+                        native: Some(native.clone()),
+                        requested_at: None,
+                        resolved_at: None,
+                    }),
+                },
+            )
+        }
+        NormalizedEvent::ApprovalResolved(event) => (
+            codex_turn_id_from_payload(event.provider_payload.as_ref()),
+            None,
+            UniversalEventKind::ApprovalResolved {
+                approval_id: event.approval_id,
+                status: match event.decision {
+                    ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => {
+                        ApprovalStatus::Approved
+                    }
+                    ApprovalDecision::Decline | ApprovalDecision::ProviderSpecific { .. } => {
+                        ApprovalStatus::Denied
+                    }
+                    ApprovalDecision::Cancel => ApprovalStatus::Cancelled,
+                },
+                resolved_at: event.resolved_at,
+                resolved_by_user_id: event.resolved_by_user_id,
+                native: Some(native.clone()),
+            },
+        ),
+        NormalizedEvent::TurnStatusChanged(turn) => (
+            Some(turn.turn_id),
+            None,
+            UniversalEventKind::TurnStatusChanged { turn: turn.clone() },
+        ),
+        NormalizedEvent::TurnFailed(turn) => (
+            Some(turn.turn_id),
+            None,
+            UniversalEventKind::TurnFailed { turn: turn.clone() },
+        ),
+        NormalizedEvent::TurnCancelled(turn) => (
+            Some(turn.turn_id),
+            None,
+            UniversalEventKind::TurnCancelled { turn: turn.clone() },
+        ),
+        NormalizedEvent::TurnInterrupted(turn) => (
+            Some(turn.turn_id),
+            None,
+            UniversalEventKind::TurnInterrupted { turn: turn.clone() },
+        ),
+        NormalizedEvent::NativeNotification(event) if event.method == "turn/started" => {
+            let turn_id = event
+                .event_id
+                .as_deref()
+                .map(stable_turn_id)
+                .or_else(|| codex_turn_id_from_payload(event.provider_payload.as_ref()))
+                .unwrap_or_else(|| stable_turn_id(&format!("{}:codex-turn", event.session_id)));
+            (
+                Some(turn_id),
+                None,
+                UniversalEventKind::TurnStarted {
+                    turn: TurnState {
+                        turn_id,
+                        session_id: event.session_id,
+                        status: TurnStatus::Running,
+                        started_at: None,
+                        completed_at: None,
+                        model: None,
+                        mode: None,
+                    },
+                },
+            )
+        }
+        NormalizedEvent::NativeNotification(event) if event.method == "thread/name/updated" => (
+            None,
+            None,
+            UniversalEventKind::SessionMetadataChanged {
+                title: event
+                    .provider_payload
+                    .as_ref()
+                    .and_then(|payload| {
+                        string_at(
+                            payload,
+                            &[
+                                "/params/threadName",
+                                "/params/thread_name",
+                                "/params/name",
+                                "/params/title",
+                            ],
+                        )
+                    })
+                    .map(str::to_owned),
+            },
+        ),
+        NormalizedEvent::NativeNotification(event)
+            if event.method == "item/fileChange/patchUpdated" =>
+        {
+            let turn_id = codex_turn_id_from_payload(event.provider_payload.as_ref());
+            (
+                turn_id,
+                None,
+                UniversalEventKind::DiffUpdated {
+                    diff: codex_file_change_diff(event, turn_id),
+                },
+            )
+        }
+        NormalizedEvent::NativeNotification(event)
+            if event.method == "item/fileChange/outputDelta" =>
+        {
+            let turn_id = codex_turn_id_from_payload(event.provider_payload.as_ref());
+            let item_id = stable_item_id(&format!(
+                "codex:file-change:{}:{}",
+                event.session_id,
+                event.event_id.as_deref().unwrap_or(&event.method)
+            ));
+            (
+                turn_id,
+                Some(item_id),
+                UniversalEventKind::ContentDelta {
+                    block_id: format!(
+                        "codex-file-change-{}",
+                        event.event_id.as_deref().unwrap_or("output")
+                    ),
+                    kind: Some(ContentBlockKind::FileDiff),
+                    delta: event.detail.clone().unwrap_or_else(|| event.title.clone()),
+                },
+            )
+        }
+        NormalizedEvent::NativeNotification(event)
+            if event.method == "item/commandExecution/terminalInteraction" =>
+        {
+            let turn_id = codex_turn_id_from_payload(event.provider_payload.as_ref());
+            let item_id = stable_item_id(&format!(
+                "codex:command:{}:{}",
+                event.session_id,
+                event.event_id.as_deref().unwrap_or(&event.method)
+            ));
+            (
+                turn_id,
+                Some(item_id),
+                UniversalEventKind::ContentDelta {
+                    block_id: format!(
+                        "codex-terminal-input-{}",
+                        event.event_id.as_deref().unwrap_or("stdin")
+                    ),
+                    kind: Some(ContentBlockKind::TerminalInput),
+                    delta: event.detail.clone().unwrap_or_else(|| event.title.clone()),
+                },
+            )
+        }
+        NormalizedEvent::ServerRequestResolved(event)
+        | NormalizedEvent::ThreadRealtimeEvent(event)
+        | NormalizedEvent::NativeNotification(event)
+            if codex_known_server_notification(&event.method) =>
+        {
+            (
+                codex_turn_id_from_payload(event.provider_payload.as_ref()),
+                None,
+                UniversalEventKind::ProviderNotification {
+                    notification: codex_provider_notification(event),
+                },
+            )
+        }
+        NormalizedEvent::NativeNotification(event) => (
+            codex_turn_id_from_payload(event.provider_payload.as_ref()),
+            None,
+            UniversalEventKind::NativeUnknown {
+                summary: Some("native notification".to_owned()),
+            },
+        ),
+        _ => return Err(Box::new(event)),
+    };
+    Ok(AdapterEvent::from_universal(
+        session_id,
+        turn_id,
+        item_id,
+        Some(native),
+        universal,
+    ))
+}
+
+fn codex_command_item_event(
+    session_id: SessionId,
+    turn_id: Option<TurnId>,
+    command_id: &str,
+    command: &str,
+    cwd: Option<String>,
+    status: ItemStatus,
+    native: NativeRef,
+) -> (Option<TurnId>, Option<ItemId>, UniversalEventKind) {
+    let item_id = stable_item_id(&format!("codex:command:{session_id}:{command_id}"));
+    (
+        turn_id,
+        Some(item_id),
+        UniversalEventKind::ItemCreated {
+            item: Box::new(ItemState {
+                item_id,
+                session_id,
+                turn_id,
+                role: ItemRole::Tool,
+                status: status.clone(),
+                content: vec![ContentBlock {
+                    block_id: format!("codex-command-{command_id}"),
+                    kind: ContentBlockKind::ToolCall,
+                    text: Some(command.to_owned()),
+                    mime_type: None,
+                    artifact_id: None,
+                }],
+                tool: Some(ToolProjection {
+                    kind: ToolProjectionKind::Command,
+                    name: "command".to_owned(),
+                    title: command.to_owned(),
+                    status,
+                    detail: cwd.clone(),
+                    input_summary: None,
+                    output_summary: None,
+                    command: Some(ToolCommandProjection {
+                        command: command.to_owned(),
+                        cwd,
+                        source: None,
+                        process_id: None,
+                        actions: Vec::new(),
+                        exit_code: None,
+                        duration_ms: None,
+                        success: None,
+                    }),
+                    subagent: None,
+                    mcp: None,
+                }),
+                native: Some(native),
+            }),
+        },
+    )
+}
+
+fn codex_provider_notification(event: &NativeNotification) -> ProviderNotification {
+    ProviderNotification {
+        category: event.category.clone(),
+        title: event.title.clone(),
+        detail: event.detail.clone(),
+        status: event.status.clone(),
+        severity: codex_provider_notification_severity(event),
+        subject: event.event_id.clone(),
+    }
+}
+
+fn codex_provider_notification_severity(
+    event: &NativeNotification,
+) -> Option<ProviderNotificationSeverity> {
+    match event.status.as_deref().or(Some(event.category.as_str())) {
+        Some("failed" | "error") => Some(ProviderNotificationSeverity::Error),
+        Some("warning" | "guardian" | "config_warning") => {
+            Some(ProviderNotificationSeverity::Warning)
+        }
+        Some("debug") => Some(ProviderNotificationSeverity::Debug),
+        _ => Some(ProviderNotificationSeverity::Info),
+    }
+}
+
+fn codex_usage_snapshot_from_native_notification(
+    event: &NativeNotification,
+) -> Option<SessionUsageSnapshot> {
+    match event.method.as_str() {
+        "thread/tokenUsage/updated" | "thread/contextWindow/updated" => {
+            codex_usage_snapshot_from_token_usage(event.provider_payload.as_ref())
+        }
+        "account/rateLimits/updated" => {
+            codex_usage_snapshot_from_rate_limits(event.provider_payload.as_ref())
+        }
+        _ => None,
+    }
+}
+
+fn codex_usage_snapshot_from_token_usage(payload: Option<&Value>) -> Option<SessionUsageSnapshot> {
+    let payload = payload?;
+    let used_tokens = unsigned_integer_at(
+        payload,
+        &[
+            "/params/tokenUsage/last/totalTokens",
+            "/params/tokenUsage/current/totalTokens",
+            "/params/tokenUsage/total/totalTokens",
+            "/params/summary/tokenUsage/total/totalTokens",
+            "/params/summary/estimatedTotalTokens",
+        ],
+    );
+    let total_tokens = unsigned_integer_at(
+        payload,
+        &[
+            "/params/tokenUsage/modelContextWindow",
+            "/params/modelContextWindow",
+            "/params/summary/tokenUsage/modelContextWindow",
+        ],
+    );
+    let used_percent = match (used_tokens, total_tokens) {
+        (Some(used), Some(total)) if total > 0 => Some(((used * 100) / total).min(100)),
+        _ => None,
+    };
+    (used_tokens.is_some() || total_tokens.is_some() || used_percent.is_some()).then(|| {
+        SessionUsageSnapshot {
+            context: Some(SessionUsageContext {
+                used_percent,
+                used_tokens,
+                total_tokens,
+            }),
+            ..SessionUsageSnapshot::default()
+        }
+    })
+}
+
+fn codex_usage_snapshot_from_rate_limits(payload: Option<&Value>) -> Option<SessionUsageSnapshot> {
+    let payload = payload?;
+    let window_5h =
+        codex_usage_window_at(payload, "/params/rateLimits/primary", Some("5h".to_owned()));
+    let week = codex_usage_window_at(
+        payload,
+        "/params/rateLimits/secondary",
+        Some("weekly".to_owned()),
+    );
+    (window_5h.is_some() || week.is_some()).then(|| SessionUsageSnapshot {
+        window_5h,
+        week,
+        ..SessionUsageSnapshot::default()
+    })
+}
+
+fn codex_usage_window_at(
+    payload: &Value,
+    pointer: &str,
+    window_label: Option<String>,
+) -> Option<SessionUsageWindow> {
+    let value = payload.pointer(pointer)?;
+    let used_percent =
+        unsigned_integer_at(value, &["/usedPercent", "/used_percent"]).map(|value| value.min(100));
+    let remaining_percent = used_percent
+        .map(|value| 100_u64.saturating_sub(value))
+        .or_else(|| {
+            unsigned_integer_at(value, &["/remainingPercent", "/remaining_percent"])
+                .map(|value| value.min(100))
+        });
+    let resets_at = unsigned_integer_at(value, &["/resetsAt", "/resets_at"])
+        .and_then(|timestamp| i64::try_from(timestamp).ok())
+        .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0));
+    (used_percent.is_some() || remaining_percent.is_some() || resets_at.is_some()).then_some({
+        SessionUsageWindow {
+            used_percent,
+            remaining_percent,
+            resets_at,
+            window_label,
+            remaining_text_hint: None,
+        }
+    })
+}
+
+fn codex_file_change_diff(event: &NativeNotification, turn_id: Option<TurnId>) -> DiffState {
+    DiffState {
+        diff_id: stable_diff_id(&format!(
+            "codex:file-change:{}:{}",
+            event.session_id,
+            event.event_id.as_deref().unwrap_or(&event.method)
+        )),
+        session_id: event.session_id,
+        turn_id,
+        title: Some(event.title.clone()),
+        files: codex_file_change_diff_files(event.provider_payload.as_ref()),
+        updated_at: None,
+    }
+}
+
+fn codex_file_change_diff_files(payload: Option<&Value>) -> Vec<agenter_core::DiffFile> {
+    payload
+        .and_then(|payload| payload.pointer("/params/changes"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|change| {
+            let path = string_at(change, &["/path"])?;
+            Some(agenter_core::DiffFile {
+                path: path.to_owned(),
+                status: match string_at(change, &["/kind/type", "/kind"]) {
+                    Some("add" | "Add" | "create" | "added") => FileChangeKind::Create,
+                    Some("delete" | "Delete" | "deleted") => FileChangeKind::Delete,
+                    Some("move" | "rename" | "renamed") => FileChangeKind::Rename,
+                    _ => FileChangeKind::Modify,
+                },
+                diff: string_at(change, &["/diff"]).map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+fn codex_plan_status(payload: Option<&Value>) -> PlanStatus {
+    let Some(payload) = payload else {
+        return PlanStatus::Draft;
+    };
+    match string_at(
+        payload,
+        &[
+            "/params/status",
+            "/params/planStatus",
+            "/params/phase",
+            "/params/update/status",
+            "/params/update/planStatus",
+            "/params/update/phase",
+            "/params/update/state",
+        ],
+    ) {
+        Some("completed" | "complete" | "done") => PlanStatus::Completed,
+        Some("implementing" | "implementation_started" | "implementationStarted") => {
+            PlanStatus::Implementing
+        }
+        Some("awaiting_approval" | "awaitingApproval" | "approval_requested") => {
+            PlanStatus::AwaitingApproval
+        }
+        Some("failed" | "error") => PlanStatus::Failed,
+        Some("cancelled" | "canceled") => PlanStatus::Cancelled,
+        _ => PlanStatus::Draft,
+    }
+}
+
+fn codex_payload_bool(payload: Option<&Value>, pointers: &[&str]) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+    bool_at(payload, pointers).unwrap_or(false)
+}
+
+fn codex_command_output_block_id(command_id: &str, stream: &CommandOutputStream) -> String {
+    let stream = match stream {
+        CommandOutputStream::Stdout => "stdout",
+        CommandOutputStream::Stderr => "stderr",
+    };
+    format!("codex-command-{command_id}-{stream}")
+}
+
+fn codex_normalized_session_id(event: &NormalizedEvent) -> Option<SessionId> {
+    match event {
+        NormalizedEvent::SessionStarted(info) => Some(info.session_id),
+        NormalizedEvent::SessionStatusChanged(event) => Some(event.session_id),
+        NormalizedEvent::UserMessage(event) => Some(event.session_id),
+        NormalizedEvent::AgentMessageDelta(event) => Some(event.session_id),
+        NormalizedEvent::AgentMessageCompleted(event) => Some(event.session_id),
+        NormalizedEvent::PlanUpdated(event) => Some(event.session_id),
+        NormalizedEvent::ToolStarted(event)
+        | NormalizedEvent::ToolUpdated(event)
+        | NormalizedEvent::ToolCompleted(event) => Some(event.session_id),
+        NormalizedEvent::CommandStarted(event) => Some(event.session_id),
+        NormalizedEvent::CommandOutputDelta(event) => Some(event.session_id),
+        NormalizedEvent::CommandCompleted(event) => Some(event.session_id),
+        NormalizedEvent::FileChangeProposed(event)
+        | NormalizedEvent::FileChangeApplied(event)
+        | NormalizedEvent::FileChangeRejected(event) => Some(event.session_id),
+        NormalizedEvent::ApprovalRequested(event) => Some(event.session_id),
+        NormalizedEvent::ApprovalResolved(event) => Some(event.session_id),
+        NormalizedEvent::QuestionRequested(event) => Some(event.session_id),
+        NormalizedEvent::QuestionAnswered(event) => Some(event.session_id),
+        NormalizedEvent::TurnStatusChanged(turn)
+        | NormalizedEvent::TurnFailed(turn)
+        | NormalizedEvent::TurnCancelled(turn)
+        | NormalizedEvent::TurnInterrupted(turn) => Some(turn.session_id),
+        NormalizedEvent::TurnDiffUpdated(event)
+        | NormalizedEvent::ItemReasoning(event)
+        | NormalizedEvent::ServerRequestResolved(event)
+        | NormalizedEvent::McpToolCallProgress(event)
+        | NormalizedEvent::ThreadRealtimeEvent(event)
+        | NormalizedEvent::NativeNotification(event) => Some(event.session_id),
+        NormalizedEvent::Error(event) => event.session_id,
+    }
+}
+
+fn codex_normalized_native_id(event: &NormalizedEvent) -> Option<String> {
+    match event {
+        NormalizedEvent::AgentMessageDelta(event) => Some(event.message_id.clone()),
+        NormalizedEvent::AgentMessageCompleted(event) => Some(event.message_id.clone()),
+        NormalizedEvent::PlanUpdated(event) => event.plan_id.clone(),
+        NormalizedEvent::CommandStarted(event) => Some(event.command_id.clone()),
+        NormalizedEvent::CommandOutputDelta(event) => Some(event.command_id.clone()),
+        NormalizedEvent::CommandCompleted(event) => Some(event.command_id.clone()),
+        NormalizedEvent::ApprovalRequested(event) => Some(event.approval_id.to_string()),
+        NormalizedEvent::ApprovalResolved(event) => Some(event.approval_id.to_string()),
+        NormalizedEvent::TurnStatusChanged(turn)
+        | NormalizedEvent::TurnFailed(turn)
+        | NormalizedEvent::TurnCancelled(turn)
+        | NormalizedEvent::TurnInterrupted(turn) => Some(turn.turn_id.to_string()),
+        NormalizedEvent::TurnDiffUpdated(event) | NormalizedEvent::NativeNotification(event) => {
+            event.event_id.clone()
+        }
+        _ => None,
+    }
+}
+
+fn codex_universal_summary(method: Option<&str>, event: &NormalizedEvent) -> &'static str {
+    match method {
+        Some("turn/started") => "Codex turn started",
+        Some("turn/plan/updated" | "item/plan/delta") => "Codex plan update",
+        Some("item/started") => "Codex item started",
+        Some("item/commandExecution/outputDelta" | "command/exec/outputDelta") => {
+            "Codex command output"
+        }
+        Some("item/completed") => "Codex item completed",
+        Some("turn/diff/updated") => "Codex diff update",
+        Some("turn/completed") => "Codex turn completed",
+        Some("item/commandExecution/requestApproval" | "item/fileChange/requestApproval") => {
+            "Codex approval requested"
+        }
+        Some("thread/name/updated") => "Codex thread renamed",
+        _ => match event {
+            NormalizedEvent::SessionStatusChanged(_) => "Codex session status changed",
+            NormalizedEvent::AgentMessageDelta(_) => "Codex assistant message delta",
+            NormalizedEvent::AgentMessageCompleted(_) => "Codex assistant message completed",
+            NormalizedEvent::ApprovalResolved(_) => "Codex approval resolved",
+            NormalizedEvent::TurnStatusChanged(_)
+            | NormalizedEvent::TurnFailed(_)
+            | NormalizedEvent::TurnCancelled(_)
+            | NormalizedEvent::TurnInterrupted(_) => "Codex turn status changed",
+            _ => "Codex native event",
+        },
+    }
 }
 
 fn codex_transition_status_event(
@@ -2102,6 +2910,96 @@ async fn handle_codex_server_request_resolved(
     );
 }
 
+async fn finish_codex_turn_detached(
+    session_id: SessionId,
+    event_sender: &mpsc::UnboundedSender<AdapterEvent>,
+    turn_driver: &mut CodexTurnDriver,
+    pending_server_requests: &mut PendingCodexServerRequests,
+    pending_approvals: &std::sync::Arc<
+        tokio::sync::Mutex<HashMap<ApprovalId, PendingCodexApproval>>,
+    >,
+    pending_questions: &std::sync::Arc<
+        tokio::sync::Mutex<HashMap<QuestionId, PendingCodexQuestion>>,
+    >,
+    reason: &str,
+) {
+    let terminal = codex_synthetic_terminal_message("turn/detached", "detached", reason);
+    let transition = turn_driver.terminal_detached(Some(&terminal));
+    send_codex_transition_status_event(
+        event_sender,
+        jsonrpc_method(&terminal),
+        session_id,
+        transition,
+        reason,
+    );
+    send_codex_transition_turn_event(
+        event_sender,
+        jsonrpc_method(&terminal),
+        session_id,
+        turn_driver,
+        transition,
+    );
+    cleanup_codex_terminal_pending_requests(
+        session_id,
+        &terminal,
+        event_sender,
+        pending_server_requests,
+        pending_approvals,
+        pending_questions,
+    )
+    .await;
+}
+
+async fn finish_codex_turn_failed(
+    session_id: SessionId,
+    event_sender: &mpsc::UnboundedSender<AdapterEvent>,
+    turn_driver: &mut CodexTurnDriver,
+    pending_server_requests: &mut PendingCodexServerRequests,
+    pending_approvals: &std::sync::Arc<
+        tokio::sync::Mutex<HashMap<ApprovalId, PendingCodexApproval>>,
+    >,
+    pending_questions: &std::sync::Arc<
+        tokio::sync::Mutex<HashMap<QuestionId, PendingCodexQuestion>>,
+    >,
+    reason: &str,
+) {
+    let terminal = codex_synthetic_terminal_message("turn/failed", "failed", reason);
+    let transition = turn_driver.terminal_failed(Some(&terminal));
+    send_codex_transition_status_event(
+        event_sender,
+        jsonrpc_method(&terminal),
+        session_id,
+        transition,
+        reason,
+    );
+    send_codex_transition_turn_event(
+        event_sender,
+        jsonrpc_method(&terminal),
+        session_id,
+        turn_driver,
+        transition,
+    );
+    cleanup_codex_terminal_pending_requests(
+        session_id,
+        &terminal,
+        event_sender,
+        pending_server_requests,
+        pending_approvals,
+        pending_questions,
+    )
+    .await;
+}
+
+fn codex_synthetic_terminal_message(method: &str, status: &str, reason: &str) -> Value {
+    json!({
+        "method": method,
+        "params": {
+            "status": status,
+            "message": reason
+        }
+    })
+}
+
 async fn cleanup_codex_terminal_pending_requests(
     session_id: SessionId,
     message: &Value,
@@ -2305,20 +3203,18 @@ pub mod codex_codec {
 
 #[allow(dead_code)]
 pub mod codex_reducer {
-    use agenter_core::{AgentProviderId, SessionId};
+    use agenter_core::SessionId;
     use serde_json::Value;
 
-    use crate::agents::adapter::{normalized_events_to_adapter_events, AdapterEvent};
+    use crate::agents::adapter::AdapterEvent;
 
     #[must_use]
     pub fn reduce_native_message(session_id: SessionId, message: &Value) -> Vec<AdapterEvent> {
         let method = super::codex_codec::method(message);
-        normalized_events_to_adapter_events(
-            AgentProviderId::from(AgentProviderId::CODEX),
-            "codex-app-server",
-            method,
-            super::normalize_codex_message(session_id, message),
-        )
+        super::normalize_codex_message(session_id, message)
+            .into_iter()
+            .map(|event| super::codex_adapter_event(method, event))
+            .collect()
     }
 }
 
@@ -2381,9 +3277,12 @@ fn normalize_codex_message_inner(session_id: SessionId, message: &Value) -> Vec<
         "agentMessage/delta" | "item/agentMessage/delta" => {
             text_delta(session_id, message).into_iter().collect()
         }
-        "agentMessage/completed" | "agentMessage/complete" => {
+        "agentMessage/completed" | "agentMessage/complete" | "item/agentMessage/completed" => {
             message_completed(session_id, message).into_iter().collect()
         }
+        "rawResponseItem/completed" => raw_response_item_completed(session_id, message)
+            .into_iter()
+            .collect(),
         "turn/started" => turn_started(session_id, message),
         "thread/status/changed" => thread_status_changed(session_id, message),
         "thread/archived" | "thread/unarchived" | "thread/closed" | "thread/name/updated" => {
@@ -2927,6 +3826,12 @@ fn codex_server_request_support(method: &str) -> Option<CodexProtocolSupport> {
         .map(|entry| entry.support)
 }
 
+fn codex_known_server_notification(method: &str) -> bool {
+    CODEX_PROTOCOL_COVERAGE.iter().any(|entry| {
+        entry.direction == CodexProtocolDirection::ServerNotification && entry.method == method
+    })
+}
+
 async fn handle_classified_codex_server_request(
     server: &mut CodexAppServer,
     session_id: SessionId,
@@ -3354,6 +4259,24 @@ fn message_completed(session_id: SessionId, message: &Value) -> Option<Normalize
                 ],
             )
             .map(str::to_owned),
+            provider_payload: Some(message.clone()),
+        },
+    ))
+}
+
+fn raw_response_item_completed(session_id: SessionId, message: &Value) -> Option<NormalizedEvent> {
+    let item = message.pointer("/params/item")?;
+    if string_at(item, &["/type"]) != Some("message") {
+        return None;
+    }
+    if string_at(item, &["/role"]) != Some("assistant") {
+        return None;
+    }
+    Some(NormalizedEvent::AgentMessageCompleted(
+        MessageCompletedEvent {
+            session_id,
+            message_id: message_id(message),
+            content: codex_text_content(item),
             provider_payload: Some(message.clone()),
         },
     ))
@@ -3842,6 +4765,13 @@ struct CodexTurnScope {
     turn_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexNotificationScope {
+    Turn,
+    Thread,
+    Global,
+}
+
 impl CodexTurnScope {
     fn observe(&mut self, message: &Value) {
         if self.thread_id.is_none() {
@@ -3854,13 +4784,70 @@ impl CodexTurnScope {
 }
 
 fn codex_message_belongs_to_scope(message: &Value, scope: &CodexTurnScope) -> bool {
+    codex_scope_mismatch_reason(message, scope).is_none()
+}
+
+fn codex_scope_mismatch_reason(message: &Value, scope: &CodexTurnScope) -> Option<&'static str> {
     if let (Some(expected), Some(actual)) = (scope.thread_id.as_deref(), message_thread_id(message))
     {
         if actual != expected {
-            return false;
+            return Some("thread_id_mismatch");
         }
     }
-    true
+    if codex_notification_scope(message) == CodexNotificationScope::Turn {
+        if let Some(expected) = scope.turn_id.as_deref() {
+            match message_turn_id(message) {
+                Some(actual) if actual == expected => {}
+                _ => return Some("turn_id_mismatch"),
+            }
+        }
+    }
+    None
+}
+
+fn codex_notification_scope(message: &Value) -> CodexNotificationScope {
+    let Some(method) = jsonrpc_method(message) else {
+        return CodexNotificationScope::Global;
+    };
+    match method {
+        "turn/started"
+        | "turn/completed"
+        | "turn/diff/updated"
+        | "turn/plan/updated"
+        | "turn/steer"
+        | "item/started"
+        | "item/completed"
+        | "rawResponseItem/completed"
+        | "item/plan/delta"
+        | "item/agentMessage/delta"
+        | "agentMessage/delta"
+        | "item/agentMessage/completed"
+        | "agentMessage/completed"
+        | "agentMessage/complete"
+        | "item/commandExecution/outputDelta"
+        | "command/exec/outputDelta"
+        | "item/fileChange/outputDelta"
+        | "item/fileChange/patchUpdated"
+        | "item/reasoning/summaryTextDelta"
+        | "item/reasoning/summaryPartAdded"
+        | "item/reasoning/textDelta"
+        | "item/mcpToolCall/progress"
+        | "serverRequest/resolved" => CodexNotificationScope::Turn,
+        method if method.starts_with("item/") || method.starts_with("turn/") => {
+            CodexNotificationScope::Turn
+        }
+        "thread/status/changed"
+        | "thread/started"
+        | "thread/archived"
+        | "thread/unarchived"
+        | "thread/closed"
+        | "thread/name/updated"
+        | "thread/contextWindow/updated"
+        | "thread/tokenUsage/updated"
+        | "thread/compacted" => CodexNotificationScope::Thread,
+        method if method.starts_with("thread/") => CodexNotificationScope::Thread,
+        _ => CodexNotificationScope::Global,
+    }
 }
 
 fn message_thread_id(message: &Value) -> Option<&str> {
@@ -3869,6 +4856,8 @@ fn message_thread_id(message: &Value) -> Option<&str> {
         &[
             "/params/threadId",
             "/params/thread/id",
+            "/params/item/threadId",
+            "/params/item/thread/id",
             "/result/threadId",
             "/result/thread/id",
         ],
@@ -3881,6 +4870,8 @@ fn message_turn_id(message: &Value) -> Option<&str> {
         &[
             "/params/turnId",
             "/params/turn/id",
+            "/params/item/turnId",
+            "/params/item/turn/id",
             "/result/turnId",
             "/result/turn/id",
         ],
@@ -4400,6 +5391,7 @@ fn native_notification_category(method: &str) -> &'static str {
         }
         "guardianWarning" => "guardian",
         "item/commandExecution/terminalInteraction" => "terminal_interaction",
+        "thread/contextWindow/updated" => "token_usage",
         "account/rateLimits/updated" => "rate_limits",
         "error" | "warning" | "deprecationNotice" | "configWarning" => "warning",
         "fs/changed" => "filesystem",
@@ -4510,6 +5502,8 @@ fn native_notification_detail(message: &Value) -> Option<String> {
             "/params/statusMessage",
             "/params/error/message",
             "/params/reason",
+            "/params/delta",
+            "/params/stdin",
         ],
     )
     .map(str::to_owned)
@@ -4525,6 +5519,16 @@ fn integer_at(message: &Value, pointers: &[&str]) -> Option<i64> {
     pointers
         .iter()
         .find_map(|pointer| message.pointer(pointer).and_then(Value::as_i64))
+}
+
+fn unsigned_integer_at(message: &Value, pointers: &[&str]) -> Option<u64> {
+    pointers.iter().find_map(|pointer| {
+        let value = message.pointer(pointer)?;
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+            .or_else(|| value.as_f64().map(|value| value.round() as u64))
+    })
 }
 
 fn bool_at(message: &Value, pointers: &[&str]) -> Option<bool> {
@@ -4601,7 +5605,10 @@ mod tests {
         assert_eq!(native.method.as_deref(), Some("agentMessage/delta"));
         assert_eq!(native.kind.as_deref(), Some(AgentProviderId::CODEX));
         assert_eq!(native.native_id.as_deref(), Some("msg-1"));
-        assert_eq!(native.summary.as_deref(), Some("assistant message delta"));
+        assert_eq!(
+            native.summary.as_deref(),
+            Some("Codex assistant message delta")
+        );
         let agenter_core::UniversalEventKind::ContentDelta {
             block_id,
             kind,
@@ -4610,7 +5617,7 @@ mod tests {
         else {
             panic!("expected universal content delta");
         };
-        assert_eq!(block_id, "text-msg-1");
+        assert_eq!(block_id, "codex-text-msg-1");
         assert_eq!(kind, &Some(agenter_core::ContentBlockKind::Text));
         assert_eq!(delta, "hello");
     }
@@ -4660,7 +5667,7 @@ mod tests {
             })
             .expect("command item");
         assert_eq!(command_item.turn_id, Some(turn_id));
-        assert_eq!(command_item.content[0].block_id, "command-cmd-1");
+        assert_eq!(command_item.content[0].block_id, "codex-command-cmd-1");
         assert_eq!(command_item.content[0].text.as_deref(), Some("cargo test"));
 
         let output = semantic
@@ -4674,7 +5681,7 @@ mod tests {
                 _ => None,
             })
             .expect("output delta");
-        assert_eq!(output.0, "command-cmd-1-stdout");
+        assert_eq!(output.0, "codex-command-cmd-1-stdout");
         assert_eq!(
             output.1,
             &Some(agenter_core::ContentBlockKind::CommandOutput)
@@ -4692,7 +5699,7 @@ mod tests {
                 _ => None,
             })
             .expect("command status");
-        assert_eq!(status.0, "command-cmd-1-status");
+        assert_eq!(status.0, "codex-command-cmd-1-status");
         assert_eq!(
             status.1,
             &Some(agenter_core::ContentBlockKind::CommandOutput)
@@ -4782,6 +5789,30 @@ mod tests {
                 "turn.completed",
             ]
         );
+        assert!(
+            semantic.iter().any(|event| matches!(
+                event.universal.event,
+                agenter_core::UniversalEventKind::PlanUpdated { .. }
+            ) && event
+                .universal
+                .native
+                .as_ref()
+                .and_then(|native| native.summary.as_deref())
+                == Some("Codex plan update")),
+            "Codex Stage 10 plan milestone must be emitted by the Codex universal mapper, not generic NormalizedEvent fallback"
+        );
+        assert!(
+            semantic.iter().any(|event| matches!(
+                event.universal.event,
+                agenter_core::UniversalEventKind::TurnCompleted { .. }
+            ) && event
+                .universal
+                .native
+                .as_ref()
+                .and_then(|native| native.summary.as_deref())
+                == Some("Codex turn completed")),
+            "Codex Stage 10 terminal milestone must be emitted by the Codex universal mapper"
+        );
 
         for approval in trace.iter().filter(|message| {
             matches!(
@@ -4793,12 +5824,7 @@ mod tests {
                 normalize_codex_approval_request(session_id, approval, None)
                     .expect("approval should normalize");
             assert!(native_request_id.is_string());
-            let semantic = crate::agents::adapter::AdapterEvent::from_normalized_event(
-                AgentProviderId::from(AgentProviderId::CODEX),
-                "codex-app-server",
-                jsonrpc_method(approval),
-                normalized,
-            );
+            let semantic = codex_adapter_event(jsonrpc_method(approval), normalized);
             let agenter_core::UniversalEventKind::ApprovalRequested { approval } =
                 semantic.universal.event
             else {
@@ -5180,6 +6206,104 @@ mod tests {
     }
 
     #[test]
+    fn codex_usage_notifications_project_to_usage_updated() {
+        let session_id = SessionId::nil();
+        let message = json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "tokenUsage": {
+                    "last": { "totalTokens": 10421 },
+                    "total": { "totalTokens": 140399004 },
+                    "modelContextWindow": 258400
+                }
+            }
+        });
+
+        let semantic = super::codex_reducer::reduce_native_message(session_id, &message);
+
+        assert_eq!(semantic.len(), 1);
+        let agenter_core::UniversalEventKind::UsageUpdated { usage } = &semantic[0].universal.event
+        else {
+            panic!("expected usage updated");
+        };
+        let context = usage.context.as_ref().expect("context usage");
+        assert_eq!(context.used_tokens, Some(10421));
+        assert_eq!(context.total_tokens, Some(258400));
+        assert_eq!(context.used_percent, Some(4));
+    }
+
+    #[test]
+    fn codex_rate_limit_notifications_project_to_usage_updated() {
+        let session_id = SessionId::nil();
+        let message = json!({
+            "method": "account/rateLimits/updated",
+            "params": {
+                "rateLimits": {
+                    "primary": {
+                        "resetsAt": 1777640533,
+                        "usedPercent": 57,
+                        "windowDurationMins": 300
+                    },
+                    "secondary": {
+                        "resetsAt": 1777968663,
+                        "usedPercent": 26,
+                        "windowDurationMins": 10080
+                    }
+                }
+            }
+        });
+
+        let semantic = super::codex_reducer::reduce_native_message(session_id, &message);
+
+        assert_eq!(semantic.len(), 1);
+        let agenter_core::UniversalEventKind::UsageUpdated { usage } = &semantic[0].universal.event
+        else {
+            panic!("expected usage updated");
+        };
+        let window_5h = usage.window_5h.as_ref().expect("5h window");
+        assert_eq!(window_5h.used_percent, Some(57));
+        assert_eq!(window_5h.remaining_percent, Some(43));
+        assert_eq!(window_5h.window_label.as_deref(), Some("5h"));
+        let week = usage.week.as_ref().expect("weekly window");
+        assert_eq!(week.used_percent, Some(26));
+        assert_eq!(week.remaining_percent, Some(74));
+        assert_eq!(week.window_label.as_deref(), Some("weekly"));
+    }
+
+    #[test]
+    fn codex_context_window_notifications_project_to_usage_updated() {
+        let session_id = SessionId::nil();
+        let message = json!({
+            "method": "thread/contextWindow/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "summary": {
+                    "estimatedTotalTokens": 42000,
+                    "tokenUsage": {
+                        "total": { "totalTokens": 42000 },
+                        "modelContextWindow": 258400
+                    }
+                }
+            }
+        });
+
+        let semantic = super::codex_reducer::reduce_native_message(session_id, &message);
+
+        assert_eq!(semantic.len(), 1);
+        let agenter_core::UniversalEventKind::UsageUpdated { usage } = &semantic[0].universal.event
+        else {
+            panic!("expected usage updated");
+        };
+        let context = usage.context.as_ref().expect("context usage");
+        assert_eq!(context.used_tokens, Some(42000));
+        assert_eq!(context.total_tokens, Some(258400));
+        assert_eq!(context.used_percent, Some(16));
+    }
+
+    #[test]
     fn normalizes_unknown_codex_notification_as_native_notification() {
         let message = json!({
             "method": "model/rerouted",
@@ -5222,7 +6346,7 @@ mod tests {
             ),
             (
                 "thread/contextWindow/updated",
-                "thread",
+                "token_usage",
                 "Thread context window updated",
                 "updated",
             ),
@@ -5732,7 +6856,7 @@ mod tests {
     }
 
     #[test]
-    fn filters_live_codex_messages_to_target_thread_but_not_turn() {
+    fn codex_turn_scope_filters_turn_scoped_messages_to_target_thread_and_turn() {
         let target = CodexTurnScope {
             thread_id: Some("thread-1".to_owned()),
             turn_id: Some("turn-1".to_owned()),
@@ -5772,11 +6896,317 @@ mod tests {
         assert!(
             normalize_codex_message_for_scope(SessionId::nil(), &other_thread, &target).is_empty()
         );
+        assert!(normalize_codex_message_for_scope(
+            SessionId::nil(),
+            &same_thread_other_turn,
+            &target
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn codex_turn_scope_accepts_nested_item_turn_targets() {
+        let target = CodexTurnScope {
+            thread_id: Some("thread-1".to_owned()),
+            turn_id: Some("turn-1".to_owned()),
+        };
+        let nested = json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "id": "msg-live-1",
+                    "type": "agentMessage",
+                    "text": "done",
+                    "threadId": "thread-1",
+                    "turnId": "turn-1"
+                }
+            }
+        });
+        let raw_response = json!({
+            "method": "rawResponseItem/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "final answer" }]
+                }
+            }
+        });
+        let other_turn = json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "id": "msg-live-2",
+                    "type": "agentMessage",
+                    "text": "wrong",
+                    "threadId": "thread-1",
+                    "turnId": "turn-2"
+                }
+            }
+        });
+
         assert_eq!(
-            normalize_codex_message_for_scope(SessionId::nil(), &same_thread_other_turn, &target)
-                .len(),
+            normalize_codex_message_for_scope(SessionId::nil(), &nested, &target).len(),
             1
         );
+        assert_eq!(
+            normalize_codex_message_for_scope(SessionId::nil(), &raw_response, &target).len(),
+            1
+        );
+        assert!(
+            normalize_codex_message_for_scope(SessionId::nil(), &other_turn, &target).is_empty()
+        );
+    }
+
+    #[test]
+    fn codex_turn_scope_allows_same_thread_thread_scoped_notifications_with_stale_turn_id() {
+        let target = CodexTurnScope {
+            thread_id: Some("thread-1".to_owned()),
+            turn_id: Some("turn-1".to_owned()),
+        };
+        let usage = json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-previous",
+                "usage": {"inputTokens": 10}
+            }
+        });
+        let title = json!({
+            "method": "thread/name/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-previous",
+                "name": "Readable title"
+            }
+        });
+        let status = json!({
+            "method": "thread/status/changed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-previous",
+                "status": {"type": "active"}
+            }
+        });
+
+        assert!(!normalize_codex_message_for_scope(SessionId::nil(), &usage, &target).is_empty());
+        assert!(!normalize_codex_message_for_scope(SessionId::nil(), &title, &target).is_empty());
+        assert!(!normalize_codex_message_for_scope(SessionId::nil(), &status, &target).is_empty());
+    }
+
+    #[test]
+    fn raw_response_item_completed_projects_assistant_text_semantically() {
+        let session_id = SessionId::nil();
+        let message = json!({
+            "method": "rawResponseItem/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        { "type": "output_text", "text": "hello " },
+                        { "type": "output_text", "text": "world" }
+                    ]
+                }
+            }
+        });
+
+        let normalized = normalize_codex_message(session_id, &message);
+        assert_eq!(normalized.len(), 1);
+        let NormalizedEvent::AgentMessageCompleted(completed) = &normalized[0] else {
+            panic!("expected assistant message completion");
+        };
+        assert_eq!(completed.content.as_deref(), Some("hello world"));
+
+        let semantic = super::codex_reducer::reduce_native_message(session_id, &message);
+        assert_eq!(semantic.len(), 1);
+        assert_eq!(semantic[0].universal.session_id, Some(session_id));
+        let agenter_core::UniversalEventKind::ContentCompleted {
+            block_id,
+            kind,
+            text,
+        } = &semantic[0].universal.event
+        else {
+            panic!("expected universal assistant content completion");
+        };
+        assert_eq!(block_id, "codex-text-turn-1");
+        assert_eq!(kind, &Some(agenter_core::ContentBlockKind::Text));
+        assert_eq!(text.as_deref(), Some("hello world"));
+        assert!(semantic[0].universal.item_id.is_some());
+    }
+
+    #[test]
+    fn high_value_codex_methods_project_to_semantic_universal_events() {
+        let session_id = SessionId::nil();
+        let messages = [
+            json!({
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "msg-1",
+                    "delta": "hi"
+                }
+            }),
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "msg-1",
+                        "type": "agentMessage",
+                        "text": "hi"
+                    }
+                }
+            }),
+            json!({
+                "method": "rawResponseItem/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "final" }]
+                    }
+                }
+            }),
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "cmd-1",
+                    "command": "cargo test"
+                }
+            }),
+            json!({
+                "method": "item/commandExecution/outputDelta",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "cmd-1",
+                    "delta": "ok\n"
+                }
+            }),
+            json!({
+                "method": "turn/plan/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "plan": [{ "step": "Patch", "status": "inProgress" }]
+                }
+            }),
+            json!({
+                "method": "turn/diff/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "id": "diff-1"
+                }
+            }),
+            json!({
+                "method": "thread/contextWindow/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "summary": {
+                        "estimatedTotalTokens": 42,
+                        "tokenUsage": {
+                            "total": { "totalTokens": 42 },
+                            "modelContextWindow": 100
+                        }
+                    }
+                }
+            }),
+            json!({
+                "method": "item/fileChange/patchUpdated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "patch-1",
+                    "changes": [
+                        {
+                            "path": "src/lib.rs",
+                            "kind": { "type": "update", "movePath": null },
+                            "diff": "@@\n-old\n+new\n"
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "method": "item/fileChange/outputDelta",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "patch-1",
+                    "delta": "updated src/lib.rs"
+                }
+            }),
+            json!({
+                "method": "item/commandExecution/terminalInteraction",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "cmd-1",
+                    "processId": "proc-1",
+                    "stdin": "y\n"
+                }
+            }),
+            json!({
+                "method": "guardianWarning",
+                "params": {
+                    "threadId": "thread-1",
+                    "message": "review warning"
+                }
+            }),
+        ];
+
+        for message in messages {
+            let semantic = super::codex_reducer::reduce_native_message(session_id, &message);
+            assert!(
+                !semantic.is_empty(),
+                "expected semantic event for {}",
+                jsonrpc_method(&message).unwrap_or("<unknown>")
+            );
+            assert!(
+                semantic.iter().all(|event| !matches!(
+                    event.universal.event,
+                    agenter_core::UniversalEventKind::NativeUnknown { .. }
+                )),
+                "expected no native fallback for {}",
+                jsonrpc_method(&message).unwrap_or("<unknown>")
+            );
+        }
+    }
+
+    #[test]
+    fn codex_known_provider_notifications_do_not_become_native_unknown() {
+        let session_id = SessionId::nil();
+        let message = json!({
+            "method": "hook/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "run": { "name": "pre-command" }
+            }
+        });
+
+        let semantic = super::codex_reducer::reduce_native_message(session_id, &message);
+        assert_eq!(semantic.len(), 1);
+        let agenter_core::UniversalEventKind::ProviderNotification { notification } =
+            &semantic[0].universal.event
+        else {
+            panic!("expected provider notification");
+        };
+        assert_eq!(notification.category, "hook");
+        assert_eq!(notification.title, "Hook started");
+        assert_eq!(notification.status.as_deref(), Some("started"));
     }
 
     #[test]
@@ -7086,6 +8516,194 @@ mod tests {
         assert!(event_receiver.recv().await.is_some());
         assert!(event_receiver.recv().await.is_some());
         assert!(event_receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn codex_turn_eof_while_running_emits_detached_terminal_turn_state() {
+        let session_id = SessionId::new();
+        let mut driver = CodexTurnDriver::new(session_id);
+        driver.observe_targets(Some("thread-1"), Some("turn-1"));
+        driver.turn_start_requested(None);
+        driver.turn_started(None);
+        let mut pending_server_requests = PendingCodexServerRequests::default();
+        let pending_approvals = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let pending_questions = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+
+        finish_codex_turn_detached(
+            session_id,
+            &event_sender,
+            &mut driver,
+            &mut pending_server_requests,
+            &pending_approvals,
+            &pending_questions,
+            "Codex app-server stream ended before a terminal turn event.",
+        )
+        .await;
+
+        let events: Vec<_> = std::iter::from_fn(|| event_receiver.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event.universal.event,
+            agenter_core::UniversalEventKind::SessionStatusChanged {
+                status: SessionStatus::Degraded,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.universal.event,
+            agenter_core::UniversalEventKind::TurnStatusChanged { ref turn }
+                if turn.status == TurnStatus::Detached
+        )));
+    }
+
+    #[tokio::test]
+    async fn codex_turn_eof_while_waiting_for_approval_cleans_pending_request_and_detaches_turn() {
+        let session_id = SessionId::new();
+        let approval_id = ApprovalId::new();
+        let mut driver = CodexTurnDriver::new(session_id);
+        driver.observe_targets(Some("thread-1"), Some("turn-1"));
+        driver.turn_start_requested(None);
+        driver.turn_started(None);
+        driver.approval_requested(None);
+        let mut pending_server_requests = PendingCodexServerRequests::default();
+        pending_server_requests.insert_approval(&json!("approval-1"), approval_id);
+        let (approval_sender, _approval_receiver) = oneshot::channel();
+        let pending_approvals = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            approval_id,
+            PendingCodexApproval::new(session_id, approval_sender),
+        )])));
+        let pending_questions = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+
+        finish_codex_turn_detached(
+            session_id,
+            &event_sender,
+            &mut driver,
+            &mut pending_server_requests,
+            &pending_approvals,
+            &pending_questions,
+            "Codex app-server stream ended before a terminal turn event.",
+        )
+        .await;
+
+        assert!(pending_server_requests.drain().is_empty());
+        assert!(pending_approvals.lock().await.is_empty());
+        let events: Vec<_> = std::iter::from_fn(|| event_receiver.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event.universal.event,
+            agenter_core::UniversalEventKind::ApprovalResolved {
+                approval_id: id,
+                status: agenter_core::ApprovalStatus::Cancelled,
+                ..
+            } if id == approval_id
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.universal.event,
+            agenter_core::UniversalEventKind::TurnStatusChanged { ref turn }
+                if turn.status == TurnStatus::Detached
+        )));
+    }
+
+    #[tokio::test]
+    async fn codex_turn_eof_while_waiting_for_input_cleans_pending_question_and_detaches_turn() {
+        let session_id = SessionId::new();
+        let question_id = QuestionId::new();
+        let mut driver = CodexTurnDriver::new(session_id);
+        driver.observe_targets(Some("thread-1"), Some("turn-1"));
+        driver.turn_start_requested(None);
+        driver.turn_started(None);
+        driver.input_requested(None);
+        let mut pending_server_requests = PendingCodexServerRequests::default();
+        pending_server_requests.insert_question(&json!("question-1"), question_id);
+        let (question_sender, _question_receiver) = oneshot::channel();
+        let pending_approvals = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let pending_questions = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            question_id,
+            PendingCodexQuestion {
+                response: question_sender,
+            },
+        )])));
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+
+        finish_codex_turn_detached(
+            session_id,
+            &event_sender,
+            &mut driver,
+            &mut pending_server_requests,
+            &pending_approvals,
+            &pending_questions,
+            "Codex app-server stream ended before a terminal turn event.",
+        )
+        .await;
+
+        assert!(pending_server_requests.drain().is_empty());
+        assert!(pending_questions.lock().await.is_empty());
+        let events: Vec<_> = std::iter::from_fn(|| event_receiver.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event.universal.event,
+            agenter_core::UniversalEventKind::QuestionAnswered { ref question }
+                if question.question_id == question_id
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.universal.event,
+            agenter_core::UniversalEventKind::TurnStatusChanged { ref turn }
+                if turn.status == TurnStatus::Detached
+        )));
+    }
+
+    #[tokio::test]
+    async fn codex_turn_error_while_waiting_for_approval_cleans_pending_request_and_fails_turn() {
+        let session_id = SessionId::new();
+        let approval_id = ApprovalId::new();
+        let mut driver = CodexTurnDriver::new(session_id);
+        driver.observe_targets(Some("thread-1"), Some("turn-1"));
+        driver.turn_start_requested(None);
+        driver.turn_started(None);
+        driver.approval_requested(None);
+        let mut pending_server_requests = PendingCodexServerRequests::default();
+        pending_server_requests.insert_approval(&json!("approval-1"), approval_id);
+        let (approval_sender, _approval_receiver) = oneshot::channel();
+        let pending_approvals = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            approval_id,
+            PendingCodexApproval::new(session_id, approval_sender),
+        )])));
+        let pending_questions = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+
+        finish_codex_turn_failed(
+            session_id,
+            &event_sender,
+            &mut driver,
+            &mut pending_server_requests,
+            &pending_approvals,
+            &pending_questions,
+            "Codex app-server read failed before a terminal turn event: broken pipe",
+        )
+        .await;
+
+        assert!(pending_server_requests.drain().is_empty());
+        assert!(pending_approvals.lock().await.is_empty());
+        let events: Vec<_> = std::iter::from_fn(|| event_receiver.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event.universal.event,
+            agenter_core::UniversalEventKind::SessionStatusChanged {
+                status: SessionStatus::Failed,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.universal.event,
+            agenter_core::UniversalEventKind::TurnStatusChanged { ref turn }
+                if turn.status == TurnStatus::Failed
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.universal.event,
+            agenter_core::UniversalEventKind::ApprovalResolved {
+                approval_id: id,
+                status: agenter_core::ApprovalStatus::Cancelled,
+                ..
+            } if id == approval_id
+        )));
     }
 
     #[test]

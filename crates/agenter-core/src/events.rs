@@ -8,6 +8,12 @@ use crate::{
     SessionInfo, SessionStatus, SlashCommandRequest, TurnId, TurnState, UserId, WorkspaceRef,
 };
 
+pub const UNIVERSAL_PROTOCOL_VERSION: &str = "uap/1";
+
+fn universal_protocol_version() -> String {
+    UNIVERSAL_PROTOCOL_VERSION.to_owned()
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum NormalizedEvent {
@@ -386,20 +392,82 @@ impl<'de> Deserialize<'de> for UniversalSeq {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UniversalEventEnvelope {
     pub event_id: String,
     pub seq: UniversalSeq,
     pub session_id: SessionId,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<TurnId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub item_id: Option<ItemId>,
     pub ts: DateTime<Utc>,
     pub source: UniversalEventSource,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub native: Option<NativeRef>,
     pub event: UniversalEventKind,
+}
+
+#[derive(Deserialize, Serialize)]
+struct UniversalEventEnvelopeWire {
+    #[serde(default = "universal_protocol_version")]
+    protocol_version: String,
+    event_id: String,
+    seq: UniversalSeq,
+    session_id: SessionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_id: Option<TurnId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item_id: Option<ItemId>,
+    ts: DateTime<Utc>,
+    source: UniversalEventSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native: Option<NativeRef>,
+    event: UniversalEventKind,
+}
+
+impl Serialize for UniversalEventEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        UniversalEventEnvelopeWire {
+            protocol_version: universal_protocol_version(),
+            event_id: self.event_id.clone(),
+            seq: self.seq,
+            session_id: self.session_id,
+            turn_id: self.turn_id,
+            item_id: self.item_id,
+            ts: self.ts,
+            source: self.source.clone(),
+            native: self.native.clone(),
+            event: self.event.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for UniversalEventEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = UniversalEventEnvelopeWire::deserialize(deserializer)?;
+        if wire.protocol_version != UNIVERSAL_PROTOCOL_VERSION {
+            return Err(de::Error::custom(format!(
+                "unsupported universal protocol version: {}",
+                wire.protocol_version
+            )));
+        }
+        Ok(Self {
+            event_id: wire.event_id,
+            seq: wire.seq,
+            session_id: wire.session_id,
+            turn_id: wire.turn_id,
+            item_id: wire.item_id,
+            ts: wire.ts,
+            source: wire.source,
+            native: wire.native,
+            event: wire.event,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -508,6 +576,8 @@ pub enum UniversalEventKind {
         code: Option<String>,
         message: String,
     },
+    #[serde(rename = "provider.notification")]
+    ProviderNotification { notification: ProviderNotification },
     #[serde(rename = "native.unknown")]
     NativeUnknown {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -515,15 +585,88 @@ pub enum UniversalEventKind {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderNotification {
+    pub category: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<ProviderNotificationSeverity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderNotificationSeverity {
+    Debug,
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct UniversalCommandEnvelope {
     pub command_id: CommandId,
     pub idempotency_key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<SessionId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<TurnId>,
     pub command: UniversalCommand,
+}
+
+#[derive(Deserialize, Serialize)]
+struct UniversalCommandEnvelopeWire {
+    #[serde(default = "universal_protocol_version")]
+    protocol_version: String,
+    command_id: CommandId,
+    idempotency_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<SessionId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_id: Option<TurnId>,
+    command: UniversalCommand,
+}
+
+impl Serialize for UniversalCommandEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        UniversalCommandEnvelopeWire {
+            protocol_version: universal_protocol_version(),
+            command_id: self.command_id,
+            idempotency_key: self.idempotency_key.clone(),
+            session_id: self.session_id,
+            turn_id: self.turn_id,
+            command: self.command.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for UniversalCommandEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = UniversalCommandEnvelopeWire::deserialize(deserializer)?;
+        if wire.protocol_version != UNIVERSAL_PROTOCOL_VERSION {
+            return Err(de::Error::custom(format!(
+                "unsupported universal protocol version: {}",
+                wire.protocol_version
+            )));
+        }
+        Ok(Self {
+            command_id: wire.command_id,
+            idempotency_key: wire.idempotency_key,
+            session_id: wire.session_id,
+            turn_id: wire.turn_id,
+            command: wire.command,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -662,9 +805,12 @@ pub enum ContentBlockKind {
     ToolCall,
     ToolResult,
     CommandOutput,
+    TerminalInput,
     FileDiff,
     Image,
     Native,
+    Warning,
+    ProviderStatus,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1234,6 +1380,7 @@ mod tests {
             serde_json::from_value(json.clone()).expect("deserialize universal event");
 
         assert_eq!(json["seq"], "42");
+        assert_eq!(json["protocol_version"], "uap/1");
         assert_eq!(json["source"], "runner");
         assert_eq!(json["event"]["type"], "content.delta");
         assert_eq!(json["native"]["summary"], "assistant text delta");
@@ -1320,6 +1467,16 @@ mod tests {
             UniversalEventKind::NativeUnknown {
                 summary: Some("unmodeled native notification".to_owned()),
             },
+            UniversalEventKind::ProviderNotification {
+                notification: crate::ProviderNotification {
+                    category: "warning".to_owned(),
+                    title: "Provider warning".to_owned(),
+                    detail: Some("check provider configuration".to_owned()),
+                    status: Some("warning".to_owned()),
+                    severity: Some(crate::ProviderNotificationSeverity::Warning),
+                    subject: None,
+                },
+            },
         ];
 
         let names: Vec<_> = events
@@ -1334,7 +1491,8 @@ mod tests {
                 "turn.started",
                 "item.created",
                 "approval.requested",
-                "native.unknown"
+                "native.unknown",
+                "provider.notification"
             ]
         );
     }
@@ -1378,6 +1536,7 @@ mod tests {
             serde_json::from_value(json.clone()).expect("deserialize command");
 
         assert_eq!(json["command_id"], CommandId::nil().to_string());
+        assert_eq!(json["protocol_version"], "uap/1");
         assert_eq!(json["command"]["type"], "send_user_input");
         assert_eq!(json["command"]["input"]["type"], "text");
         assert_eq!(decoded, command);
@@ -1402,6 +1561,7 @@ mod tests {
             serde_json::from_value(json.clone()).expect("deserialize command");
 
         assert_eq!(json["command"]["type"], "resolve_approval");
+        assert_eq!(json["protocol_version"], "uap/1");
         assert_eq!(
             json["command"]["approval_id"],
             ApprovalId::nil().to_string()

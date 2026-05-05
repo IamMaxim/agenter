@@ -29,16 +29,39 @@ git status --short
 Run the focused conformance checks first:
 
 ```sh
+cargo test -p agenter-protocol --test browser_json_frame_conformance
+cargo test -p agenter-protocol browser
 cargo test -p agenter-runner codex_stage10_conformance_trace_preserves_expected_milestones
 cargo test -p agenter-runner acp_stage10_provider_traces_share_prompt_plan_permission_shape
 cargo test -p agenter-control-plane subscribe_snapshot_replays_after_seq_in_strict_order
 cargo test -p agenter-control-plane runner_event_ack_state_dedupes_replayed_sequences
 cargo test -p agenter-control-plane seeded_runner_ack_marks_old_replay_as_duplicate
+cargo test -p agenter-control-plane runner_event_receipts_survive_new_app_state_and_prevent_duplicate_append
 cargo test -p agenter-runner interrupt_cancels_blocked_approval_for_same_session
 cargo test -p agenter-runner interrupt_does_not_count_completed_approval_cancel_replay_as_new_cancel
+cargo test -p agenter-runner codex_turn
+cd web
+npm run test -- normalizers sessionSnapshot universalEvents
 ```
 
 Expected output shape is one or more `... ok` lines and exit status `0`.
+
+## JSON Frame Conformance
+
+Automated checks:
+
+```sh
+cargo test -p agenter-protocol --test browser_json_frame_conformance
+cargo test -p agenter-protocol browser
+cd web
+npm run test -- normalizers sessionSnapshot universalEvents
+```
+
+These tests prove that newly written browser `session_snapshot` and live
+`universal_event` frames carry `protocol_version: "uap/1"`, that replayed
+events inside snapshots are also versioned, and that legacy missing-version
+frames are normalized only for the migration window. They do not prove live
+provider behavior; use the provider smoke section for that.
 
 ## Fake Runner And Browser Path
 
@@ -204,14 +227,40 @@ Manual checks:
 
 ## Chaos Checks
 
-Run these against fake runner first, then one live provider when locally available:
+Run automated coverage first:
+
+```sh
+cargo test -p agenter-control-plane subscribe_snapshot_replays_after_seq_in_strict_order
+cargo test -p agenter-control-plane subscribe_snapshot_replays_universal_events_after_source_cache_miss
+cargo test -p agenter-control-plane subscribe_snapshot_marks_universal_replay_has_more_when_bounded
+cargo test -p agenter-control-plane runner_event_ack_state_dedupes_replayed_sequences
+cargo test -p agenter-control-plane seeded_runner_ack_marks_old_replay_as_duplicate
+cargo test -p agenter-control-plane runner_event_receipts_survive_new_app_state_and_prevent_duplicate_append
+cargo test -p agenter-runner interrupt_cancels_blocked_approval_for_same_session
+cargo test -p agenter-runner interrupt_does_not_count_completed_approval_cancel_replay_as_new_cancel
+cargo test -p agenter-runner codex_turn
+cd web
+npm run test -- sessionSnapshot
+```
+
+What is automated today:
+
+- Browser replay/reconnect cursor behavior: snapshot first, replay in strict order, duplicate replay/live boundary events ignored, and truncated replay marked incomplete.
+- Runner unacked replay: in-memory ack dedupe and DB-backed runner receipts prevent duplicate universal event append across a new control-plane `AppState`.
+- Interrupt while approval is blocked: Codex runner cancellation delivers one native cancel decision and does not replay completed cancellation as a fresh cancel.
+- Codex EOF/error exits: focused `codex_turn` tests cover detached or failed terminal states and pending approval/question cleanup.
+
+Run manual chaos drills against fake runner first, then one live provider when locally available:
 
 - Browser reload during approval: pending/resolving approval must reappear from control-plane state.
 - Browser WebSocket disconnect during replay: reconnect with the last known `after_seq`; no duplicate rows.
-- Runner WebSocket reconnect after unacked event: runner WAL replay must be acked once and deduped by runner sequence.
+- Runner WebSocket reconnect after unacked event: runner WAL replay must be acked once and deduped by runner sequence. Automated DB receipt coverage exists, but the end-to-end socket drop should still be smoke-tested.
 - Duplicate runner event replay: no second browser-visible universal event for the same accepted runner sequence.
-- Runner reconnect during native permission: pending native waiter should accept the eventual answer exactly once when the runner process and provider runtime survive. This remains a Stage 10 risk until reconnect-stable runtime ownership is covered by an automated chaos test.
+- Runner reconnect during native permission: pending native waiter should accept the eventual answer exactly once when the runner process and provider runtime survive. If the runner process exits, expected state is `orphaned`, `failed`, or `detached`, not silent success.
+- Runner reconnect during user input question: the question card should remain pending or resolving in browser state; answering after reconnect should be accepted once or return a typed stale/orphan error.
+- Runner reconnect during streaming: streamed content should resume from replayed WAL/control-plane state without duplicate rows; any live provider gap must end in `turn.detached` or `turn.failed`.
 - Cancel while updates are still arriving: final state must be one of `turn.cancelled`, `turn.interrupted`, `turn.failed`, or a typed unsupported-cancel error; Codex should use `turn.interrupted` when the live hook is available. Do not report inert success.
+- Codex EOF during a turn: kill the app-server process while running, while approval is pending, and while a question is pending. Expected state is `turn.detached` or `turn.failed`; pending obligations should not remain live without a native waiter.
 - Harness crash during tool: pending approvals become `orphaned` and the turn becomes `failed` or `detached` based on runner evidence.
 
 ## Cleanup

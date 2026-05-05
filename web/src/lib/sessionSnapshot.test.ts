@@ -42,6 +42,7 @@ function snapshot(overrides: Partial<SessionSnapshot> = {}): SessionSnapshot {
 
 function universalEvent(seq: string, eventId = `evt-${seq}`): UniversalEventEnvelope {
   return {
+    protocol_version: 'uap/1',
     event_id: eventId,
     seq,
     session_id: 's1',
@@ -437,7 +438,7 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     const message: BrowserServerMessage = {
       type: 'session_snapshot',
-      snapshot: snapshot({
+      protocol_version: 'uap/1',      snapshot: snapshot({
         latest_seq: '5',
         items: {
           a1: {
@@ -466,7 +467,7 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      snapshot: snapshot({ latest_seq: '5' }),
+      protocol_version: 'uap/1',      snapshot: snapshot({ latest_seq: '5' }),
       latest_seq: '6',
       has_more: false,
       events: [universalEvent('6', 'evt-live')]
@@ -482,11 +483,150 @@ describe('universal session snapshot client reducer', () => {
     ]);
   });
 
+  test('applies versioned snapshot and live universal event frames', () => {
+    let state = createUniversalClientState();
+    state = applyUniversalClientMessage(state, {
+      type: 'session_snapshot',
+      protocol_version: 'uap/1',
+      snapshot: snapshot({
+        latest_seq: '1',
+        items: {
+          a1: {
+            item_id: 'a1',
+            session_id: 's1',
+            role: 'assistant',
+            status: 'streaming',
+            content: [{ block_id: 'assistant-block', kind: 'text', text: 'Hello' }]
+          }
+        }
+      }),
+      latest_seq: '1',
+      has_more: false,
+      events: []
+    });
+
+    state = applyUniversalClientMessage(state, {
+      type: 'universal_event',
+      ...universalEvent('2', '22222222-2222-4222-8222-222222222222')
+    });
+
+    expect(state.latestSeq).toBe('2');
+    expect(state.snapshot?.items.a1.content[0].text).toBe('Hello live');
+  });
+
+  test('materializes Codex universal assistant and command events instead of native-only rows', () => {
+    const state = applyUniversalClientMessage(createUniversalClientState(), {
+      type: 'session_snapshot',
+      protocol_version: 'uap/1',
+      snapshot: snapshot({ latest_seq: '0' }),
+      latest_seq: '4',
+      has_more: false,
+      events: [
+        {
+          ...universalEvent('1', 'evt-assistant-completed'),
+          item_id: 'assistant-raw-response',
+          native: {
+            protocol: 'codex-app-server',
+            method: 'rawResponseItem/completed',
+            type: 'codex',
+            summary: 'Codex assistant message completed'
+          },
+          event: {
+            type: 'content.completed',
+            data: {
+              block_id: 'codex-text-turn-1',
+              kind: 'text',
+              text: 'Final answer'
+            }
+          }
+        },
+        {
+          ...universalEvent('2', 'evt-command-started'),
+          item_id: 'command-1',
+          native: {
+            protocol: 'codex-app-server',
+            method: 'item/started',
+            type: 'codex',
+            summary: 'Codex item started'
+          },
+          event: {
+            type: 'item.created',
+            data: {
+              item: {
+                item_id: 'command-1',
+                session_id: 's1',
+                role: 'tool',
+                status: 'streaming',
+                content: [{ block_id: 'codex-command-cmd-1', kind: 'tool_call', text: 'cargo test' }],
+                tool: {
+                  kind: 'command',
+                  name: 'command',
+                  title: 'cargo test',
+                  status: 'streaming',
+                  command: { command: 'cargo test', actions: [] }
+                }
+              }
+            }
+          }
+        },
+        {
+          ...universalEvent('3', 'evt-command-output'),
+          item_id: 'command-1',
+          native: {
+            protocol: 'codex-app-server',
+            method: 'item/commandExecution/outputDelta',
+            type: 'codex',
+            summary: 'Codex command output'
+          },
+          event: {
+            type: 'content.delta',
+            data: {
+              block_id: 'codex-command-cmd-1-stdout',
+              kind: 'command_output',
+              delta: 'ok\n'
+            }
+          }
+        },
+        {
+          ...universalEvent('4', 'evt-command-completed'),
+          item_id: 'command-1',
+          native: {
+            protocol: 'codex-app-server',
+            method: 'item/completed',
+            type: 'codex',
+            summary: 'Codex item completed'
+          },
+          event: {
+            type: 'content.completed',
+            data: {
+              block_id: 'codex-command-cmd-1-status',
+              kind: 'command_output',
+              text: 'command completed'
+            }
+          }
+        }
+      ]
+    });
+
+    expect(state.chat.items).toMatchObject([
+      { id: 'agent:assistant-raw-response', kind: 'assistant', content: 'Final answer', completed: true },
+      {
+        id: 'event:item:command-1',
+        kind: 'inlineEvent',
+        eventKind: 'command',
+        title: 'cargo test',
+        output: 'ok\n',
+        status: 'completed'
+      }
+    ]);
+    expect(state.chat.items.some((item) => item.kind === 'inlineEvent' && item.eventKind === 'event')).toBe(false);
+  });
+
   test('rejects unseen live events at or behind the latest seq cursor', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      snapshot: snapshot({ latest_seq: '6' }),
+      protocol_version: 'uap/1',      snapshot: snapshot({ latest_seq: '6' }),
       latest_seq: '6',
       has_more: false,
       events: []
@@ -508,7 +648,7 @@ describe('universal session snapshot client reducer', () => {
   test('applies snapshot checkpoint when replay page is truncated', () => {
     const state = applyUniversalClientMessage(createUniversalClientState(), {
       type: 'session_snapshot',
-      snapshot: snapshot({
+      protocol_version: 'uap/1',      snapshot: snapshot({
         latest_seq: '5',
         items: {
           a1: {
@@ -612,11 +752,45 @@ describe('universal session snapshot client reducer', () => {
     ]);
   });
 
+  test('renders terminal question snapshot states after orphan or detach', () => {
+    const state = applyUniversalClientMessage(createUniversalClientState(), {
+      type: 'session_snapshot',
+      protocol_version: 'uap/1',      snapshot: snapshot({
+        latest_seq: null,
+        questions: {
+          orphaned: {
+            question_id: 'orphaned',
+            session_id: 's1',
+            title: 'Pick target',
+            description: 'Provider exited',
+            fields: [],
+            status: 'orphaned'
+          },
+          detached: {
+            question_id: 'detached',
+            session_id: 's1',
+            title: 'Clarify input',
+            fields: [],
+            status: 'detached'
+          }
+        }
+      }),
+      events: [],
+      latest_seq: null,
+      has_more: false
+    });
+
+    expect(state.chat.items).toMatchObject([
+      { id: 'question:orphaned', kind: 'question', answered: false, status: 'orphaned', resolvedState: 'orphaned' },
+      { id: 'question:detached', kind: 'question', answered: false, status: 'detached', resolvedState: 'detached' }
+    ]);
+  });
+
   test('preserves replay chronology for interleaved assistant approval and diff rows', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      snapshot: snapshot({ latest_seq: '0' }),
+      protocol_version: 'uap/1',      snapshot: snapshot({ latest_seq: '0' }),
       latest_seq: '3',
       has_more: false,
       events: [
@@ -672,7 +846,7 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      snapshot: snapshot({
+      protocol_version: 'uap/1',      snapshot: snapshot({
         latest_seq: '3',
         diffs: {
           d1: {
@@ -763,7 +937,7 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      snapshot: snapshot({
+      protocol_version: 'uap/1',      snapshot: snapshot({
         latest_seq: '3',
         items: {
           'assistant-item': {
@@ -848,7 +1022,7 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      snapshot: snapshot({
+      protocol_version: 'uap/1',      snapshot: snapshot({
         latest_seq: '5',
         items: {
           'assistant-before': {
@@ -928,7 +1102,7 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      snapshot: snapshot({
+      protocol_version: 'uap/1',      snapshot: snapshot({
         latest_seq: '10',
         items: {
           'assistant-before': {
@@ -1050,7 +1224,7 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      snapshot: snapshot({
+      protocol_version: 'uap/1',      snapshot: snapshot({
         latest_seq: '3',
         plans: {
           p1: {
@@ -1175,6 +1349,236 @@ describe('universal session snapshot client reducer', () => {
         displayLevel: 'raw',
         title: 'native notification',
         status: 'native'
+      }
+    ]);
+  });
+
+  test('renders provider notifications without native unknown fallback', () => {
+    let state = createUniversalClientState();
+    state = applyUniversalClientMessage(state, {
+      type: 'universal_event',
+      ...universalEvent('9', 'evt-hook'),
+      native: {
+        protocol: 'codex-app-server',
+        method: 'hook/started',
+        type: 'codex',
+        native_id: 'hook-1',
+        summary: 'Codex provider notification',
+        hash: null,
+        pointer: null
+      },
+      event: {
+        type: 'provider.notification',
+        data: {
+          notification: {
+            category: 'hook',
+            title: 'Hook started',
+            detail: null,
+            status: 'started',
+            severity: 'info',
+            subject: 'hook-1'
+          }
+        }
+      }
+    });
+
+    expect(state.chat.items).toMatchObject([
+      {
+        id: 'event:artifact:provider:evt-hook',
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        displayLevel: 'normal',
+        title: 'Hook started',
+        detail: 'status: started\nsubject: hook-1',
+        status: 'native'
+      }
+    ]);
+  });
+
+  test('keeps latest usage from live universal usage events without session info', () => {
+    let state = createUniversalClientState();
+    state = applyUniversalClientMessage(state, {
+      type: 'universal_event',
+      ...universalEvent('10', 'evt-usage'),
+      event: {
+        type: 'usage.updated',
+        data: {
+          usage: {
+            context: { used_percent: 52, used_tokens: 52000, total_tokens: 100000 },
+            window_5h: { remaining_percent: 21 },
+            week: { remaining_percent: 71 }
+          }
+        }
+      }
+    });
+
+    expect(state.latestUsage).toMatchObject({
+      context: { used_percent: 52, used_tokens: 52000, total_tokens: 100000 },
+      window_5h: { remaining_percent: 21 },
+      week: { remaining_percent: 71 }
+    });
+    expect(state.snapshot?.info?.usage).toMatchObject({
+      context: { used_percent: 52 }
+    });
+  });
+
+  test('orders reducer-created error provider and native rows by event sequence', () => {
+    let state = createUniversalClientState();
+    state = applyUniversalClientMessage(state, {
+      type: 'universal_event',
+      ...universalEvent('11', 'evt-provider-order'),
+      event: {
+        type: 'provider.notification',
+        data: { notification: { category: 'hook', title: 'Hook completed', status: 'completed' } }
+      }
+    });
+    state = applyUniversalClientMessage(state, {
+      type: 'universal_event',
+      ...universalEvent('12', 'evt-error-order'),
+      event: {
+        type: 'error.reported',
+        data: { code: 'provider_error', message: 'Provider failed' }
+      }
+    });
+    state = applyUniversalClientMessage(state, {
+      type: 'universal_event',
+      ...universalEvent('13', 'evt-native-order'),
+      event: {
+        type: 'native.unknown',
+        data: { summary: 'raw provider payload' }
+      }
+    });
+
+    expect(state.chat.items.map((item) => item.id)).toEqual([
+      'event:artifact:provider:evt-provider-order',
+      'event:artifact:error:evt-error-order',
+      'event:artifact:native:evt-native-order'
+    ]);
+    expect(state.rowOrder.get('event:artifact:provider:evt-provider-order')?.seq).toBe('11');
+    expect(state.rowOrder.get('event:artifact:error:evt-error-order')?.seq).toBe('12');
+    expect(state.rowOrder.get('event:artifact:native:evt-native-order')?.seq).toBe('13');
+  });
+
+  test('orders command content deltas by event item row instead of assistant fallback row', () => {
+    let state = createUniversalClientState();
+    state = applyUniversalClientMessage(state, {
+      type: 'universal_event',
+      ...universalEvent('14', 'evt-command-output'),
+      item_id: 'cmd-live',
+      event: {
+        type: 'content.delta',
+        data: { block_id: 'cmd-live-stdout', kind: 'command_output', delta: 'ok\n' }
+      }
+    });
+
+    expect(state.chat.items).toMatchObject([
+      {
+        id: 'event:item:cmd-live',
+        kind: 'inlineEvent',
+        eventKind: 'command',
+        output: 'ok\n'
+      }
+    ]);
+    expect(state.rowOrder.get('event:item:cmd-live')?.seq).toBe('14');
+    expect(state.rowOrder.has('agent:cmd-live')).toBe(false);
+  });
+
+  test('materializes all universal content block kinds with deliberate row policies', () => {
+    const state = materializeSnapshotChatState(
+      snapshot({
+        items: {
+          reason: {
+            item_id: 'reason',
+            session_id: 's1',
+            role: 'assistant',
+            status: 'streaming',
+            content: [{ block_id: 'reason-block', kind: 'reasoning', text: 'Checking constraints' }]
+          },
+          terminal: {
+            item_id: 'terminal',
+            session_id: 's1',
+            role: 'tool',
+            status: 'completed',
+            content: [
+              { block_id: 'stdin', kind: 'terminal_input', text: 'yes\n' },
+              { block_id: 'stdout', kind: 'command_output', text: 'accepted\n' }
+            ]
+          },
+          warning: {
+            item_id: 'warning',
+            session_id: 's1',
+            role: 'system',
+            status: 'completed',
+            content: [{ block_id: 'warning-block', kind: 'warning', text: 'Sandbox degraded' }]
+          },
+          provider: {
+            item_id: 'provider',
+            session_id: 's1',
+            role: 'system',
+            status: 'completed',
+            content: [{ block_id: 'provider-block', kind: 'provider_status', text: 'MCP connected' }]
+          },
+          image: {
+            item_id: 'image',
+            session_id: 's1',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ block_id: 'image-block', kind: 'image', text: 'Screenshot', artifact_id: 'artifact-image' }]
+          },
+          native: {
+            item_id: 'native',
+            session_id: 's1',
+            role: 'system',
+            status: 'completed',
+            content: [{ block_id: 'native-block', kind: 'native', text: 'Raw detail' }]
+          }
+        }
+      })
+    );
+
+    expect(state.items).toMatchObject([
+      {
+        id: 'event:item:reason',
+        kind: 'inlineEvent',
+        eventKind: 'tool',
+        displayLevel: 'thinking',
+        title: 'Reasoning',
+        detail: 'Checking constraints'
+      },
+      {
+        id: 'event:item:terminal',
+        kind: 'inlineEvent',
+        eventKind: 'command',
+        output: '$ yes\naccepted\n'
+      },
+      {
+        id: 'event:item:warning',
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        title: 'Warning',
+        detail: 'Sandbox degraded'
+      },
+      {
+        id: 'event:item:provider',
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        title: 'Provider status',
+        detail: 'MCP connected'
+      },
+      {
+        id: 'event:item:image',
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        title: 'Image',
+        detail: 'artifact-image\nScreenshot'
+      },
+      {
+        id: 'event:item:native',
+        kind: 'inlineEvent',
+        eventKind: 'event',
+        displayLevel: 'raw',
+        title: 'Native event',
+        detail: 'Raw detail'
       }
     ]);
   });

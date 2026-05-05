@@ -56,6 +56,7 @@ describe('chat debug export', () => {
     };
     const message: BrowserServerMessage = {
       type: 'universal_event',
+      protocol_version: 'uap/1',
       event_id: 'evt-1',
       seq: '9',
       session_id: 's1',

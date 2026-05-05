@@ -171,7 +171,7 @@
   $: slashSuggestions = filterSlashCommands(draft, slashCommands);
   $: parsedSlash = parseSlashCommand(draft, slashCommands);
   $: slashMenuOpen = isSlashDraft(draft) && slashSuggestions.length > 0;
-  $: usage = session?.usage ?? null;
+  $: usage = universalState.latestUsage ?? universalState.snapshot?.info?.usage ?? session?.usage ?? null;
   $: defaultModeId = resolveDefaultModeId(agentOptions.collaboration_modes);
   $: defaultModeAvailable = defaultModeId !== null;
   $: universalCapabilities = universalState.snapshot?.capabilities;

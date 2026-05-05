@@ -7,12 +7,12 @@ use agenter_core::{
     ApprovalRequest, ApprovalRequestEvent, ApprovalStatus, CapabilitySet, CommandAction,
     CommandOutputStream, ContentBlock, ContentBlockKind, DiffFile, DiffState, FileChangeEvent,
     ItemId, ItemRole, ItemState, ItemStatus, NativeNotification, NativeRef, NormalizedEvent,
-    PlanSource, PlanState, PlanStatus, QuestionState, QuestionStatus, SessionId,
-    SlashCommandDefinition, SlashCommandRequest, SlashCommandResult, ToolActionProjection,
-    ToolCommandProjection, ToolEvent, ToolMcpProjection, ToolProjection, ToolProjectionKind,
-    ToolSubagentOperation, ToolSubagentProjection, ToolSubagentStateProjection, TurnId, TurnState,
-    TurnStatus, UniversalCommandEnvelope, UniversalEventKind, UniversalEventSource, UserInput,
-    WorkspaceRef,
+    PlanSource, PlanState, PlanStatus, ProviderNotification, ProviderNotificationSeverity,
+    QuestionState, QuestionStatus, SessionId, SlashCommandDefinition, SlashCommandRequest,
+    SlashCommandResult, ToolActionProjection, ToolCommandProjection, ToolEvent, ToolMcpProjection,
+    ToolProjection, ToolProjectionKind, ToolSubagentOperation, ToolSubagentProjection,
+    ToolSubagentStateProjection, TurnId, TurnState, TurnStatus, UniversalCommandEnvelope,
+    UniversalEventKind, UniversalEventSource, UserInput, WorkspaceRef, UNIVERSAL_PROTOCOL_VERSION,
 };
 use agenter_protocol::runner::{AgentInput, AgentUniversalEvent, RunnerCommandResult, RunnerError};
 use serde_json::Value;
@@ -242,6 +242,7 @@ impl AdapterEvent {
     pub fn universal_projection_for_wal(&self) -> Option<AgentUniversalEvent> {
         let session_id = self.universal.session_id?;
         Some(AgentUniversalEvent {
+            protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
             session_id,
             event_id: None,
             turn_id: self.universal.turn_id,
@@ -293,6 +294,7 @@ impl AdapterEvent {
             | UniversalEventKind::ContentCompleted { .. }
             | UniversalEventKind::UsageUpdated { .. }
             | UniversalEventKind::ErrorReported { .. }
+            | UniversalEventKind::ProviderNotification { .. }
             | UniversalEventKind::NativeUnknown { .. } => {}
         }
         self
@@ -903,6 +905,15 @@ fn universal_event_from_normalized(
                 },
             )
         }
+        NormalizedEvent::ServerRequestResolved(event)
+        | NormalizedEvent::ThreadRealtimeEvent(event)
+        | NormalizedEvent::NativeNotification(event) => (
+            turn_id_from_provider_payload(event.provider_payload.as_ref()),
+            None,
+            UniversalEventKind::ProviderNotification {
+                notification: provider_notification(event),
+            },
+        ),
         NormalizedEvent::Error(event) if event.session_id.is_some() => (
             None,
             None,
@@ -918,6 +929,30 @@ fn universal_event_from_normalized(
                 summary: Some(normalized_event_summary(event)),
             },
         ),
+    }
+}
+
+fn provider_notification(event: &NativeNotification) -> ProviderNotification {
+    ProviderNotification {
+        category: event.category.clone(),
+        title: event.title.clone(),
+        detail: event.detail.clone(),
+        status: event.status.clone(),
+        severity: provider_notification_severity(event),
+        subject: event.event_id.clone(),
+    }
+}
+
+fn provider_notification_severity(
+    event: &NativeNotification,
+) -> Option<ProviderNotificationSeverity> {
+    match event.status.as_deref().or(Some(event.category.as_str())) {
+        Some("failed" | "error") => Some(ProviderNotificationSeverity::Error),
+        Some("warning" | "guardian" | "config_warning") => {
+            Some(ProviderNotificationSeverity::Warning)
+        }
+        Some("debug") => Some(ProviderNotificationSeverity::Debug),
+        _ => Some(ProviderNotificationSeverity::Info),
     }
 }
 

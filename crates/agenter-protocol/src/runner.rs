@@ -2,7 +2,7 @@ use agenter_core::{
     AgentCapabilities, AgentOptions, AgentProviderId, AgentQuestionAnswer, AgentTurnSettings,
     ApprovalDecision, ApprovalId, FileChangeKind, ItemId, NativeRef, SessionId,
     SlashCommandDefinition, SlashCommandRequest, SlashCommandResult, TurnId, UniversalEventKind,
-    UniversalEventSource, UserMessageEvent, WorkspaceRef,
+    UniversalEventSource, UserMessageEvent, WorkspaceRef, UNIVERSAL_PROTOCOL_VERSION,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -305,6 +305,8 @@ pub enum RunnerOperationLogLevel {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AgentUniversalEvent {
+    #[serde(default = "runner_universal_protocol_version")]
+    pub protocol_version: String,
     pub session_id: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
@@ -318,6 +320,10 @@ pub struct AgentUniversalEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<NativeRef>,
     pub event: UniversalEventKind,
+}
+
+fn runner_universal_protocol_version() -> String {
+    UNIVERSAL_PROTOCOL_VERSION.to_owned()
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -681,6 +687,7 @@ mod tests {
             runner_event_seq: Some(123),
             acked_runner_event_seq: Some(122),
             event: RunnerEvent::AgentEvent(Box::new(AgentUniversalEvent {
+                protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
                 session_id: SessionId::nil(),
                 event_id: Some("11111111-1111-1111-1111-111111111111".to_owned()),
                 turn_id: None,
@@ -711,6 +718,7 @@ mod tests {
         assert_eq!(json["runner_event_seq"], 123);
         assert_eq!(json["acked_runner_event_seq"], 122);
         assert_eq!(json["event"]["type"], "agent_event");
+        assert_eq!(json["event"]["protocol_version"], "uap/1");
         assert_eq!(json["event"]["native"]["protocol"], "codex-app-server");
         assert_eq!(json["event"]["event"]["type"], "native.unknown");
         assert_eq!(decoded, message);

@@ -9,20 +9,22 @@ pub mod slash_command;
 pub mod workspace;
 
 pub use approval::{
-    ApprovalDecision, ApprovalKind, ApprovalOption, ApprovalOptionKind, ApprovalPolicyMetadata,
-    ApprovalPolicyRulePreview, ApprovalRequest, ApprovalRequestEvent, ApprovalResolutionState,
-    ApprovalResolvedEvent, ApprovalRisk, ApprovalStatus, PolicyAction,
+    AgentObligation, AgentObligationKind, AgentObligationStatus, ApprovalDecision, ApprovalKind,
+    ApprovalOption, ApprovalOptionKind, ApprovalPolicyMetadata, ApprovalPolicyRulePreview,
+    ApprovalRequest, ApprovalRequestEvent, ApprovalResolutionState, ApprovalResolvedEvent,
+    ApprovalRisk, ApprovalStatus, PolicyAction,
 };
 pub use events::{
     AgentErrorEvent, AgentMessageDeltaEvent, ArtifactKind, ArtifactState, CommandAction,
     CommandCompletedEvent, CommandEvent, CommandOutputEvent, CommandOutputStream, ContentBlock,
     ContentBlockKind, DiffFile, DiffState, FileChangeEvent, FileChangeKind, ItemRole, ItemState,
     ItemStatus, MessageCompletedEvent, NativeNotification, NativeRef, NormalizedEvent, PlanEntry,
-    PlanEntryStatus, PlanEvent, PlanSource, PlanState, PlanStatus, SessionStatusChangedEvent,
-    ToolActionProjection, ToolCommandProjection, ToolEvent, ToolMcpProjection, ToolProjection,
-    ToolProjectionKind, ToolSubagentOperation, ToolSubagentProjection, ToolSubagentStateProjection,
-    UniversalCommand, UniversalCommandEnvelope, UniversalEventEnvelope, UniversalEventKind,
-    UniversalEventSource, UniversalPlanEntry, UniversalSeq, UserInput, UserMessageEvent,
+    PlanEntryStatus, PlanEvent, PlanSource, PlanState, PlanStatus, ProviderNotification,
+    ProviderNotificationSeverity, SessionStatusChangedEvent, ToolActionProjection,
+    ToolCommandProjection, ToolEvent, ToolMcpProjection, ToolProjection, ToolProjectionKind,
+    ToolSubagentOperation, ToolSubagentProjection, ToolSubagentStateProjection, UniversalCommand,
+    UniversalCommandEnvelope, UniversalEventEnvelope, UniversalEventKind, UniversalEventSource,
+    UniversalPlanEntry, UniversalSeq, UserInput, UserMessageEvent, UNIVERSAL_PROTOCOL_VERSION,
 };
 pub use ids::{
     ApprovalId, ArtifactId, CommandId, ConnectorBindingId, DiffId, ItemId, PlanId, QuestionId,

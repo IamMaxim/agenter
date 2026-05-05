@@ -1,3 +1,4 @@
+import { UAP_PROTOCOL_VERSION, type UapProtocolVersion } from '../api/types';
 import type {
   AgentCollaborationMode,
   AgentModelOption,
@@ -28,6 +29,7 @@ import type {
   PlanSource,
   PlanState,
   PlanStatus,
+  ProviderNotification,
   QuestionState,
   QuestionStatus,
   BrowserServerMessage,
@@ -162,6 +164,7 @@ export function normalizeBrowserSessionSnapshot(value: unknown): BrowserSessionS
   const record = objectRecord(value);
   return {
     type: 'session_snapshot',
+    protocol_version: normalizeUapProtocolVersion(record.protocol_version),
     ...(typeof record.request_id === 'string' ? { request_id: record.request_id } : {}),
     snapshot: normalizeSessionSnapshot(record.snapshot),
     events: arrayValue(record.events).map(normalizeUniversalEventEnvelope),
@@ -202,6 +205,7 @@ export function normalizeUniversalEventEnvelope(value: unknown): UniversalEventE
     throw new Error('Universal event event_id must be UUID-shaped.');
   }
   return {
+    protocol_version: normalizeUapProtocolVersion(record.protocol_version),
     event_id: record.event_id,
     seq,
     session_id: typeof record.session_id === 'string' ? record.session_id : '',
@@ -214,6 +218,16 @@ export function normalizeUniversalEventEnvelope(value: unknown): UniversalEventE
   };
 }
 
+function normalizeUapProtocolVersion(value: unknown): UapProtocolVersion {
+  if (value === undefined || value === null) {
+    return UAP_PROTOCOL_VERSION;
+  }
+  if (value === UAP_PROTOCOL_VERSION) {
+    return UAP_PROTOCOL_VERSION;
+  }
+  throw new Error(`Unsupported universal protocol version: ${String(value)}`);
+}
+
 function normalizeUniversalEventKind(value: unknown): UniversalEventKind {
   const record = objectRecord(value);
   const type = typeof record.type === 'string' ? record.type : 'native.unknown';
@@ -221,6 +235,21 @@ function normalizeUniversalEventKind(value: unknown): UniversalEventKind {
   switch (type) {
     case 'session.created':
       return { type, data: { session: normalizeSessionInfo(data.session) ?? minimalSessionInfo() } };
+    case 'session.status_changed':
+      return {
+        type,
+        data: {
+          status: stringOr(data.status, 'degraded') as SessionStatus,
+          reason: typeof data.reason === 'string' ? data.reason : null
+        }
+      };
+    case 'session.metadata_changed':
+      return {
+        type,
+        data: {
+          title: typeof data.title === 'string' ? data.title : null
+        }
+      };
     case 'turn.started':
     case 'turn.status_changed':
     case 'turn.completed':
@@ -273,11 +302,33 @@ function normalizeUniversalEventKind(value: unknown): UniversalEventKind {
       return { type, data: { artifact: normalizeArtifactState(data.artifact) } };
     case 'usage.updated':
       return { type, data: { usage: normalizeSessionUsage(data.usage) ?? {} } };
+    case 'error.reported':
+      return {
+        type,
+        data: {
+          code: typeof data.code === 'string' ? data.code : null,
+          message: stringOr(data.message, 'Provider error')
+        }
+      };
+    case 'provider.notification':
+      return { type, data: { notification: normalizeProviderNotification(data.notification) } };
     case 'native.unknown':
       return { type, data: { summary: typeof data.summary === 'string' ? data.summary : null } };
     default:
       return { type: 'native.unknown', data: { summary: type } };
   }
+}
+
+function normalizeProviderNotification(value: unknown): ProviderNotification {
+  const record = objectRecord(value);
+  return {
+    category: stringOr(record.category, 'provider'),
+    title: stringOr(record.title, 'Provider event'),
+    detail: typeof record.detail === 'string' ? record.detail : null,
+    status: typeof record.status === 'string' ? record.status : null,
+    severity: typeof record.severity === 'string' ? record.severity : null,
+    subject: typeof record.subject === 'string' ? record.subject : null
+  };
 }
 
 function normalizeCapabilitySet(value: unknown): CapabilitySet | undefined {

@@ -1,4 +1,6 @@
-use agenter_core::{SessionId, SessionSnapshot, UniversalEventEnvelope, UniversalSeq};
+use agenter_core::{
+    SessionId, SessionSnapshot, UniversalEventEnvelope, UniversalSeq, UNIVERSAL_PROTOCOL_VERSION,
+};
 use serde::{Deserialize, Serialize};
 
 pub use crate::{EventId, RequestId};
@@ -35,6 +37,8 @@ fn is_false(value: &bool) -> bool {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct BrowserSessionSnapshot {
+    #[serde(default = "browser_universal_protocol_version")]
+    pub protocol_version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<RequestId>,
     pub snapshot: SessionSnapshot,
@@ -44,6 +48,10 @@ pub struct BrowserSessionSnapshot {
     pub latest_seq: Option<UniversalSeq>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub has_more: bool,
+}
+
+fn browser_universal_protocol_version() -> String {
+    UNIVERSAL_PROTOCOL_VERSION.to_owned()
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -107,6 +115,7 @@ mod tests {
             },
         };
         let message = BrowserServerMessage::SessionSnapshot(BrowserSessionSnapshot {
+            protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
             request_id: Some(RequestId::from("snapshot-1")),
             snapshot: SessionSnapshot {
                 session_id: SessionId::nil(),
@@ -123,8 +132,10 @@ mod tests {
             serde_json::from_value(json.clone()).expect("deserialize snapshot");
 
         assert_eq!(json["type"], "session_snapshot");
+        assert_eq!(json["protocol_version"], "uap/1");
         assert_eq!(json["latest_seq"], "7");
         assert_eq!(json.get("has_more"), None);
+        assert_eq!(json["events"][0]["protocol_version"], "uap/1");
         assert_eq!(json["events"][0]["event"]["type"], "native.unknown");
         assert_eq!(decoded, message);
     }
@@ -152,6 +163,7 @@ mod tests {
             serde_json::from_value(json.clone()).expect("deserialize universal event");
 
         assert_eq!(json["type"], "universal_event");
+        assert_eq!(json["protocol_version"], "uap/1");
         assert_eq!(json["seq"], "9");
         assert_eq!(decoded, message);
     }
@@ -159,6 +171,7 @@ mod tests {
     #[test]
     fn browser_session_snapshot_allows_empty_latest_seq() {
         let message = BrowserServerMessage::SessionSnapshot(BrowserSessionSnapshot {
+            protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
             request_id: Some(RequestId::from("snapshot-empty")),
             snapshot: SessionSnapshot {
                 session_id: SessionId::nil(),
@@ -182,6 +195,7 @@ mod tests {
     #[test]
     fn session_snapshot_can_mark_truncated_replay() {
         let message = BrowserServerMessage::SessionSnapshot(BrowserSessionSnapshot {
+            protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
             request_id: None,
             snapshot: SessionSnapshot {
                 session_id: SessionId::nil(),

@@ -1,8 +1,9 @@
 use agenter_core::{
-    AgentProviderId, AgentTurnSettings, ApprovalDecision, ApprovalId, ApprovalKind,
-    ApprovalRequest, ApprovalStatus as UniversalApprovalStatus, CommandId, ItemId, RunnerId,
-    SessionId, SessionSnapshot, SessionStatus, SessionUsageSnapshot, TurnId,
-    UniversalEventEnvelope, UniversalEventKind, UniversalEventSource, UniversalSeq, UserId,
+    AgentObligationKind, AgentObligationStatus, AgentProviderId, AgentTurnSettings,
+    ApprovalDecision, ApprovalId, ApprovalKind, ApprovalRequest,
+    ApprovalStatus as UniversalApprovalStatus, CommandId, ItemId, QuestionId, QuestionState,
+    QuestionStatus, RunnerId, SessionId, SessionSnapshot, SessionStatus, SessionUsageSnapshot,
+    TurnId, UniversalEventEnvelope, UniversalEventKind, UniversalEventSource, UniversalSeq, UserId,
     WorkspaceId,
 };
 use chrono::{DateTime, Utc};
@@ -10,9 +11,10 @@ use sqlx::{postgres::PgRow, PgPool, Postgres, Result, Row, Transaction};
 use uuid::Uuid;
 
 use crate::models::{
-    AgentEvent, AgentSession, AgentSessionWithWorkspace, ApprovalPolicyRule, BrowserAuthSession,
-    CommandIdempotencyRecord, CommandIdempotencyStatus, ConnectorAccount, ConnectorLinkCode,
-    OidcLoginState, OidcProvider, PendingApproval, Runner, StoredSessionSnapshot,
+    AgentEvent, AgentObligation as DbAgentObligation, AgentSession, AgentSessionWithWorkspace,
+    ApprovalPolicyRule, BrowserAuthSession, CommandIdempotencyRecord, CommandIdempotencyStatus,
+    ConnectorAccount, ConnectorLinkCode, OidcLoginState, OidcProvider, PendingApproval, Runner,
+    RunnerEventReceipt, RunnerUniversalAppendOutcome, StoredSessionSnapshot,
     UniversalAppendOutcome, User, Workspace,
 };
 
@@ -1091,6 +1093,7 @@ where
             } else {
                 materialize_pending_approval_tx(&mut tx, approval).await?;
             }
+            upsert_approval_obligation_tx(&mut tx, approval).await?;
         }
         UniversalEventKind::ApprovalResolved {
             approval_id,
@@ -1107,6 +1110,14 @@ where
                 native.as_ref(),
             )
             .await?;
+            resolve_approval_obligation_tx(&mut tx, *approval_id, status, *resolved_at, None)
+                .await?;
+        }
+        UniversalEventKind::QuestionRequested { question } => {
+            upsert_question_obligation_tx(&mut tx, question).await?;
+        }
+        UniversalEventKind::QuestionAnswered { question } => {
+            upsert_question_obligation_tx(&mut tx, question).await?;
         }
         _ => {}
     }
@@ -1116,6 +1127,117 @@ where
     let snapshot = store_session_snapshot_tx(&mut tx, &snapshot).await?;
     tx.commit().await?;
     Ok(UniversalAppendOutcome { event, snapshot })
+}
+
+pub async fn append_runner_universal_event_reducing_snapshot<F>(
+    pool: &PgPool,
+    workspace_id: WorkspaceId,
+    runner_id: RunnerId,
+    runner_event_seq: u64,
+    envelope: UniversalEventEnvelope,
+    command_id: Option<CommandId>,
+    reduce: F,
+) -> Result<RunnerUniversalAppendOutcome>
+where
+    F: FnOnce(&mut SessionSnapshot, &UniversalEventEnvelope) + Send,
+{
+    let runner_event_seq_i64 = runner_event_seq_to_i64(runner_event_seq)?;
+    let mut tx = pool.begin().await?;
+    lock_runner_for_receipt_tx(&mut tx, runner_id).await?;
+    if let Some(receipt) =
+        load_runner_event_receipt_tx(&mut tx, runner_id, runner_event_seq_i64).await?
+    {
+        tx.commit().await?;
+        return Ok(RunnerUniversalAppendOutcome::Duplicate(receipt));
+    }
+
+    lock_session_for_projection_tx(&mut tx, envelope.session_id).await?;
+    let event = insert_universal_event_tx(&mut tx, workspace_id, &envelope, command_id).await?;
+    match &event.event {
+        UniversalEventKind::ApprovalRequested { approval } => {
+            if is_resolved_universal_approval_status(&approval.status) {
+                resolve_pending_approval_from_universal_tx(&mut tx, approval).await?;
+            } else {
+                materialize_pending_approval_tx(&mut tx, approval).await?;
+            }
+            upsert_approval_obligation_tx(&mut tx, approval).await?;
+        }
+        UniversalEventKind::ApprovalResolved {
+            approval_id,
+            status,
+            resolved_at,
+            native,
+            ..
+        } => {
+            resolve_existing_pending_approval_tx(
+                &mut tx,
+                *approval_id,
+                status,
+                *resolved_at,
+                native.as_ref(),
+            )
+            .await?;
+            resolve_approval_obligation_tx(&mut tx, *approval_id, status, *resolved_at, None)
+                .await?;
+        }
+        UniversalEventKind::QuestionRequested { question } => {
+            upsert_question_obligation_tx(&mut tx, question).await?;
+        }
+        UniversalEventKind::QuestionAnswered { question } => {
+            upsert_question_obligation_tx(&mut tx, question).await?;
+        }
+        _ => {}
+    }
+    let mut snapshot = load_session_snapshot_for_update_tx(&mut tx, event.session_id).await?;
+    reduce(&mut snapshot, &event.envelope());
+    snapshot.latest_seq = Some(event.seq);
+    let snapshot = store_session_snapshot_tx(&mut tx, &snapshot).await?;
+    insert_runner_event_receipt_tx(&mut tx, runner_id, runner_event_seq_i64, &event).await?;
+    tx.commit().await?;
+    Ok(RunnerUniversalAppendOutcome::Accepted(Box::new(
+        UniversalAppendOutcome { event, snapshot },
+    )))
+}
+
+pub async fn runner_event_receipt_exists(
+    pool: &PgPool,
+    runner_id: RunnerId,
+    runner_event_seq: u64,
+) -> Result<bool> {
+    let runner_event_seq = runner_event_seq_to_i64(runner_event_seq)?;
+    let exists: bool = sqlx::query_scalar(
+        "select exists (
+            select 1
+            from runner_event_receipts
+            where runner_id = $1 and runner_event_seq = $2
+        )",
+    )
+    .bind(runner_id.as_uuid())
+    .bind(runner_event_seq)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
+}
+
+pub async fn durable_runner_event_ack_cursor(
+    pool: &PgPool,
+    runner_id: RunnerId,
+) -> Result<Option<u64>> {
+    let cursor: Option<i64> = sqlx::query_scalar(
+        "with ordered as (
+            select runner_event_seq,
+                   row_number() over (order by runner_event_seq asc) as expected_seq
+            from runner_event_receipts
+            where runner_id = $1
+        )
+        select max(runner_event_seq)
+        from ordered
+        where runner_event_seq = expected_seq",
+    )
+    .bind(runner_id.as_uuid())
+    .fetch_one(pool)
+    .await?;
+    cursor.map(i64_to_runner_event_seq).transpose()
 }
 
 pub async fn list_universal_events_after(
@@ -1615,6 +1737,62 @@ async fn insert_universal_event_tx(
     agent_event_from_row(&row)
 }
 
+async fn lock_runner_for_receipt_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    runner_id: RunnerId,
+) -> Result<()> {
+    sqlx::query("select 1 from runners where runner_id = $1 for update")
+        .bind(runner_id.as_uuid())
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn load_runner_event_receipt_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    runner_id: RunnerId,
+    runner_event_seq: i64,
+) -> Result<Option<RunnerEventReceipt>> {
+    let row = sqlx::query(
+        "select runner_id, runner_event_seq, event_seq, event_id, accepted_at
+         from runner_event_receipts
+         where runner_id = $1 and runner_event_seq = $2
+         for update",
+    )
+    .bind(runner_id.as_uuid())
+    .bind(runner_event_seq)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    row.as_ref().map(runner_event_receipt_from_row).transpose()
+}
+
+async fn insert_runner_event_receipt_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    runner_id: RunnerId,
+    runner_event_seq: i64,
+    event: &AgentEvent,
+) -> Result<RunnerEventReceipt> {
+    let row = sqlx::query(
+        "insert into runner_event_receipts (
+            runner_id,
+            runner_event_seq,
+            event_seq,
+            event_id
+         )
+         values ($1, $2, $3, $4)
+         returning runner_id, runner_event_seq, event_seq, event_id, accepted_at",
+    )
+    .bind(runner_id.as_uuid())
+    .bind(runner_event_seq)
+    .bind(event.seq.as_i64())
+    .bind(event.event_id)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    runner_event_receipt_from_row(&row)
+}
+
 async fn lock_session_for_projection_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: SessionId,
@@ -1865,6 +2043,149 @@ async fn resolve_existing_pending_approval_tx(
     Ok(())
 }
 
+async fn upsert_approval_obligation_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    approval: &ApprovalRequest,
+) -> Result<()> {
+    let payload = serde_json::to_value(approval).map_err(sqlx::Error::decode)?;
+    let native_request_id = approval.native_request_id.as_deref().or_else(|| {
+        approval
+            .native
+            .as_ref()
+            .and_then(|native| native.native_id.as_deref())
+    });
+    let status = approval_status_to_obligation_status(&approval.status);
+    sqlx::query(
+        "insert into agent_obligations (
+            obligation_id,
+            session_id,
+            turn_id,
+            native_request_id,
+            kind,
+            approval_id,
+            question_id,
+            status,
+            payload_json,
+            resolved_at
+         )
+         values ($1, $2, $3, $4, 'approval', $5, null, $6, $7, $8)
+         on conflict (obligation_id)
+         do update set turn_id = coalesce(excluded.turn_id, agent_obligations.turn_id),
+                       native_request_id = coalesce(excluded.native_request_id, agent_obligations.native_request_id),
+                       status = excluded.status,
+                       payload_json = excluded.payload_json,
+                       resolved_at = coalesce(excluded.resolved_at, agent_obligations.resolved_at),
+                       updated_at = now()",
+    )
+    .bind(format!("approval:{}", approval.approval_id))
+    .bind(approval.session_id.as_uuid())
+    .bind(approval.turn_id.map(TurnId::as_uuid))
+    .bind(native_request_id)
+    .bind(approval.approval_id.as_uuid())
+    .bind(obligation_status_to_db(&status))
+    .bind(payload)
+    .bind(approval.resolved_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn resolve_approval_obligation_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    approval_id: ApprovalId,
+    status: &UniversalApprovalStatus,
+    resolved_at: DateTime<Utc>,
+    command_id: Option<CommandId>,
+) -> Result<()> {
+    let obligation_status = approval_status_to_obligation_status(status);
+    sqlx::query(
+        "update agent_obligations
+         set status = $2,
+             resolution_command_id = coalesce($3, resolution_command_id),
+             resolved_at = $4,
+             updated_at = now()
+         where approval_id = $1",
+    )
+    .bind(approval_id.as_uuid())
+    .bind(obligation_status_to_db(&obligation_status))
+    .bind(command_id.map(CommandId::as_uuid))
+    .bind(resolved_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn upsert_question_obligation_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    question: &QuestionState,
+) -> Result<()> {
+    let payload = serde_json::to_value(question).map_err(sqlx::Error::decode)?;
+    let status = question_status_to_obligation_status(&question.status);
+    let resolved_at = match question.status {
+        QuestionStatus::Answered | QuestionStatus::Cancelled => question.answered_at,
+        QuestionStatus::Expired | QuestionStatus::Orphaned | QuestionStatus::Detached => {
+            question.answered_at.or(Some(Utc::now()))
+        }
+        QuestionStatus::Pending => None,
+    };
+    let native_request_id = question
+        .native
+        .as_ref()
+        .and_then(|native| native.native_id.as_deref());
+    sqlx::query(
+        "insert into agent_obligations (
+            obligation_id,
+            session_id,
+            turn_id,
+            native_request_id,
+            kind,
+            approval_id,
+            question_id,
+            status,
+            payload_json,
+            resolved_at
+         )
+         values ($1, $2, $3, $4, 'question', null, $5, $6, $7, $8)
+         on conflict (obligation_id)
+         do update set turn_id = coalesce(excluded.turn_id, agent_obligations.turn_id),
+                       native_request_id = coalesce(excluded.native_request_id, agent_obligations.native_request_id),
+                       status = excluded.status,
+                       payload_json = excluded.payload_json,
+                       resolved_at = coalesce(excluded.resolved_at, agent_obligations.resolved_at),
+                       updated_at = now()",
+    )
+    .bind(format!("question:{}", question.question_id))
+    .bind(question.session_id.as_uuid())
+    .bind(question.turn_id.map(TurnId::as_uuid))
+    .bind(native_request_id)
+    .bind(question.question_id.as_uuid())
+    .bind(obligation_status_to_db(&status))
+    .bind(payload)
+    .bind(resolved_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_session_obligations(
+    pool: &PgPool,
+    session_id: SessionId,
+) -> Result<Vec<DbAgentObligation>> {
+    let rows = sqlx::query(
+        "select obligation_id, session_id, turn_id, runner_id, native_request_id, kind,
+                approval_id, question_id, status, delivery_generation, resolution_command_id,
+                payload_json, resolved_at, created_at, updated_at
+         from agent_obligations
+         where session_id = $1
+         order by created_at asc, obligation_id asc",
+    )
+    .bind(session_id.as_uuid())
+    .fetch_all(pool)
+    .await?;
+
+    rows.iter().map(agent_obligation_from_row).collect()
+}
+
 fn user_from_row(row: &PgRow) -> Result<User> {
     Ok(User {
         user_id: UserId::from_uuid(row.try_get("user_id")?),
@@ -1941,6 +2262,16 @@ fn agent_event_from_row(row: &PgRow) -> Result<AgentEvent> {
         source: universal_event_source_from_db(&source)?,
         command_id: command_id.map(CommandId::from_uuid),
         created_at: row.try_get("created_at")?,
+    })
+}
+
+fn runner_event_receipt_from_row(row: &PgRow) -> Result<RunnerEventReceipt> {
+    Ok(RunnerEventReceipt {
+        runner_id: RunnerId::from_uuid(row.try_get("runner_id")?),
+        runner_event_seq: i64_to_runner_event_seq(row.try_get("runner_event_seq")?)?,
+        event_seq: UniversalSeq::new(row.try_get("event_seq")?),
+        event_id: row.try_get("event_id")?,
+        accepted_at: row.try_get("accepted_at")?,
     })
 }
 
@@ -2034,6 +2365,100 @@ fn approval_from_row(row: &PgRow) -> Result<PendingApproval> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+fn agent_obligation_from_row(row: &PgRow) -> Result<DbAgentObligation> {
+    let kind: String = row.try_get("kind")?;
+    let status: String = row.try_get("status")?;
+    let turn_id: Option<Uuid> = row.try_get("turn_id")?;
+    let runner_id: Option<Uuid> = row.try_get("runner_id")?;
+    let approval_id: Option<Uuid> = row.try_get("approval_id")?;
+    let question_id: Option<Uuid> = row.try_get("question_id")?;
+    let resolution_command_id: Option<Uuid> = row.try_get("resolution_command_id")?;
+    Ok(DbAgentObligation {
+        obligation_id: row.try_get("obligation_id")?,
+        session_id: SessionId::from_uuid(row.try_get("session_id")?),
+        turn_id: turn_id.map(TurnId::from_uuid),
+        runner_id: runner_id.map(RunnerId::from_uuid),
+        native_request_id: row.try_get("native_request_id")?,
+        kind: agent_obligation_kind_from_db(&kind)?,
+        approval_id: approval_id.map(ApprovalId::from_uuid),
+        question_id: question_id.map(QuestionId::from_uuid),
+        status: obligation_status_from_db(&status)?,
+        delivery_generation: row.try_get("delivery_generation")?,
+        resolution_command_id: resolution_command_id.map(CommandId::from_uuid),
+        payload: row.try_get("payload_json")?,
+        resolved_at: row.try_get("resolved_at")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn agent_obligation_kind_from_db(value: &str) -> Result<AgentObligationKind> {
+    match value {
+        "approval" => Ok(AgentObligationKind::Approval),
+        "question" => Ok(AgentObligationKind::Question),
+        _ => Err(sqlx::Error::ColumnDecode {
+            index: "kind".to_owned(),
+            source: format!("unknown agent obligation kind {value:?}").into(),
+        }),
+    }
+}
+
+fn approval_status_to_obligation_status(status: &UniversalApprovalStatus) -> AgentObligationStatus {
+    match status {
+        UniversalApprovalStatus::Pending => AgentObligationStatus::Pending,
+        UniversalApprovalStatus::Presented => AgentObligationStatus::Presented,
+        UniversalApprovalStatus::Resolving => AgentObligationStatus::Resolving,
+        UniversalApprovalStatus::Approved
+        | UniversalApprovalStatus::Denied
+        | UniversalApprovalStatus::Cancelled => AgentObligationStatus::Resolved,
+        UniversalApprovalStatus::Expired => AgentObligationStatus::Expired,
+        UniversalApprovalStatus::Orphaned => AgentObligationStatus::Orphaned,
+        UniversalApprovalStatus::Detached => AgentObligationStatus::Detached,
+    }
+}
+
+fn question_status_to_obligation_status(status: &QuestionStatus) -> AgentObligationStatus {
+    match status {
+        QuestionStatus::Pending => AgentObligationStatus::Pending,
+        QuestionStatus::Answered | QuestionStatus::Cancelled => AgentObligationStatus::Resolved,
+        QuestionStatus::Expired => AgentObligationStatus::Expired,
+        QuestionStatus::Orphaned => AgentObligationStatus::Orphaned,
+        QuestionStatus::Detached => AgentObligationStatus::Detached,
+    }
+}
+
+fn obligation_status_to_db(status: &AgentObligationStatus) -> &'static str {
+    match status {
+        AgentObligationStatus::Pending => "pending",
+        AgentObligationStatus::Presented => "presented",
+        AgentObligationStatus::Resolving => "resolving",
+        AgentObligationStatus::DeliveredToRunner => "delivered_to_runner",
+        AgentObligationStatus::AcceptedByNative => "accepted_by_native",
+        AgentObligationStatus::Resolved => "resolved",
+        AgentObligationStatus::Orphaned => "orphaned",
+        AgentObligationStatus::Expired => "expired",
+        AgentObligationStatus::Detached => "detached",
+    }
+}
+
+fn obligation_status_from_db(value: &str) -> Result<AgentObligationStatus> {
+    match value {
+        "pending" => Ok(AgentObligationStatus::Pending),
+        "presented" => Ok(AgentObligationStatus::Presented),
+        "resolving" => Ok(AgentObligationStatus::Resolving),
+        "delivered_to_runner" => Ok(AgentObligationStatus::DeliveredToRunner),
+        "accepted_by_native" => Ok(AgentObligationStatus::AcceptedByNative),
+        "resolved" => Ok(AgentObligationStatus::Resolved),
+        "orphaned" => Ok(AgentObligationStatus::Orphaned),
+        "expired" => Ok(AgentObligationStatus::Expired),
+        "detached" => Ok(AgentObligationStatus::Detached),
+        _ => Err(sqlx::Error::ColumnDecode {
+            index: "status".to_owned(),
+            source: format!("unknown agent obligation status {value:?}").into(),
+        }),
+    }
 }
 
 fn approval_policy_rule_from_row(row: &PgRow) -> Result<ApprovalPolicyRule> {
@@ -2196,6 +2621,26 @@ fn parse_control_plane_event_id(value: &str) -> Result<Uuid> {
     })
 }
 
+fn runner_event_seq_to_i64(value: u64) -> Result<i64> {
+    if value == 0 {
+        return Err(sqlx::Error::ColumnDecode {
+            index: "runner_event_seq".to_owned(),
+            source: "runner_event_seq must be positive".into(),
+        });
+    }
+    i64::try_from(value).map_err(|error| sqlx::Error::ColumnDecode {
+        index: "runner_event_seq".to_owned(),
+        source: format!("runner_event_seq exceeds Postgres bigint range: {error}").into(),
+    })
+}
+
+fn i64_to_runner_event_seq(value: i64) -> Result<u64> {
+    u64::try_from(value).map_err(|error| sqlx::Error::ColumnDecode {
+        index: "runner_event_seq".to_owned(),
+        source: format!("stored runner_event_seq cannot be represented as u64: {error}").into(),
+    })
+}
+
 fn universal_event_type(event: &UniversalEventKind) -> &'static str {
     match event {
         UniversalEventKind::SessionCreated { .. } => "session.created",
@@ -2220,6 +2665,7 @@ fn universal_event_type(event: &UniversalEventKind) -> &'static str {
         UniversalEventKind::ArtifactCreated { .. } => "artifact.created",
         UniversalEventKind::UsageUpdated { .. } => "usage.updated",
         UniversalEventKind::ErrorReported { .. } => "error.reported",
+        UniversalEventKind::ProviderNotification { .. } => "provider.notification",
         UniversalEventKind::NativeUnknown { .. } => "native.unknown",
     }
 }
@@ -2289,6 +2735,7 @@ fn is_resolved_universal_approval_status(status: &UniversalApprovalStatus) -> bo
             | UniversalApprovalStatus::Cancelled
             | UniversalApprovalStatus::Expired
             | UniversalApprovalStatus::Orphaned
+            | UniversalApprovalStatus::Detached
     )
 }
 
@@ -2302,6 +2749,7 @@ fn universal_approval_status_to_db(status: &UniversalApprovalStatus) -> &'static
         UniversalApprovalStatus::Cancelled => "cancelled",
         UniversalApprovalStatus::Expired => "expired",
         UniversalApprovalStatus::Orphaned => "orphaned",
+        UniversalApprovalStatus::Detached => "detached",
     }
 }
 
@@ -2315,6 +2763,7 @@ fn universal_approval_status_from_db(value: &str) -> Result<UniversalApprovalSta
         "cancelled" => Ok(UniversalApprovalStatus::Cancelled),
         "expired" => Ok(UniversalApprovalStatus::Expired),
         "orphaned" => Ok(UniversalApprovalStatus::Orphaned),
+        "detached" => Ok(UniversalApprovalStatus::Detached),
         _ => Err(sqlx::Error::ColumnDecode {
             index: "universal_status".to_owned(),
             source: format!("unknown universal approval status {value:?}").into(),
@@ -2674,6 +3123,119 @@ mod tests {
             .await
             .expect("load cleared snapshot")
             .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
+    async fn universal_event_receipts_dedupe_runner_wal_replay() {
+        let pool = test_pool().await;
+
+        let suffix = uuid::Uuid::new_v4();
+        let user = create_user(
+            &pool,
+            &format!("runner-receipts-user-{suffix}@example.test"),
+            Some("Runner Receipts User"),
+        )
+        .await
+        .expect("create user");
+        let runner = register_runner(&pool, &format!("runner-receipts-{suffix}"), Some("test"))
+            .await
+            .expect("register runner");
+        let workspace = upsert_workspace(
+            &pool,
+            runner.runner_id,
+            &format!("/tmp/agenter-runner-receipts-{suffix}"),
+            Some("Runner Receipts Workspace"),
+        )
+        .await
+        .expect("upsert workspace");
+        let session = create_session(
+            &pool,
+            user.user_id,
+            runner.runner_id,
+            workspace.workspace_id,
+            AgentProviderId::from(AgentProviderId::CODEX),
+            None,
+            Some("Runner Receipts Session"),
+        )
+        .await
+        .expect("create session");
+
+        let first_event_id = uuid::Uuid::new_v4();
+        let first = append_runner_universal_event_reducing_snapshot(
+            &pool,
+            workspace.workspace_id,
+            runner.runner_id,
+            1,
+            UniversalEventEnvelope {
+                event_id: first_event_id.to_string(),
+                seq: UniversalSeq::zero(),
+                session_id: session.session_id,
+                turn_id: None,
+                item_id: None,
+                ts: Utc::now(),
+                source: UniversalEventSource::Runner,
+                native: None,
+                event: UniversalEventKind::NativeUnknown {
+                    summary: Some("first replayable runner event".to_owned()),
+                },
+            },
+            None,
+            |snapshot: &mut SessionSnapshot, event| {
+                snapshot.session_id = event.session_id;
+                snapshot.latest_seq = Some(event.seq);
+            },
+        )
+        .await
+        .expect("append first runner event");
+
+        assert!(matches!(first, RunnerUniversalAppendOutcome::Accepted(_)));
+
+        let duplicate = append_runner_universal_event_reducing_snapshot(
+            &pool,
+            workspace.workspace_id,
+            runner.runner_id,
+            1,
+            UniversalEventEnvelope {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                seq: UniversalSeq::zero(),
+                session_id: session.session_id,
+                turn_id: None,
+                item_id: None,
+                ts: Utc::now(),
+                source: UniversalEventSource::Runner,
+                native: None,
+                event: UniversalEventKind::NativeUnknown {
+                    summary: Some("duplicate replay should not append".to_owned()),
+                },
+            },
+            None,
+            |snapshot: &mut SessionSnapshot, event| {
+                snapshot.session_id = event.session_id;
+                snapshot.latest_seq = Some(event.seq);
+            },
+        )
+        .await
+        .expect("dedupe duplicate runner event");
+
+        let RunnerUniversalAppendOutcome::Duplicate(receipt) = duplicate else {
+            panic!("duplicate replay should return the existing durable receipt");
+        };
+        assert_eq!(receipt.runner_id, runner.runner_id);
+        assert_eq!(receipt.runner_event_seq, 1);
+        assert_eq!(receipt.event_id, first_event_id);
+
+        let replay = list_universal_events_after(&pool, session.session_id, None, 10)
+            .await
+            .expect("list universal events");
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].event_id, first_event_id);
+        assert_eq!(
+            durable_runner_event_ack_cursor(&pool, runner.runner_id)
+                .await
+                .expect("load ack cursor"),
+            Some(1)
+        );
     }
 
     #[tokio::test]

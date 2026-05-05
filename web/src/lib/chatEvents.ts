@@ -91,6 +91,8 @@ export type ChatItem =
       description?: string;
       fields: AgentQuestionField[];
       answered: boolean;
+      status?: string;
+      resolvedState?: string;
     }
   | {
       id: string;

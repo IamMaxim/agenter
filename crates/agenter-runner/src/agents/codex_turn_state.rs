@@ -235,6 +235,27 @@ impl CodexTurnDriver {
         })
     }
 
+    pub(crate) fn terminal_detached(
+        &mut self,
+        payload: Option<&Value>,
+    ) -> CodexTurnStateTransition {
+        self.transition(
+            CodexTurnDriverState::Detached,
+            "turn/detached",
+            payload,
+            |previous| !matches!(previous, CodexTurnDriverState::Idle) && !previous.is_terminal(),
+        )
+    }
+
+    pub(crate) fn terminal_failed(&mut self, payload: Option<&Value>) -> CodexTurnStateTransition {
+        self.transition(
+            CodexTurnDriverState::Failed,
+            "turn/failed",
+            payload,
+            |previous| !matches!(previous, CodexTurnDriverState::Idle) && !previous.is_terminal(),
+        )
+    }
+
     fn transition(
         &mut self,
         next: CodexTurnDriverState,

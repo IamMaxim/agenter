@@ -4,6 +4,7 @@ import {
   defaultReasoningEfforts,
   effortsForSelectedModel,
   normalizeAgentOptions,
+  normalizeBrowserServerMessage,
   normalizeRunners,
   normalizeSessionSnapshot,
   normalizeSessions,
@@ -159,5 +160,92 @@ describe('frontend API normalizers', () => {
         reason: 'Visible but not executed remotely.'
       }
     ]);
+  });
+
+  test('normalizes versioned universal snapshot frames and defaults legacy missing versions', () => {
+    const versioned = normalizeBrowserServerMessage({
+      type: 'session_snapshot',
+      protocol_version: 'uap/1',
+      snapshot: { session_id: 'session-1' },
+      events: [
+        {
+          protocol_version: 'uap/1',
+          event_id: '11111111-1111-4111-8111-111111111111',
+          seq: '1',
+          session_id: 'session-1',
+          ts: '2026-05-05T12:00:00Z',
+          source: 'runner',
+          event: { type: 'native.unknown', data: { summary: 'hello' } }
+        }
+      ],
+      latest_seq: '1'
+    });
+
+    expect(versioned.type).toBe('session_snapshot');
+    if (versioned.type !== 'session_snapshot') throw new Error('expected snapshot');
+    expect(versioned.protocol_version).toBe('uap/1');
+    expect(versioned.events[0].protocol_version).toBe('uap/1');
+
+    const legacy = normalizeBrowserServerMessage({
+      type: 'universal_event',
+      event_id: '22222222-2222-4222-8222-222222222222',
+      seq: '2',
+      session_id: 'session-1',
+      ts: '2026-05-05T12:00:01Z',
+      source: 'runner',
+      event: { type: 'native.unknown', data: { summary: 'legacy' } }
+    });
+
+    expect(legacy.type).toBe('universal_event');
+    if (legacy.type !== 'universal_event') throw new Error('expected universal event');
+    expect(legacy.protocol_version).toBe('uap/1');
+  });
+
+  test('normalizes all known universal event types without native unknown fallback', () => {
+    const base = {
+      type: 'universal_event',
+      protocol_version: 'uap/1',
+      event_id: '33333333-3333-4333-8333-333333333333',
+      seq: '3',
+      session_id: 'session-1',
+      ts: '2026-05-05T12:00:02Z',
+      source: 'runner'
+    };
+    const cases: Array<{ type: string; data: Record<string, unknown> }> = [
+      {
+        type: 'session.created',
+        data: { session: { session_id: 'session-1', workspace_id: 'workspace-1' } }
+      },
+      { type: 'session.status_changed', data: { status: 'running', reason: 'turn started' } },
+      { type: 'session.metadata_changed', data: { title: 'Readable title' } },
+      { type: 'turn.started', data: { turn: { turn_id: 'turn-1', session_id: 'session-1', status: 'running' } } },
+      { type: 'turn.status_changed', data: { turn: { turn_id: 'turn-1', session_id: 'session-1', status: 'waiting_for_input' } } },
+      { type: 'turn.completed', data: { turn: { turn_id: 'turn-1', session_id: 'session-1', status: 'completed' } } },
+      { type: 'turn.failed', data: { turn: { turn_id: 'turn-1', session_id: 'session-1', status: 'failed' } } },
+      { type: 'turn.cancelled', data: { turn: { turn_id: 'turn-1', session_id: 'session-1', status: 'cancelled' } } },
+      { type: 'turn.interrupted', data: { turn: { turn_id: 'turn-1', session_id: 'session-1', status: 'interrupted' } } },
+      { type: 'turn.detached', data: { turn: { turn_id: 'turn-1', session_id: 'session-1', status: 'detached' } } },
+      { type: 'item.created', data: { item: { item_id: 'item-1', session_id: 'session-1', role: 'assistant', status: 'created' } } },
+      { type: 'content.delta', data: { block_id: 'block-1', kind: 'text', delta: 'hello' } },
+      { type: 'content.completed', data: { block_id: 'block-1', kind: 'text', text: 'hello' } },
+      { type: 'approval.requested', data: { approval: { approval_id: 'approval-1', session_id: 'session-1', kind: 'command', title: 'Run command', status: 'pending' } } },
+      { type: 'approval.resolved', data: { approval_id: 'approval-1', status: 'approved', resolved_at: '2026-05-05T12:00:03Z' } },
+      { type: 'question.requested', data: { question: { question_id: 'question-1', session_id: 'session-1', title: 'Input', status: 'pending' } } },
+      { type: 'question.answered', data: { question: { question_id: 'question-1', session_id: 'session-1', title: 'Input', status: 'answered' } } },
+      { type: 'plan.updated', data: { plan: { plan_id: 'plan-1', session_id: 'session-1', status: 'draft' } } },
+      { type: 'diff.updated', data: { diff: { diff_id: 'diff-1', session_id: 'session-1', files: [] } } },
+      { type: 'artifact.created', data: { artifact: { artifact_id: 'artifact-1', session_id: 'session-1', kind: 'file', title: 'Artifact' } } },
+      { type: 'usage.updated', data: { usage: { context: { used_percent: 25 } } } },
+      { type: 'error.reported', data: { code: 'provider_error', message: 'Provider failed' } },
+      { type: 'provider.notification', data: { notification: { category: 'hook', title: 'Hook started' } } },
+      { type: 'native.unknown', data: { summary: 'future event' } }
+    ];
+
+    for (const entry of cases) {
+      const message = normalizeBrowserServerMessage({ ...base, event: entry });
+      expect(message.type).toBe('universal_event');
+      if (message.type !== 'universal_event') throw new Error('expected universal event');
+      expect(message.event.type).toBe(entry.type);
+    }
   });
 });

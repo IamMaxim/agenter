@@ -1187,6 +1187,7 @@ mod tests {
                     runner_event_seq: None,
                     acked_runner_event_seq: None,
                     event: RunnerEvent::AgentEvent(Box::new(AgentUniversalEvent {
+                        protocol_version: agenter_core::UNIVERSAL_PROTOCOL_VERSION.to_owned(),
                         session_id: session.session_id,
                         event_id: None,
                         turn_id: None,

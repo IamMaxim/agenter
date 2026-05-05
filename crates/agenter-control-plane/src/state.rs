@@ -9,12 +9,13 @@ use agenter_core::{
     ApprovalOption, ApprovalRequest, ApprovalResolutionState,
     ApprovalStatus as UniversalApprovalStatus, CapabilitySet, CommandAction, CommandOutputStream,
     ContentBlock, ContentBlockKind, ItemRole, ItemState, ItemStatus, NativeNotification, NativeRef,
-    NormalizedEvent, QuestionId, QuestionState, QuestionStatus, RunnerId, SessionId, SessionInfo,
-    SessionSnapshot, SessionStatus, SessionUsageContext, SessionUsageSnapshot, SessionUsageWindow,
-    ToolActionProjection, ToolCommandProjection, ToolEvent, ToolMcpProjection, ToolProjection,
-    ToolProjectionKind, ToolSubagentOperation, ToolSubagentProjection, ToolSubagentStateProjection,
-    TurnStatus, UniversalCommandEnvelope, UniversalEventEnvelope, UniversalEventKind,
-    UniversalEventSource, UniversalSeq, UserId, WorkspaceId, WorkspaceRef,
+    NormalizedEvent, ProviderNotification, ProviderNotificationSeverity, QuestionId, QuestionState,
+    QuestionStatus, RunnerId, SessionId, SessionInfo, SessionSnapshot, SessionStatus,
+    SessionUsageContext, SessionUsageSnapshot, SessionUsageWindow, ToolActionProjection,
+    ToolCommandProjection, ToolEvent, ToolMcpProjection, ToolProjection, ToolProjectionKind,
+    ToolSubagentOperation, ToolSubagentProjection, ToolSubagentStateProjection, TurnStatus,
+    UniversalCommandEnvelope, UniversalEventEnvelope, UniversalEventKind, UniversalEventSource,
+    UniversalSeq, UserId, WorkspaceId, WorkspaceRef, UNIVERSAL_PROTOCOL_VERSION,
 };
 use agenter_protocol::{
     browser::BrowserSessionSnapshot,
@@ -88,7 +89,9 @@ pub struct RegisteredApproval {
 #[derive(Clone, Debug)]
 pub struct RegisteredQuestion {
     pub session_id: SessionId,
-    pub resolved: bool,
+    pub status: QuestionStatus,
+    pub request: Option<Box<CachedEventEnvelope>>,
+    pub state: Option<Box<QuestionState>>,
 }
 
 /// Tracks client-visible approval lifecycle. Pending/Resolving carry the original
@@ -798,10 +801,16 @@ impl AppState {
         connection_id
     }
 
+    #[cfg(test)]
     pub async fn seed_runner_event_ack(&self, runner_id: RunnerId, acked_seq: Option<u64>) {
         let Some(acked_seq) = acked_seq else {
             return;
         };
+        self.seed_process_runner_event_ack(runner_id, acked_seq)
+            .await;
+    }
+
+    async fn seed_process_runner_event_ack(&self, runner_id: RunnerId, acked_seq: u64) {
         self.inner
             .runner_event_acks
             .lock()
@@ -813,6 +822,33 @@ impl AppState {
         for seq in 1..=acked_seq {
             seen.insert((runner_id, seq));
         }
+    }
+
+    pub async fn seed_runner_event_ack_from_hello(
+        &self,
+        runner_id: RunnerId,
+        runner_supplied_acked_seq: Option<u64>,
+    ) -> Option<u64> {
+        let acked_seq = if let Some(pool) = &self.inner.db_pool {
+            match agenter_db::durable_runner_event_ack_cursor(pool, runner_id).await {
+                Ok(acked_seq) => acked_seq,
+                Err(error) => {
+                    tracing::warn!(
+                        %runner_id,
+                        %error,
+                        "failed to derive runner event ack cursor from durable receipts"
+                    );
+                    None
+                }
+            }
+        } else {
+            runner_supplied_acked_seq
+        };
+        if let Some(acked_seq) = acked_seq {
+            self.seed_process_runner_event_ack(runner_id, acked_seq)
+                .await;
+        }
+        acked_seq
     }
 
     pub async fn runner_event_already_accepted(
@@ -833,11 +869,37 @@ impl AppState {
         {
             return true;
         }
-        self.inner
+        if self
+            .inner
             .seen_runner_events
             .lock()
             .await
             .contains(&(runner_id, seq))
+        {
+            return true;
+        }
+        if let Some(pool) = &self.inner.db_pool {
+            match agenter_db::runner_event_receipt_exists(pool, runner_id, seq).await {
+                Ok(true) => {
+                    self.inner
+                        .seen_runner_events
+                        .lock()
+                        .await
+                        .insert((runner_id, seq));
+                    return true;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        %runner_id,
+                        runner_event_seq = seq,
+                        %error,
+                        "failed to check durable runner event receipt"
+                    );
+                }
+            }
+        }
+        false
     }
 
     pub async fn mark_runner_event_accepted(&self, runner_id: RunnerId, runner_event_seq: u64) {
@@ -1590,6 +1652,7 @@ impl AppState {
                 };
             self.hydrate_snapshot_capabilities(&mut snapshot).await;
             return Some(BrowserSessionSnapshot {
+                protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
                 request_id: None,
                 snapshot,
                 events,
@@ -1642,6 +1705,7 @@ impl AppState {
                 .or_else(|| events.last().map(|event| event.seq))
         };
         Some(BrowserSessionSnapshot {
+            protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
             request_id: None,
             snapshot,
             events,
@@ -2011,14 +2075,16 @@ impl AppState {
                     request.question_id,
                     RegisteredQuestion {
                         session_id,
-                        resolved: false,
+                        status: QuestionStatus::Pending,
+                        request: Some(Box::new(envelope.clone())),
+                        state: None,
                     },
                 );
             }
             NormalizedEvent::QuestionAnswered(answered) => {
                 let mut registry = self.inner.registry.lock().await;
                 if let Some(question) = registry.questions.get_mut(&answered.question_id) {
-                    question.resolved = true;
+                    question.status = QuestionStatus::Answered;
                 }
             }
             NormalizedEvent::SessionStatusChanged(status) => {
@@ -2065,6 +2131,11 @@ impl AppState {
                 "runner reported native session ownership ended",
             )
             .await;
+            self.orphan_pending_questions_for_session(
+                session_id,
+                "runner reported native session ownership ended",
+            )
+            .await;
         }
         stored
     }
@@ -2081,6 +2152,34 @@ impl AppState {
         Ok(stored)
     }
 
+    pub async fn accept_runner_agent_event_with_receipt(
+        &self,
+        runner_id: RunnerId,
+        runner_event_seq: Option<u64>,
+        universal_event: AgentUniversalEvent,
+    ) -> anyhow::Result<Option<UniversalEventEnvelope>> {
+        let Some(runner_event_seq) = runner_event_seq else {
+            return self
+                .accept_runner_agent_event(universal_event)
+                .await
+                .map(Some);
+        };
+        let session_id = universal_event.session_id;
+        let stored = self
+            .store_runner_universal_event_with_receipt(
+                runner_id,
+                runner_event_seq,
+                session_id,
+                universal_event,
+                true,
+            )
+            .await?;
+        if let Some(stored) = &stored {
+            self.apply_accepted_universal_event(stored).await;
+        }
+        Ok(stored)
+    }
+
     pub async fn publish_universal_event(
         &self,
         session_id: SessionId,
@@ -2092,6 +2191,7 @@ impl AppState {
             .store_universal_event_with_acceptance(
                 session_id,
                 AgentUniversalEvent {
+                    protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
                     session_id,
                     event_id: None,
                     turn_id,
@@ -2129,14 +2229,17 @@ impl AppState {
                     question.question_id,
                     RegisteredQuestion {
                         session_id: envelope.session_id,
-                        resolved: false,
+                        status: question.status.clone(),
+                        request: None,
+                        state: Some(question.clone()),
                     },
                 );
             }
             UniversalEventKind::QuestionAnswered { question } => {
                 let mut registry = self.inner.registry.lock().await;
                 if let Some(registered) = registry.questions.get_mut(&question.question_id) {
-                    registered.resolved = true;
+                    registered.status = question.status.clone();
+                    registered.state = Some(question.clone());
                 }
             }
             UniversalEventKind::SessionCreated { session } => {
@@ -2148,6 +2251,11 @@ impl AppState {
                     .await;
                 if session_status_orphans_approvals(status) {
                     self.orphan_pending_approvals_for_session(
+                        envelope.session_id,
+                        "runner reported native session ownership ended",
+                    )
+                    .await;
+                    self.orphan_pending_questions_for_session(
                         envelope.session_id,
                         "runner reported native session ownership ended",
                     )
@@ -2172,6 +2280,7 @@ impl AppState {
                     }
                 }
             }
+            UniversalEventKind::ProviderNotification { .. } => {}
             _ => {}
         }
     }
@@ -2497,7 +2606,7 @@ impl AppState {
             .await
             .questions
             .get(&question_id)
-            .filter(|question| !question.resolved)
+            .filter(|question| question.status == QuestionStatus::Pending)
             .map(|question| question.session_id)
     }
 
@@ -2546,6 +2655,74 @@ impl AppState {
 
         for envelope in orphaned {
             self.store_event(session_id, envelope).await;
+        }
+    }
+
+    async fn orphan_pending_questions_for_session(&self, session_id: SessionId, reason: &str) {
+        let orphaned = {
+            let mut registry = self.inner.registry.lock().await;
+            let mut orphaned = Vec::new();
+            for (&question_id, question) in &mut registry.questions {
+                if question.session_id != session_id || question.status.is_terminal() {
+                    continue;
+                }
+                let mut state = question
+                    .state
+                    .as_deref()
+                    .cloned()
+                    .or_else(|| {
+                        let request = question.request.as_deref()?;
+                        let NormalizedEvent::QuestionRequested(request) = &request.event else {
+                            return None;
+                        };
+                        Some(source_question_request(request, Utc::now()))
+                    })
+                    .unwrap_or_else(|| QuestionState {
+                        question_id,
+                        session_id,
+                        turn_id: None,
+                        title: "Input requested".to_owned(),
+                        description: None,
+                        fields: Vec::new(),
+                        status: QuestionStatus::Pending,
+                        answer: None,
+                        native: None,
+                        requested_at: None,
+                        answered_at: None,
+                    });
+                state.status = QuestionStatus::Orphaned;
+                state.answer = None;
+                if state.description.is_none() {
+                    state.description = Some(reason.to_owned());
+                }
+                question.status = QuestionStatus::Orphaned;
+                question.state = Some(Box::new(state.clone()));
+                tracing::warn!(%session_id, %question_id, "question marked orphaned");
+                orphaned.push(state);
+            }
+            orphaned
+        };
+
+        for question in orphaned {
+            self.store_universal_event_with_acceptance(
+                session_id,
+                AgentUniversalEvent {
+                    protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
+                    session_id,
+                    event_id: None,
+                    turn_id: question.turn_id,
+                    item_id: None,
+                    ts: None,
+                    source: UniversalEventSource::ControlPlane,
+                    native: None,
+                    event: UniversalEventKind::QuestionRequested {
+                        question: Box::new(question),
+                    },
+                },
+                false,
+            )
+            .await
+            .ok();
         }
     }
 
@@ -2659,6 +2836,115 @@ impl AppState {
             universal_event: Some(envelope.clone()),
         });
         Ok(envelope)
+    }
+
+    async fn store_runner_universal_event_with_receipt(
+        &self,
+        runner_id: RunnerId,
+        runner_event_seq: u64,
+        session_id: SessionId,
+        universal_event: AgentUniversalEvent,
+        strict_db: bool,
+    ) -> anyhow::Result<Option<UniversalEventEnvelope>> {
+        let fallback_event_id = universal_event
+            .event_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let mut envelope =
+            runner_universal_event_envelope(session_id, &fallback_event_id, &universal_event);
+        let Some(pool) = &self.inner.db_pool else {
+            let stored = self
+                .store_universal_event_with_acceptance(session_id, universal_event, strict_db)
+                .await?;
+            return Ok(Some(stored));
+        };
+        let Some(workspace_id) = self.workspace_id_for_session(session_id).await else {
+            if strict_db {
+                return Err(anyhow::anyhow!(
+                    "failed to durably append universal runner event without a registered workspace"
+                ));
+            }
+            tracing::warn!(
+                %session_id,
+                "failed to persist universal runner event without a registered workspace; continuing with in-memory universal broadcast"
+            );
+            let stored = self
+                .store_universal_event_with_acceptance(session_id, universal_event, false)
+                .await?;
+            return Ok(Some(stored));
+        };
+
+        match agenter_db::append_runner_universal_event_reducing_snapshot(
+            pool,
+            workspace_id,
+            runner_id,
+            runner_event_seq,
+            envelope.clone(),
+            None,
+            apply_universal_event_to_snapshot,
+        )
+        .await
+        {
+            Ok(agenter_db::models::RunnerUniversalAppendOutcome::Accepted(outcome)) => {
+                envelope = outcome.event.envelope();
+            }
+            Ok(agenter_db::models::RunnerUniversalAppendOutcome::Duplicate(receipt)) => {
+                tracing::debug!(
+                    %runner_id,
+                    runner_event_seq,
+                    event_id = %receipt.event_id,
+                    "deduped runner event from durable receipt"
+                );
+                self.inner
+                    .seen_runner_events
+                    .lock()
+                    .await
+                    .insert((runner_id, runner_event_seq));
+                return Ok(None);
+            }
+            Err(error) => {
+                if strict_db {
+                    return Err(anyhow::anyhow!(
+                        "failed to durably append universal runner event with receipt: {error}"
+                    ));
+                }
+                tracing::warn!(%session_id, %error, "failed to persist universal runner event with receipt");
+            }
+        }
+
+        let sender = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let events = sessions
+                .entry(session_id)
+                .or_insert_with(SessionEvents::new);
+            apply_universal_event_to_snapshot(&mut events.snapshot, &envelope);
+            events.universal_cache.push(envelope.clone());
+            if events.universal_cache.len() > UNIVERSAL_EVENT_REPLAY_LIMIT {
+                let overflow = events.universal_cache.len() - UNIVERSAL_EVENT_REPLAY_LIMIT;
+                events.universal_cache.drain(..overflow);
+            }
+            events.sender.clone()
+        };
+
+        let _ = sender.send(SessionBroadcastEvent {
+            #[cfg(test)]
+            normalized_event: CachedEventEnvelope {
+                event_id: Some(envelope.event_id.clone().into()),
+                event: NormalizedEvent::NativeNotification(NativeNotification {
+                    session_id,
+                    provider_id: AgentProviderId::from("universal"),
+                    event_id: Some(envelope.event_id.clone()),
+                    category: "universal".to_owned(),
+                    method: "universal_event".to_owned(),
+                    title: "Universal event".to_owned(),
+                    detail: None,
+                    status: None,
+                    provider_payload: None,
+                }),
+            },
+            universal_event: Some(envelope.clone()),
+        });
+        Ok(Some(envelope))
     }
 
     async fn store_event_with_universal_acceptance(
@@ -3303,6 +3589,9 @@ pub fn apply_universal_event_to_snapshot(
                 });
             }
             item.status = ItemStatus::Streaming;
+            if let Some(tool) = &mut item.tool {
+                tool.status = ItemStatus::Streaming;
+            }
         }
         UniversalEventKind::ContentCompleted {
             block_id,
@@ -3343,6 +3632,9 @@ pub fn apply_universal_event_to_snapshot(
                 });
             }
             item.status = ItemStatus::Completed;
+            if let Some(tool) = &mut item.tool {
+                tool.status = ItemStatus::Completed;
+            }
         }
         UniversalEventKind::ApprovalRequested { approval } => {
             merge_approval_into_snapshot(snapshot, approval);
@@ -3375,7 +3667,11 @@ pub fn apply_universal_event_to_snapshot(
                 if let Some(turn) = snapshot.turns.get_mut(&turn_id) {
                     turn.status = match &question.status {
                         QuestionStatus::Pending => TurnStatus::WaitingForInput,
-                        QuestionStatus::Answered | QuestionStatus::Cancelled => turn.status.clone(),
+                        QuestionStatus::Answered
+                        | QuestionStatus::Cancelled
+                        | QuestionStatus::Expired
+                        | QuestionStatus::Orphaned => turn.status.clone(),
+                        QuestionStatus::Detached => TurnStatus::Detached,
                     };
                 }
                 set_active_turn(
@@ -3402,6 +3698,7 @@ pub fn apply_universal_event_to_snapshot(
             }
         }
         UniversalEventKind::ErrorReported { .. } => {}
+        UniversalEventKind::ProviderNotification { .. } => {}
         UniversalEventKind::NativeUnknown { .. } => {}
     }
 }
@@ -3939,8 +4236,8 @@ fn universal_projection_universal_event(
                     },
                 }
             } else {
-                UniversalEventKind::NativeUnknown {
-                    summary: Some(normalized_event_name(event).to_owned()),
+                UniversalEventKind::ProviderNotification {
+                    notification: provider_notification_from_native(native_notification),
                 }
             }
         }
@@ -4938,6 +5235,30 @@ fn usage_snapshot_from_native_notification(
     }
 }
 
+fn provider_notification_from_native(event: &NativeNotification) -> ProviderNotification {
+    ProviderNotification {
+        category: event.category.clone(),
+        title: event.title.clone(),
+        detail: event.detail.clone(),
+        status: event.status.clone(),
+        severity: provider_notification_severity(event),
+        subject: event.event_id.clone(),
+    }
+}
+
+fn provider_notification_severity(
+    event: &NativeNotification,
+) -> Option<ProviderNotificationSeverity> {
+    match event.status.as_deref().or(Some(event.category.as_str())) {
+        Some("failed" | "error") => Some(ProviderNotificationSeverity::Error),
+        Some("warning" | "guardian" | "config_warning") => {
+            Some(ProviderNotificationSeverity::Warning)
+        }
+        Some("debug") => Some(ProviderNotificationSeverity::Debug),
+        _ => Some(ProviderNotificationSeverity::Info),
+    }
+}
+
 fn usage_snapshot_from_token_usage(payload: Option<&Value>) -> Option<SessionUsageSnapshot> {
     let payload = payload?;
     let used_tokens = integer_at(
@@ -4946,6 +5267,8 @@ fn usage_snapshot_from_token_usage(payload: Option<&Value>) -> Option<SessionUsa
             "/params/tokenUsage/last/totalTokens",
             "/params/tokenUsage/current/totalTokens",
             "/params/tokenUsage/total/totalTokens",
+            "/params/summary/tokenUsage/total/totalTokens",
+            "/params/summary/estimatedTotalTokens",
         ],
     );
     let total_tokens = integer_at(
@@ -4953,6 +5276,7 @@ fn usage_snapshot_from_token_usage(payload: Option<&Value>) -> Option<SessionUsa
         &[
             "/params/tokenUsage/modelContextWindow",
             "/params/modelContextWindow",
+            "/params/summary/tokenUsage/modelContextWindow",
         ],
     );
     let used_percent = match (used_tokens, total_tokens) {
@@ -6473,6 +6797,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stopped_session_orphans_pending_question_in_universal_snapshot() {
+        let state = AppState::new_with_bootstrap_admin(
+            "dev-token".to_owned(),
+            "admin@example.test".to_owned(),
+            "correct horse battery staple".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        )
+        .expect("create bootstrap admin");
+        let owner_user_id = state
+            .inner
+            .bootstrap_admin
+            .as_ref()
+            .expect("bootstrap admin")
+            .user
+            .user_id;
+        let runner_id = RunnerId::new();
+        let workspace = WorkspaceRef {
+            workspace_id: WorkspaceId::new(),
+            runner_id,
+            path: "/work/agenter".to_owned(),
+            display_name: Some("agenter".to_owned()),
+        };
+        let session = state
+            .create_session(
+                SessionId::new(),
+                owner_user_id,
+                runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let question_id = QuestionId::new();
+        state
+            .publish_event(
+                session.session_id,
+                NormalizedEvent::QuestionRequested(agenter_core::QuestionRequestedEvent {
+                    session_id: session.session_id,
+                    question_id,
+                    title: "Pick target".to_owned(),
+                    description: Some("Need a deployment target".to_owned()),
+                    fields: Vec::new(),
+                    provider_payload: None,
+                }),
+            )
+            .await;
+
+        state
+            .publish_event(
+                session.session_id,
+                NormalizedEvent::SessionStatusChanged(agenter_core::SessionStatusChangedEvent {
+                    session_id: session.session_id,
+                    status: SessionStatus::Stopped,
+                    reason: Some("provider exited".to_owned()),
+                }),
+            )
+            .await;
+
+        let snapshot = state
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(&session.session_id)
+            .expect("session events")
+            .snapshot
+            .clone();
+        assert_eq!(
+            snapshot
+                .questions
+                .get(&question_id)
+                .map(|question| &question.status),
+            Some(&QuestionStatus::Orphaned),
+            "stopped provider should orphan pending questions for reload snapshots"
+        );
+        assert_eq!(state.question_session(question_id).await, None);
+    }
+
+    #[tokio::test]
     async fn runner_disconnect_leaves_sessions_live_until_runner_evidence() {
         let state = AppState::new_with_bootstrap_admin(
             "dev-token".to_owned(),
@@ -7571,6 +7973,7 @@ mod tests {
 
         let result = state
             .accept_runner_agent_event(AgentUniversalEvent {
+                protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
                 session_id,
                 event_id: None,
                 turn_id: None,
@@ -7603,6 +8006,7 @@ mod tests {
 
         state
             .accept_runner_agent_event(AgentUniversalEvent {
+                protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
                 session_id,
                 event_id: None,
                 turn_id: None,
@@ -7709,6 +8113,108 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
+    async fn runner_event_receipts_survive_new_app_state_and_prevent_duplicate_append() {
+        let pool = durable_test_pool().await;
+        let suffix = Uuid::new_v4();
+        let user = agenter_db::create_user(
+            &pool,
+            &format!("runner-receipt-state-{suffix}@example.test"),
+            Some("Runner Receipt State"),
+        )
+        .await
+        .expect("create user");
+        let runner_id = RunnerId::new();
+        let workspace = WorkspaceRef {
+            workspace_id: WorkspaceId::new(),
+            runner_id,
+            path: format!("/tmp/agenter-runner-receipt-state-{suffix}"),
+            display_name: Some("runner receipt state".to_owned()),
+        };
+        let session_id = SessionId::new();
+
+        let state1 = AppState::new_with_test_db_pool(pool.clone());
+        state1
+            .register_runner(
+                runner_id,
+                runner_capabilities_for_test(),
+                vec![workspace.clone()],
+            )
+            .await;
+        state1
+            .create_session(
+                session_id,
+                user.user_id,
+                runner_id,
+                workspace.clone(),
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+        let stored = state1
+            .accept_runner_agent_event_with_receipt(
+                runner_id,
+                Some(1),
+                runner_native_unknown_for_test(session_id, "durable first event"),
+            )
+            .await
+            .expect("accept first runner event")
+            .expect("first event should append");
+        assert!(stored.seq > UniversalSeq::zero());
+
+        let state2 = AppState::new_with_test_db_pool(pool.clone());
+        state2
+            .register_runner(
+                runner_id,
+                runner_capabilities_for_test(),
+                vec![workspace.clone()],
+            )
+            .await;
+        state2
+            .create_session(
+                session_id,
+                user.user_id,
+                runner_id,
+                workspace,
+                AgentProviderId::from(AgentProviderId::CODEX),
+            )
+            .await;
+
+        assert_eq!(
+            state2
+                .seed_runner_event_ack_from_hello(runner_id, Some(99))
+                .await,
+            Some(1),
+            "DB-backed hello must use durable receipts, not the runner-supplied cursor"
+        );
+        assert!(
+            state2
+                .runner_event_already_accepted(runner_id, Some(1))
+                .await
+        );
+        assert!(
+            !state2
+                .runner_event_already_accepted(runner_id, Some(2))
+                .await
+        );
+
+        let duplicate = state2
+            .accept_runner_agent_event_with_receipt(
+                runner_id,
+                Some(1),
+                runner_native_unknown_for_test(session_id, "duplicate should not append"),
+            )
+            .await
+            .expect("duplicate replay is ackable");
+        assert!(duplicate.is_none());
+
+        let replay = agenter_db::list_universal_events_after(&pool, session_id, None, 10)
+            .await
+            .expect("load durable events");
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].event_id.to_string(), stored.event_id);
+    }
+
+    #[tokio::test]
     async fn refresh_operation_update_advances_job_and_records_log() {
         let state = AppState::new("dev-token".to_owned(), CookieSecurity::DevelopmentInsecure);
         let request_id = RequestId::from("refresh-progress-1");
@@ -7746,6 +8252,49 @@ mod tests {
         assert_eq!(job.progress.expect("progress").percent, Some(50));
         assert_eq!(job.log.len(), 1);
         assert_eq!(job.log[0].message, "Read 2 of 4 sessions");
+    }
+
+    async fn durable_test_pool() -> sqlx::PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set to run ignored SQLx integration tests");
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect to DATABASE_URL");
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    fn runner_capabilities_for_test() -> RunnerCapabilities {
+        RunnerCapabilities {
+            agent_providers: vec![AgentProviderAdvertisement {
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                capabilities: AgentCapabilities::default(),
+            }],
+            transports: vec!["codex-app-server".to_owned()],
+            workspace_discovery: false,
+        }
+    }
+
+    fn runner_native_unknown_for_test(
+        session_id: SessionId,
+        summary: &str,
+    ) -> agenter_protocol::runner::AgentUniversalEvent {
+        agenter_protocol::runner::AgentUniversalEvent {
+            protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
+            session_id,
+            event_id: Some(Uuid::new_v4().to_string()),
+            turn_id: None,
+            item_id: None,
+            ts: None,
+            source: UniversalEventSource::Runner,
+            native: None,
+            event: UniversalEventKind::NativeUnknown {
+                summary: Some(summary.to_owned()),
+            },
+        }
     }
 
     #[tokio::test]

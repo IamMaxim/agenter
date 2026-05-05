@@ -21,6 +21,7 @@ function snapshot(overrides: Partial<SessionSnapshot> = {}): SessionSnapshot {
 
 function event(overrides: Partial<UniversalEventEnvelope>): UniversalEventEnvelope {
   return {
+    protocol_version: 'uap/1',
     event_id: 'evt-1',
     seq: '2',
     session_id: 's1',
@@ -35,6 +36,31 @@ function event(overrides: Partial<UniversalEventEnvelope>): UniversalEventEnvelo
 }
 
 describe('universal event reducer', () => {
+  test('stores usage updates even before session info is known', () => {
+    const state = applyUniversalEvent(
+      snapshot({ info: null }),
+      event({
+        event_id: 'evt-usage',
+        event: {
+          type: 'usage.updated',
+          data: {
+            usage: {
+              context: { used_percent: 41, used_tokens: 41000, total_tokens: 100000 },
+              window_5h: { remaining_percent: 33, resets_at: '2026-05-05T17:00:00Z' },
+              week: { remaining_percent: 88 }
+            }
+          }
+        }
+      })
+    );
+
+    expect(state.info?.usage).toMatchObject({
+      context: { used_percent: 41, used_tokens: 41000, total_tokens: 100000 },
+      window_5h: { remaining_percent: 33, resets_at: '2026-05-05T17:00:00Z' },
+      week: { remaining_percent: 88 }
+    });
+  });
+
   test('merges resolved approval projection without losing request details', () => {
     const state = applyUniversalEvent(
       snapshot({

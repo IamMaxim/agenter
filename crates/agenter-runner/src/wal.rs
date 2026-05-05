@@ -256,7 +256,7 @@ async fn persist_records(path: &Path, records: &[RunnerWalRecord]) -> anyhow::Re
 mod tests {
     use agenter_core::{
         AgentProviderId, NativeRef, RunnerId, SessionId, UniversalEventKind, UniversalEventSource,
-        WorkspaceId, WorkspaceRef,
+        WorkspaceId, WorkspaceRef, UNIVERSAL_PROTOCOL_VERSION,
     };
     use agenter_protocol::runner::{
         AgentUniversalEvent, DiscoveredSession, DiscoveredSessionHistoryItem,
@@ -268,6 +268,7 @@ mod tests {
 
     fn wal_event(session_id: SessionId) -> RunnerEvent {
         RunnerEvent::AgentEvent(Box::new(AgentUniversalEvent {
+            protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
             session_id,
             event_id: None,
             turn_id: None,

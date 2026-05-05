@@ -2,9 +2,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use agenter_core::{
-    AgentProviderId, AgentTurnSettings, ApprovalDecision, ApprovalId, ApprovalKind, ApprovalOption,
-    ApprovalStatus as UniversalApprovalStatus, CommandId, ItemId, NativeRef, RunnerId, SessionId,
-    SessionSnapshot, SessionStatus, SessionUsageSnapshot, TurnId, UniversalEventKind,
+    AgentObligationKind, AgentObligationStatus, AgentProviderId, AgentTurnSettings,
+    ApprovalDecision, ApprovalId, ApprovalKind, ApprovalOption,
+    ApprovalStatus as UniversalApprovalStatus, CommandId, ItemId, NativeRef, QuestionId, RunnerId,
+    SessionId, SessionSnapshot, SessionStatus, SessionUsageSnapshot, TurnId, UniversalEventKind,
     UniversalEventSource, UniversalSeq, UserId, WorkspaceId,
 };
 
@@ -116,6 +117,21 @@ pub struct UniversalAppendOutcome {
     pub snapshot: StoredSessionSnapshot,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunnerEventReceipt {
+    pub runner_id: RunnerId,
+    pub runner_event_seq: u64,
+    pub event_seq: UniversalSeq,
+    pub event_id: uuid::Uuid,
+    pub accepted_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum RunnerUniversalAppendOutcome {
+    Accepted(Box<UniversalAppendOutcome>),
+    Duplicate(RunnerEventReceipt),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandIdempotencyStatus {
@@ -154,6 +170,25 @@ pub struct PendingApproval {
     pub expires_at: Option<DateTime<Utc>>,
     pub resolved_decision: Option<ApprovalDecision>,
     pub resolved_by_user_id: Option<UserId>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentObligation {
+    pub obligation_id: String,
+    pub session_id: SessionId,
+    pub turn_id: Option<TurnId>,
+    pub runner_id: Option<RunnerId>,
+    pub native_request_id: Option<String>,
+    pub kind: AgentObligationKind,
+    pub approval_id: Option<ApprovalId>,
+    pub question_id: Option<QuestionId>,
+    pub status: AgentObligationStatus,
+    pub delivery_generation: i64,
+    pub resolution_command_id: Option<CommandId>,
+    pub payload: Option<serde_json::Value>,
     pub resolved_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

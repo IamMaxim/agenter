@@ -79,13 +79,19 @@ Environment prerequisites:
 Focused automated smoke:
 
 ```sh
+cargo test -p agenter-protocol --test browser_json_frame_conformance
+cargo test -p agenter-protocol browser
 cargo test -p agenter-runner codex_stage10_conformance_trace_preserves_expected_milestones
 cargo test -p agenter-runner acp_stage10_provider_traces_share_prompt_plan_permission_shape
 cargo test -p agenter-control-plane subscribe_snapshot_replays_after_seq_in_strict_order
 cargo test -p agenter-control-plane runner_event_ack_state_dedupes_replayed_sequences
 cargo test -p agenter-control-plane seeded_runner_ack_marks_old_replay_as_duplicate
+cargo test -p agenter-control-plane runner_event_receipts_survive_new_app_state_and_prevent_duplicate_append
 cargo test -p agenter-runner interrupt_cancels_blocked_approval_for_same_session
 cargo test -p agenter-runner interrupt_does_not_count_completed_approval_cancel_replay_as_new_cancel
+cargo test -p agenter-runner codex_turn
+cd web
+npm run test -- normalizers sessionSnapshot universalEvents
 ```
 
 Full universal protocol gate, when feasible:
@@ -108,7 +114,7 @@ Manual provider smoke should record:
 - provider command and version;
 - workspace path;
 - prompt used;
-- whether plan, approval/question, command/tool, diff/artifact, cancel, and terminal state were observed;
+- whether plan, approval/question, command/tool, diff/artifact, browser reconnect, runner reconnect, interrupt, Codex EOF/harness death, and terminal state were observed;
 - expected final state: replayed, resolving, detached, cancelled, failed, or orphaned;
 - exact setup limitation if the provider could not run.
 
