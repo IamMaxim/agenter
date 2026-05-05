@@ -96,8 +96,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: UserId) {
     let mut sent_universal_events = std::collections::HashSet::new();
     if let Some(mut snapshot) = session_subscription.snapshot.take() {
         snapshot.request_id = subscription.request_id.clone();
-        let replay_incomplete = snapshot.has_more;
-        let latest_seq = snapshot.latest_seq;
+        let replay_incomplete = !snapshot.replay_complete;
+        let replay_through_seq = snapshot.replay_through_seq;
+        let snapshot_seq = snapshot.snapshot_seq;
         for event in &snapshot.events {
             sent_universal_events.insert((event.seq, event.event_id.clone()));
         }
@@ -115,7 +116,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: UserId) {
                     request_id: subscription.request_id.clone(),
                     code: "snapshot_replay_incomplete".to_owned(),
                     message: format!(
-                        "universal event replay is incomplete; resubscribe/page from snapshot.latest_seq {latest_seq:?} before consuming live events"
+                        "universal event replay is incomplete; replay through {replay_through_seq:?} did not reach snapshot cursor {snapshot_seq:?}"
                     ),
                 }),
             )
@@ -161,22 +162,21 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: UserId) {
             event = session_subscription.receiver.recv() => {
                 match event {
                     Ok(event) => {
-                        if let Some(universal_event) = event.universal_event {
-                            if !sent_universal_events
-                                .insert((universal_event.seq, universal_event.event_id.clone()))
-                            {
-                                continue;
-                            }
-                            if send_server_message(
-                                &mut sender,
-                                BrowserServerMessage::UniversalEvent(universal_event),
-                            )
-                            .await
-                            .is_err()
-                            {
-                                tracing::warn!(%user_id, session_id = %subscription.session_id, "browser websocket send universal event failed");
-                                return;
-                            }
+                        let universal_event = event.universal_event;
+                        if !sent_universal_events
+                            .insert((universal_event.seq, universal_event.event_id.clone()))
+                        {
+                            continue;
+                        }
+                        if send_server_message(
+                            &mut sender,
+                            BrowserServerMessage::UniversalEvent(universal_event),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            tracing::warn!(%user_id, session_id = %subscription.session_id, "browser websocket send universal event failed");
+                            return;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {

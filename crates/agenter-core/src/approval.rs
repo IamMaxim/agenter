@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{ApprovalId, ItemId, NativeRef, QuestionId, SessionId, TurnId, UserId};
+use crate::{ApprovalId, ItemId, NativeRef, QuestionId, SessionId, TurnId};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
@@ -210,6 +210,8 @@ pub struct ApprovalRequest {
     pub requested_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolving_decision: Option<ApprovalDecision>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -315,55 +317,4 @@ impl ApprovalOption {
             Self::cancel_turn(),
         ]
     }
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct ApprovalRequestEvent {
-    pub session_id: SessionId,
-    pub approval_id: ApprovalId,
-    pub kind: ApprovalKind,
-    pub title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<DateTime<Utc>>,
-    /// Provider-neutral UI hints (Codex-correlated today). Browsers render rich approval cards from this shape.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub presentation: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resolution_state: Option<ApprovalResolutionState>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resolving_decision: Option<ApprovalDecision>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<ApprovalStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub turn_id: Option<TurnId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub item_id: Option<ItemId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub options: Vec<ApprovalOption>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub risk: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subject: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub native_request_id: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub native_blocking: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub policy: Option<ApprovalPolicyMetadata>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_payload: Option<serde_json::Value>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct ApprovalResolvedEvent {
-    pub session_id: SessionId,
-    pub approval_id: ApprovalId,
-    pub decision: ApprovalDecision,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resolved_by_user_id: Option<UserId>,
-    pub resolved_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_payload: Option<serde_json::Value>,
 }

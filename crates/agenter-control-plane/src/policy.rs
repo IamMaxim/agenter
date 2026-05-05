@@ -1,6 +1,6 @@
 use agenter_core::{
     ApprovalDecision, ApprovalKind, ApprovalOption, ApprovalOptionKind, ApprovalPolicyMetadata,
-    ApprovalPolicyRulePreview, ApprovalRequestEvent, ApprovalRisk, PolicyAction,
+    ApprovalPolicyRulePreview, ApprovalRequest, ApprovalRisk, PolicyAction,
 };
 use agenter_db::models::ApprovalPolicyRule;
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ pub struct PolicyEngine;
 
 impl PolicyEngine {
     #[must_use]
-    pub fn evaluate_approval_request(&self, request: &ApprovalRequestEvent) -> PolicyDecision {
+    pub fn evaluate_approval_request(&self, request: &ApprovalRequest) -> PolicyDecision {
         self.evaluate(PolicyInput {
             approval_kind: request.kind.clone(),
             subject: request.subject.clone().or_else(|| request.details.clone()),
@@ -67,7 +67,7 @@ impl PolicyEngine {
     }
 
     #[must_use]
-    pub fn persistent_rule_options(&self, request: &ApprovalRequestEvent) -> Vec<ApprovalOption> {
+    pub fn persistent_rule_options(&self, request: &ApprovalRequest) -> Vec<ApprovalOption> {
         rule_previews_for_request(request)
             .into_iter()
             .enumerate()
@@ -88,7 +88,7 @@ impl PolicyEngine {
     #[must_use]
     pub fn matching_rule<'a>(
         &self,
-        request: &ApprovalRequestEvent,
+        request: &ApprovalRequest,
         rules: &'a [ApprovalPolicyRule],
     ) -> Option<&'a ApprovalPolicyRule> {
         rules.iter().find(|rule| {
@@ -117,13 +117,11 @@ fn command_looks_networked(subject: &str) -> bool {
         .any(|needle| lower.contains(needle))
 }
 
-fn rule_previews_for_request(request: &ApprovalRequestEvent) -> Vec<ApprovalPolicyRulePreview> {
+fn rule_previews_for_request(request: &ApprovalRequest) -> Vec<ApprovalPolicyRulePreview> {
     let mut previews = Vec::new();
     match request.kind {
         ApprovalKind::Command => {
-            if let Some(prefix) = provider_execpolicy_prefix(request)
-                .or_else(|| command_prefix_from_presentation(request))
-            {
+            if let Some(prefix) = command_prefix_from_request(request) {
                 let rendered = prefix.join(" ");
                 previews.push(ApprovalPolicyRulePreview {
                     kind: ApprovalKind::Command,
@@ -155,24 +153,8 @@ fn rule_previews_for_request(request: &ApprovalRequestEvent) -> Vec<ApprovalPoli
     previews
 }
 
-fn provider_execpolicy_prefix(request: &ApprovalRequestEvent) -> Option<Vec<String>> {
-    let payload = request.provider_payload.as_ref()?;
-    let command = payload
-        .pointer("/params/proposed_execpolicy_amendment")
-        .or_else(|| payload.pointer("/params/proposedExecpolicyAmendment"))
-        .or_else(|| payload.pointer("/params/proposed_execpolicy_amendment/command"))
-        .or_else(|| payload.pointer("/params/proposedExecpolicyAmendment/command"))?;
-    json_array_to_nonempty_strings(command)
-}
-
-fn command_prefix_from_presentation(request: &ApprovalRequestEvent) -> Option<Vec<String>> {
-    let command = request
-        .presentation
-        .as_ref()
-        .and_then(|presentation| presentation.get("command"))
-        .and_then(Value::as_str)
-        .or(request.subject.as_deref())
-        .or(request.details.as_deref())?;
+fn command_prefix_from_request(request: &ApprovalRequest) -> Option<Vec<String>> {
+    let command = request.subject.as_deref().or(request.details.as_deref())?;
     if command
         .chars()
         .any(|c| matches!(c, '\n' | '\r' | ';' | '&' | '|' | '<' | '>' | '$' | '`'))
@@ -187,11 +169,11 @@ fn command_prefix_from_presentation(request: &ApprovalRequestEvent) -> Option<Ve
     (!parts.is_empty()).then_some(parts)
 }
 
-fn native_method(request: &ApprovalRequestEvent) -> Option<String> {
+fn native_method(request: &ApprovalRequest) -> Option<String> {
     request
-        .provider_payload
+        .native
         .as_ref()
-        .and_then(|payload| payload.get("method").and_then(Value::as_str))
+        .and_then(|native| native.method.as_deref())
         .or(request.native_request_id.as_deref())
         .map(str::to_owned)
 }
@@ -209,7 +191,7 @@ fn json_array_to_nonempty_strings(value: &Value) -> Option<Vec<String>> {
     (!out.is_empty()).then_some(out)
 }
 
-fn rule_matches_request(matcher: &Value, request: &ApprovalRequestEvent) -> bool {
+fn rule_matches_request(matcher: &Value, request: &ApprovalRequest) -> bool {
     match matcher.get("type").and_then(Value::as_str) {
         Some("command_prefix") => {
             let Some(prefix) = matcher
@@ -219,11 +201,8 @@ fn rule_matches_request(matcher: &Value, request: &ApprovalRequestEvent) -> bool
                 return false;
             };
             let command = request
-                .presentation
-                .as_ref()
-                .and_then(|presentation| presentation.get("command"))
-                .and_then(Value::as_str)
-                .or(request.subject.as_deref())
+                .subject
+                .as_deref()
                 .or(request.details.as_deref())
                 .unwrap_or_default();
             command_has_prefix(command, &prefix)
@@ -249,29 +228,28 @@ fn command_has_prefix(command: &str, prefix: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agenter_core::{ApprovalId, SessionId};
+    use agenter_core::{ApprovalId, ApprovalStatus, SessionId};
 
-    fn request(kind: ApprovalKind, details: Option<&str>) -> ApprovalRequestEvent {
-        ApprovalRequestEvent {
+    fn request(kind: ApprovalKind, details: Option<&str>) -> ApprovalRequest {
+        ApprovalRequest {
             session_id: SessionId::nil(),
             approval_id: ApprovalId::nil(),
+            turn_id: None,
+            item_id: None,
             kind,
             title: "approval".to_owned(),
             details: details.map(str::to_owned),
-            expires_at: None,
-            presentation: None,
-            resolution_state: None,
-            resolving_decision: None,
-            status: None,
-            turn_id: None,
-            item_id: None,
             options: Vec::new(),
+            status: ApprovalStatus::Pending,
             risk: None,
             subject: details.map(str::to_owned),
             native_request_id: None,
             native_blocking: false,
             policy: None,
-            provider_payload: None,
+            native: None,
+            requested_at: None,
+            resolved_at: None,
+            resolving_decision: None,
         }
     }
 
@@ -294,10 +272,7 @@ mod tests {
     #[test]
     fn derives_command_prefix_persistent_option() {
         let mut request = request(ApprovalKind::Command, Some("cargo test -p agenter-db"));
-        request.presentation = Some(json!({
-            "variant": "codex_command",
-            "command": "cargo test -p agenter-db"
-        }));
+        request.subject = Some("cargo test -p agenter-db".to_owned());
 
         let options = PolicyEngine.persistent_rule_options(&request);
 
@@ -316,10 +291,7 @@ mod tests {
     #[test]
     fn command_prefix_rule_matches_later_command() {
         let mut request = request(ApprovalKind::Command, Some("cargo test -p agenter-core"));
-        request.presentation = Some(json!({
-            "variant": "codex_command",
-            "command": "cargo test -p agenter-core"
-        }));
+        request.subject = Some("cargo test -p agenter-core".to_owned());
 
         assert!(super::rule_matches_request(
             &json!({ "type": "command_prefix", "prefix": ["cargo", "test"] }),

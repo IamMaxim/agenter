@@ -19,7 +19,7 @@ Add an append-only `agent_events` log as the durable `uap/1` browser replay and 
 
 Native harnesses remain canonical history where their history can be reloaded. The control-plane `agent_events` log is authoritative for Agenter's browser/reconnect projection and pending control-plane state, not an audit-grade full transcript unless a future ADR explicitly expands that scope.
 
-`native_json` and native references in `agent_events` store redacted summaries, native IDs, method/type names, hashes, or pointers by default, not full raw provider payloads. Raw Codex JSON-RPC/wire payloads remain runner-local opt-in diagnostics under `docs/decisions/2026-05-03-runner-local-codex-wire-logs.md` and must not be stored in the control-plane database, browser WebSocket stream, control-plane API, or app event cache by default. Persisting full raw native payloads requires a later explicit policy ADR.
+`native_json` and native references in `agent_events` store redacted summaries, native IDs, method/type names, hashes, or pointers by default, not full raw provider payloads. Raw native diagnostics remain runner-local opt-in artifacts and must not be stored in the control-plane database, browser WebSocket stream, control-plane API, or app event cache by default. Persisting full raw native payloads requires a later explicit policy ADR.
 
 `SessionSnapshot` and related session, turn, item, approval, plan, diff, and artifact views are materialized views derived from `agent_events`. Snapshots may be rebuilt from the log, and clients should treat snapshots plus events after a cursor as the replay contract.
 
@@ -33,7 +33,7 @@ Browser reconnect uses snapshot plus `after_seq` replay. The browser subscribes 
 
 ## Open Question Resolutions
 
-1. Codex-native app-server remains the primary Codex source; its reloadable native history is preferred where available, with `agent_events` serving Agenter replay.
+1. Native-native session history remains preferred where reloadable; with `agent_events` serving Agenter replay.
 2. Harnesses execute their own tools for the first milestone; `agent_events` stores the resulting universal facts and native payloads needed for policy, UI, and debugging.
 3. One active turn per native session keeps recent-turn correlation tractable. Parallelism uses separate Agenter sessions until native adapters prove concurrency support.
 4. Pending approvals wait through transient runner/control-plane outages. If the runner survives, it retains the native request obligation; if the runner or native process dies, the approval becomes orphaned and the turn is failed, cancelled, or detached according to evidence.

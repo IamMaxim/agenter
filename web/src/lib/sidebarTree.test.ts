@@ -46,7 +46,7 @@ const sessions: SessionInfo[] = [
     owner_user_id: 'user-1',
     runner_id: 'runner-a',
     workspace_id: 'workspace-a',
-    provider_id: 'codex',
+    provider_id: 'qwen',
     status: 'running',
     title: 'Sidebar tree redesign',
     created_at: '2026-04-30T11:00:00Z',

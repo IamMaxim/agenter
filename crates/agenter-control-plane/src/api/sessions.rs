@@ -16,8 +16,7 @@ pub(super) struct CreateSessionRequest {
     pub(super) title: Option<String>,
     /// Optional first user message to seed the new session with. When present,
     /// the control plane dispatches it to the runner immediately after
-    /// registration, mirroring Codex TUI's "Clear context and implement"
-    /// handoff which spawns a fresh thread carrying the prior plan content.
+    /// registration so a fresh session can carry prior plan content.
     #[serde(default)]
     pub(super) initial_message: Option<String>,
     /// Optional turn-settings override applied to the seed message and
@@ -36,9 +35,7 @@ pub(super) struct SendMessageRequest {
     /// Atomic per-turn settings override. When present we persist these
     /// settings as the session's sticky configuration BEFORE forwarding the
     /// runner command, so the model sees the new collaboration mode on this
-    /// turn and every subsequent turn until the user changes it again. This
-    /// mirrors Codex TUI's `SubmitUserMessageWithMode` event and lets the
-    /// browser implement the "Implement plan" handoff in one round-trip.
+    /// turn and every subsequent turn until the user changes it again.
     #[serde(default)]
     pub(super) settings_override: Option<agenter_core::AgentTurnSettings>,
 }
@@ -967,6 +964,6 @@ pub(super) async fn session_history(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    tracing::debug!(user_id = %user.user_id, %session_id, event_count = history.len(), "returned session history");
+    tracing::debug!(user_id = %user.user_id, %session_id, event_count = history.events.len(), "returned session history");
     Json(history).into_response()
 }

@@ -17,7 +17,7 @@ describe('approval rule APIs', () => {
             {
               rule_id: 'rule-1',
               workspace_id: 'workspace-1',
-              provider_id: 'codex',
+              provider_id: 'qwen',
               kind: 'command',
               label: 'Approve commands starting with `cargo test`',
               matcher: { type: 'command_prefix', prefix: ['cargo', 'test'] },
@@ -31,9 +31,9 @@ describe('approval rule APIs', () => {
     });
     vi.stubGlobal('fetch', fetch);
 
-    await expect(listApprovalRules('workspace 1', 'codex')).resolves.toHaveLength(1);
+    await expect(listApprovalRules('workspace 1', 'qwen')).resolves.toHaveLength(1);
     expect(fetch).toHaveBeenCalledWith(
-      '/api/approval-rules?workspace_id=workspace+1&provider_id=codex',
+      '/api/approval-rules?workspace_id=workspace+1&provider_id=qwen',
       expect.objectContaining({ credentials: 'include' })
     );
   });
@@ -47,7 +47,7 @@ describe('approval rule APIs', () => {
           JSON.stringify({
             rule_id: 'rule-1',
             workspace_id: 'workspace-1',
-            provider_id: 'codex',
+            provider_id: 'qwen',
             kind: 'command',
             label: 'Approve commands starting with `cargo test`',
             matcher: { type: 'command_prefix', prefix: ['cargo', 'test'] },

@@ -221,9 +221,9 @@ function providerNotificationDetail(notification: {
 }
 
 function errorEventTitle(code: string | null | undefined, method: string | null | undefined): string {
-  if (code === 'codex_auth_refresh_required') return 'Codex auth refresh required';
-  if (code === 'codex_capability_gap') return 'Codex capability gap';
-  if (code === 'codex_unknown_server_request') return 'Unknown Codex server request';
+  if (code?.endsWith('_auth_refresh_required')) return 'Provider auth refresh required';
+  if (code?.endsWith('_capability_gap')) return 'Provider capability gap';
+  if (code?.endsWith('_unknown_server_request')) return 'Unknown provider server request';
   return method ? nativeEventTitle(method, code ?? undefined) : (code ?? 'Provider error');
 }
 

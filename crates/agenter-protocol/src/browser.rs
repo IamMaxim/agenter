@@ -31,10 +31,6 @@ pub enum BrowserServerMessage {
     Error(BrowserError),
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct BrowserSessionSnapshot {
     #[serde(default = "browser_universal_protocol_version")]
@@ -45,9 +41,12 @@ pub struct BrowserSessionSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<UniversalEventEnvelope>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_seq: Option<UniversalSeq>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub has_more: bool,
+    pub snapshot_seq: Option<UniversalSeq>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_from_seq: Option<UniversalSeq>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_through_seq: Option<UniversalSeq>,
+    pub replay_complete: bool,
 }
 
 fn browser_universal_protocol_version() -> String {
@@ -123,8 +122,10 @@ mod tests {
                 ..SessionSnapshot::default()
             },
             events: vec![event],
-            latest_seq: Some(UniversalSeq::new(7)),
-            has_more: false,
+            snapshot_seq: Some(UniversalSeq::new(7)),
+            replay_from_seq: Some(UniversalSeq::new(7)),
+            replay_through_seq: Some(UniversalSeq::new(7)),
+            replay_complete: true,
         });
 
         let json = serde_json::to_value(&message).expect("serialize snapshot");
@@ -132,10 +133,14 @@ mod tests {
             serde_json::from_value(json.clone()).expect("deserialize snapshot");
 
         assert_eq!(json["type"], "session_snapshot");
-        assert_eq!(json["protocol_version"], "uap/1");
-        assert_eq!(json["latest_seq"], "7");
-        assert_eq!(json.get("has_more"), None);
-        assert_eq!(json["events"][0]["protocol_version"], "uap/1");
+        assert_eq!(json["protocol_version"], "uap/2");
+        assert_eq!(json["snapshot_seq"], "7");
+        assert_eq!(json["replay_from_seq"], "7");
+        assert_eq!(json["replay_through_seq"], "7");
+        assert_eq!(json["replay_complete"], true);
+        assert!(json.get("latest_seq").is_none());
+        assert!(json.get("has_more").is_none());
+        assert_eq!(json["events"][0]["protocol_version"], "uap/2");
         assert_eq!(json["events"][0]["event"]["type"], "native.unknown");
         assert_eq!(decoded, message);
     }
@@ -163,7 +168,7 @@ mod tests {
             serde_json::from_value(json.clone()).expect("deserialize universal event");
 
         assert_eq!(json["type"], "universal_event");
-        assert_eq!(json["protocol_version"], "uap/1");
+        assert_eq!(json["protocol_version"], "uap/2");
         assert_eq!(json["seq"], "9");
         assert_eq!(decoded, message);
     }
@@ -179,8 +184,10 @@ mod tests {
                 ..SessionSnapshot::default()
             },
             events: Vec::new(),
-            latest_seq: None,
-            has_more: false,
+            snapshot_seq: None,
+            replay_from_seq: None,
+            replay_through_seq: None,
+            replay_complete: true,
         });
 
         let json = serde_json::to_value(&message).expect("serialize empty snapshot");
@@ -189,11 +196,12 @@ mod tests {
 
         assert_eq!(json["type"], "session_snapshot");
         assert!(json.get("latest_seq").is_none());
+        assert_eq!(json["replay_complete"], true);
         assert_eq!(decoded, message);
     }
 
     #[test]
-    fn session_snapshot_can_mark_truncated_replay() {
+    fn session_snapshot_can_mark_incomplete_replay() {
         let message = BrowserServerMessage::SessionSnapshot(BrowserSessionSnapshot {
             protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
             request_id: None,
@@ -203,8 +211,10 @@ mod tests {
                 ..SessionSnapshot::default()
             },
             events: Vec::new(),
-            latest_seq: Some(UniversalSeq::new(50)),
-            has_more: true,
+            snapshot_seq: Some(UniversalSeq::new(100)),
+            replay_from_seq: None,
+            replay_through_seq: Some(UniversalSeq::new(50)),
+            replay_complete: false,
         });
 
         let json = serde_json::to_value(&message).expect("serialize truncated snapshot");
@@ -212,8 +222,11 @@ mod tests {
             serde_json::from_value(json.clone()).expect("deserialize truncated snapshot");
 
         assert_eq!(json["type"], "session_snapshot");
-        assert_eq!(json["latest_seq"], "50");
-        assert_eq!(json["has_more"], true);
+        assert_eq!(json["snapshot_seq"], "100");
+        assert_eq!(json["replay_through_seq"], "50");
+        assert_eq!(json["replay_complete"], false);
+        assert!(json.get("latest_seq").is_none());
+        assert!(json.get("has_more").is_none());
         assert_eq!(decoded, message);
     }
 }

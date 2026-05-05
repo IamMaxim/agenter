@@ -21,7 +21,7 @@ function snapshot(overrides: Partial<SessionSnapshot> = {}): SessionSnapshot {
 
 function event(overrides: Partial<UniversalEventEnvelope>): UniversalEventEnvelope {
   return {
-    protocol_version: 'uap/1',
+    protocol_version: 'uap/2',
     event_id: 'evt-1',
     seq: '2',
     session_id: 's1',

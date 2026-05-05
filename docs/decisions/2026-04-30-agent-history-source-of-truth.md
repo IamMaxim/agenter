@@ -5,7 +5,7 @@ Date: 2026-04-30
 
 ## Context
 
-Codex and Qwen maintain their own session state. Agenter needs cross-connector routing and UI responsiveness, but it should not become an audit-grade transcript database in the first version.
+Provider runtimes maintain their own session state. Agenter needs cross-connector routing and UI responsiveness, but it should not become an audit-grade transcript database in the first version.
 
 ## Decision
 

@@ -47,6 +47,7 @@
   import {
     approvalUiButtonLabel,
     approvalUiChoices,
+    commandApprovalPresentation,
     createChatState,
     fileChangeApprovalFiles,
     type ChatItem,
@@ -150,10 +151,6 @@
     window.location.hash = '#/';
   }
 
-  // Verbatim copy of Codex TUI's PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX
-  // (`tmp/codex/codex-rs/tui/src/chatwidget/plan_implementation.rs`). Mirrors
-  // the exact wording so the model interprets a fresh-thread implementation
-  // request the same way Codex does.
   const PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX =
     "A previous agent produced the plan below to accomplish the user's task. " +
     'Implement the plan in a fresh context. Treat the plan as the source of ' +
@@ -297,7 +294,7 @@
           try {
             universalState = applyUniversalClientMessage(universalState, message);
             chatState = universalState.chat;
-            if (message.type === 'session_snapshot' && message.has_more) {
+            if (message.type === 'session_snapshot' && !message.replay_complete) {
               connectionState = 'Loaded snapshot';
             }
             if (universalState.snapshot?.info) {
@@ -1192,7 +1189,7 @@
     {#if visibleItems.length === 0}
       <div class="empty-state">
         <strong>No events yet</strong>
-        <span>Send a message or wait for the connected runner to stream normalized events.</span>
+        <span>Send a message or wait for the connected runner to stream universal events.</span>
       </div>
     {:else}
       {#each visibleItems as item (item.id)}
@@ -1235,16 +1232,16 @@
                 <span class="log-eyebrow">! approval requested</span>
               </div>
               <strong>{item.title}</strong>
-              {#if item.presentation?.variant === 'codex_command' && typeof item.presentation.command === 'string'}
+              {#if commandApprovalPresentation(item.presentation)}
                 <div class="approval-meta-grid">
                   <span>command</span>
-                  <strong>{item.presentation.command}</strong>
+                  <strong>{commandApprovalPresentation(item.presentation)}</strong>
                   {#if presentationString(item.presentation, 'cwd')}
                     <span>cwd</span>
                     <strong>{presentationString(item.presentation, 'cwd')}</strong>
                   {/if}
                 </div>
-                <pre class="approval-command">{item.presentation.command}</pre>
+                <pre class="approval-command">{commandApprovalPresentation(item.presentation)}</pre>
               {/if}
               {#each fileChangeApprovalFiles(item.presentation) as file}
                 <details class="approval-file-diff">

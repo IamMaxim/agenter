@@ -99,12 +99,12 @@ describe('session APIs', () => {
     });
     vi.stubGlobal('fetch', fetch);
 
-    await expect(refreshWorkspaceProviderSessions('workspace 1', 'codex')).resolves.toEqual({
+    await expect(refreshWorkspaceProviderSessions('workspace 1', 'qwen')).resolves.toEqual({
       refresh_id: 'refresh-1',
       status: 'queued'
     });
     expect(fetch).toHaveBeenCalledWith(
-      '/api/workspaces/workspace%201/providers/codex/sessions/refresh',
+      '/api/workspaces/workspace%201/providers/qwen/sessions/refresh',
       expect.objectContaining({ method: 'POST' })
     );
   });
@@ -123,12 +123,12 @@ describe('session APIs', () => {
     });
     vi.stubGlobal('fetch', fetch);
 
-    await expect(refreshWorkspaceProviderSessions('workspace 1', 'codex', { force: true })).resolves.toEqual({
+    await expect(refreshWorkspaceProviderSessions('workspace 1', 'qwen', { force: true })).resolves.toEqual({
       refresh_id: 'refresh-1',
       status: 'queued'
     });
     expect(fetch).toHaveBeenCalledWith(
-      '/api/workspaces/workspace%201/providers/codex/sessions/refresh',
+      '/api/workspaces/workspace%201/providers/qwen/sessions/refresh',
       expect.objectContaining({
         method: 'POST',
         body: JSON.stringify({ force: true })
@@ -171,7 +171,7 @@ describe('session APIs', () => {
     vi.stubGlobal('fetch', fetch);
 
     await expect(
-      getWorkspaceProviderSessionRefreshStatus('workspace 1', 'codex', 'refresh-1')
+      getWorkspaceProviderSessionRefreshStatus('workspace 1', 'qwen', 'refresh-1')
     ).resolves.toEqual({
       refresh_id: 'refresh-1',
       status: 'reading_history',
@@ -198,7 +198,7 @@ describe('session APIs', () => {
       updated_at: '2026-05-03T00:00:00Z'
     });
     expect(fetch).toHaveBeenCalledWith(
-      '/api/workspaces/workspace%201/providers/codex/sessions/refresh/refresh-1',
+      '/api/workspaces/workspace%201/providers/qwen/sessions/refresh/refresh-1',
       expect.objectContaining({ credentials: 'include' })
     );
   });
@@ -213,12 +213,12 @@ describe('session APIs', () => {
           Promise.resolve(
             JSON.stringify([
               {
-                id: 'codex.shell',
+                id: 'qwen.shell',
                 name: 'shell',
                 aliases: ['sh'],
                 description: 'Run shell',
                 category: 'provider',
-                provider_id: 'codex',
+                provider_id: 'qwen',
                 target: 'provider',
                 danger_level: 'dangerous',
                 arguments: [
@@ -242,7 +242,7 @@ describe('session APIs', () => {
           Promise.resolve(
             JSON.stringify({
               accepted: true,
-              message: 'Codex shell command submitted.',
+              message: 'Provider shell command submitted.',
               session: null,
               provider_payload: { id: 1 }
             })
@@ -252,7 +252,7 @@ describe('session APIs', () => {
 
     await expect(listSlashCommands('session 1')).resolves.toEqual([
       expect.objectContaining({
-        id: 'codex.shell',
+        id: 'qwen.shell',
         name: 'shell',
         danger_level: 'dangerous',
         arguments: [expect.objectContaining({ name: 'command', kind: 'rest' })]
@@ -260,14 +260,14 @@ describe('session APIs', () => {
     ]);
     await expect(
       executeSlashCommand('session 1', {
-        command_id: 'codex.shell',
+        command_id: 'qwen.shell',
         arguments: { command: 'pwd' },
         raw_input: '/shell pwd',
         confirmed: true
       })
     ).resolves.toEqual({
       accepted: true,
-      message: 'Codex shell command submitted.',
+      message: 'Provider shell command submitted.',
       session: undefined,
       provider_payload: { id: 1 }
     });
@@ -276,7 +276,7 @@ describe('session APIs', () => {
       expect.objectContaining({
         method: 'POST',
         body: JSON.stringify({
-          command_id: 'codex.shell',
+          command_id: 'qwen.shell',
           arguments: { command: 'pwd' },
           raw_input: '/shell pwd',
           confirmed: true
@@ -321,9 +321,9 @@ describe('session APIs', () => {
             owner_user_id: 'u1',
             runner_id: 'r1',
             workspace_id: 'w1',
-            provider_id: 'codex',
+            provider_id: 'qwen',
             status: 'starting',
-            external_session_id: 'codex-thread-2',
+            external_session_id: 'provider-thread-2',
             title: 'Implement plan'
           })
         )
@@ -332,7 +332,7 @@ describe('session APIs', () => {
 
     await createSession({
       workspace_id: 'w1',
-      provider_id: 'codex',
+      provider_id: 'qwen',
       title: 'Implement plan',
       initial_message: 'PREAMBLE\n\nplan body',
       settings_override: { collaboration_mode: 'default' }
@@ -344,7 +344,7 @@ describe('session APIs', () => {
         method: 'POST',
         body: JSON.stringify({
           workspace_id: 'w1',
-          provider_id: 'codex',
+          provider_id: 'qwen',
           title: 'Implement plan',
           initial_message: 'PREAMBLE\n\nplan body',
           settings_override: { collaboration_mode: 'default' }

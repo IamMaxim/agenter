@@ -11,20 +11,17 @@ pub mod workspace;
 pub use approval::{
     AgentObligation, AgentObligationKind, AgentObligationStatus, ApprovalDecision, ApprovalKind,
     ApprovalOption, ApprovalOptionKind, ApprovalPolicyMetadata, ApprovalPolicyRulePreview,
-    ApprovalRequest, ApprovalRequestEvent, ApprovalResolutionState, ApprovalResolvedEvent,
-    ApprovalRisk, ApprovalStatus, PolicyAction,
+    ApprovalRequest, ApprovalResolutionState, ApprovalRisk, ApprovalStatus, PolicyAction,
 };
 pub use events::{
-    AgentErrorEvent, AgentMessageDeltaEvent, ArtifactKind, ArtifactState, CommandAction,
-    CommandCompletedEvent, CommandEvent, CommandOutputEvent, CommandOutputStream, ContentBlock,
-    ContentBlockKind, DiffFile, DiffState, FileChangeEvent, FileChangeKind, ItemRole, ItemState,
-    ItemStatus, MessageCompletedEvent, NativeNotification, NativeRef, NormalizedEvent, PlanEntry,
-    PlanEntryStatus, PlanEvent, PlanSource, PlanState, PlanStatus, ProviderNotification,
-    ProviderNotificationSeverity, SessionStatusChangedEvent, ToolActionProjection,
-    ToolCommandProjection, ToolEvent, ToolMcpProjection, ToolProjection, ToolProjectionKind,
-    ToolSubagentOperation, ToolSubagentProjection, ToolSubagentStateProjection, UniversalCommand,
-    UniversalCommandEnvelope, UniversalEventEnvelope, UniversalEventKind, UniversalEventSource,
-    UniversalPlanEntry, UniversalSeq, UserInput, UserMessageEvent, UNIVERSAL_PROTOCOL_VERSION,
+    ArtifactKind, ArtifactState, ContentBlock, ContentBlockKind, DiffFile, DiffState,
+    FileChangeKind, ItemRole, ItemState, ItemStatus, NativeRef, PlanEntry, PlanEntryStatus,
+    PlanSource, PlanState, PlanStatus, ProviderNotification, ProviderNotificationSeverity,
+    ToolActionProjection, ToolCommandProjection, ToolEvent, ToolMcpProjection, ToolProjection,
+    ToolProjectionKind, ToolSubagentOperation, ToolSubagentProjection, ToolSubagentStateProjection,
+    UniversalCommand, UniversalCommandEnvelope, UniversalEventEnvelope, UniversalEventKind,
+    UniversalEventSource, UniversalPlanEntry, UniversalSeq, UserInput, UserMessageEvent,
+    UNIVERSAL_PROTOCOL_VERSION,
 };
 pub use ids::{
     ApprovalId, ArtifactId, CommandId, ConnectorBindingId, DiffId, ItemId, PlanId, QuestionId,
@@ -35,10 +32,9 @@ pub use session::{
     AgentQuestionAnswer, AgentQuestionChoice, AgentQuestionField, AgentReasoningEffort,
     AgentTurnSettings, ApprovalCapabilities, CapabilitySet, ContentCapabilities,
     IntegrationCapabilities, ModeCapabilities, PlanCapabilities, ProtocolCapabilities,
-    ProviderCapabilityDetail, ProviderCapabilityStatus, QuestionAnsweredEvent,
-    QuestionRequestedEvent, QuestionState, QuestionStatus, SessionInfo, SessionSnapshot,
-    SessionStatus, SessionUsageContext, SessionUsageSnapshot, SessionUsageWindow, ToolCapabilities,
-    TurnState, TurnStatus,
+    ProviderCapabilityDetail, ProviderCapabilityStatus, QuestionState, QuestionStatus, SessionInfo,
+    SessionSnapshot, SessionStatus, SessionUsageContext, SessionUsageSnapshot, SessionUsageWindow,
+    ToolCapabilities, TurnState, TurnStatus,
 };
 pub use slash_command::{
     SlashCommandArgument, SlashCommandArgumentKind, SlashCommandDangerLevel,

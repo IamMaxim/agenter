@@ -168,8 +168,10 @@ export function normalizeBrowserSessionSnapshot(value: unknown): BrowserSessionS
     ...(typeof record.request_id === 'string' ? { request_id: record.request_id } : {}),
     snapshot: normalizeSessionSnapshot(record.snapshot),
     events: arrayValue(record.events).map(normalizeUniversalEventEnvelope),
-    latest_seq: normalizeSeq(record.latest_seq),
-    has_more: record.has_more === true
+    snapshot_seq: normalizeSeq(record.snapshot_seq),
+    replay_from_seq: normalizeSeq(record.replay_from_seq),
+    replay_through_seq: normalizeSeq(record.replay_through_seq),
+    replay_complete: record.replay_complete === true
   };
 }
 

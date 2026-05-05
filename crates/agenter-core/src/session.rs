@@ -15,7 +15,6 @@ use crate::{
 pub struct AgentProviderId(String);
 
 impl AgentProviderId {
-    pub const CODEX: &'static str = "codex";
     pub const QWEN: &'static str = "qwen";
     pub const GEMINI: &'static str = "gemini";
     pub const OPENCODE: &'static str = "opencode";
@@ -359,28 +358,6 @@ pub struct AgentCollaborationMode {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<AgentReasoningEffort>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct QuestionRequestedEvent {
-    pub session_id: crate::SessionId,
-    pub question_id: QuestionId,
-    pub title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fields: Vec<AgentQuestionField>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_payload: Option<serde_json::Value>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct QuestionAnsweredEvent {
-    pub session_id: crate::SessionId,
-    pub question_id: QuestionId,
-    pub answer: AgentQuestionAnswer,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_payload: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

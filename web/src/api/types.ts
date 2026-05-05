@@ -20,7 +20,7 @@ export interface RunnerInfo {
   last_seen_at?: string | null;
 }
 
-export type AgentProviderId = 'codex' | 'qwen' | string;
+export type AgentProviderId = string;
 
 export type SessionStatus =
   | 'starting'
@@ -188,7 +188,7 @@ export interface QuestionState {
 
 export type UniversalSeq = string;
 export type UniversalEventSource = 'control_plane' | 'runner' | 'browser' | 'connector' | 'native' | string;
-export const UAP_PROTOCOL_VERSION = 'uap/1' as const;
+export const UAP_PROTOCOL_VERSION = 'uap/2' as const;
 export type UapProtocolVersion = typeof UAP_PROTOCOL_VERSION;
 
 export interface NativeRef {
@@ -575,8 +575,10 @@ export interface BrowserSessionSnapshot {
   request_id?: string;
   snapshot: SessionSnapshot;
   events: UniversalEventEnvelope[];
-  latest_seq?: UniversalSeq | null;
-  has_more?: boolean;
+  snapshot_seq?: UniversalSeq | null;
+  replay_from_seq?: UniversalSeq | null;
+  replay_through_seq?: UniversalSeq | null;
+  replay_complete: boolean;
 }
 
 export type UniversalCommand =

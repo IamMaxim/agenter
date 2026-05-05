@@ -57,8 +57,7 @@ Composer usage bar manual checklist:
 
 Protocol and connector work should include focused integration checks:
 
-- Codex app-server spike can initialize, create or resume a session, send a turn, receive events, and route one approval request.
-- Qwen ACP spike can initialize, create or resume a session when supported, send a prompt, receive session updates, and route one permission request.
+- ACP smoke can initialize, create or resume a session when supported, send a prompt, receive session updates, and route one permission request.
 - Runner reconnect test proves pending session state is recovered or marked degraded.
 - Browser WebSocket test proves session subscription and event delivery.
 - Telegram test proves login linking, session selection, message routing, and approval decision.
@@ -74,24 +73,22 @@ Environment prerequisites:
 - Docker Compose is available for the DB-backed path.
 - `DATABASE_URL` points at the local Postgres database for DB spot checks.
 - `websocat` is optional but useful for raw browser WebSocket inspection.
-- Live provider checks require locally installed and authenticated `codex`, `qwen`, `gemini`, and/or `opencode` CLIs. Provider authentication remains a local prerequisite; do not treat auth/setup failure as universal protocol failure without a direct provider spike.
+- Live provider checks require locally installed and authenticated `qwen`, `gemini`, and/or `opencode` CLIs. Provider authentication remains a local prerequisite; do not treat auth/setup failure as universal protocol failure without a direct provider spike.
 
 Focused automated smoke:
 
 ```sh
 cargo test -p agenter-protocol --test browser_json_frame_conformance
 cargo test -p agenter-protocol browser
-cargo test -p agenter-runner codex_stage10_conformance_trace_preserves_expected_milestones
-cargo test -p agenter-runner acp_stage10_provider_traces_share_prompt_plan_permission_shape
-cargo test -p agenter-control-plane subscribe_snapshot_replays_after_seq_in_strict_order
-cargo test -p agenter-control-plane runner_event_ack_state_dedupes_replayed_sequences
-cargo test -p agenter-control-plane seeded_runner_ack_marks_old_replay_as_duplicate
-cargo test -p agenter-control-plane runner_event_receipts_survive_new_app_state_and_prevent_duplicate_append
-cargo test -p agenter-runner interrupt_cancels_blocked_approval_for_same_session
-cargo test -p agenter-runner interrupt_does_not_count_completed_approval_cancel_replay_as_new_cancel
-cargo test -p agenter-runner codex_turn
+cargo test -p agenter-protocol runner
+cargo test -p agenter-runner acp
+cargo test -p agenter-runner fake
+cargo test -p agenter-control-plane universal
+cargo test -p agenter-control-plane approval
+cargo test -p agenter-control-plane subscribe_snapshot
+cargo test -p agenter-control-plane runner_event
 cd web
-npm run test -- normalizers sessionSnapshot universalEvents
+npm run test -- normalizers sessionSnapshot universalEvents events sessions
 ```
 
 Full universal protocol gate, when feasible:
@@ -114,9 +111,10 @@ Manual provider smoke should record:
 - provider command and version;
 - workspace path;
 - prompt used;
-- whether plan, approval/question, command/tool, diff/artifact, browser reconnect, runner reconnect, interrupt, Codex EOF/harness death, and terminal state were observed;
+- whether plan, approval/question, command/tool, diff/artifact, browser reconnect, runner reconnect, interrupt, harness death, and terminal state were observed;
 - expected final state: replayed, resolving, detached, cancelled, failed, or orphaned;
 - exact setup limitation if the provider could not run.
+
 
 ## Completion Rule
 

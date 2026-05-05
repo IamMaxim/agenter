@@ -7,7 +7,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -54,10 +53,7 @@ pub(super) async fn list_approvals(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let envelopes = state
-        .pending_approval_request_envelopes(query.session_id)
-        .await;
-    Json(envelopes).into_response()
+    Json(state.pending_approval_requests(query.session_id).await).into_response()
 }
 
 pub(super) async fn decide_approval(
@@ -98,20 +94,20 @@ pub(super) async fn decide_approval(
     );
 
     match lookup {
-        ApprovalResolutionLookup::AlreadyResolved { envelope, .. } => {
-            if !approval_envelope_matches_decision(&envelope.event, &decision) {
+        ApprovalResolutionLookup::AlreadyResolved { request, .. } => {
+            if !approval_request_matches_decision(&request, &decision) {
                 return super::command_conflict_response(approval_decision_conflict())
                     .into_response();
             }
-            return Json(*envelope).into_response();
+            return Json(*request).into_response();
         }
-        ApprovalResolutionLookup::InProgress { envelope, .. } => {
-            if !approval_envelope_matches_decision(&envelope.event, &decision) {
+        ApprovalResolutionLookup::InProgress { request, .. } => {
+            if !approval_request_matches_decision(&request, &decision) {
                 return super::command_conflict_response(approval_decision_conflict())
                     .into_response();
             }
             tracing::debug!(%approval_id, "approval decision already resolving");
-            return Json(*envelope).into_response();
+            return Json(*request).into_response();
         }
         ApprovalResolutionLookup::Pending { .. } => {
             let command_start = state.begin_universal_command(&universal_command).await;
@@ -127,8 +123,8 @@ pub(super) async fn decide_approval(
         .await
     {
         ApprovalResolutionStart::Started => {}
-        ApprovalResolutionStart::AlreadyResolved { envelope, .. } => {
-            let body = serde_json::to_value(&*envelope).ok();
+        ApprovalResolutionStart::AlreadyResolved { request, .. } => {
+            let body = serde_json::to_value(&*request).ok();
             if let Some(response) = super::finish_command_or_error_response(
                 &state,
                 &universal_command,
@@ -139,10 +135,10 @@ pub(super) async fn decide_approval(
             {
                 return response;
             }
-            return Json(*envelope).into_response();
+            return Json(*request).into_response();
         }
-        ApprovalResolutionStart::InProgress { envelope, .. } => {
-            return Json(*envelope).into_response();
+        ApprovalResolutionStart::InProgress { request, .. } => {
+            return Json(*request).into_response();
         }
         ApprovalResolutionStart::Missing => {
             let response = super::command_response(StatusCode::NOT_FOUND, None);
@@ -234,7 +230,7 @@ async fn persist_approval_rule_option(
         tracing::warn!(%approval_id, %session_id, "persistent approval rule ignored for missing session");
         return;
     };
-    let Some(request) = state.approval_request_event(approval_id).await else {
+    let Some(request) = state.approval_request(approval_id).await else {
         tracing::warn!(%approval_id, "persistent approval rule ignored for missing pending request");
         return;
     };
@@ -268,17 +264,12 @@ async fn persist_approval_rule_option(
     }
 }
 
-fn approval_envelope_matches_decision(
-    event: &agenter_core::NormalizedEvent,
+fn approval_request_matches_decision(
+    request: &agenter_core::ApprovalRequest,
     incoming: &agenter_core::ApprovalDecision,
 ) -> bool {
-    match event {
-        agenter_core::NormalizedEvent::ApprovalResolved(resolved) => resolved.decision == *incoming,
-        agenter_core::NormalizedEvent::ApprovalRequested(request) => {
-            request.resolving_decision.as_ref() == Some(incoming)
-        }
-        _ => false,
-    }
+    request.resolving_decision.as_ref() == Some(incoming)
+        || (request.status.is_terminal() && request.resolving_decision.is_none())
 }
 
 fn approval_decision_conflict() -> crate::state::UniversalCommandConflict {
@@ -346,23 +337,13 @@ async fn finish_approval_operation(
         agenter_protocol::runner::RunnerResponseOutcome,
         crate::state::RunnerCommandWaitError,
     >,
-) -> Result<crate::state::CachedEventEnvelope, StatusCode> {
+) -> Result<agenter_core::ApprovalRequest, StatusCode> {
     match outcome {
         Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok {
             result: agenter_protocol::runner::RunnerCommandResult::Accepted,
         }) => {
-            let resolved = agenter_core::NormalizedEvent::ApprovalResolved(
-                agenter_core::ApprovalResolvedEvent {
-                    session_id,
-                    approval_id,
-                    decision,
-                    resolved_by_user_id,
-                    resolved_at: Utc::now(),
-                    provider_payload: None,
-                },
-            );
-            let Some(envelope) = state
-                .finish_approval_resolution(approval_id, session_id, resolved)
+            let Some(request) = state
+                .finish_approval_resolution(approval_id, session_id, decision, resolved_by_user_id)
                 .await
             else {
                 tracing::warn!(%approval_id, %session_id, "approval decision could not finish resolution");
@@ -372,7 +353,7 @@ async fn finish_approval_operation(
                 .finish_universal_command(
                     &command,
                     crate::state::UniversalCommandIdempotencyStatus::Succeeded,
-                    super::command_response(StatusCode::OK, serde_json::to_value(&envelope).ok()),
+                    super::command_response(StatusCode::OK, serde_json::to_value(&request).ok()),
                 )
                 .await
                 .is_err()
@@ -380,7 +361,7 @@ async fn finish_approval_operation(
                 return Err(StatusCode::SERVICE_UNAVAILABLE);
             }
             tracing::info!(%approval_id, %session_id, "approval decision resolved after runner acknowledgement");
-            Ok(envelope)
+            Ok(request)
         }
         Ok(agenter_protocol::runner::RunnerResponseOutcome::Error { error }) => {
             cancel_failed_approval_resolution(
@@ -565,7 +546,9 @@ pub(super) async fn answer_question(
         Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok {
             result: agenter_protocol::runner::RunnerCommandResult::Accepted,
         }) => {
-            let envelope = state.finish_question_answer(session_id, answer).await;
+            let Ok(envelope) = state.finish_question_answer(session_id, answer).await else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
             if let Some(response) = super::finish_command_or_error_response(
                 &state,
                 &universal_command,

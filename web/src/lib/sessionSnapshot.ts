@@ -130,7 +130,7 @@ function applySessionSnapshotMessage(
   message: Extract<BrowserServerMessage, { type: 'session_snapshot' }>
 ): UniversalClientState {
   let snapshot = cloneSnapshot(message.snapshot);
-  if (message.has_more) {
+  if (!message.replay_complete) {
     const rowOrder = new Map(state.rowOrder);
     const seenUniversalEvents = new Set(state.seenUniversalEvents);
     for (const event of message.events) {
@@ -140,7 +140,7 @@ function applySessionSnapshotMessage(
     return {
       chat: materializeSnapshotChatState(snapshot, rowOrder),
       snapshot,
-      latestSeq: snapshot.latest_seq ?? undefined,
+      latestSeq: message.snapshot_seq ?? snapshot.latest_seq ?? undefined,
       latestUsage: snapshot.info?.usage ?? state.latestUsage ?? null,
       usingUniversal: true,
       snapshotIncomplete: true,
@@ -149,7 +149,7 @@ function applySessionSnapshotMessage(
     };
   }
 
-  let latestSeq = snapshot.latest_seq ?? undefined;
+  let latestSeq = message.snapshot_seq ?? snapshot.latest_seq ?? undefined;
   const seenUniversalEvents = new Set(state.seenUniversalEvents);
   const rowOrder = new Map(state.rowOrder);
 
@@ -163,9 +163,9 @@ function applySessionSnapshotMessage(
     latestSeq = event.seq;
   }
 
-  if (message.latest_seq && compareSeq(message.latest_seq, latestSeq) > 0) {
-    latestSeq = message.latest_seq;
-    snapshot.latest_seq = message.latest_seq;
+  if (message.replay_through_seq && compareSeq(message.replay_through_seq, latestSeq) > 0) {
+    latestSeq = message.replay_through_seq;
+    snapshot.latest_seq = message.replay_through_seq;
   }
 
   return {

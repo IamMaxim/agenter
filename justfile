@@ -51,9 +51,6 @@ runner-json mode="fake" workspace=workspace:
 fake-runner workspace=workspace:
     just runner fake '{{workspace}}'
 
-codex-runner workspace=workspace:
-    just runner codex '{{workspace}}'
-
 qwen-runner workspace=workspace:
     just runner qwen '{{workspace}}'
 
@@ -65,9 +62,6 @@ gemini-runner workspace=workspace:
 
 opencode-runner workspace=workspace:
     just runner opencode '{{workspace}}'
-
-codex-spike workspace prompt="Reply with one short sentence. Do not edit files or run commands.":
-    RUST_LOG=codex_app_server_spike=debug,agenter_runner=debug,agenter_core=debug AGENTER_LOG_PAYLOADS=1 AGENTER_SPIKE_PROMPT='{{prompt}}' cargo run -p agenter-runner --bin codex_app_server_spike -- '{{workspace}}'
 
 web:
     cd web && npm run dev -- --host 0.0.0.0

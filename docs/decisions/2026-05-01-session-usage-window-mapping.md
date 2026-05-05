@@ -4,7 +4,7 @@ Status: accepted
 
 ## Context
 
-Codex emits `account/rateLimits/updated` provider events with `primary` and `secondary` windows. The browser needs stable labels for composer usage metrics.
+The native provider emits `account/rateLimits/updated` events with `primary` and `secondary` windows. The browser needs stable labels for composer usage metrics.
 
 ## Decision
 

@@ -5,7 +5,7 @@ Date: 2026-04-30
 
 ## Context
 
-Agenter needs extensible agent providers and extensible interaction interfaces. The first implementation includes Codex, Qwen, browser, Telegram, and Mattermost, with likely future providers and connectors.
+Agenter needs extensible agent providers and extensible interaction interfaces. The first implementation includes local ACP providers, Telegram, and Mattermost, with likely future providers and connectors.
 
 ## Decision
 
@@ -17,5 +17,5 @@ Adding a provider should not require changes to connector business logic. Adding
 
 ## Alternatives Considered
 
-- Connector-specific provider handling: simpler initial bots, but leads to duplicated Codex/Qwen logic.
+- Connector-specific provider handling: simpler initial bots, but can lead to duplicated provider logic.
 - One broad shared utility layer: fewer files early, but weak ownership boundaries and harder testing.

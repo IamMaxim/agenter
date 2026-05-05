@@ -11,36 +11,36 @@ import {
 
 const commands: SlashCommandDefinition[] = [
   {
-    id: 'codex.shell',
+    id: 'qwen.shell',
     name: 'shell',
     aliases: ['sh'],
     description: 'Run shell',
     category: 'provider',
-    provider_id: 'codex',
+    provider_id: 'qwen',
     target: 'provider',
     danger_level: 'dangerous',
     arguments: [{ name: 'command', kind: 'rest', required: true, description: null, choices: [] }],
     examples: []
   },
   {
-    id: 'codex.review',
+    id: 'qwen.review',
     name: 'review',
     aliases: [],
     description: 'Review changes',
     category: 'provider',
-    provider_id: 'codex',
+    provider_id: 'qwen',
     target: 'provider',
     danger_level: 'safe',
     arguments: [{ name: 'target', kind: 'rest', required: false, description: null, choices: [] }],
     examples: []
   },
   {
-    id: 'codex.rollback',
+    id: 'qwen.rollback',
     name: 'rollback',
     aliases: [],
     description: 'Rollback turns',
     category: 'provider',
-    provider_id: 'codex',
+    provider_id: 'qwen',
     target: 'provider',
     danger_level: 'dangerous',
     arguments: [{ name: 'numTurns', kind: 'number', required: true, description: null, choices: [] }],
@@ -57,7 +57,7 @@ describe('slash commands', () => {
 
   test('filters commands by name and alias', () => {
     expect(filterSlashCommands('/sh', commands).map((command) => command.id)).toEqual([
-      'codex.shell'
+      'qwen.shell'
     ]);
     expect(filterSlashCommands('/r', commands).map((command) => command.name)).toEqual([
       'review',
@@ -82,7 +82,7 @@ describe('slash commands', () => {
     const shell = commands[0];
     expect(needsSlashConfirmation(shell)).toBe(true);
     expect(slashRequest('/shell pwd', shell, true)).toEqual({
-      command_id: 'codex.shell',
+      command_id: 'qwen.shell',
       arguments: { command: 'pwd' },
       raw_input: '/shell pwd',
       confirmed: true

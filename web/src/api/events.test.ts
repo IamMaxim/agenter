@@ -46,7 +46,7 @@ describe('browser websocket events', () => {
       parseBrowserServerMessage(
         JSON.stringify({
           type: 'universal_event',
-          protocol_version: 'uap/1',
+          protocol_version: 'uap/2',
           seq: 'not-a-seq',
           event_id: '11111111-1111-4111-8111-111111111111',
           session_id: 's1',
@@ -61,7 +61,7 @@ describe('browser websocket events', () => {
       parseBrowserServerMessage(
         JSON.stringify({
           type: 'universal_event',
-          protocol_version: 'uap/1',
+          protocol_version: 'uap/2',
           seq: '7',
           session_id: 's1',
           ts: '2026-05-03T12:00:00Z',
@@ -75,7 +75,7 @@ describe('browser websocket events', () => {
       parseBrowserServerMessage(
         JSON.stringify({
           type: 'universal_event',
-          protocol_version: 'uap/1',
+          protocol_version: 'uap/2',
           seq: '7',
           event_id: 'not-a-uuid',
           session_id: 's1',

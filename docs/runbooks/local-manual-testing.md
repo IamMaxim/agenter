@@ -95,30 +95,26 @@ Start the deterministic fake runner:
 just fake-runner
 ```
 
-Start a real provider runner for a workspace:
+Start a real ACP provider runner for a workspace:
 
 ```sh
-just codex-runner /path/to/workspace
 just acp-runner /path/to/workspace
 just qwen-runner /path/to/workspace
 just gemini-runner /path/to/workspace
 just opencode-runner /path/to/workspace
 ```
 
-The real provider runners require authenticated local provider CLIs. Codex runner mode keeps one persistent app-server process per runner workspace and stores the native thread id on Agenter session creation. ACP runner mode advertises locally available Qwen, Gemini, and OpenCode profiles for the workspace; single-provider `qwen`, `gemini`, and `opencode` modes use the same shared ACP runtime with a narrower provider list.
+The real provider runners require authenticated local provider CLIs. ACP runner mode advertises locally available Qwen, Gemini, and OpenCode profiles for the workspace; single-provider `qwen`, `gemini`, and `opencode` modes use the same shared ACP runtime with a narrower provider list.
 
 ACP session creation calls provider `session/new` and stores the native ACP `sessionId` as `external_session_id`. Browser messages should include that stored external id and then route through `session/prompt`. Provider authentication remains local setup; if a provider hangs or returns auth errors during `initialize`, fix the local CLI auth first.
 
-Codex runner mode now creates the native Codex thread when the browser creates an Agenter session. A successful create-session flow should log `CreateSession`, `thread/start`, and a `SessionCreated` runner response with the Codex thread id stored as `external_session_id`; browser messages should then include that stored external id.
-
-If Codex sessions accept messages but never stream a response, run the direct provider diagnostic:
+If ACP sessions accept messages but never stream a response, run the direct provider diagnostic for the relevant provider:
 
 ```sh
-just codex-spike /path/to/workspace
+just qwen-runner /path/to/workspace
 ```
 
-The spike logs raw JSON-RPC previews with `AGENTER_LOG_PAYLOADS=1`. A failure mentioning `~/.codex/sessions`, `~/.codex/shell_snapshots`, or `Operation not permitted` points at local Codex runtime permissions rather than the browser or control-plane pipeline.
-For live Codex 0.125, a successful no-tool diagnostic should show `item/agentMessage/delta`, `item/completed`, and `turn/completed` with a null error for the active thread. When this tool sandbox blocks access to `~/.codex`, rerun the same `just codex-spike` command from a normal terminal or approve the outside-sandbox command.
+Run with `AGENTER_LOG_PAYLOADS=1` when you need provider transport-level payload previews.
 
 Runner logs are written to:
 

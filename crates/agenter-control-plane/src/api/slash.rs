@@ -84,20 +84,32 @@ pub(super) async fn execute_slash_command(
         tracing::warn!(user_id = %user.user_id, %session_id, "slash command rejected session not found");
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(definition) = local_slash_commands(&session.provider_id)
+    let definition = local_slash_commands(&session.provider_id)
         .into_iter()
-        .find(|command| command.id == request.command_id)
-    else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(agenter_core::SlashCommandResult {
-                accepted: false,
-                message: format!("Unknown slash command `{}`.", request.raw_input),
-                session: None,
-                provider_payload: None,
-            }),
-        )
-            .into_response();
+        .find(|command| command.id == request.command_id);
+    let definition = if let Some(definition) = definition {
+        definition
+    } else if request.command_id == "runner.interrupt" {
+        local_slash_commands(&session.provider_id)
+            .into_iter()
+            .find(|command| command.id == request.command_id)
+            .expect("runner interrupt is local")
+    } else {
+        let Some(definition) =
+            provider_slash_command_definition(&state, &session, &request.command_id).await
+        else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(agenter_core::SlashCommandResult {
+                    accepted: false,
+                    message: format!("Unknown slash command `{}`.", request.raw_input),
+                    session: None,
+                    provider_payload: None,
+                }),
+            )
+                .into_response();
+        };
+        definition
     };
     if matches!(
         definition.danger_level,
@@ -123,23 +135,45 @@ pub(super) async fn execute_slash_command(
     if request.command_id == "runner.interrupt" {
         return execute_runner_interrupt_slash_command(state, session, request, definition).await;
     }
-    if !request
-        .command_id
-        .starts_with(&format!("{}.", session.provider_id.as_str()))
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(agenter_core::SlashCommandResult {
-                accepted: false,
-                message: format!("Unknown slash command `{}`.", request.raw_input),
-                session: None,
-                provider_payload: None,
-            }),
-        )
-            .into_response();
-    }
-
     execute_provider_slash_command(state, user.user_id, session, request, definition).await
+}
+
+async fn provider_slash_command_definition(
+    state: &crate::state::AppState,
+    session: &crate::state::RegisteredSession,
+    command_id: &str,
+) -> Option<agenter_core::SlashCommandDefinition> {
+    let request_id = agenter_protocol::RequestId::from(uuid::Uuid::new_v4().to_string());
+    let message = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
+        agenter_protocol::runner::RunnerCommandEnvelope {
+            request_id: request_id.clone(),
+            command: agenter_protocol::runner::RunnerCommand::ListProviderCommands(
+                agenter_protocol::runner::ListProviderCommandsCommand {
+                    session_id: session.session_id,
+                    provider_id: session.provider_id.clone(),
+                },
+            ),
+        },
+    ));
+    match state
+        .send_runner_command_and_wait(
+            session.runner_id,
+            request_id,
+            message,
+            super::RUNNER_COMMAND_RESPONSE_TIMEOUT,
+        )
+        .await
+    {
+        Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok {
+            result: agenter_protocol::runner::RunnerCommandResult::ProviderCommands { commands },
+        }) => commands
+            .into_iter()
+            .find(|command| command.id == command_id),
+        other => {
+            tracing::debug!(session_id = %session.session_id, ?other, "provider slash command definition unavailable");
+            None
+        }
+    }
 }
 
 async fn execute_local_slash_command(
@@ -564,11 +598,16 @@ async fn create_session_from_slash(
         .await;
     let info = session.info();
     state
-        .publish_event(
+        .publish_universal_event(
             info.session_id,
-            agenter_core::NormalizedEvent::SessionStarted(info.clone()),
+            None,
+            None,
+            agenter_core::UniversalEventKind::SessionCreated {
+                session: Box::new(info.clone()),
+            },
         )
-        .await;
+        .await
+        .ok();
     let result = agenter_core::SlashCommandResult {
         accepted: true,
         message: "New session created.".to_owned(),
@@ -792,22 +831,6 @@ async fn execute_provider_slash_command(
     request: agenter_core::SlashCommandRequest,
     definition: agenter_core::SlashCommandDefinition,
 ) -> Response {
-    let provider_definition = provider_slash_commands(&session.provider_id)
-        .into_iter()
-        .find(|command| command.id == request.command_id);
-    if provider_definition.is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(agenter_core::SlashCommandResult {
-                accepted: false,
-                message: format!("Unknown slash command `{}`.", request.raw_input),
-                session: None,
-                provider_payload: None,
-            }),
-        )
-            .into_response();
-    }
-
     let request_id = agenter_protocol::RequestId::from(uuid::Uuid::new_v4().to_string());
     let universal_command = slash_command_envelope(
         user_id,
@@ -823,7 +846,6 @@ async fn execute_provider_slash_command(
         return response;
     }
     publish_slash_user_echo(&state, user_id, session.session_id, &request).await;
-    let command_id = request.command_id.clone();
     let command_request = request.clone();
     let message = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
         agenter_protocol::runner::RunnerCommandEnvelope {
@@ -849,45 +871,8 @@ async fn execute_provider_slash_command(
     {
         Ok(agenter_protocol::runner::RunnerResponseOutcome::Ok {
             result:
-                agenter_protocol::runner::RunnerCommandResult::ProviderCommandExecuted { mut result },
+                agenter_protocol::runner::RunnerCommandResult::ProviderCommandExecuted { result },
         }) => {
-            if command_id == "codex.fork" {
-                if let Some(forked) = register_forked_session_from_provider_result(
-                    &state,
-                    user_id,
-                    &session,
-                    result.provider_payload.as_ref(),
-                )
-                .await
-                {
-                    result.session = Some(forked);
-                }
-            }
-            if let Some(status) = provider_slash_session_status(&command_id) {
-                if let Some(updated) = state
-                    .update_session_status(user_id, session.session_id, status.clone())
-                    .await
-                {
-                    state
-                        .publish_event(
-                            session.session_id,
-                            agenter_core::NormalizedEvent::SessionStatusChanged(
-                                agenter_core::SessionStatusChangedEvent {
-                                    session_id: session.session_id,
-                                    status,
-                                    reason: Some(format!(
-                                        "Updated by /{}.",
-                                        command_id
-                                            .strip_prefix("codex.")
-                                            .unwrap_or(command_id.as_str())
-                                    )),
-                                },
-                            ),
-                        )
-                        .await;
-                    result.session = Some(updated);
-                }
-            }
             if let Some(response) = super::finish_command_or_error_response(
                 &state,
                 &universal_command,
@@ -1008,17 +993,34 @@ async fn publish_slash_user_echo(
     session_id: agenter_core::SessionId,
     request: &agenter_core::SlashCommandRequest,
 ) {
+    let item_id = agenter_core::ItemId::new();
     state
-        .publish_event(
+        .publish_universal_event(
             session_id,
-            agenter_core::NormalizedEvent::UserMessage(agenter_core::UserMessageEvent {
-                session_id,
-                message_id: Some(uuid::Uuid::new_v4().to_string()),
-                author_user_id: Some(user_id),
-                content: request.raw_input.clone(),
-            }),
+            None,
+            Some(item_id),
+            agenter_core::UniversalEventKind::ItemCreated {
+                item: Box::new(agenter_core::ItemState {
+                    item_id,
+                    session_id,
+                    turn_id: None,
+                    role: agenter_core::ItemRole::User,
+                    status: agenter_core::ItemStatus::Completed,
+                    content: vec![agenter_core::ContentBlock {
+                        block_id: format!("slash-{}", uuid::Uuid::new_v4()),
+                        kind: agenter_core::ContentBlockKind::Text,
+                        text: Some(request.raw_input.clone()),
+                        mime_type: None,
+                        artifact_id: None,
+                    }],
+                    tool: None,
+                    native: None,
+                }),
+            },
         )
-        .await;
+        .await
+        .ok();
+    let _ = user_id;
 }
 
 async fn slash_result_response(
@@ -1041,97 +1043,34 @@ async fn publish_slash_result_event(
     result: &agenter_core::SlashCommandResult,
 ) {
     state
-        .publish_event(
+        .publish_universal_event(
             session_id,
-            agenter_core::NormalizedEvent::NativeNotification(agenter_core::NativeNotification {
-                session_id,
-                provider_id: definition
-                    .provider_id
-                    .clone()
-                    .unwrap_or_else(|| agenter_core::AgentProviderId::from("local")),
-                event_id: Some(format!(
-                    "slash-{}-{}",
-                    request.command_id.replace('.', "-"),
-                    uuid::Uuid::new_v4()
-                )),
-                method: "slash_command_result".to_owned(),
-                category: "slash_command".to_owned(),
-                title: format!("/{}", definition.name),
-                detail: Some(result.message.clone()),
-                status: Some(
-                    if result.accepted {
-                        "accepted"
+            None,
+            None,
+            agenter_core::UniversalEventKind::ProviderNotification {
+                notification: agenter_core::ProviderNotification {
+                    category: "slash_command".to_owned(),
+                    title: format!("/{}", definition.name),
+                    detail: Some(result.message.clone()),
+                    status: Some(
+                        if result.accepted {
+                            "accepted"
+                        } else {
+                            "rejected"
+                        }
+                        .to_owned(),
+                    ),
+                    severity: Some(if result.accepted {
+                        agenter_core::ProviderNotificationSeverity::Info
                     } else {
-                        "rejected"
-                    }
-                    .to_owned(),
-                ),
-                provider_payload: Some(serde_json::json!({
-                    "command_id": request.command_id,
-                    "raw_input": request.raw_input,
-                    "target": definition.target,
-                    "danger_level": definition.danger_level,
-                    "arguments": request.arguments,
-                    "accepted": result.accepted,
-                    "message": result.message,
-                    "provider_payload": result.provider_payload,
-                })),
-            }),
+                        agenter_core::ProviderNotificationSeverity::Error
+                    }),
+                    subject: Some(request.command_id.clone()),
+                },
+            },
         )
-        .await;
-}
-
-async fn register_forked_session_from_provider_result(
-    state: &crate::state::AppState,
-    user_id: agenter_core::UserId,
-    source: &crate::state::RegisteredSession,
-    provider_payload: Option<&serde_json::Value>,
-) -> Option<agenter_core::SessionInfo> {
-    let external_session_id = provider_payload
-        .and_then(|payload| {
-            string_pointer(
-                payload,
-                &[
-                    "/result/thread/id",
-                    "/result/threadId",
-                    "/thread/id",
-                    "/threadId",
-                ],
-            )
-        })?
-        .to_owned();
-    let session = state
-        .register_session(SessionRegistration {
-            session_id: agenter_core::SessionId::new(),
-            owner_user_id: user_id,
-            runner_id: source.runner_id,
-            workspace: source.workspace.clone(),
-            provider_id: source.provider_id.clone(),
-            title: Some(format!(
-                "Fork of {}",
-                source.title.as_deref().unwrap_or("session")
-            )),
-            external_session_id: Some(external_session_id),
-            turn_settings: source.turn_settings.clone(),
-            usage: source.usage.clone(),
-        })
-        .await;
-    let info = session.info();
-    state
-        .publish_event(
-            info.session_id,
-            agenter_core::NormalizedEvent::SessionStarted(info.clone()),
-        )
-        .await;
-    Some(info)
-}
-
-fn provider_slash_session_status(command_id: &str) -> Option<agenter_core::SessionStatus> {
-    match command_id {
-        "codex.archive" => Some(agenter_core::SessionStatus::Archived),
-        "codex.unarchive" => Some(agenter_core::SessionStatus::Running),
-        _ => None,
-    }
+        .await
+        .ok();
 }
 
 async fn refresh_workspace_provider_sessions_for_user(
@@ -1268,7 +1207,7 @@ async fn refresh_workspace_provider_sessions_for_user(
 pub(super) fn local_slash_commands(
     provider_id: &agenter_core::AgentProviderId,
 ) -> Vec<agenter_core::SlashCommandDefinition> {
-    let mut commands: Vec<agenter_core::SlashCommandDefinition> = vec![
+    let commands: Vec<agenter_core::SlashCommandDefinition> = vec![
         slash_command(
             "local.help",
             "help",
@@ -1360,109 +1299,8 @@ pub(super) fn local_slash_commands(
     .into_iter()
     .map(Into::into)
     .collect();
-    commands.extend(provider_slash_commands(provider_id));
+    let _ = provider_id;
     commands
-}
-
-fn provider_slash_commands(
-    provider_id: &agenter_core::AgentProviderId,
-) -> Vec<agenter_core::SlashCommandDefinition> {
-    if provider_id.as_str() != agenter_core::AgentProviderId::CODEX {
-        return Vec::new();
-    }
-    vec![
-        slash_command(
-            "codex.compact",
-            "compact",
-            "Start native Codex context compaction.",
-            "provider",
-            agenter_core::SlashCommandTarget::Provider,
-        )
-        .into(),
-        slash_command(
-            "codex.review",
-            "review",
-            "Start a native Codex code review.",
-            "provider",
-            agenter_core::SlashCommandTarget::Provider,
-        )
-        .with_argument(
-            "target",
-            agenter_core::SlashCommandArgumentKind::Rest,
-            false,
-            "Review target flags",
-        )
-        .into(),
-        slash_command(
-            "codex.steer",
-            "steer",
-            "Steer the active Codex turn.",
-            "provider",
-            agenter_core::SlashCommandTarget::Provider,
-        )
-        .with_argument(
-            "input",
-            agenter_core::SlashCommandArgumentKind::Rest,
-            true,
-            "Text to steer with",
-        )
-        .into(),
-        slash_command(
-            "codex.fork",
-            "fork",
-            "Fork the current Codex thread.",
-            "provider",
-            agenter_core::SlashCommandTarget::Provider,
-        )
-        .into(),
-        slash_command(
-            "codex.archive",
-            "archive",
-            "Archive the current Codex thread.",
-            "provider",
-            agenter_core::SlashCommandTarget::Provider,
-        )
-        .into(),
-        slash_command(
-            "codex.unarchive",
-            "unarchive",
-            "Unarchive the current Codex thread.",
-            "provider",
-            agenter_core::SlashCommandTarget::Provider,
-        )
-        .into(),
-        slash_command(
-            "codex.rollback",
-            "rollback",
-            "Drop recent turns from Codex history. Does not revert files.",
-            "provider",
-            agenter_core::SlashCommandTarget::Provider,
-        )
-        .danger(agenter_core::SlashCommandDangerLevel::Dangerous)
-        .with_argument(
-            "numTurns",
-            agenter_core::SlashCommandArgumentKind::Number,
-            true,
-            "Number of turns",
-        )
-        .into(),
-        slash_command(
-            "codex.shell",
-            "shell",
-            "Run an unsandboxed provider-native shell command.",
-            "provider",
-            agenter_core::SlashCommandTarget::Provider,
-        )
-        .danger(agenter_core::SlashCommandDangerLevel::Dangerous)
-        .with_alias("sh")
-        .with_argument(
-            "command",
-            agenter_core::SlashCommandArgumentKind::Rest,
-            true,
-            "Shell command",
-        )
-        .into(),
-    ]
 }
 
 struct SlashCommandBuilder(agenter_core::SlashCommandDefinition);
@@ -1489,16 +1327,6 @@ impl SlashCommandBuilder {
         if let Some(argument) = self.0.arguments.last_mut() {
             argument.choices = choices.into_iter().map(str::to_owned).collect();
         }
-        self
-    }
-
-    fn with_alias(mut self, alias: &str) -> Self {
-        self.0.aliases.push(alias.to_owned());
-        self
-    }
-
-    fn danger(mut self, danger_level: agenter_core::SlashCommandDangerLevel) -> Self {
-        self.0.danger_level = danger_level;
         self
     }
 }
@@ -1543,10 +1371,4 @@ fn agent_reasoning_effort_from_str(value: &str) -> Option<agenter_core::AgentRea
         "xhigh" => Some(agenter_core::AgentReasoningEffort::Xhigh),
         _ => None,
     }
-}
-
-fn string_pointer<'a>(value: &'a serde_json::Value, pointers: &[&str]) -> Option<&'a str> {
-    pointers
-        .iter()
-        .find_map(|pointer| value.pointer(pointer).and_then(serde_json::Value::as_str))
 }

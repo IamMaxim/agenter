@@ -5,7 +5,7 @@ Date: 2026-04-30
 
 ## Context
 
-Agenter must support workspaces on a home PC, VPS, or other machine. Native agent harnesses need local workspace access and may expose stdio-first or otherwise local protocols. Public clients should not connect directly to Codex or Qwen harness transports.
+Agenter must support workspaces on a home PC, VPS, or other machine. Native agent harnesses need local workspace access and may expose stdio-first or otherwise local protocols. Public clients should not connect directly to native provider harness transports.
 
 ## Decision
 

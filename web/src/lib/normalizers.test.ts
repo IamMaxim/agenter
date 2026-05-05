@@ -165,11 +165,11 @@ describe('frontend API normalizers', () => {
   test('normalizes versioned universal snapshot frames and defaults legacy missing versions', () => {
     const versioned = normalizeBrowserServerMessage({
       type: 'session_snapshot',
-      protocol_version: 'uap/1',
-      snapshot: { session_id: 'session-1' },
+      protocol_version: 'uap/2',
+      snapshot: { session_id: 'session-1', latest_seq: '1' },
       events: [
         {
-          protocol_version: 'uap/1',
+          protocol_version: 'uap/2',
           event_id: '11111111-1111-4111-8111-111111111111',
           seq: '1',
           session_id: 'session-1',
@@ -178,13 +178,20 @@ describe('frontend API normalizers', () => {
           event: { type: 'native.unknown', data: { summary: 'hello' } }
         }
       ],
-      latest_seq: '1'
+      snapshot_seq: '1',
+      replay_from_seq: '1',
+      replay_through_seq: '1',
+      replay_complete: true
     });
 
     expect(versioned.type).toBe('session_snapshot');
     if (versioned.type !== 'session_snapshot') throw new Error('expected snapshot');
-    expect(versioned.protocol_version).toBe('uap/1');
-    expect(versioned.events[0].protocol_version).toBe('uap/1');
+    expect(versioned.protocol_version).toBe('uap/2');
+    expect(versioned.events[0].protocol_version).toBe('uap/2');
+    expect(versioned.snapshot_seq).toBe('1');
+    expect(versioned.replay_from_seq).toBe('1');
+    expect(versioned.replay_through_seq).toBe('1');
+    expect(versioned.replay_complete).toBe(true);
 
     const legacy = normalizeBrowserServerMessage({
       type: 'universal_event',
@@ -198,13 +205,13 @@ describe('frontend API normalizers', () => {
 
     expect(legacy.type).toBe('universal_event');
     if (legacy.type !== 'universal_event') throw new Error('expected universal event');
-    expect(legacy.protocol_version).toBe('uap/1');
+    expect(legacy.protocol_version).toBe('uap/2');
   });
 
   test('normalizes all known universal event types without native unknown fallback', () => {
     const base = {
       type: 'universal_event',
-      protocol_version: 'uap/1',
+      protocol_version: 'uap/2',
       event_id: '33333333-3333-4333-8333-333333333333',
       seq: '3',
       session_id: 'session-1',

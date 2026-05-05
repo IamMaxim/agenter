@@ -407,7 +407,7 @@ mod tests {
                     path: "/tmp/workspace".to_owned(),
                     display_name: Some("workspace".to_owned()),
                 },
-                provider_id: AgentProviderId::from("codex"),
+                provider_id: AgentProviderId::from("qwen"),
                 sessions: vec![DiscoveredSession {
                     external_session_id: "native-session".to_owned(),
                     title: Some("Native session".to_owned()),
@@ -465,7 +465,7 @@ mod tests {
                     path: "/tmp/workspace".to_owned(),
                     display_name: None,
                 },
-                provider_id: AgentProviderId::from("codex"),
+                provider_id: AgentProviderId::from("qwen"),
                 sessions: Vec::new(),
             }
         )));

@@ -30,6 +30,7 @@ struct DiscoveryImportCompletion {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub fn smoke_session_id() -> SessionId {
     SessionId::from_uuid(uuid::Uuid::from_u128(0x11111111111111111111111111111111))
 }

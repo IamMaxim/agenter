@@ -6,7 +6,7 @@ Date: 2026-05-02
 
 ## Context
 
-Pending Codex approvals can outlive individual `approval_requested` rows in the control plane’s bounded in-memory ring buffer (`SESSION_EVENT_CACHE_LIMIT`). Without another source of truth, a browser reload could lose the approval card while the runner still waited on JSON-RPC approval.
+Pending provider approvals can outlive individual `approval_requested` rows in the control plane’s bounded in-memory ring buffer (`SESSION_EVENT_CACHE_LIMIT`). Without another source of truth, a browser reload could lose the approval card while the runner still waits on a native approval.
 
 ## Decision
 
@@ -16,7 +16,7 @@ Pending Codex approvals can outlive individual `approval_requested` rows in the 
 
 3. **`GET /api/approvals?session_id=…`** returns the same pending/resolving request envelopes for an owned session (auth + `can_access_session`).
 
-4. **Resolution means provider-adapter acknowledgement, not WebSocket delivery.** Browser approval decisions move the registry to `Resolving` and start an in-memory runner command operation. The approval becomes `Resolved` only after the runner confirms the native Codex/Qwen approval response was written successfully. If the runner rejects, disconnects, times out, or loses the provider request, the control plane returns the approval to `Pending` and emits a visible error/status event.
+4. **Resolution means provider-adapter acknowledgement, not WebSocket delivery.** Browser approval decisions move the registry to `Resolving` and start an in-memory runner command operation. The approval becomes `Resolved` only after the runner confirms the native approval response was written successfully. If the runner rejects, disconnects, times out, or loses the provider request, the control plane returns the approval to `Pending` and emits a visible error/status event.
 
 5. **Replay exposes in-flight state.** Replayed unresolved approval requests may include `resolution_state: "pending" | "resolving"` and, while resolving, `resolving_decision`. Browser clients render resolving approvals as disabled/in-flight rather than resolved.
 

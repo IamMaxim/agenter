@@ -42,7 +42,7 @@ function snapshot(overrides: Partial<SessionSnapshot> = {}): SessionSnapshot {
 
 function universalEvent(seq: string, eventId = `evt-${seq}`): UniversalEventEnvelope {
   return {
-    protocol_version: 'uap/1',
+    protocol_version: 'uap/2',
     event_id: eventId,
     seq,
     session_id: 's1',
@@ -438,7 +438,7 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     const message: BrowserServerMessage = {
       type: 'session_snapshot',
-      protocol_version: 'uap/1',      snapshot: snapshot({
+      protocol_version: 'uap/2',      snapshot: snapshot({
         latest_seq: '5',
         items: {
           a1: {
@@ -450,8 +450,8 @@ describe('universal session snapshot client reducer', () => {
           }
         }
       }),
-      latest_seq: '6',
-      has_more: false,
+      replay_through_seq: '6',
+      replay_complete: true,
       events: [universalEvent('5', 'evt-snapshot-boundary'), universalEvent('6')]
     };
 
@@ -467,9 +467,9 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      protocol_version: 'uap/1',      snapshot: snapshot({ latest_seq: '5' }),
-      latest_seq: '6',
-      has_more: false,
+      protocol_version: 'uap/2',      snapshot: snapshot({ latest_seq: '5' }),
+      replay_through_seq: '6',
+      replay_complete: true,
       events: [universalEvent('6', 'evt-live')]
     });
     state = applyUniversalClientMessage(state, {
@@ -487,7 +487,7 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      protocol_version: 'uap/1',
+      protocol_version: 'uap/2',
       snapshot: snapshot({
         latest_seq: '1',
         items: {
@@ -500,8 +500,8 @@ describe('universal session snapshot client reducer', () => {
           }
         }
       }),
-      latest_seq: '1',
-      has_more: false,
+      replay_through_seq: '1',
+      replay_complete: true,
       events: []
     });
 
@@ -514,27 +514,27 @@ describe('universal session snapshot client reducer', () => {
     expect(state.snapshot?.items.a1.content[0].text).toBe('Hello live');
   });
 
-  test('materializes Codex universal assistant and command events instead of native-only rows', () => {
+  test('materializes universal assistant and command events instead of native-only rows', () => {
     const state = applyUniversalClientMessage(createUniversalClientState(), {
       type: 'session_snapshot',
-      protocol_version: 'uap/1',
+      protocol_version: 'uap/2',
       snapshot: snapshot({ latest_seq: '0' }),
-      latest_seq: '4',
-      has_more: false,
+      replay_through_seq: '4',
+      replay_complete: true,
       events: [
         {
           ...universalEvent('1', 'evt-assistant-completed'),
           item_id: 'assistant-raw-response',
           native: {
-            protocol: 'codex-app-server',
+            protocol: 'acp',
             method: 'rawResponseItem/completed',
-            type: 'codex',
-            summary: 'Codex assistant message completed'
+            type: 'qwen',
+            summary: 'Assistant message completed'
           },
           event: {
             type: 'content.completed',
             data: {
-              block_id: 'codex-text-turn-1',
+              block_id: 'acp-text-turn-1',
               kind: 'text',
               text: 'Final answer'
             }
@@ -544,10 +544,10 @@ describe('universal session snapshot client reducer', () => {
           ...universalEvent('2', 'evt-command-started'),
           item_id: 'command-1',
           native: {
-            protocol: 'codex-app-server',
+            protocol: 'acp',
             method: 'item/started',
-            type: 'codex',
-            summary: 'Codex item started'
+            type: 'qwen',
+            summary: 'Item started'
           },
           event: {
             type: 'item.created',
@@ -557,7 +557,7 @@ describe('universal session snapshot client reducer', () => {
                 session_id: 's1',
                 role: 'tool',
                 status: 'streaming',
-                content: [{ block_id: 'codex-command-cmd-1', kind: 'tool_call', text: 'cargo test' }],
+                content: [{ block_id: 'acp-command-cmd-1', kind: 'tool_call', text: 'cargo test' }],
                 tool: {
                   kind: 'command',
                   name: 'command',
@@ -573,15 +573,15 @@ describe('universal session snapshot client reducer', () => {
           ...universalEvent('3', 'evt-command-output'),
           item_id: 'command-1',
           native: {
-            protocol: 'codex-app-server',
+            protocol: 'acp',
             method: 'item/commandExecution/outputDelta',
-            type: 'codex',
-            summary: 'Codex command output'
+            type: 'qwen',
+            summary: 'Command output'
           },
           event: {
             type: 'content.delta',
             data: {
-              block_id: 'codex-command-cmd-1-stdout',
+              block_id: 'acp-command-cmd-1-stdout',
               kind: 'command_output',
               delta: 'ok\n'
             }
@@ -591,15 +591,15 @@ describe('universal session snapshot client reducer', () => {
           ...universalEvent('4', 'evt-command-completed'),
           item_id: 'command-1',
           native: {
-            protocol: 'codex-app-server',
+            protocol: 'acp',
             method: 'item/completed',
-            type: 'codex',
-            summary: 'Codex item completed'
+            type: 'qwen',
+            summary: 'Item completed'
           },
           event: {
             type: 'content.completed',
             data: {
-              block_id: 'codex-command-cmd-1-status',
+              block_id: 'acp-command-cmd-1-status',
               kind: 'command_output',
               text: 'command completed'
             }
@@ -626,9 +626,9 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      protocol_version: 'uap/1',      snapshot: snapshot({ latest_seq: '6' }),
-      latest_seq: '6',
-      has_more: false,
+      protocol_version: 'uap/2',      snapshot: snapshot({ latest_seq: '6' }),
+      replay_through_seq: '6',
+      replay_complete: true,
       events: []
     });
 
@@ -648,7 +648,7 @@ describe('universal session snapshot client reducer', () => {
   test('applies snapshot checkpoint when replay page is truncated', () => {
     const state = applyUniversalClientMessage(createUniversalClientState(), {
       type: 'session_snapshot',
-      protocol_version: 'uap/1',      snapshot: snapshot({
+      protocol_version: 'uap/2',      snapshot: snapshot({
         latest_seq: '5',
         items: {
           a1: {
@@ -660,8 +660,8 @@ describe('universal session snapshot client reducer', () => {
           }
         }
       }),
-      latest_seq: '9',
-      has_more: true,
+      replay_through_seq: '9',
+      replay_complete: false,
       events: [universalEvent('9')]
     });
 
@@ -755,7 +755,7 @@ describe('universal session snapshot client reducer', () => {
   test('renders terminal question snapshot states after orphan or detach', () => {
     const state = applyUniversalClientMessage(createUniversalClientState(), {
       type: 'session_snapshot',
-      protocol_version: 'uap/1',      snapshot: snapshot({
+      protocol_version: 'uap/2',      snapshot: snapshot({
         latest_seq: null,
         questions: {
           orphaned: {
@@ -776,8 +776,8 @@ describe('universal session snapshot client reducer', () => {
         }
       }),
       events: [],
-      latest_seq: null,
-      has_more: false
+      replay_through_seq: null,
+      replay_complete: true
     });
 
     expect(state.chat.items).toMatchObject([
@@ -790,9 +790,9 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      protocol_version: 'uap/1',      snapshot: snapshot({ latest_seq: '0' }),
-      latest_seq: '3',
-      has_more: false,
+      protocol_version: 'uap/2',      snapshot: snapshot({ latest_seq: '0' }),
+      replay_through_seq: '3',
+      replay_complete: true,
       events: [
         {
           ...universalEvent('1', 'evt-assistant'),
@@ -846,7 +846,7 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      protocol_version: 'uap/1',      snapshot: snapshot({
+      protocol_version: 'uap/2',      snapshot: snapshot({
         latest_seq: '3',
         diffs: {
           d1: {
@@ -876,8 +876,8 @@ describe('universal session snapshot client reducer', () => {
           }
         }
       }),
-      latest_seq: '3',
-      has_more: false,
+      replay_through_seq: '3',
+      replay_complete: true,
       events: [
         {
           ...universalEvent('1', 'evt-assistant'),
@@ -937,7 +937,7 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      protocol_version: 'uap/1',      snapshot: snapshot({
+      protocol_version: 'uap/2',      snapshot: snapshot({
         latest_seq: '3',
         items: {
           'assistant-item': {
@@ -967,8 +967,8 @@ describe('universal session snapshot client reducer', () => {
           }
         }
       }),
-      latest_seq: '3',
-      has_more: false,
+      replay_through_seq: '3',
+      replay_complete: true,
       events: [
         {
           ...universalEvent('1', 'evt-approval'),
@@ -1022,7 +1022,7 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      protocol_version: 'uap/1',      snapshot: snapshot({
+      protocol_version: 'uap/2',      snapshot: snapshot({
         latest_seq: '5',
         items: {
           'assistant-before': {
@@ -1051,8 +1051,8 @@ describe('universal session snapshot client reducer', () => {
           }
         }
       }),
-      latest_seq: '3',
-      has_more: true,
+      replay_through_seq: '3',
+      replay_complete: false,
       events: [
         {
           ...universalEvent('1', 'evt-assistant-before'),
@@ -1102,7 +1102,7 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      protocol_version: 'uap/1',      snapshot: snapshot({
+      protocol_version: 'uap/2',      snapshot: snapshot({
         latest_seq: '10',
         items: {
           'assistant-before': {
@@ -1133,8 +1133,8 @@ describe('universal session snapshot client reducer', () => {
           }
         }
       }),
-      latest_seq: '10',
-      has_more: true,
+      replay_through_seq: '10',
+      replay_complete: false,
       events: [
         {
           ...universalEvent('1', 'evt-assistant-before'),
@@ -1224,7 +1224,7 @@ describe('universal session snapshot client reducer', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'session_snapshot',
-      protocol_version: 'uap/1',      snapshot: snapshot({
+      protocol_version: 'uap/2',      snapshot: snapshot({
         latest_seq: '3',
         plans: {
           p1: {
@@ -1241,8 +1241,8 @@ describe('universal session snapshot client reducer', () => {
           }
         }
       }),
-      latest_seq: '5',
-      has_more: false,
+      replay_through_seq: '5',
+      replay_complete: true,
       events: [
         {
           ...universalEvent('5', 'evt-assistant'),
@@ -1269,9 +1269,9 @@ describe('universal session snapshot client reducer', () => {
       type: 'universal_event',
       ...universalEvent('6', 'evt-capability-gap'),
       native: {
-        protocol: 'codex-app-server',
+        protocol: 'acp',
         method: 'item/tool/call',
-        type: 'codex',
+        type: 'qwen',
         native_id: null,
         summary: 'error reported',
         hash: null,
@@ -1280,8 +1280,8 @@ describe('universal session snapshot client reducer', () => {
       event: {
         type: 'error.reported',
         data: {
-          code: 'codex_capability_gap',
-          message: 'Codex server request `item/tool/call` is classified but not supported by Agenter.'
+          code: 'provider_capability_gap',
+          message: 'Provider server request `item/tool/call` is classified but not supported by Agenter.'
         }
       }
     });
@@ -1290,21 +1290,21 @@ describe('universal session snapshot client reducer', () => {
       {
         id: 'event:artifact:error:evt-capability-gap',
         kind: 'error',
-        title: 'Codex capability gap',
-        detail: 'Codex server request `item/tool/call` is classified but not supported by Agenter.'
+        title: 'Provider capability gap',
+        detail: 'Provider server request `item/tool/call` is classified but not supported by Agenter.'
       }
     ]);
   });
 
-  test('renders promoted native Codex notifications and hides raw native noise outside debug', () => {
+  test('renders promoted native provider notifications and hides raw native noise outside debug', () => {
     let state = createUniversalClientState();
     state = applyUniversalClientMessage(state, {
       type: 'universal_event',
       ...universalEvent('7', 'evt-guardian'),
       native: {
-        protocol: 'codex-app-server',
+        protocol: 'acp',
         method: 'guardianWarning',
-        type: 'codex',
+        type: 'qwen',
         native_id: null,
         summary: 'native notification',
         hash: null,
@@ -1319,9 +1319,9 @@ describe('universal session snapshot client reducer', () => {
       type: 'universal_event',
       ...universalEvent('8', 'evt-raw-native'),
       native: {
-        protocol: 'codex-app-server',
+        protocol: 'acp',
         method: 'raw/unclassified',
-        type: 'codex',
+        type: 'qwen',
         native_id: null,
         summary: 'native notification',
         hash: null,
@@ -1359,11 +1359,11 @@ describe('universal session snapshot client reducer', () => {
       type: 'universal_event',
       ...universalEvent('9', 'evt-hook'),
       native: {
-        protocol: 'codex-app-server',
+        protocol: 'acp',
         method: 'hook/started',
-        type: 'codex',
+        type: 'qwen',
         native_id: 'hook-1',
-        summary: 'Codex provider notification',
+        summary: 'Provider notification',
         hash: null,
         pointer: null
       },

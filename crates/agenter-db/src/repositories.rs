@@ -2912,7 +2912,7 @@ mod tests {
             user.user_id,
             runner.runner_id,
             workspace.workspace_id,
-            AgentProviderId::from(AgentProviderId::CODEX),
+            AgentProviderId::from(AgentProviderId::QWEN),
             Some("external-session-1"),
             Some("First Session"),
         )
@@ -2953,7 +2953,7 @@ mod tests {
             user.user_id,
             runner.runner_id,
             workspace.workspace_id,
-            AgentProviderId::from(AgentProviderId::CODEX),
+            AgentProviderId::from(AgentProviderId::QWEN),
             None,
             Some("Universal Session"),
         )
@@ -2975,7 +2975,7 @@ mod tests {
                     owner_user_id: user.user_id,
                     runner_id: runner.runner_id,
                     workspace_id: workspace.workspace_id,
-                    provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                    provider_id: AgentProviderId::from(AgentProviderId::QWEN),
                     status: SessionStatus::Running,
                     external_session_id: None,
                     title: Some("Universal Session".to_owned()),
@@ -3028,7 +3028,7 @@ mod tests {
                     native_blocking: true,
                     policy: None,
                     native: Some(NativeRef {
-                        protocol: "codex.app_server".to_owned(),
+                        protocol: "acp.qwen".to_owned(),
                         method: Some("approval/requested".to_owned()),
                         kind: Some("command".to_owned()),
                         native_id: Some("native-approval-1".to_owned()),
@@ -3038,6 +3038,7 @@ mod tests {
                     }),
                     requested_at: Some(Utc::now()),
                     resolved_at: None,
+                    resolving_decision: None,
                 }),
             },
         };
@@ -3154,7 +3155,7 @@ mod tests {
             user.user_id,
             runner.runner_id,
             workspace.workspace_id,
-            AgentProviderId::from(AgentProviderId::CODEX),
+            AgentProviderId::from(AgentProviderId::QWEN),
             None,
             Some("Runner Receipts Session"),
         )
@@ -3240,14 +3241,14 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
-    async fn upserts_codex_imports_and_preserves_source_timestamps() {
+    async fn upserts_provider_imports_and_preserves_source_timestamps() {
         let pool = test_pool().await;
 
         let suffix = uuid::Uuid::new_v4();
         let user = create_user(
             &pool,
-            &format!("codex-import-user-{suffix}@example.test"),
-            Some("Codex Import User"),
+            &format!("provider-import-user-{suffix}@example.test"),
+            Some("Provider Import User"),
         )
         .await
         .expect("create user");
@@ -3256,7 +3257,7 @@ mod tests {
         let runner = upsert_runner_with_id(
             &pool,
             runner_id,
-            &format!("codex-runner-{suffix}"),
+            &format!("provider-runner-{suffix}"),
             Some("test"),
         )
         .await
@@ -3265,8 +3266,8 @@ mod tests {
             &pool,
             workspace_id,
             runner.runner_id,
-            &format!("/tmp/agenter-codex-import-{suffix}"),
-            Some("Codex Import Workspace"),
+            &format!("/tmp/agenter-provider-import-{suffix}"),
+            Some("Provider Import Workspace"),
         )
         .await
         .expect("upsert workspace");
@@ -3277,9 +3278,9 @@ mod tests {
                 owner_user_id: user.user_id,
                 runner_id: runner.runner_id,
                 workspace_id: workspace.workspace_id,
-                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
-                external_session_id: "codex-thread-imported",
-                title: Some("Imported Codex Thread"),
+                provider_id: AgentProviderId::from(AgentProviderId::QWEN),
+                external_session_id: "provider-thread-imported",
+                title: Some("Imported Provider Thread"),
                 updated_at: None,
             },
         )
@@ -3291,9 +3292,9 @@ mod tests {
                 owner_user_id: user.user_id,
                 runner_id: runner.runner_id,
                 workspace_id: workspace.workspace_id,
-                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
-                external_session_id: "codex-thread-imported",
-                title: Some("Renamed Codex Thread"),
+                provider_id: AgentProviderId::from(AgentProviderId::QWEN),
+                external_session_id: "provider-thread-imported",
+                title: Some("Renamed Provider Thread"),
                 updated_at: None,
             },
         )
@@ -3301,7 +3302,7 @@ mod tests {
         .expect("upsert duplicate imported session");
 
         assert_eq!(imported.session_id, duplicate.session_id);
-        assert_eq!(duplicate.title.as_deref(), Some("Renamed Codex Thread"));
+        assert_eq!(duplicate.title.as_deref(), Some("Renamed Provider Thread"));
 
         let source_updated_at = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .expect("parse fixed timestamp")
@@ -3312,9 +3313,9 @@ mod tests {
                 owner_user_id: user.user_id,
                 runner_id: runner.runner_id,
                 workspace_id: workspace.workspace_id,
-                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
-                external_session_id: "codex-thread-imported",
-                title: Some("Timestamped Codex Thread"),
+                provider_id: AgentProviderId::from(AgentProviderId::QWEN),
+                external_session_id: "provider-thread-imported",
+                title: Some("Timestamped Provider Thread"),
                 updated_at: Some(source_updated_at),
             },
         )
@@ -3328,8 +3329,8 @@ mod tests {
                 owner_user_id: user.user_id,
                 runner_id: runner.runner_id,
                 workspace_id: workspace.workspace_id,
-                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
-                external_session_id: "codex-thread-imported",
+                provider_id: AgentProviderId::from(AgentProviderId::QWEN),
+                external_session_id: "provider-thread-imported",
                 title: Some("Preserved Timestamp"),
                 updated_at: None,
             },

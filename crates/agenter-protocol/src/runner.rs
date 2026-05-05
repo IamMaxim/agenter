@@ -500,7 +500,7 @@ mod tests {
             token: "runner-token".to_owned(),
             capabilities: RunnerCapabilities {
                 agent_providers: vec![AgentProviderAdvertisement {
-                    provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                    provider_id: AgentProviderId::from(AgentProviderId::QWEN),
                     capabilities: AgentCapabilities {
                         streaming: true,
                         approvals: true,
@@ -537,7 +537,7 @@ mod tests {
         assert_eq!(json["replay_from_runner_event_seq"], 41);
         assert_eq!(
             json["capabilities"]["agent_providers"][0]["provider_id"],
-            "codex"
+            "qwen"
         );
         assert_eq!(
             json["capabilities"]["agent_providers"][0]["capabilities"]["provider_details"][0]
@@ -553,7 +553,7 @@ mod tests {
             request_id: RequestId::from("req-1"),
             command: RunnerCommand::AgentSendInput(AgentInputCommand {
                 session_id: SessionId::nil(),
-                provider_id: Some(AgentProviderId::from(AgentProviderId::CODEX)),
+                provider_id: Some(AgentProviderId::from(AgentProviderId::QWEN)),
                 external_session_id: Some("thread-1".to_owned()),
                 settings: None,
                 input: AgentInput::Text {
@@ -609,7 +609,7 @@ mod tests {
             request_id: RequestId::from("refresh-1"),
             command: RunnerCommand::RefreshSessions(RefreshSessionsCommand {
                 workspace: workspace.clone(),
-                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                provider_id: AgentProviderId::from(AgentProviderId::QWEN),
             }),
         }));
 
@@ -619,7 +619,7 @@ mod tests {
 
         assert_eq!(json["type"], "runner_command");
         assert_eq!(json["command"]["type"], "refresh_sessions");
-        assert_eq!(json["command"]["provider_id"], AgentProviderId::CODEX);
+        assert_eq!(json["command"]["provider_id"], AgentProviderId::QWEN);
         assert_eq!(json["command"]["workspace"]["path"], workspace.path);
         assert_eq!(decoded, message);
     }
@@ -630,7 +630,7 @@ mod tests {
             request_id: RequestId::from("provider-commands-1"),
             command: RunnerCommand::ListProviderCommands(ListProviderCommandsCommand {
                 session_id: SessionId::nil(),
-                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                provider_id: AgentProviderId::from(AgentProviderId::QWEN),
             }),
         }));
         let manifest_json = serde_json::to_value(&manifest).expect("serialize manifest request");
@@ -644,9 +644,9 @@ mod tests {
             command: RunnerCommand::ExecuteProviderCommand(ProviderCommandExecutionCommand {
                 session_id: SessionId::nil(),
                 external_session_id: Some("thread-1".to_owned()),
-                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                provider_id: AgentProviderId::from(AgentProviderId::QWEN),
                 command: agenter_core::SlashCommandRequest {
-                    command_id: "codex.compact".to_owned(),
+                    command_id: "qwen.compact".to_owned(),
                     universal_command_id: None,
                     idempotency_key: None,
                     arguments: serde_json::json!({}),
@@ -695,9 +695,9 @@ mod tests {
                 ts: None,
                 source: UniversalEventSource::Native,
                 native: Some(NativeRef {
-                    protocol: "codex-app-server".to_owned(),
+                    protocol: "qwen-app-server".to_owned(),
                     method: Some("thread/item".to_owned()),
-                    kind: Some("codex".to_owned()),
+                    kind: Some("qwen".to_owned()),
                     native_id: Some("native-msg-1".to_owned()),
                     summary: Some("native message".to_owned()),
                     hash: None,
@@ -718,8 +718,8 @@ mod tests {
         assert_eq!(json["runner_event_seq"], 123);
         assert_eq!(json["acked_runner_event_seq"], 122);
         assert_eq!(json["event"]["type"], "agent_event");
-        assert_eq!(json["event"]["protocol_version"], "uap/1");
-        assert_eq!(json["event"]["native"]["protocol"], "codex-app-server");
+        assert_eq!(json["event"]["protocol_version"], "uap/2");
+        assert_eq!(json["event"]["native"]["protocol"], "qwen-app-server");
         assert_eq!(json["event"]["event"]["type"], "native.unknown");
         assert_eq!(decoded, message);
     }
@@ -753,10 +753,10 @@ mod tests {
             acked_runner_event_seq: None,
             event: RunnerEvent::SessionsDiscovered(DiscoveredSessions {
                 workspace: workspace.clone(),
-                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                provider_id: AgentProviderId::from(AgentProviderId::QWEN),
                 sessions: vec![DiscoveredSession {
-                    external_session_id: "codex-thread-1".to_owned(),
-                    title: Some("Existing Codex Thread".to_owned()),
+                    external_session_id: "provider-thread-1".to_owned(),
+                    title: Some("Existing Provider Thread".to_owned()),
                     updated_at: None,
                     history_status: DiscoveredSessionHistoryStatus::Loaded,
                     history: vec![
@@ -779,11 +779,11 @@ mod tests {
 
         assert_eq!(json["type"], "runner_event");
         assert_eq!(json["event"]["type"], "sessions_discovered");
-        assert_eq!(json["event"]["provider_id"], AgentProviderId::CODEX);
+        assert_eq!(json["event"]["provider_id"], AgentProviderId::QWEN);
         assert_eq!(json["event"]["workspace"]["path"], workspace.path);
         assert_eq!(
             json["event"]["sessions"][0]["external_session_id"],
-            "codex-thread-1"
+            "provider-thread-1"
         );
         assert_eq!(
             json["event"]["sessions"][0]["history"][0]["type"],
@@ -806,9 +806,9 @@ mod tests {
             acked_runner_event_seq: None,
             event: RunnerEvent::SessionsDiscovered(DiscoveredSessions {
                 workspace,
-                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                provider_id: AgentProviderId::from(AgentProviderId::QWEN),
                 sessions: vec![DiscoveredSession {
-                    external_session_id: "codex-thread-failed".to_owned(),
+                    external_session_id: "provider-thread-failed".to_owned(),
                     title: None,
                     updated_at: None,
                     history_status: DiscoveredSessionHistoryStatus::Failed {
@@ -844,7 +844,7 @@ mod tests {
                 operation_id: RequestId::from("refresh-1"),
                 kind: RunnerOperationKind::SessionRefresh,
                 status: RunnerOperationStatus::ReadingHistory,
-                stage_label: "Reading Codex history".to_owned(),
+                stage_label: "Reading provider history".to_owned(),
                 progress: Some(RunnerOperationProgress {
                     current: Some(2),
                     total: Some(5),
@@ -873,7 +873,7 @@ mod tests {
     fn agent_input_command_supports_structured_user_message_payload() {
         let command = RunnerCommand::AgentSendInput(AgentInputCommand {
             session_id: SessionId::nil(),
-            provider_id: Some(AgentProviderId::from(AgentProviderId::CODEX)),
+            provider_id: Some(AgentProviderId::from(AgentProviderId::QWEN)),
             external_session_id: None,
             settings: None,
             input: AgentInput::UserMessage {
@@ -897,7 +897,7 @@ mod tests {
     fn round_trips_agent_input_settings_without_breaking_absent_settings() {
         let with_settings = RunnerCommand::AgentSendInput(AgentInputCommand {
             session_id: SessionId::nil(),
-            provider_id: Some(AgentProviderId::from(AgentProviderId::CODEX)),
+            provider_id: Some(AgentProviderId::from(AgentProviderId::QWEN)),
             external_session_id: Some("thread-1".to_owned()),
             settings: Some(AgentTurnSettings {
                 model: Some("gpt-5.4".to_owned()),
@@ -934,7 +934,7 @@ mod tests {
             request_id: RequestId::from("options-1"),
             command: RunnerCommand::GetAgentOptions(GetAgentOptionsCommand {
                 session_id: SessionId::nil(),
-                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                provider_id: AgentProviderId::from(AgentProviderId::QWEN),
             }),
         }));
         let answer = RunnerServerMessage::Command(Box::new(RunnerCommandEnvelope {

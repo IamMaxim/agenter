@@ -31,7 +31,6 @@ The runner owns:
 
 - local workspace access;
 - persistent agent harness processes;
-- Codex app-server integration;
 - Qwen ACP integration;
 - native protocol supervision;
 - event normalization before forwarding to the control plane.
@@ -50,12 +49,11 @@ The runner should connect outbound to the control plane over a secure bidirectio
 
 ## Initial Agent Providers
 
-Codex:
+ACP:
 
-- integrate through `codex app-server`;
-- prefer stdio JSON-RPC transport;
-- do not expose raw app-server networking publicly;
-- map threads, turns, items, command execution, file changes, and approval requests into app events.
+- integrate through local ACP CLIs (`qwen --acp`, `gemini --acp`, and `opencode acp`);
+- keep provider auth and runtime local to the workspace;
+- map provider turns/items/messages into normalized events for control-plane replay.
 
 Qwen:
 
@@ -111,8 +109,8 @@ Include:
 - Postgres schema;
 - browser session list and chat;
 - browser streaming;
-- Codex adapter;
-- Qwen ACP adapter;
+- ACP adapter;
+- Qwen/Gemini/OpenCode ACP runtime;
 - Telegram connector;
 - Mattermost connector;
 - login/password auth;
@@ -136,11 +134,10 @@ Exclude for the first implementation:
 
 These need protocol spikes or explicit decisions before implementation hardens:
 
-- exact Codex app-server JSON-RPC behavior and approval payloads;
+- exact ACP session semantics and approval payloads;
 - exact Qwen ACP session history/resume support;
 - runner protocol authentication and token rotation;
 - database migration tool choice;
 - frontend app shape: SvelteKit versus Svelte SPA;
 - connector retry and idempotency model;
 - local embedded runner mode versus always separate process.
-

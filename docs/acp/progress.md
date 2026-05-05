@@ -44,7 +44,7 @@ Open questions to close during implementation:
 
 Conformance artifacts added:
 
-- `docs/runbooks/universal-protocol-smoke.md` defines fake-runner, DB-backed, provider-trace, snapshot/replay, approval/question/cancel, chaos, cleanup, and troubleshooting checks for `uap/1`.
+- `docs/runbooks/universal-protocol-smoke.md` defines fake-runner, DB-backed, provider-trace, snapshot/replay, approval/question/cancel, chaos, cleanup, and troubleshooting checks for `uap/2`.
 - `crates/agenter-runner/tests/fixtures/acp_stage10_trace.json` covers sanitized Qwen/Gemini/OpenCode-style prompt, plan, tool/message, and permission slices.
 - `cargo test -p agenter-runner acp_stage10_provider_traces_share_prompt_plan_permission_shape` validates the ACP fixture slices against the current universal reducer shape.
 

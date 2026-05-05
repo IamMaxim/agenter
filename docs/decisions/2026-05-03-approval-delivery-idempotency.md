@@ -7,7 +7,7 @@ Date: 2026-05-03
 ## Context
 
 Browser reloads during Vite hot reload can interrupt the visible approval flow while
-Codex or an ACP provider is still blocked on a native approval request. The control
+A provider is still blocked on a native approval request. The control
 plane already replays pending and resolving approvals, but the runner removed a
 native pending approval from its in-memory map as soon as it received an
 `AnswerApproval` command. If the browser or runner connection dropped before the

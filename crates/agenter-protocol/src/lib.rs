@@ -99,7 +99,7 @@ mod runner_transport_tests {
                     path: "/work/agenter".to_owned(),
                     display_name: Some("agenter".to_owned()),
                 },
-                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                provider_id: AgentProviderId::from(AgentProviderId::QWEN),
                 sessions: vec![DiscoveredSession {
                     external_session_id: "thread-large".to_owned(),
                     title: None,
@@ -192,7 +192,7 @@ mod runner_transport_tests {
                 command: crate::runner::RunnerCommand::AgentSendInput(
                     crate::runner::AgentInputCommand {
                         session_id: SessionId::nil(),
-                        provider_id: Some(agenter_core::AgentProviderId::from("codex")),
+                        provider_id: Some(agenter_core::AgentProviderId::from("qwen")),
                         external_session_id: Some("thread-large".to_owned()),
                         settings: None,
                         input: crate::runner::AgentInput::Text {

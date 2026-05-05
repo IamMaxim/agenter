@@ -2,9 +2,9 @@
 
 ## Purpose
 
-Prove that `uap/1` snapshot/replay, provider normalization, approval/question/cancel state, and runner replay behavior work across the fake runner, DB-backed browser path, and locally available native providers.
+Prove that `uap/2` snapshot/replay, direct provider reduction, approval/question/cancel state, and runner replay behavior work across the fake runner, DB-backed browser path, and locally available native providers.
 
-The repeatable automated checks use repo-local sanitized fixtures. Live provider captures are still required before claiming real Codex/Qwen/Gemini/OpenCode parity for a local machine.
+The repeatable automated checks use repo-local sanitized fixtures. Live provider captures are still required before claiming full Qwen/Gemini/OpenCode parity for a local machine.
 
 ## Prerequisites
 
@@ -12,8 +12,7 @@ The repeatable automated checks use repo-local sanitized fixtures. Live provider
 - Node dependencies are installed under `web/` for frontend checks.
 - Docker Compose is available for DB-backed smoke.
 - Optional live provider paths require authenticated local CLIs:
-  - `codex app-server --listen stdio://`
-  - `qwen --acp --approval-mode default`
+- `qwen --acp --approval-mode default`
   - `gemini --acp`
   - `opencode acp --cwd <workspace>`
 - Optional WebSocket inspection uses `websocat`.
@@ -31,17 +30,15 @@ Run the focused conformance checks first:
 ```sh
 cargo test -p agenter-protocol --test browser_json_frame_conformance
 cargo test -p agenter-protocol browser
-cargo test -p agenter-runner codex_stage10_conformance_trace_preserves_expected_milestones
-cargo test -p agenter-runner acp_stage10_provider_traces_share_prompt_plan_permission_shape
-cargo test -p agenter-control-plane subscribe_snapshot_replays_after_seq_in_strict_order
-cargo test -p agenter-control-plane runner_event_ack_state_dedupes_replayed_sequences
-cargo test -p agenter-control-plane seeded_runner_ack_marks_old_replay_as_duplicate
-cargo test -p agenter-control-plane runner_event_receipts_survive_new_app_state_and_prevent_duplicate_append
-cargo test -p agenter-runner interrupt_cancels_blocked_approval_for_same_session
-cargo test -p agenter-runner interrupt_does_not_count_completed_approval_cancel_replay_as_new_cancel
-cargo test -p agenter-runner codex_turn
+cargo test -p agenter-protocol runner
+cargo test -p agenter-runner acp
+cargo test -p agenter-runner fake
+cargo test -p agenter-control-plane universal
+cargo test -p agenter-control-plane approval
+cargo test -p agenter-control-plane subscribe_snapshot
+cargo test -p agenter-control-plane runner_event
 cd web
-npm run test -- normalizers sessionSnapshot universalEvents
+npm run test -- normalizers sessionSnapshot universalEvents events sessions
 ```
 
 Expected output shape is one or more `... ok` lines and exit status `0`.
@@ -58,10 +55,11 @@ npm run test -- normalizers sessionSnapshot universalEvents
 ```
 
 These tests prove that newly written browser `session_snapshot` and live
-`universal_event` frames carry `protocol_version: "uap/1"`, that replayed
-events inside snapshots are also versioned, and that legacy missing-version
-frames are normalized only for the migration window. They do not prove live
-provider behavior; use the provider smoke section for that.
+`universal_event` frames carry `protocol_version: "uap/2"`, that replayed
+events inside snapshots are also versioned, and that snapshot frames carry
+explicit `snapshot_seq`, `replay_from_seq`, `replay_through_seq`, and
+`replay_complete` fields. They do not prove live provider behavior; use the
+provider smoke section for that.
 
 ## Fake Runner And Browser Path
 
@@ -136,12 +134,10 @@ Expected shape:
 
 Automated fixture checks:
 
-- Codex fixture: `crates/agenter-runner/tests/fixtures/codex_stage10_trace.json`.
 - ACP fixture: `crates/agenter-runner/tests/fixtures/acp_stage10_trace.json`.
 
 These fixture slices are sanitized golden vocabulary derived from the current reducers. They cover:
 
-- Codex turn start, plan update, shell approval, file approval, command output, diff update, and turn completion.
 - Qwen-like prompt text, plan update, and permission request.
 - Gemini-like plan/question permission shape.
 - OpenCode-like `todowrite`/tool, plan update, and permission request.
@@ -149,8 +145,7 @@ These fixture slices are sanitized golden vocabulary derived from the current re
 Live capture is still pending for the exact Stage 10 stories. To capture fresh provider traces, run the provider spike runbooks:
 
 ```sh
-just codex-spike /tmp/agenter-codex-smoke
-cargo run -p agenter-runner --bin qwen_acp_spike -- /tmp/agenter-qwen-smoke
+just qwen-runner /tmp/agenter-qwen-smoke
 ```
 
 For Gemini and OpenCode, use the `docs/acp/spikes/` notes and the corresponding runner modes:
@@ -194,8 +189,8 @@ Automated checks:
 
 ```sh
 cargo test -p agenter-control-plane subscribe_snapshot_replays_after_seq_in_strict_order
-cargo test -p agenter-control-plane subscribe_snapshot_replays_universal_events_after_legacy_cache_miss
-cargo test -p agenter-control-plane subscribe_snapshot_marks_universal_replay_has_more_when_bounded
+cargo test -p agenter-control-plane subscribe_snapshot_replays_universal_events_after_source_cache_miss
+cargo test -p agenter-control-plane subscribe_snapshot_marks_universal_replay_incomplete_when_bounded
 cd web && npm run test -- sessionSnapshot.test.ts
 ```
 
@@ -203,7 +198,7 @@ Manual checks:
 
 - Subscribe with `after_seq: "0"` and `include_snapshot: true`; verify the replay starts from the first available event.
 - Subscribe with `after_seq` equal to a known event; verify only higher `seq` events are replayed.
-- Force a bounded/incomplete replay; verify the server reports `snapshot_replay_incomplete` and closes the universal subscription instead of forwarding later live events.
+- Force a bounded/incomplete replay; verify the server reports `replay_complete: false` on snapshot-bearing subscriptions, and reports `snapshot_replay_incomplete` plus closes the universal subscription on replay-only subscriptions before forwarding later live events.
 - Reload the browser; verify timeline rows are not duplicated at the replay/live boundary.
 
 ## Approval, Question, And Cancel Checks
@@ -222,7 +217,7 @@ Manual checks:
 - Conflicting duplicate approval: retry with the same key but a different semantic decision. Expected state: `idempotency_conflict` or `approval_conflicting_decision`.
 - Question/user input: answer a question and retry with the same key. Expected state: stored response replay, not a second native response.
 - Cancel while approval is pending: expected state is `cancelled` when a blocked native request is answered with cancel; otherwise a typed `provider_cancel_not_supported` error and no false `turn.cancelled`.
-- Cancel while a provider turn is running without a blocked native approval: Codex should now complete with `turn.interrupted` after a live `turn/interrupt` delivery; ACP and other providers should still return a typed `provider_cancel_not_supported` error unless they explicitly advertise and implement a live interrupt hook.
+- Cancel while a provider turn is running without a blocked native approval: ACP providers should return a typed `provider_cancel_not_supported` error unless they explicitly advertise and implement a live interrupt hook.
 - Harness death while approval is pending: expected state is `approval.orphaned` only when runner/harness evidence says ownership is lost, not on transient WebSocket disconnect.
 
 ## Chaos Checks
@@ -232,13 +227,13 @@ Run automated coverage first:
 ```sh
 cargo test -p agenter-control-plane subscribe_snapshot_replays_after_seq_in_strict_order
 cargo test -p agenter-control-plane subscribe_snapshot_replays_universal_events_after_source_cache_miss
-cargo test -p agenter-control-plane subscribe_snapshot_marks_universal_replay_has_more_when_bounded
+cargo test -p agenter-control-plane subscribe_snapshot_marks_universal_replay_incomplete_when_bounded
 cargo test -p agenter-control-plane runner_event_ack_state_dedupes_replayed_sequences
-cargo test -p agenter-control-plane seeded_runner_ack_marks_old_replay_as_duplicate
-cargo test -p agenter-control-plane runner_event_receipts_survive_new_app_state_and_prevent_duplicate_append
+cargo test -p agenter-control-plane runner_event_ack_state_dedupes_replayed_sequences
+cargo test -p agenter-control-plane runner_event
 cargo test -p agenter-runner interrupt_cancels_blocked_approval_for_same_session
 cargo test -p agenter-runner interrupt_does_not_count_completed_approval_cancel_replay_as_new_cancel
-cargo test -p agenter-runner codex_turn
+cargo test -p agenter-runner acp_stage10_provider_traces_share_prompt_plan_permission_shape
 cd web
 npm run test -- sessionSnapshot
 ```
@@ -247,8 +242,8 @@ What is automated today:
 
 - Browser replay/reconnect cursor behavior: snapshot first, replay in strict order, duplicate replay/live boundary events ignored, and truncated replay marked incomplete.
 - Runner unacked replay: in-memory ack dedupe and DB-backed runner receipts prevent duplicate universal event append across a new control-plane `AppState`.
-- Interrupt while approval is blocked: Codex runner cancellation delivers one native cancel decision and does not replay completed cancellation as a fresh cancel.
-- Codex EOF/error exits: focused `codex_turn` tests cover detached or failed terminal states and pending approval/question cleanup.
+- Interrupt while approval is blocked: blocked-native cancellation should not replay completed cancellation as a fresh cancel.
+- EOF/error exits: focused ACP interruption coverage should cover detached or failed terminal states and pending approval/question cleanup.
 
 Run manual chaos drills against fake runner first, then one live provider when locally available:
 
@@ -259,8 +254,7 @@ Run manual chaos drills against fake runner first, then one live provider when l
 - Runner reconnect during native permission: pending native waiter should accept the eventual answer exactly once when the runner process and provider runtime survive. If the runner process exits, expected state is `orphaned`, `failed`, or `detached`, not silent success.
 - Runner reconnect during user input question: the question card should remain pending or resolving in browser state; answering after reconnect should be accepted once or return a typed stale/orphan error.
 - Runner reconnect during streaming: streamed content should resume from replayed WAL/control-plane state without duplicate rows; any live provider gap must end in `turn.detached` or `turn.failed`.
-- Cancel while updates are still arriving: final state must be one of `turn.cancelled`, `turn.interrupted`, `turn.failed`, or a typed unsupported-cancel error; Codex should use `turn.interrupted` when the live hook is available. Do not report inert success.
-- Codex EOF during a turn: kill the app-server process while running, while approval is pending, and while a question is pending. Expected state is `turn.detached` or `turn.failed`; pending obligations should not remain live without a native waiter.
+- Cancel while updates are still arriving: final state must be one of `turn.cancelled`, `turn.interrupted`, `turn.failed`, or a typed unsupported-cancel error. Do not report inert success.
 - Harness crash during tool: pending approvals become `orphaned` and the turn becomes `failed` or `detached` based on runner evidence.
 
 ## Cleanup
@@ -269,14 +263,13 @@ Stop services with `Ctrl-C`, then:
 
 ```sh
 just db-down
-rm -rf /tmp/agenter-codex-smoke /tmp/agenter-qwen-smoke /tmp/agenter-gemini-smoke /tmp/agenter-opencode-smoke
+rm -rf /tmp/agenter-qwen-smoke /tmp/agenter-gemini-smoke /tmp/agenter-opencode-smoke
 rm -f /tmp/agenter-*-smoke/agenter-*-approval-probe.txt
 ```
 
 If provider spike processes remain:
 
 ```sh
-pkill -f "codex app-server --listen stdio://"
 pkill -f "qwen --acp"
 pkill -f "gemini --acp"
 pkill -f "opencode acp"
@@ -287,6 +280,6 @@ pkill -f "opencode acp"
 - `listen EPERM: operation not permitted 0.0.0.0` during Gemini auth is a local sandbox limitation; rerun outside the restrictive sandbox.
 - Qwen `-32603 Internal error` with `Connection error.` after ACP framing usually points at provider/model connectivity, not Agenter ACP wiring.
 - OpenCode may need outside-sandbox access to its local state database.
-- Codex errors mentioning `~/.codex/sessions`, `~/.codex/shell_snapshots`, or `Operation not permitted` usually require running the spike from a normal terminal.
+- Provider state permission errors may require rerunning a spike from a normal terminal.
 - If `snapshot_replay_incomplete` appears, resubscribe from the snapshot cursor named in the error instead of advancing to later live events.
 - If Cargo or Vite fail with lockfile/temp-file `EPERM`, rerun in a writable environment before treating the result as a product failure.

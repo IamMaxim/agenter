@@ -41,7 +41,7 @@
   let contextMenuVisible = false;
   let refreshJobsByGroup: Record<string, WorkspaceSessionRefreshJob[]> = {};
   let refreshExpandedGroups: Record<string, boolean> = {};
-  const FALLBACK_REFRESH_PROVIDER = 'codex';
+  const FALLBACK_REFRESH_PROVIDER = 'qwen';
   const TERMINAL_REFRESH_STATUSES: WorkspaceSessionRefreshStatus[] = ['succeeded', 'failed', 'cancelled'];
 
   $: groups = buildSessionTree({ runners, workspacesByRunner, sessions });
@@ -218,7 +218,7 @@
     try {
       const session = await createSession({
         workspace_id: group.workspace.workspace_id,
-        provider_id: 'codex',
+        provider_id: group.sessions[0]?.provider_id ?? FALLBACK_REFRESH_PROVIDER,
         title: `Chat in ${group.workspace.display_name ?? group.workspace.path}`
       });
       window.location.hash = routeHref({ name: 'chat', sessionId: session.session_id }).slice(1);

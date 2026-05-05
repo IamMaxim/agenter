@@ -43,8 +43,7 @@ export interface SendMessageRequest {
   /**
    * Atomic per-turn settings override. The control plane persists these as
    * the session's sticky settings BEFORE forwarding the runner command, so
-   * the model sees the new collaboration mode on this very turn. Mirrors
-   * Codex TUI's `SubmitUserMessageWithMode` event.
+   * the model sees the new collaboration mode on this very turn.
    */
   settings_override?: AgentTurnSettings;
 }

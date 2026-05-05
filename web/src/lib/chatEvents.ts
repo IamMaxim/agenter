@@ -73,7 +73,6 @@ export type ChatItem =
       approvalId: string;
       title: string;
       detail?: string;
-      /** Serialized shapes from runners (Codex-correlated today). See runner `presentation` on `approval_requested`. */
       presentation?: Record<string, unknown>;
       options?: ApprovalUiChoice[];
       status?: string;
@@ -149,9 +148,8 @@ export interface ChatState {
   latestPlanId?: string;
   /**
    * True when the turn that produced `latestPlanId` has finished (status
-   * transitioned to a non-`running` state). Mirrors Codex TUI's
-   * `latest_proposed_plan_markdown` gate: the "Implement plan" handoff is
-   * only offered once the model has stopped streaming the plan.
+   * transitioned to a non-`running` state). The "Implement plan" handoff is
+   * only offered once the provider has stopped streaming the plan.
    */
   planTurnComplete: boolean;
 }
@@ -173,7 +171,7 @@ const DEFAULT_APPROVAL_ACTIONS: ApprovalDecisionName[] = [
   'cancel'
 ];
 
-function mapCodexDecisionLabel(raw: string): ApprovalDecisionName | undefined {
+function mapNativeDecisionLabel(raw: string): ApprovalDecisionName | undefined {
   const norm = raw.replace(/_/g, '').toLowerCase();
   switch (norm) {
     case 'accept':
@@ -202,17 +200,16 @@ function dedupeStable<T extends string>(items: T[]): T[] {
   return out;
 }
 
-/** Maps Codex `available_decisions` (when present) to API `ApprovalDecision` names; otherwise all four Codex-supported outcomes. */
 export function approvalUiChoices(item: Extract<ChatItem, { kind: 'approval' }>): ApprovalUiChoice[] {
   if (item.options && item.options.length > 0) {
     return item.options;
   }
   const p = item.presentation;
   const variant = p && typeof p.variant === 'string' ? p.variant : '';
-  if (variant === 'codex_command' && p && Array.isArray(p.available_decisions)) {
+  if (commandPresentationVariant(variant) && p && Array.isArray(p.available_decisions)) {
     const mapped = p.available_decisions
       .filter((entry): entry is string => typeof entry === 'string')
-      .map(mapCodexDecisionLabel)
+      .map(mapNativeDecisionLabel)
       .filter((x): x is ApprovalDecisionName => Boolean(x));
     if (mapped.length > 0) {
       return dedupeStable(mapped).map(choiceFromDefaultDecision);
@@ -290,8 +287,25 @@ function approvalDecisionFromOption(option: ApprovalOption): ApprovalDecisionNam
     case 'cancel_turn':
       return 'cancel';
     default:
-      return mapCodexDecisionLabel(option.native_option_id ?? option.kind);
+      return mapNativeDecisionLabel(option.native_option_id ?? option.kind);
   }
+}
+
+function commandPresentationVariant(variant: string): boolean {
+  return variant === 'command' || variant === 'shell_command';
+}
+
+export function commandApprovalPresentation(
+  presentation: Record<string, unknown> | undefined
+): string | undefined {
+  if (!presentation) {
+    return undefined;
+  }
+  const variant = typeof presentation.variant === 'string' ? presentation.variant : '';
+  if (!commandPresentationVariant(variant)) {
+    return undefined;
+  }
+  return typeof presentation.command === 'string' ? presentation.command : undefined;
 }
 
 export function fileChangeApprovalFiles(presentation: Record<string, unknown> | undefined): {
@@ -299,7 +313,7 @@ export function fileChangeApprovalFiles(presentation: Record<string, unknown> | 
   changeKind?: string;
   diff?: string;
 }[] {
-  if (!presentation || presentation.variant !== 'codex_file_change') {
+  if (!presentation || presentation.variant !== 'file_change') {
     return [];
   }
   const raw = presentation.files;

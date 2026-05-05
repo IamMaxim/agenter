@@ -33,7 +33,7 @@ describe('requestJson', () => {
         text: () =>
           Promise.resolve(
             JSON.stringify({
-              code: 'codex_provider_command_failed',
+              code: 'provider_command_failed',
               message: 'thread not found'
             })
           )
@@ -43,7 +43,7 @@ describe('requestJson', () => {
     await expect(requestJson('/api/sessions/s1/slash-commands', { method: 'POST' })).rejects.toMatchObject({
       name: 'ApiError',
       status: 502,
-      code: 'codex_provider_command_failed',
+      code: 'provider_command_failed',
       detail: 'thread not found',
       message: 'thread not found'
     } satisfies Partial<ApiError>);

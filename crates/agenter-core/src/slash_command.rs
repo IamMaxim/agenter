@@ -89,32 +89,32 @@ mod tests {
     #[test]
     fn slash_command_definition_uses_stable_shape() {
         let command = SlashCommandDefinition {
-            id: "codex.shell".to_owned(),
-            name: "shell".to_owned(),
-            aliases: vec!["sh".to_owned()],
-            description: "Run a provider-native shell command.".to_owned(),
+            id: "qwen.compact".to_owned(),
+            name: "compact".to_owned(),
+            aliases: Vec::new(),
+            description: "Run a provider-native command.".to_owned(),
             category: "provider".to_owned(),
-            provider_id: Some(AgentProviderId::from(AgentProviderId::CODEX)),
+            provider_id: Some(AgentProviderId::from(AgentProviderId::QWEN)),
             target: SlashCommandTarget::Provider,
-            danger_level: SlashCommandDangerLevel::Dangerous,
+            danger_level: SlashCommandDangerLevel::Confirm,
             arguments: vec![SlashCommandArgument {
-                name: "command".to_owned(),
-                kind: SlashCommandArgumentKind::Rest,
-                required: true,
-                description: Some("Command to run".to_owned()),
+                name: "summary".to_owned(),
+                kind: SlashCommandArgumentKind::String,
+                required: false,
+                description: Some("Optional summary".to_owned()),
                 choices: Vec::new(),
             }],
-            examples: vec!["/shell pwd".to_owned()],
+            examples: vec!["/compact".to_owned()],
         };
 
         let value = serde_json::to_value(&command).expect("serialize command");
 
-        assert_eq!(value["id"], "codex.shell");
-        assert_eq!(value["name"], "shell");
-        assert_eq!(value["provider_id"], "codex");
+        assert_eq!(value["id"], "qwen.compact");
+        assert_eq!(value["name"], "compact");
+        assert_eq!(value["provider_id"], "qwen");
         assert_eq!(value["target"], "provider");
-        assert_eq!(value["danger_level"], "dangerous");
-        assert_eq!(value["arguments"][0]["kind"], "rest");
+        assert_eq!(value["danger_level"], "confirm");
+        assert_eq!(value["arguments"][0]["kind"], "string");
     }
 
     #[test]
