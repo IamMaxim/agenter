@@ -12,6 +12,7 @@ import type {
   AgentOptions,
   AgentQuestionAnswer,
   AgentTurnSettings,
+  PlanHandoffAction,
   RunnerInfo,
   SessionInfo,
   SlashCommandDefinition,
@@ -36,6 +37,7 @@ export interface CreateSessionRequest {
    * is also present, the override is applied to that first turn as well.
    */
   settings_override?: AgentTurnSettings;
+  source_plan_handoff?: PlanHandoffRequest;
 }
 
 export interface SendMessageRequest {
@@ -46,6 +48,13 @@ export interface SendMessageRequest {
    * the model sees the new collaboration mode on this very turn.
    */
   settings_override?: AgentTurnSettings;
+  plan_handoff?: PlanHandoffRequest;
+}
+
+export interface PlanHandoffRequest {
+  session_id?: string | null;
+  plan_id: string;
+  action: PlanHandoffAction;
 }
 
 export interface RenameSessionRequest {
@@ -245,6 +254,16 @@ export async function sendSessionMessage(
   request: SendMessageRequest
 ): Promise<void> {
   await requestJson<void>(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
+    method: 'POST',
+    body: JSON.stringify(request)
+  });
+}
+
+export async function markPlanHandoff(
+  sessionId: string,
+  request: { plan_id: string; action: PlanHandoffAction }
+): Promise<void> {
+  await requestJson<void>(`/api/sessions/${encodeURIComponent(sessionId)}/plan-handoff`, {
     method: 'POST',
     body: JSON.stringify(request)
   });

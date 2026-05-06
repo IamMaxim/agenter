@@ -503,12 +503,14 @@ function mergePlan(existing: PlanState | undefined, incoming: PlanState): PlanSt
   return {
     ...existing,
     ...incoming,
+    title: incoming.title ?? existing.title,
     content:
       typeof incoming.content === 'string'
         ? `${existing.content ?? ''}${incoming.content}`
         : existing.content,
     entries,
-    artifact_refs: incoming.artifact_refs.length > 0 ? incoming.artifact_refs : existing.artifact_refs
+    artifact_refs: incoming.artifact_refs.length > 0 ? incoming.artifact_refs : existing.artifact_refs,
+    handoff: incoming.handoff ?? existing.handoff
   };
 }
 

@@ -470,17 +470,7 @@ impl CodexReducer {
             "item/agentMessage/delta" => {
                 self.content_delta(params, native, "text", ContentBlockKind::Text, "delta")
             }
-            "item/plan/delta" => {
-                let mut outputs = self.content_delta(
-                    params,
-                    native.clone(),
-                    "text",
-                    ContentBlockKind::Text,
-                    "delta",
-                );
-                outputs.extend(self.plan_delta(params, native));
-                outputs
-            }
+            "item/plan/delta" => self.plan_delta(params, native),
             "item/reasoning/summaryTextDelta" => self.content_delta(
                 params,
                 native,
@@ -668,6 +658,32 @@ impl CodexReducer {
             raw_item,
             status,
         } = reduction;
+        if kind == "plan" {
+            return vec![self.output(
+                turn_id,
+                Some(item_id),
+                native,
+                UniversalEventKind::PlanUpdated {
+                    plan: PlanState {
+                        plan_id: plan_id_for(self.session_id, item_id),
+                        session_id: self.session_id,
+                        turn_id,
+                        status: if matches!(status, ItemStatus::Completed) {
+                            PlanStatus::Draft
+                        } else {
+                            PlanStatus::Discovering
+                        },
+                        title: Some("Codex plan".to_owned()),
+                        content: string_at(&raw_item, &["text"]),
+                        entries: Vec::new(),
+                        artifact_refs: Vec::new(),
+                        source: PlanSource::NativeStructured,
+                        partial: !matches!(status, ItemStatus::Completed),
+                        updated_at: Some(Utc::now()),
+                    },
+                },
+            )];
+        }
         let item = item_state(
             self.session_id,
             turn_id,
@@ -704,30 +720,6 @@ impl CodexReducer {
         }
 
         match kind.as_str() {
-            "plan" => outputs.push(self.output(
-                turn_id,
-                Some(item_id),
-                native.clone(),
-                UniversalEventKind::PlanUpdated {
-                    plan: PlanState {
-                        plan_id: plan_id_for(self.session_id, item_id),
-                        session_id: self.session_id,
-                        turn_id,
-                        status: if matches!(status, ItemStatus::Completed) {
-                            PlanStatus::Draft
-                        } else {
-                            PlanStatus::Discovering
-                        },
-                        title: Some("Codex plan".to_owned()),
-                        content: string_at(&raw_item, &["text"]),
-                        entries: Vec::new(),
-                        artifact_refs: Vec::new(),
-                        source: PlanSource::NativeStructured,
-                        partial: !matches!(status, ItemStatus::Completed),
-                        updated_at: Some(Utc::now()),
-                    },
-                },
-            )),
             "fileChange" => outputs.push(self.output(
                 turn_id,
                 Some(item_id),
@@ -2389,7 +2381,7 @@ mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use agenter_core::{ContentBlockKind, SessionId, UniversalEventKind};
+    use agenter_core::{ContentBlockKind, ItemRole, SessionId, UniversalEventKind};
     use serde_json::json;
 
     use crate::agents::codex::{
@@ -2440,6 +2432,7 @@ mod tests {
                 outputs.iter().any(|output| matches!(
                     output.event,
                     UniversalEventKind::ItemCreated { .. }
+                        | UniversalEventKind::PlanUpdated { .. }
                         | UniversalEventKind::ProviderNotification { .. }
                         | UniversalEventKind::NativeUnknown { .. }
                 )),
@@ -2571,6 +2564,108 @@ mod tests {
         assert_eq!(block_id, completed_block_id);
         assert_eq!(kind, &Some(ContentBlockKind::Text));
         assert_eq!(text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn codex_reducer_native_user_message_still_emits_user_item() {
+        let session_id = SessionId::new();
+        let mut reducer = super::CodexReducer::new(session_id, CodexIdMap::for_session(session_id));
+        let completed = json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "type": "userMessage",
+                    "id": "user-1",
+                    "content": [{ "type": "text", "text": "Implement the plan." }]
+                }
+            }
+        });
+
+        let outputs = reducer.reduce_server_notification(&decode_notification(completed));
+        let created = outputs
+            .iter()
+            .find_map(|output| match &output.event {
+                UniversalEventKind::ItemCreated { item } => Some(item),
+                _ => None,
+            })
+            .expect("user item output");
+
+        assert_eq!(created.role, ItemRole::User);
+        assert_eq!(
+            created.content[0].text.as_deref(),
+            Some("Implement the plan.")
+        );
+    }
+
+    #[test]
+    fn codex_reducer_plan_delta_emits_only_plan_update() {
+        let session_id = SessionId::new();
+        let mut reducer = super::CodexReducer::new(session_id, CodexIdMap::for_session(session_id));
+        let delta = json!({
+            "method": "item/plan/delta",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "plan-1",
+                "delta": "# Plan"
+            }
+        });
+
+        let outputs = reducer.reduce_server_notification(&decode_notification(delta));
+
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(
+            outputs[0].event,
+            UniversalEventKind::PlanUpdated { .. }
+        ));
+    }
+
+    #[test]
+    fn codex_reducer_completed_plan_item_emits_only_plan_update() {
+        let session_id = SessionId::new();
+        let mut reducer = super::CodexReducer::new(session_id, CodexIdMap::for_session(session_id));
+        let completed = json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "type": "plan",
+                    "id": "plan-1",
+                    "text": "# Plan"
+                }
+            }
+        });
+
+        let outputs = reducer.reduce_server_notification(&decode_notification(completed));
+
+        assert_eq!(outputs.len(), 1);
+        let UniversalEventKind::PlanUpdated { plan } = &outputs[0].event else {
+            panic!("expected plan update");
+        };
+        assert_eq!(plan.content.as_deref(), Some("# Plan"));
+        assert!(!plan.partial);
+    }
+
+    #[test]
+    fn codex_reducer_history_plan_item_emits_only_plan_update() {
+        let session_id = SessionId::new();
+        let mut reducer = super::CodexReducer::new(session_id, CodexIdMap::for_session(session_id));
+        let raw_item = json!({
+            "type": "plan",
+            "id": "plan-1",
+            "text": "# Plan"
+        });
+
+        let outputs = reducer.reduce_history_item("thread-1", "turn-1", raw_item);
+
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(
+            outputs[0].event,
+            UniversalEventKind::PlanUpdated { .. }
+        ));
     }
 
     fn decode_notification(raw: serde_json::Value) -> CodexServerNotificationFrame {

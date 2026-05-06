@@ -475,6 +475,26 @@ export interface PlanState {
   source: PlanSource;
   partial?: boolean;
   updated_at?: string | null;
+  handoff?: PlanHandoffState | null;
+}
+
+export type PlanHandoffStatus =
+  | 'available'
+  | 'dismissed'
+  | 'implementing'
+  | 'implemented'
+  | string;
+export type PlanHandoffAction =
+  | 'same_thread'
+  | 'fresh_thread'
+  | 'stay_in_plan'
+  | string;
+
+export interface PlanHandoffState {
+  state: PlanHandoffStatus;
+  action?: PlanHandoffAction | null;
+  target_session_id?: string | null;
+  updated_at?: string | null;
 }
 
 export type FileChangeKind = 'added' | 'modified' | 'deleted' | 'renamed' | string;

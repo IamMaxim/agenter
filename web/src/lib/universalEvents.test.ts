@@ -234,4 +234,60 @@ describe('universal event reducer', () => {
       params: { item: { id: 'item1', type: 'web_search' } }
     });
   });
+
+  test('merges partial plan handoff updates without losing plan title or content', () => {
+    const state = applyUniversalEvent(
+      snapshot({
+        plans: {
+          p1: {
+            plan_id: 'p1',
+            session_id: 'session-1',
+            status: 'draft',
+            title: 'Existing plan',
+            content: 'Do it',
+            entries: [],
+            artifact_refs: [],
+            source: 'native_structured',
+            partial: false
+          }
+        }
+      }),
+      {
+        protocol_version: 'uap/2',
+        event_id: 'evt-plan-handoff',
+        seq: '2',
+        session_id: 'session-1',
+        ts: '2026-05-06T12:00:00Z',
+        source: 'control_plane',
+        event: {
+          type: 'plan.updated',
+          data: {
+            plan: {
+              plan_id: 'p1',
+              session_id: 'session-1',
+              status: 'draft',
+              title: null,
+              content: null,
+              entries: [],
+              artifact_refs: [],
+              source: 'native_structured',
+              partial: true,
+              handoff: {
+                state: 'implementing',
+                action: 'same_thread',
+                updated_at: '2026-05-06T12:00:00Z'
+              }
+            }
+          }
+        }
+      }
+    );
+
+    expect(state.plans.p1.title).toBe('Existing plan');
+    expect(state.plans.p1.content).toBe('Do it');
+    expect(state.plans.p1.handoff).toMatchObject({
+      state: 'implementing',
+      action: 'same_thread'
+    });
+  });
 });

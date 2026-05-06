@@ -17,6 +17,7 @@
     getSessionSettings,
     getSession,
     listSlashCommands,
+    markPlanHandoff,
     renameSession,
     interruptSessionTurn,
     executeSlashCommand,
@@ -856,7 +857,7 @@
     return modes[0]?.id ?? null;
   }
 
-  async function handleImplementPlan() {
+  async function handleImplementPlan(planId: string) {
     if (!session) {
       return;
     }
@@ -875,8 +876,13 @@
     try {
       await sendSessionMessage(sessionId, {
         content: PLAN_IMPLEMENTATION_CODING_MESSAGE,
-        settings_override: override
+        settings_override: override,
+        plan_handoff: {
+          plan_id: planId.replace(/^plan:/, ''),
+          action: 'same_thread'
+        }
       });
+      dismissedPlanIds = new Set([...dismissedPlanIds, planId]);
     } catch (error) {
       sendError = apiErrorMessage(error, 'Could not implement plan.');
       pushToast({ severity: 'error', message: sendError });
@@ -885,7 +891,7 @@
     }
   }
 
-  async function handleClearContextImplement(planContent: string) {
+  async function handleClearContextImplement(planId: string, planContent: string) {
     if (!session) {
       return;
     }
@@ -908,8 +914,14 @@
         provider_id: session.provider_id,
         title: session.title ?? undefined,
         initial_message: `${PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX}\n\n${trimmed}`,
-        settings_override: { collaboration_mode: defaultModeId }
+        settings_override: { collaboration_mode: defaultModeId },
+        source_plan_handoff: {
+          session_id: session.session_id,
+          plan_id: planId.replace(/^plan:/, ''),
+          action: 'fresh_thread'
+        }
       });
+      dismissedPlanIds = new Set([...dismissedPlanIds, planId]);
       window.dispatchEvent(new CustomEvent('agenter:sessions-changed'));
       window.location.hash = routeHref({
         name: 'chat',
@@ -926,8 +938,21 @@
     }
   }
 
-  function handleStayInPlan(planId: string) {
+  async function handleStayInPlan(planId: string) {
     dismissedPlanIds = new Set([...dismissedPlanIds, planId]);
+    try {
+      await markPlanHandoff(sessionId, {
+        plan_id: planId.replace(/^plan:/, ''),
+        action: 'stay_in_plan'
+      });
+    } catch (error) {
+      sendError = apiErrorMessage(error, 'Could not persist plan handoff choice.');
+      pushToast({ severity: 'error', message: sendError });
+    }
+  }
+
+  function planHandoffAvailable(item: ChatItem) {
+    return item.kind === 'plan' && (!item.handoff || item.handoff.state === 'available');
   }
 
   function setCollaborationMode(collaboration_mode: string) {
@@ -1251,11 +1276,12 @@
             {item}
             pendingHandoff={item.id === latestPlanId &&
               planTurnComplete &&
-              !dismissedPlanIds.has(item.id)}
+              !dismissedPlanIds.has(item.id) &&
+              planHandoffAvailable(item)}
             {turnActive}
             {defaultModeAvailable}
-            onImplement={() => handleImplementPlan()}
-            onClearContextImplement={() => handleClearContextImplement(item.content)}
+            onImplement={() => handleImplementPlan(item.id)}
+            onClearContextImplement={() => handleClearContextImplement(item.id, item.content)}
             onStayInPlan={() => handleStayInPlan(item.id)}
           />
         {:else if item.kind === 'approval'}

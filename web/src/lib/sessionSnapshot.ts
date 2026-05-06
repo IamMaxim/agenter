@@ -37,6 +37,12 @@ interface RowOrder {
   index: number;
 }
 
+interface MaterializationContext {
+  controlPlaneUserFingerprints: Map<string, number>;
+  planFingerprints: Set<string>;
+  hasPlanRows: boolean;
+}
+
 export function createUniversalClientState(): UniversalClientState {
   return {
     chat: createChatState(),
@@ -68,8 +74,12 @@ export function materializeSnapshotChatState(
   rowOrder: Map<string, RowOrder> = new Map()
 ): ChatState {
   const items: ChatItem[] = [];
+  const context = buildMaterializationContext(snapshot);
 
   for (const item of Object.values(snapshot.items)) {
+    if (!shouldMaterializeItem(item, context)) {
+      continue;
+    }
     const chatItem = materializeItem(item);
     if (chatItem) {
       items.push(chatItem);
@@ -108,6 +118,57 @@ export function materializeSnapshotChatState(
       return status === 'running' || status === 'waiting_for_approval' || status === 'waiting_for_input' || status === 'interrupting';
     })
   };
+}
+
+function buildMaterializationContext(snapshot: SessionSnapshot): MaterializationContext {
+  const controlPlaneUserFingerprints = new Map<string, number>();
+  const planFingerprints = new Set<string>();
+
+  for (const item of Object.values(snapshot.items)) {
+    const fingerprint = normalizedTranscriptText(itemText(item.content));
+    if (!fingerprint) {
+      continue;
+    }
+    if (item.role === 'user' && !isNativeCodexUserMessage(item)) {
+      controlPlaneUserFingerprints.set(
+        fingerprint,
+        (controlPlaneUserFingerprints.get(fingerprint) ?? 0) + 1
+      );
+    }
+  }
+
+  for (const plan of Object.values(snapshot.plans)) {
+    const content = normalizedTranscriptText(plan.content ?? '');
+    if (content) {
+      planFingerprints.add(content);
+    }
+  }
+
+  return {
+    controlPlaneUserFingerprints,
+    planFingerprints,
+    hasPlanRows: Object.keys(snapshot.plans).length > 0
+  };
+}
+
+function shouldMaterializeItem(item: ItemState, context: MaterializationContext): boolean {
+  if (isNativeCodexUserMessage(item)) {
+    const fingerprint = normalizedTranscriptText(itemText(item.content));
+    const remainingEchoes = context.controlPlaneUserFingerprints.get(fingerprint) ?? 0;
+    if (remainingEchoes > 0) {
+      context.controlPlaneUserFingerprints.set(fingerprint, remainingEchoes - 1);
+      return false;
+    }
+  }
+
+  if (isNativeCodexPlanItem(item)) {
+    const fingerprint = normalizedTranscriptText(itemText(item.content));
+    if (context.hasPlanRows || (fingerprint && context.planFingerprints.has(fingerprint))) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 export function hasCapabilitySignal(capabilities: CapabilitySet | undefined): boolean {
@@ -494,6 +555,32 @@ function nativeRowFields(item: ItemState): { source?: string; rawPayload?: unkno
   };
 }
 
+function normalizedTranscriptText(text: string): string {
+  return text.replace(/\r\n/g, '\n').trim().replace(/\s+/g, ' ');
+}
+
+function isNativeCodexUserMessage(item: ItemState): boolean {
+  return item.native?.protocol === 'codex/app-server/v2' && nativeCodexItemType(item) === 'userMessage';
+}
+
+function isNativeCodexPlanItem(item: ItemState): boolean {
+  return item.native?.protocol === 'codex/app-server/v2' && nativeCodexItemType(item) === 'plan';
+}
+
+function nativeCodexItemType(item: ItemState): string | undefined {
+  const raw = objectRecord(item.native?.raw_payload);
+  const params = objectRecord(raw.params);
+  const rawItem = objectRecord(params.item);
+  const itemType = rawItem.type;
+  return typeof itemType === 'string' ? itemType : undefined;
+}
+
+function objectRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
 function methodFileChangeTitle(method: string | null | undefined): string | undefined {
   if (!method?.startsWith('file_change_')) {
     return undefined;
@@ -543,6 +630,7 @@ function materializePlan(plan: PlanState): Extract<ChatItem, { kind: 'plan' }> |
     content,
     status: plan.status,
     source: plan.source,
+    handoff: plan.handoff ?? null,
     entries: plan.entries.map((entry) => ({
       id: entry.entry_id,
       label: entry.label,
@@ -729,11 +817,31 @@ function snapshotTimestampOrder(
       return compareSeq(left.seq, right.seq);
     });
   const nextAnchor = anchors.find((order) => order.ts >= ts);
+  const seq = nextAnchor?.seq ?? fallbackRowOrderSeq(snapshot.latest_seq);
+  const baseIndex = nextAnchor?.index ?? rowOrder.size;
   return {
-    seq: nextAnchor?.seq ?? fallbackRowOrderSeq(snapshot.latest_seq),
+    seq,
     ts,
-    index: nextAnchor?.index ?? rowOrder.size
+    index: nextAvailableRowIndex(rowOrder, seq, ts, baseIndex)
   };
+}
+
+function nextAvailableRowIndex(
+  rowOrder: Map<string, RowOrder>,
+  seq: string,
+  ts: string,
+  baseIndex: number
+): number {
+  const occupied = new Set(
+    [...rowOrder.values()]
+      .filter((order) => order.seq === seq && order.ts === ts)
+      .map((order) => order.index)
+  );
+  let index = baseIndex;
+  while (occupied.has(index)) {
+    index += 1;
+  }
+  return index;
 }
 
 function snapshotItemTimestamp(item: ChatItem, snapshot: SessionSnapshot): string | undefined {

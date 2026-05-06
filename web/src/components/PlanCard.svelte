@@ -16,6 +16,16 @@
     : turnActive
       ? 'Wait for the current turn to finish'
       : '';
+  $: handoffState = item.handoff?.state ?? 'available';
+  $: handoffAvailable = handoffState === 'available';
+  $: handoffStatusLabel =
+    handoffState === 'implementing'
+      ? 'Implementation started'
+      : handoffState === 'implemented'
+        ? 'Implementation completed'
+        : handoffState === 'dismissed'
+          ? 'Plan handoff dismissed'
+          : '';
 </script>
 
 <article class="plan-card">
@@ -35,7 +45,7 @@
       {/each}
     </ol>
   {/if}
-  {#if pendingHandoff}
+  {#if pendingHandoff && handoffAvailable}
     <div class="plan-handoff" role="group" aria-label="Implement this plan?">
       <span class="plan-handoff-title">Implement this plan?</span>
       <div class="plan-handoff-actions">
@@ -65,6 +75,10 @@
           Stay in Plan mode
         </button>
       </div>
+    </div>
+  {:else if pendingHandoff && handoffStatusLabel}
+    <div class="plan-handoff status" role="status">
+      <span class="plan-handoff-title">{handoffStatusLabel}</span>
     </div>
   {/if}
 </article>

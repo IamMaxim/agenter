@@ -1246,6 +1246,10 @@ Work completed:
   intentionally guarded: supported commands execute, confirmed guarded thread
   maintenance commands execute, and high-risk/global command families return an
   explicit unsupported result with provider payload.
+- Runner restart follow-ups must rehydrate Codex native thread state with
+  `thread/resume` before `turn/start`/`turn/steer`. Persisted Agenter
+  `external_session_id` values identify the native thread, but a fresh Codex
+  app-server process may not have that thread loaded in memory.
 - Added `just codex-runner` and `just codex-runner-json`.
 - Updated the live smoke runbook to use `AGENTER_LOG_PAYLOADS=1 just
   codex-runner /private/tmp/agenter-codex-smoke`.
@@ -1272,6 +1276,41 @@ Live smoke status:
 - Not yet executed in this implementation pass. The code and `just` recipe are
   now present so the runbook can be executed against a real local Codex account
   and disposable workspace.
+
+## Stage 12: Reload Row Sequencing Hardening
+
+Owner: live browser debugging pass.
+
+Status: implemented; live re-smoke pending.
+
+Work completed:
+
+- Browser reload with `include_snapshot=true` must replay through the durable
+  snapshot cursor. Local research bandwidth is intentionally not constrained;
+  the browser needs complete event chronology to rebuild row order for plans,
+  questions, approvals, diffs, and native rows.
+- Cursor-only subscriptions without a full snapshot remain bounded by the
+  live replay limit and report incomplete replay when the requested event range
+  is too large.
+- Structured obligations now receive durable ordering timestamps when the
+  runner omits native timestamps: `question.requested` and `approval.requested`
+  use the universal envelope timestamp as `requested_at`.
+- `plan.updated` uses the envelope timestamp when missing, but preserves an
+  existing plan's earlier anchor timestamp when a later resume/history import
+  repeats the same content.
+- Frontend snapshot-only fallback ordering is now deterministic and avoids
+  assigning identical row indexes to multiple timestamp-anchored structured
+  rows.
+
+Verification notes:
+
+- `cargo test -p agenter-control-plane
+  reducer_sets_missing_structured_request_timestamps_from_envelope` passed.
+- `cargo test -p agenter-control-plane
+  db_snapshot_replay_with_snapshot_is_not_truncated_at_live_replay_limit`
+  compiled and was ignored because it requires `DATABASE_URL` for disposable
+  Postgres.
+- `cd web && npm run test -- sessionSnapshot` passed.
 
 ## Subagent Coordination
 

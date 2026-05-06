@@ -543,6 +543,20 @@ function normalizePlanState(value: unknown): PlanState {
     artifact_refs: arrayValue(record.artifact_refs).filter(isString),
     source: stringOr(record.source, 'native_structured') as PlanSource,
     partial: record.partial === true,
+    updated_at: typeof record.updated_at === 'string' ? record.updated_at : null,
+    handoff: normalizePlanHandoffState(record.handoff)
+  };
+}
+
+function normalizePlanHandoffState(value: unknown): PlanState['handoff'] {
+  const record = objectRecord(value);
+  if (!record.state) {
+    return null;
+  }
+  return {
+    state: stringOr(record.state, 'available'),
+    action: typeof record.action === 'string' ? record.action : null,
+    target_session_id: typeof record.target_session_id === 'string' ? record.target_session_id : null,
     updated_at: typeof record.updated_at === 'string' ? record.updated_at : null
   };
 }

@@ -555,80 +555,184 @@ impl CodexRuntimeActor {
         input: AgentInput,
         settings: Option<AgentTurnSettings>,
     ) -> anyhow::Result<()> {
-        if let Some(external_session_id) = external_session_id {
-            self.bind_session(session_id, external_session_id);
-        }
         let native_thread_id = self
-            .session_threads
-            .get(&session_id)
-            .cloned()
-            .context("Codex session has no native thread id")?;
+            .ensure_thread_resumed(session_id, external_session_id.clone(), false)
+            .await?;
         let input = user_input_from_agent_input(input);
-        let mut id_map = CodexIdMap::for_session(session_id);
+        let settings = self.normalize_turn_settings(settings).await?;
         if let Some(active_turn_id) = self.active_turns.get(&session_id).cloned() {
-            let result = CodexTurnClient::new(&mut self.transport)
-                .steer_turn(
-                    steer_request_from_universal(
-                        native_thread_id,
-                        active_turn_id,
-                        &input,
-                        Map::new(),
-                    ),
-                    &mut id_map,
+            let result = self
+                .steer_turn_for_session(
+                    session_id,
+                    native_thread_id.clone(),
+                    active_turn_id,
+                    &input,
                 )
-                .await?;
-            self.active_turns
-                .insert(session_id, result.native_turn_id.clone());
-            self.emit_codex_output(CodexReducerOutput {
-                session_id,
-                turn_id: Some(result.turn_id),
-                item_id: None,
-                ts: chrono::Utc::now(),
-                native: result.native,
-                event: UniversalEventKind::ProviderNotification {
-                    notification: agenter_core::ProviderNotification {
-                        category: "turn".to_owned(),
-                        title: "Codex turn steered".to_owned(),
-                        detail: Some(result.native_turn_id),
-                        status: Some("accepted".to_owned()),
-                        severity: None,
-                        subject: None,
-                    },
-                },
-            });
-        } else {
-            let settings = self.normalize_turn_settings(settings).await?;
-            let result = CodexTurnClient::new(&mut self.transport)
-                .start_turn(
-                    start_request_from_universal(
-                        native_thread_id,
-                        &input,
-                        settings.as_ref(),
-                        Map::new(),
-                    ),
-                    &mut id_map,
-                )
-                .await?;
-            self.active_turns
-                .insert(session_id, result.native_turn_id.clone());
-            let mut reducer = CodexReducer::new(session_id, id_map);
-            for item in result
-                .turn
-                .get("items")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                for output in reducer.reduce_history_item(
-                    &result.native_thread_id,
-                    &result.native_turn_id,
-                    item.clone(),
-                ) {
-                    self.emit_codex_output(output);
+                .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if is_codex_thread_not_found_error(&error, "turn/steer") => {
+                    self.active_turns.remove(&session_id);
+                    self.unbind_session(session_id);
+                    let native_thread_id = self
+                        .ensure_thread_resumed(
+                            session_id,
+                            external_session_id.or(Some(native_thread_id)),
+                            true,
+                        )
+                        .await?;
+                    return self
+                        .start_turn_for_session(session_id, native_thread_id, &input, settings)
+                        .await;
                 }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let result = self
+            .start_turn_for_session(
+                session_id,
+                native_thread_id.clone(),
+                &input,
+                settings.clone(),
+            )
+            .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if is_codex_thread_not_found_error(&error, "turn/start") => {
+                self.unbind_session(session_id);
+                let native_thread_id = self
+                    .ensure_thread_resumed(
+                        session_id,
+                        external_session_id.or(Some(native_thread_id)),
+                        true,
+                    )
+                    .await?;
+                self.start_turn_for_session(session_id, native_thread_id, &input, settings)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn ensure_thread_resumed(
+        &mut self,
+        session_id: SessionId,
+        external_session_id: Option<String>,
+        force: bool,
+    ) -> anyhow::Result<String> {
+        if !force {
+            if let Some(native_thread_id) = self.session_threads.get(&session_id) {
+                return Ok(native_thread_id.clone());
+            }
+        }
+        let thread_id = external_session_id
+            .or_else(|| self.session_threads.get(&session_id).cloned())
+            .context("Codex session has no native thread id")?;
+        let mut id_map = CodexIdMap::for_session(session_id);
+        let operation = CodexSessionClient::new(&mut self.transport)
+            .resume_thread(
+                CodexThreadResumeRequest {
+                    thread_id: thread_id.clone(),
+                    cwd: Some(self.workspace_path.display().to_string()),
+                    persist_extended_history: true,
+                    ..Default::default()
+                },
+                &mut id_map,
+            )
+            .await?;
+        let native_thread_id = operation.thread.native_thread_id.clone();
+        self.bind_session(session_id, native_thread_id.clone());
+        self.emit_history(session_id, &operation.thread);
+        self.emit_lifecycle_status(
+            session_id,
+            operation.native.clone(),
+            operation.thread.status.clone(),
+            Some("Codex thread resumed for send".to_owned()),
+        );
+        Ok(native_thread_id)
+    }
+
+    async fn steer_turn_for_session(
+        &mut self,
+        session_id: SessionId,
+        native_thread_id: String,
+        active_turn_id: String,
+        input: &UserInput,
+    ) -> anyhow::Result<()> {
+        let mut id_map = CodexIdMap::for_session(session_id);
+        let result = CodexTurnClient::new(&mut self.transport)
+            .steer_turn(
+                steer_request_from_universal(native_thread_id, active_turn_id, input, Map::new()),
+                &mut id_map,
+            )
+            .await?;
+        self.active_turns
+            .insert(session_id, result.native_turn_id.clone());
+        self.emit_codex_output(CodexReducerOutput {
+            session_id,
+            turn_id: Some(result.turn_id),
+            item_id: None,
+            ts: chrono::Utc::now(),
+            native: result.native,
+            event: UniversalEventKind::ProviderNotification {
+                notification: agenter_core::ProviderNotification {
+                    category: "turn".to_owned(),
+                    title: "Codex turn steered".to_owned(),
+                    detail: Some(result.native_turn_id),
+                    status: Some("accepted".to_owned()),
+                    severity: None,
+                    subject: None,
+                },
+            },
+        });
+        Ok(())
+    }
+
+    async fn start_turn_for_session(
+        &mut self,
+        session_id: SessionId,
+        native_thread_id: String,
+        input: &UserInput,
+        settings: Option<AgentTurnSettings>,
+    ) -> anyhow::Result<()> {
+        let mut id_map = CodexIdMap::for_session(session_id);
+        let result = CodexTurnClient::new(&mut self.transport)
+            .start_turn(
+                start_request_from_universal(
+                    native_thread_id,
+                    input,
+                    settings.as_ref(),
+                    Map::new(),
+                ),
+                &mut id_map,
+            )
+            .await?;
+        self.active_turns
+            .insert(session_id, result.native_turn_id.clone());
+        let mut reducer = CodexReducer::new(session_id, id_map);
+        for item in result
+            .turn
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for output in reducer.reduce_history_item(
+                &result.native_thread_id,
+                &result.native_turn_id,
+                item.clone(),
+            ) {
+                self.emit_codex_output(output);
             }
         }
         Ok(())
+    }
+
+    fn unbind_session(&mut self, session_id: SessionId) {
+        if let Some(thread_id) = self.session_threads.remove(&session_id) {
+            self.thread_sessions.remove(&thread_id);
+        }
     }
 
     async fn normalize_turn_settings(
@@ -891,7 +995,10 @@ impl CodexRuntimeActor {
                 "Codex provider command is guarded or unsupported in this live pass.",
             ));
         }
-        if let Some(external_session_id) = external_session_id {
+        if command.category == CodexProviderCommandCategory::ThreadMaintenance {
+            self.ensure_thread_resumed(session_id, external_session_id.clone(), false)
+                .await?;
+        } else if let Some(external_session_id) = external_session_id {
             self.bind_session(session_id, external_session_id);
         }
         let params = provider_command_params(
@@ -1506,6 +1613,12 @@ fn is_terminal_native_turn_status(status: &str) -> bool {
     )
 }
 
+fn is_codex_thread_not_found_error(error: &anyhow::Error, method: &str) -> bool {
+    let message = error.to_string();
+    message.contains(&format!("Codex app-server `{method}` request"))
+        && message.contains("thread not found:")
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1546,6 +1659,19 @@ mod tests {
         .unwrap()
     }
 
+    fn turn_response(id: i64, turn_id: &str) -> String {
+        serde_json::to_string(&json!({
+            "id": id,
+            "result": {
+                "turn": {
+                    "id": turn_id,
+                    "items": []
+                }
+            }
+        }))
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn codex_runtime_hello_capabilities_and_manifest_are_codex() {
         let registration = CodexRunnerRuntime::registration();
@@ -1572,6 +1698,111 @@ mod tests {
 
         assert_eq!(handle.session_id, session_id);
         assert_eq!(handle.external_session_id, "thread-1");
+    }
+
+    #[tokio::test]
+    async fn codex_runtime_cold_send_resumes_external_thread_before_turn_start() {
+        let script = format!(
+            concat!(
+                "read line\nprintf '%s\\n' '{{\"id\":1,\"result\":{{\"ok\":true}}}}'\n",
+                "python3 -c 'import json,sys; req=json.loads(sys.stdin.readline()); ",
+                "assert req[\"method\"]==\"thread/resume\", req; ",
+                "assert req[\"params\"][\"threadId\"]==\"thread-1\", req; ",
+                "print({resume:?}, flush=True)'\n",
+                "python3 -c 'import json,sys; req=json.loads(sys.stdin.readline()); ",
+                "assert req[\"method\"]==\"turn/start\", req; ",
+                "assert req[\"params\"][\"threadId\"]==\"thread-1\", req; ",
+                "print({turn:?}, flush=True)'\n"
+            ),
+            resume = create_response(2, "thread-1"),
+            turn = turn_response(3, "turn-1"),
+        );
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let runtime = fake_runtime(&script, sender);
+        let session_id = SessionId::new();
+
+        runtime
+            .send_input(
+                session_id,
+                Some("thread-1".to_owned()),
+                AgentInput::Text {
+                    text: "after restart".to_owned(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_runtime_retries_start_after_thread_not_found_by_resuming() {
+        let script = format!(
+            concat!(
+                "read line\nprintf '%s\\n' '{{\"id\":1,\"result\":{{\"ok\":true}}}}'\n",
+                "read line\nprintf '%s\\n' '{create}'\n",
+                "python3 -c 'import json,sys; req=json.loads(sys.stdin.readline()); ",
+                "assert req[\"method\"]==\"turn/start\", req; ",
+                "print(\"{{\\\"id\\\":3,\\\"error\\\":{{\\\"code\\\":-32600,\\\"message\\\":\\\"thread not found: thread-1\\\"}}}}\", flush=True)'\n",
+                "python3 -c 'import json,sys; req=json.loads(sys.stdin.readline()); ",
+                "assert req[\"method\"]==\"thread/resume\", req; ",
+                "assert req[\"params\"][\"threadId\"]==\"thread-1\", req; ",
+                "print({resume:?}, flush=True)'\n",
+                "python3 -c 'import json,sys; req=json.loads(sys.stdin.readline()); ",
+                "assert req[\"method\"]==\"turn/start\", req; ",
+                "assert req[\"params\"][\"threadId\"]==\"thread-1\", req; ",
+                "print({turn:?}, flush=True)'\n"
+            ),
+            create = create_response(2, "thread-1"),
+            resume = create_response(4, "thread-1"),
+            turn = turn_response(5, "turn-1"),
+        );
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let runtime = fake_runtime(&script, sender);
+        let session_id = SessionId::new();
+        runtime.create_session(session_id, None).await.unwrap();
+
+        runtime
+            .send_input(
+                session_id,
+                None,
+                AgentInput::Text {
+                    text: "retry me".to_owned(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_runtime_reports_missing_thread_when_forced_resume_fails() {
+        let script = format!(
+            concat!(
+                "read line\nprintf '%s\\n' '{{\"id\":1,\"result\":{{\"ok\":true}}}}'\n",
+                "read line\nprintf '%s\\n' '{create}'\n",
+                "read line\nprintf '%s\\n' '{{\"id\":3,\"error\":{{\"code\":-32600,\"message\":\"thread not found: thread-1\"}}}}'\n",
+                "read line\nprintf '%s\\n' '{{\"id\":4,\"error\":{{\"code\":-32600,\"message\":\"thread not found: thread-1\"}}}}'\n"
+            ),
+            create = create_response(2, "thread-1"),
+        );
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let runtime = fake_runtime(&script, sender);
+        let session_id = SessionId::new();
+        runtime.create_session(session_id, None).await.unwrap();
+
+        let error = runtime
+            .send_input(
+                session_id,
+                None,
+                AgentInput::Text {
+                    text: "missing".to_owned(),
+                },
+                None,
+            )
+            .await
+            .expect_err("missing native thread should be reported");
+
+        assert!(error.to_string().contains("thread not found: thread-1"));
     }
 
     #[tokio::test]

@@ -1,7 +1,8 @@
 import type {
   AgentQuestionField,
   ApprovalOption,
-  ApprovalDecisionName
+  ApprovalDecisionName,
+  PlanHandoffState
 } from '../api/types';
 
 export type ChatItem =
@@ -57,6 +58,7 @@ export type ChatItem =
       status?: string;
       entries?: PlanEntryView[];
       source?: string;
+      handoff?: PlanHandoffState | null;
     }
   | {
       id: string;

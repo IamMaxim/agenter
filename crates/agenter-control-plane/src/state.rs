@@ -1523,9 +1523,9 @@ impl AppState {
                             None => first.seq.as_i64() > 1,
                         });
                     let replay_incomplete = starts_after_requested_cursor
-                        || replay.len() > UNIVERSAL_EVENT_REPLAY_LIMIT;
+                        || (!include_snapshot && replay.len() > UNIVERSAL_EVENT_REPLAY_LIMIT);
                     let mut replay = replay;
-                    if replay_incomplete {
+                    if !include_snapshot && replay_incomplete {
                         replay.truncate(UNIVERSAL_EVENT_REPLAY_LIMIT);
                     }
                     let mut snapshot = events.snapshot.clone();
@@ -1569,26 +1569,28 @@ impl AppState {
                 ..SessionSnapshot::default()
             });
         self.hydrate_snapshot_capabilities(&mut snapshot).await;
-        let replay = agenter_db::list_universal_events_after(
-            pool,
-            session_id,
-            after_seq,
-            UNIVERSAL_EVENT_REPLAY_LIMIT + 1,
-        )
-        .await
-        .map(|events| {
-            events
-                .into_iter()
-                .map(|event| event.envelope())
-                .collect::<Vec<_>>()
-        });
+        let replay_limit = if include_snapshot {
+            usize::MAX
+        } else {
+            UNIVERSAL_EVENT_REPLAY_LIMIT + 1
+        };
+        let replay =
+            agenter_db::list_universal_events_after(pool, session_id, after_seq, replay_limit)
+                .await
+                .map(|events| {
+                    events
+                        .into_iter()
+                        .map(|event| event.envelope())
+                        .collect::<Vec<_>>()
+                });
         let replay_failed = replay.is_err();
         let mut events = replay.unwrap_or_else(|error| {
             tracing::warn!(%session_id, %error, "failed to replay universal session events");
             Vec::new()
         });
-        let replay_incomplete = replay_failed || events.len() > UNIVERSAL_EVENT_REPLAY_LIMIT;
-        if replay_incomplete {
+        let replay_incomplete =
+            replay_failed || (!include_snapshot && events.len() > UNIVERSAL_EVENT_REPLAY_LIMIT);
+        if !include_snapshot && replay_incomplete {
             events.truncate(UNIVERSAL_EVENT_REPLAY_LIMIT);
         }
         let snapshot_seq = snapshot.latest_seq;
@@ -2710,13 +2712,37 @@ impl AppState {
     }
 
     async fn workspace_id_for_session(&self, session_id: SessionId) -> Option<WorkspaceId> {
-        self.inner
+        if let Some(workspace_id) = self
+            .inner
             .registry
             .lock()
             .await
             .sessions
             .get(&session_id)
             .map(|session| session.workspace.workspace_id)
+        {
+            return Some(workspace_id);
+        }
+
+        let pool = self.inner.db_pool.as_ref()?;
+        let persisted = agenter_db::find_session_by_id(pool, session_id)
+            .await
+            .ok()??;
+        let workspace = WorkspaceRef {
+            workspace_id: persisted.workspace.workspace_id,
+            runner_id: persisted.workspace.runner_id,
+            path: persisted.workspace.path.clone(),
+            display_name: persisted.workspace.display_name.clone(),
+        };
+        let session = registered_session_from_db(&persisted.session, &workspace);
+        self.inner
+            .registry
+            .lock()
+            .await
+            .sessions
+            .entry(session_id)
+            .or_insert(session);
+        Some(workspace.workspace_id)
     }
 
     pub async fn import_discovered_sessions(
@@ -3267,7 +3293,11 @@ pub fn apply_universal_event_to_snapshot(
             }
         }
         UniversalEventKind::ApprovalRequested { approval } => {
-            merge_approval_into_snapshot(snapshot, approval);
+            let mut approval = (**approval).clone();
+            if approval.requested_at.is_none() {
+                approval.requested_at = Some(envelope.ts);
+            }
+            merge_approval_into_snapshot(snapshot, &approval);
             if let Some(turn_id) = approval.turn_id {
                 if let Some(turn) = snapshot.turns.get_mut(&turn_id) {
                     turn.status = TurnStatus::WaitingForApproval;
@@ -3292,7 +3322,13 @@ pub fn apply_universal_event_to_snapshot(
         }
         UniversalEventKind::QuestionRequested { question }
         | UniversalEventKind::QuestionAnswered { question } => {
-            merge_question_into_snapshot(snapshot, question);
+            let mut question = (**question).clone();
+            if matches!(envelope.event, UniversalEventKind::QuestionRequested { .. })
+                && question.requested_at.is_none()
+            {
+                question.requested_at = Some(envelope.ts);
+            }
+            merge_question_into_snapshot(snapshot, &question);
             if let Some(turn_id) = question.turn_id {
                 if let Some(turn) = snapshot.turns.get_mut(&turn_id) {
                     turn.status = match &question.status {
@@ -3373,6 +3409,7 @@ fn merge_approval_into_snapshot(snapshot: &mut SessionSnapshot, approval: &Appro
 fn merge_question_into_snapshot(snapshot: &mut SessionSnapshot, question: &QuestionState) {
     if let Some(existing) = snapshot.questions.get_mut(&question.question_id) {
         existing.status = question.status.clone();
+        existing.requested_at = question.requested_at.or(existing.requested_at);
         existing.answered_at = question.answered_at.or(existing.answered_at);
         if question.answer.is_some() {
             existing.answer = question.answer.clone();
@@ -3433,6 +3470,7 @@ fn merge_plan_into_snapshot(
     envelope: &UniversalEventEnvelope,
     plan: &agenter_core::PlanState,
 ) {
+    let incoming_updated_at = plan.updated_at.or(Some(envelope.ts));
     let mut next = if plan.partial {
         snapshot
             .plans
@@ -3444,6 +3482,10 @@ fn merge_plan_into_snapshot(
     };
 
     if plan.partial {
+        let existing_before = snapshot.plans.get(&plan.plan_id);
+        let changed = existing_before
+            .map(|existing| plan_changes_existing_plan(existing, plan))
+            .unwrap_or(true);
         next.status = plan.status.clone();
         if let Some(title) = &plan.title {
             next.title = Some(title.clone());
@@ -3473,11 +3515,40 @@ fn merge_plan_into_snapshot(
             next.artifact_refs.sort();
             next.artifact_refs.dedup();
         }
-        next.updated_at = plan.updated_at;
+        if changed || next.updated_at.is_none() {
+            next.updated_at = incoming_updated_at;
+        }
+    } else if let Some(existing) = snapshot.plans.get(&plan.plan_id) {
+        if plan_changes_existing_plan(existing, &next) {
+            next.updated_at = incoming_updated_at;
+        } else {
+            next.updated_at = existing.updated_at.or(incoming_updated_at);
+        }
+    } else if next.updated_at.is_none() {
+        next.updated_at = incoming_updated_at;
     }
 
     materialize_plan_item(snapshot, envelope, &next);
     snapshot.plans.insert(next.plan_id, next);
+}
+
+fn plan_changes_existing_plan(
+    existing: &agenter_core::PlanState,
+    incoming: &agenter_core::PlanState,
+) -> bool {
+    incoming.content.as_ref().is_some_and(|content| {
+        existing
+            .content
+            .as_ref()
+            .map(|existing| existing != content)
+            .unwrap_or(true)
+    }) || incoming
+        .title
+        .as_ref()
+        .is_some_and(|title| existing.title.as_ref() != Some(title))
+        || incoming.status != existing.status
+        || !incoming.entries.is_empty()
+        || !incoming.artifact_refs.is_empty()
 }
 
 fn materialize_plan_item(
@@ -4273,6 +4344,19 @@ mod tests {
     use super::*;
     use agenter_core::{ApprovalKind, ApprovalStatus as UniversalApprovalStatus, ItemId, TurnId};
 
+    async fn test_pool() -> sqlx::PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set to run ignored SQLx integration tests");
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect to DATABASE_URL");
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
     fn envelope(session_id: SessionId, event: UniversalEventKind) -> UniversalEventEnvelope {
         UniversalEventEnvelope {
             event_id: Uuid::new_v4().to_string(),
@@ -4344,6 +4428,110 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reducer_sets_missing_structured_request_timestamps_from_envelope() {
+        let session_id = SessionId::new();
+        let ts = DateTime::parse_from_rfc3339("2026-05-06T10:05:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&Utc);
+        let approval_id = ApprovalId::new();
+        let question_id = QuestionId::new();
+        let mut snapshot = SessionSnapshot {
+            session_id,
+            ..SessionSnapshot::default()
+        };
+
+        apply_universal_event_to_snapshot(
+            &mut snapshot,
+            &UniversalEventEnvelope {
+                ts,
+                event: UniversalEventKind::ApprovalRequested {
+                    approval: Box::new(ApprovalRequest {
+                        approval_id,
+                        session_id,
+                        turn_id: None,
+                        item_id: None,
+                        kind: ApprovalKind::Command,
+                        title: "Run command".to_owned(),
+                        details: None,
+                        options: Vec::new(),
+                        status: UniversalApprovalStatus::Pending,
+                        risk: None,
+                        subject: None,
+                        native_request_id: None,
+                        native_blocking: true,
+                        policy: None,
+                        native: None,
+                        requested_at: None,
+                        resolved_at: None,
+                        resolving_decision: None,
+                    }),
+                },
+                ..envelope(
+                    session_id,
+                    UniversalEventKind::ProviderNotification {
+                        notification: ProviderNotification {
+                            category: "test".to_owned(),
+                            title: "placeholder".to_owned(),
+                            detail: None,
+                            status: None,
+                            severity: None,
+                            subject: None,
+                        },
+                    },
+                )
+            },
+        );
+
+        apply_universal_event_to_snapshot(
+            &mut snapshot,
+            &UniversalEventEnvelope {
+                ts,
+                event: UniversalEventKind::QuestionRequested {
+                    question: Box::new(QuestionState {
+                        question_id,
+                        session_id,
+                        turn_id: None,
+                        title: "Input".to_owned(),
+                        description: None,
+                        fields: Vec::new(),
+                        status: QuestionStatus::Pending,
+                        answer: None,
+                        native_request_id: None,
+                        native_blocking: true,
+                        native: None,
+                        requested_at: None,
+                        answered_at: None,
+                    }),
+                },
+                ..envelope(
+                    session_id,
+                    UniversalEventKind::ProviderNotification {
+                        notification: ProviderNotification {
+                            category: "test".to_owned(),
+                            title: "placeholder".to_owned(),
+                            detail: None,
+                            status: None,
+                            severity: None,
+                            subject: None,
+                        },
+                    },
+                )
+            },
+        );
+
+        assert_eq!(
+            snapshot.approvals[&approval_id].requested_at,
+            Some(ts),
+            "approval.requested should get a durable ordering timestamp"
+        );
+        assert_eq!(
+            snapshot.questions[&question_id].requested_at,
+            Some(ts),
+            "question.requested should get a durable ordering timestamp"
+        );
+    }
+
     #[tokio::test]
     async fn approval_lifecycle_lists_resolving_universal_request() {
         let state = AppState::new(
@@ -4406,6 +4594,172 @@ mod tests {
         assert_eq!(
             requests[0].resolving_decision,
             Some(ApprovalDecision::Accept)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
+    async fn runner_event_after_restart_uses_persisted_session_workspace_for_receipt_append() {
+        let pool = test_pool().await;
+        let suffix = Uuid::new_v4();
+        let user = agenter_db::create_user(
+            &pool,
+            &format!("restart-{suffix}@example.test"),
+            Some("Restart Test"),
+        )
+        .await
+        .expect("create user");
+        let runner_id = RunnerId::new();
+        agenter_db::upsert_runner_with_id(&pool, runner_id, "restart-runner", Some("test"))
+            .await
+            .expect("upsert runner");
+        let workspace_id = WorkspaceId::from_uuid(Uuid::new_v4());
+        agenter_db::upsert_workspace_with_id(
+            &pool,
+            workspace_id,
+            runner_id,
+            &format!("/tmp/agenter-restart-{suffix}"),
+            Some("Restart Workspace"),
+        )
+        .await
+        .expect("upsert workspace");
+        let session_id = SessionId::new();
+        agenter_db::create_session_with_id(
+            &pool,
+            agenter_db::CreateSessionRecord {
+                session_id,
+                owner_user_id: user.user_id,
+                runner_id,
+                workspace_id,
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                external_session_id: Some("thread-after-restart".to_owned()),
+                title: Some("Restarted Codex".to_owned()),
+                status: SessionStatus::Idle,
+                usage_snapshot: None,
+                turn_settings: None,
+            },
+        )
+        .await
+        .expect("create session");
+
+        let restarted_state = AppState::new_with_test_db_pool(pool.clone());
+        let stored = restarted_state
+            .accept_runner_agent_event_with_receipt(
+                runner_id,
+                Some(1),
+                AgentUniversalEvent {
+                    protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
+                    session_id,
+                    event_id: None,
+                    turn_id: None,
+                    item_id: None,
+                    ts: None,
+                    source: UniversalEventSource::Native,
+                    native: None,
+                    event: UniversalEventKind::SessionStatusChanged {
+                        status: SessionStatus::Running,
+                        reason: Some("Codex thread resumed for send".to_owned()),
+                    },
+                },
+            )
+            .await
+            .expect("runner event should append using DB session workspace");
+
+        assert!(stored.is_some());
+        assert_eq!(
+            restarted_state.workspace_id_for_session(session_id).await,
+            Some(workspace_id)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
+    async fn db_snapshot_replay_with_snapshot_is_not_truncated_at_live_replay_limit() {
+        let pool = test_pool().await;
+        let suffix = Uuid::new_v4();
+        let user = agenter_db::create_user(
+            &pool,
+            &format!("snapshot-replay-{suffix}@example.test"),
+            Some("Snapshot Replay Test"),
+        )
+        .await
+        .expect("create user");
+        let runner_id = RunnerId::new();
+        agenter_db::upsert_runner_with_id(&pool, runner_id, "snapshot-replay-runner", Some("test"))
+            .await
+            .expect("upsert runner");
+        let workspace_id = WorkspaceId::from_uuid(Uuid::new_v4());
+        agenter_db::upsert_workspace_with_id(
+            &pool,
+            workspace_id,
+            runner_id,
+            &format!("/tmp/agenter-snapshot-replay-{suffix}"),
+            Some("Snapshot Replay Workspace"),
+        )
+        .await
+        .expect("upsert workspace");
+        let session_id = SessionId::new();
+        agenter_db::create_session_with_id(
+            &pool,
+            agenter_db::CreateSessionRecord {
+                session_id,
+                owner_user_id: user.user_id,
+                runner_id,
+                workspace_id,
+                provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+                external_session_id: Some("thread-snapshot-replay".to_owned()),
+                title: Some("Snapshot Replay".to_owned()),
+                status: SessionStatus::Idle,
+                usage_snapshot: None,
+                turn_settings: None,
+            },
+        )
+        .await
+        .expect("create session");
+
+        for index in 0..=UNIVERSAL_EVENT_REPLAY_LIMIT {
+            let envelope = UniversalEventEnvelope {
+                event_id: Uuid::new_v4().to_string(),
+                seq: UniversalSeq::zero(),
+                session_id,
+                turn_id: None,
+                item_id: None,
+                ts: Utc::now(),
+                source: UniversalEventSource::Runner,
+                native: None,
+                event: UniversalEventKind::ProviderNotification {
+                    notification: ProviderNotification {
+                        category: "replay-test".to_owned(),
+                        title: format!("event {index}"),
+                        detail: None,
+                        status: None,
+                        severity: None,
+                        subject: None,
+                    },
+                },
+            };
+            agenter_db::append_universal_event_reducing_snapshot(
+                &pool,
+                workspace_id,
+                envelope,
+                None,
+                apply_universal_event_to_snapshot,
+            )
+            .await
+            .expect("append universal event");
+        }
+
+        let state = AppState::new_with_test_db_pool(pool);
+        let replay = state
+            .session_snapshot_replay(session_id, Some(UniversalSeq::zero()), true)
+            .await
+            .expect("snapshot replay");
+
+        assert!(replay.replay_complete);
+        assert_eq!(replay.events.len(), UNIVERSAL_EVENT_REPLAY_LIMIT + 1);
+        assert_eq!(
+            replay.replay_through_seq, replay.snapshot_seq,
+            "full snapshot reload should replay through the durable snapshot cursor"
         );
     }
 

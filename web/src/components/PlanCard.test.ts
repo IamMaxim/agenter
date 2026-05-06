@@ -34,6 +34,23 @@ describe('PlanCard', () => {
     expect(body).not.toMatch(/Implement plan[^<]*<\/button>[\s\S]*disabled/);
   });
 
+  test('does not render handoff actions when the plan is already implementing', () => {
+    const { body } = render(PlanCard, {
+      props: {
+        item: {
+          ...planItem,
+          handoff: { state: 'implementing', action: 'same_thread' }
+        },
+        pendingHandoff: true,
+        turnActive: false,
+        defaultModeAvailable: true
+      }
+    });
+    expect(body).not.toContain('Implement plan');
+    expect(body).not.toContain('Implement in fresh thread');
+    expect(body).toContain('Implementation started');
+  });
+
   test('disables both Implement actions when default mode is unavailable', () => {
     const { body } = render(PlanCard, {
       props: {

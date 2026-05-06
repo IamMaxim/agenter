@@ -289,7 +289,8 @@ pub(super) async fn create_session(
 
 /// Internal helper used by both `send_session_message` and `create_session`'s
 /// initial-message path. Performs the `AgentSendInput` round-trip with the
-/// given (already-resolved) settings, publishes the user-message event, and
+/// given (already-resolved) settings, publishes the user-message event when
+/// the provider does not supply a native echo, and
 /// emits status events on success/failure.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -366,6 +367,10 @@ async fn publish_user_message(
     }
 }
 
+fn should_publish_user_message_echo(provider_id: &agenter_core::AgentProviderId) -> bool {
+    provider_id.as_str() != agenter_core::AgentProviderId::CODEX
+}
+
 async fn dispatch_user_message(
     state: &crate::state::AppState,
     request: DispatchUserMessage,
@@ -377,7 +382,9 @@ async fn dispatch_user_message(
         author_user_id: Some(request.user_id),
         content: request.content,
     };
-    publish_user_message(state, &user_message).await;
+    if should_publish_user_message_echo(&request.provider_id) {
+        publish_user_message(state, &user_message).await;
+    }
     super::publish_session_status_event(
         state,
         session_id,
@@ -624,7 +631,9 @@ pub(super) async fn send_session_message(
         author_user_id: Some(user.user_id),
         content: content.to_owned(),
     };
-    publish_user_message(&state, &user_message).await;
+    if should_publish_user_message_echo(&session.provider_id) {
+        publish_user_message(&state, &user_message).await;
+    }
     super::publish_session_status_event(
         &state,
         session_id,
@@ -966,4 +975,19 @@ pub(super) async fn session_history(
 
     tracing::debug!(user_id = %user.user_id, %session_id, event_count = history.events.len(), "returned session history");
     Json(history).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_sessions_use_native_user_message_echoes() {
+        assert!(!should_publish_user_message_echo(
+            &agenter_core::AgentProviderId::from(agenter_core::AgentProviderId::CODEX)
+        ));
+        assert!(should_publish_user_message_echo(
+            &agenter_core::AgentProviderId::from(agenter_core::AgentProviderId::QWEN)
+        ));
+    }
 }

@@ -7,6 +7,7 @@ import {
   getWorkspaceProviderSessionRefreshStatus,
   interruptSessionTurn,
   listSlashCommands,
+  markPlanHandoff,
   refreshWorkspaceProviderSessions,
   sendSessionMessage
 } from './sessions';
@@ -326,7 +327,8 @@ describe('session APIs', () => {
 
     await sendSessionMessage('session 1', {
       content: 'Implement the plan.',
-      settings_override: { collaboration_mode: 'default' }
+      settings_override: { collaboration_mode: 'default' },
+      plan_handoff: { plan_id: 'plan-1', action: 'same_thread' }
     });
 
     expect(fetch).toHaveBeenCalledWith(
@@ -335,7 +337,8 @@ describe('session APIs', () => {
         method: 'POST',
         body: JSON.stringify({
           content: 'Implement the plan.',
-          settings_override: { collaboration_mode: 'default' }
+          settings_override: { collaboration_mode: 'default' },
+          plan_handoff: { plan_id: 'plan-1', action: 'same_thread' }
         })
       })
     );
@@ -366,7 +369,12 @@ describe('session APIs', () => {
       provider_id: 'qwen',
       title: 'Implement plan',
       initial_message: 'PREAMBLE\n\nplan body',
-      settings_override: { collaboration_mode: 'default' }
+      settings_override: { collaboration_mode: 'default' },
+      source_plan_handoff: {
+        session_id: 'source-session',
+        plan_id: 'plan-1',
+        action: 'fresh_thread'
+      }
     });
 
     expect(fetch).toHaveBeenCalledWith(
@@ -378,7 +386,37 @@ describe('session APIs', () => {
           provider_id: 'qwen',
           title: 'Implement plan',
           initial_message: 'PREAMBLE\n\nplan body',
-          settings_override: { collaboration_mode: 'default' }
+          settings_override: { collaboration_mode: 'default' },
+          source_plan_handoff: {
+            session_id: 'source-session',
+            plan_id: 'plan-1',
+            action: 'fresh_thread'
+          }
+        })
+      })
+    );
+  });
+
+  test('markPlanHandoff persists stay-in-plan choice', async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 204,
+      text: () => Promise.resolve('')
+    });
+    vi.stubGlobal('fetch', fetch);
+
+    await markPlanHandoff('session 1', {
+      plan_id: 'plan-1',
+      action: 'stay_in_plan'
+    });
+
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/sessions/session%201/plan-handoff',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          plan_id: 'plan-1',
+          action: 'stay_in_plan'
         })
       })
     );

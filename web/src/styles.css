@@ -1577,7 +1577,7 @@ button.busy:disabled .button-spinner {
   padding: 0.9rem 1rem;
   color: var(--muted);
   background: #11151b;
-  box-shadow: inset 2px 0 0 var(--line-strong);
+  /* box-shadow: inset 2px 0 0 var(--line-strong); */
 }
 
 .log-card-heading {
@@ -1758,8 +1758,8 @@ button.busy:disabled .button-spinner {
 }
 
 .question-card .question-field {
-  border-left: 1px solid var(--line-strong);
-  padding-left: 0.65rem;
+  /* border-left: 1px solid var(--line-strong); */
+  /* padding-left: 0.65rem; */
 }
 
 .question-field small {
@@ -1781,7 +1781,7 @@ button.busy:disabled .button-spinner {
 
 .single-choice-list {
   display: grid;
-  gap: 0.5rem;
+  gap: 0;
 }
 
 .choice-list label {
@@ -1789,10 +1789,21 @@ button.busy:disabled .button-spinner {
   align-items: center;
   gap: 0.35rem;
   border: 1px solid var(--line-soft);
-  border-radius: 5px;
+  border-top: none;
   padding: 0.25rem 0.5rem;
   color: var(--text);
   background: var(--bg);
+}
+
+.choice-list > *:first-child {
+  border-top-left-radius: 6px;
+  border-top-right-radius: 6px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.choice-list > *:last-child {
+  border-bottom-left-radius: 6px;
+  border-bottom-right-radius: 6px;
 }
 
 .single-choice-list label {
@@ -1823,6 +1834,8 @@ button.busy:disabled .button-spinner {
 
 .choice-list input {
   width: auto;
+  border-radius: 0;
+  border-top: none;
 }
 
 .question-custom-input {

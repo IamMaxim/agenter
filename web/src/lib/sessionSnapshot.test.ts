@@ -60,6 +60,78 @@ function universalEvent(seq: string, eventId = `evt-${seq}`): UniversalEventEnve
 }
 
 describe('universal session snapshot client reducer', () => {
+  test('orders snapshot-only structured rows by timestamp without index collisions', () => {
+    const rowOrder = new Map([
+      ['agent:before', { seq: '10', ts: '2026-05-06T10:00:00Z', index: 0 }],
+      ['agent:after', { seq: '20', ts: '2026-05-06T10:10:00Z', index: 1 }]
+    ]);
+
+    const state = materializeSnapshotChatState(
+      snapshot({
+        latest_seq: '21',
+        items: {
+          before: {
+            item_id: 'before',
+            session_id: 's1',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ block_id: 'before-text', kind: 'text', text: 'Before' }]
+          },
+          after: {
+            item_id: 'after',
+            session_id: 's1',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ block_id: 'after-text', kind: 'text', text: 'After' }]
+          }
+        },
+        questions: {
+          q1: {
+            question_id: 'q1',
+            session_id: 's1',
+            title: 'First question',
+            fields: [],
+            status: 'answered',
+            answered_at: '2026-05-06T10:05:00Z'
+          },
+          q2: {
+            question_id: 'q2',
+            session_id: 's1',
+            title: 'Second question',
+            fields: [],
+            status: 'answered',
+            answered_at: '2026-05-06T10:05:00Z'
+          }
+        },
+        plans: {
+          p1: {
+            plan_id: 'p1',
+            session_id: 's1',
+            status: 'draft',
+            title: 'Plan',
+            content: 'Plan body',
+            entries: [],
+            artifact_refs: [],
+            source: 'native_structured',
+            partial: false,
+            updated_at: '2026-05-06T10:06:00Z'
+          }
+        }
+      }),
+      rowOrder
+    );
+
+    expect(state.items.map((item) => item.id)).toEqual([
+      'agent:before',
+      'question:q1',
+      'question:q2',
+      'plan:p1',
+      'agent:after'
+    ]);
+    expect(rowOrder.get('question:q1')?.index).not.toBe(rowOrder.get('question:q2')?.index);
+    expect(rowOrder.get('plan:p1')?.index).not.toBe(rowOrder.get('question:q2')?.index);
+  });
+
   test('materializes snapshot turns, items, plans, approvals, diffs, and artifacts into chat rows', () => {
     const state = materializeSnapshotChatState(
       snapshot({
@@ -161,6 +233,40 @@ describe('universal session snapshot client reducer', () => {
       optionId: 'approve_once',
       decision: 'accept',
       label: 'Approve once'
+    });
+  });
+
+  test('materializes plan handoff state from snapshots', () => {
+    const state = materializeSnapshotChatState(
+      snapshot({
+        plans: {
+          p1: {
+            plan_id: 'p1',
+            session_id: 's1',
+            status: 'draft',
+            title: 'Plan',
+            content: 'Do it',
+            entries: [],
+            artifact_refs: [],
+            source: 'native_structured',
+            partial: false,
+            handoff: {
+              state: 'implementing',
+              action: 'same_thread',
+              updated_at: '2026-05-06T12:00:00Z'
+            }
+          }
+        }
+      })
+    );
+
+    const plan = state.items.find((item) => item.kind === 'plan');
+    expect(plan).toMatchObject({
+      kind: 'plan',
+      handoff: {
+        state: 'implementing',
+        action: 'same_thread'
+      }
     });
   });
 
@@ -282,6 +388,160 @@ describe('universal session snapshot client reducer', () => {
     ]);
     expect(state.items.map((item) => ('title' in item ? item.title : ''))).not.toContain('tool completed');
     expect(state.items.map((item) => ('title' in item ? item.title : ''))).not.toContain('Tool activity');
+  });
+
+  test('uses native Codex user messages without rendering old control-plane duplicates', () => {
+    const state = materializeSnapshotChatState(
+      snapshot({
+        items: {
+          echo: {
+            item_id: 'echo',
+            session_id: 's1',
+            role: 'user',
+            status: 'completed',
+            content: [{ block_id: 'echo-text', kind: 'text', text: 'Implement the plan.' }]
+          },
+          native: {
+            item_id: 'native',
+            session_id: 's1',
+            turn_id: 't1',
+            role: 'user',
+            status: 'completed',
+            content: [{ block_id: 'native-text', kind: 'text', text: 'Implement the plan.' }],
+            native: {
+              protocol: 'codex/app-server/v2',
+              method: 'item/completed',
+              raw_payload: {
+                method: 'item/completed',
+                params: { item: { type: 'userMessage', id: 'native' } }
+              }
+            }
+          }
+        }
+      })
+    );
+
+    expect(state.items).toMatchObject([
+      { id: 'user:echo', kind: 'user', content: 'Implement the plan.' }
+    ]);
+  });
+
+  test('keeps repeated control-plane user messages while suppressing matching Codex echoes', () => {
+    const state = materializeSnapshotChatState(
+      snapshot({
+        items: {
+          echo1: {
+            item_id: 'echo1',
+            session_id: 's1',
+            role: 'user',
+            status: 'completed',
+            content: [{ block_id: 'echo1-text', kind: 'text', text: 'Again' }]
+          },
+          native1: {
+            item_id: 'native1',
+            session_id: 's1',
+            role: 'user',
+            status: 'completed',
+            content: [{ block_id: 'native1-text', kind: 'text', text: 'Again' }],
+            native: {
+              protocol: 'codex/app-server/v2',
+              raw_payload: { params: { item: { type: 'userMessage' } } }
+            }
+          },
+          echo2: {
+            item_id: 'echo2',
+            session_id: 's1',
+            role: 'user',
+            status: 'completed',
+            content: [{ block_id: 'echo2-text', kind: 'text', text: 'Again' }]
+          },
+          native2: {
+            item_id: 'native2',
+            session_id: 's1',
+            role: 'user',
+            status: 'completed',
+            content: [{ block_id: 'native2-text', kind: 'text', text: 'Again' }],
+            native: {
+              protocol: 'codex/app-server/v2',
+              raw_payload: { params: { item: { type: 'userMessage' } } }
+            }
+          }
+        }
+      })
+    );
+
+    expect(state.items.map((item) => item.id)).toEqual(['user:echo1', 'user:echo2']);
+  });
+
+  test('keeps native-only Codex user messages', () => {
+    const state = materializeSnapshotChatState(
+      snapshot({
+        items: {
+          native: {
+            item_id: 'native',
+            session_id: 's1',
+            role: 'user',
+            status: 'completed',
+            content: [{ block_id: 'native-text', kind: 'text', text: 'Native only' }],
+            native: {
+              protocol: 'codex/app-server/v2',
+              raw_payload: { params: { item: { type: 'userMessage' } } }
+            }
+          }
+        }
+      })
+    );
+
+    expect(state.items).toMatchObject([
+      { id: 'user:native', kind: 'user', content: 'Native only' }
+    ]);
+  });
+
+  test('renders Codex native plan items only through the plan card', () => {
+    const planText = '# Scratch-Direction Exercise\n\nUse the scratch workspace.';
+    const state = materializeSnapshotChatState(
+      snapshot({
+        items: {
+          planItem: {
+            item_id: 'planItem',
+            session_id: 's1',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ block_id: 'plan-text', kind: 'text', text: planText }],
+            native: {
+              protocol: 'codex/app-server/v2',
+              raw_payload: { params: { item: { type: 'plan' } } }
+            }
+          },
+          agent: {
+            item_id: 'agent',
+            session_id: 's1',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ block_id: 'agent-text', kind: 'text', text: planText }],
+            native: {
+              protocol: 'codex/app-server/v2',
+              raw_payload: { params: { item: { type: 'agentMessage' } } }
+            }
+          }
+        },
+        plans: {
+          p1: {
+            plan_id: 'p1',
+            session_id: 's1',
+            status: 'draft',
+            title: 'Codex plan',
+            content: planText,
+            entries: [],
+            artifact_refs: [],
+            source: 'native_structured',
+            partial: false
+          }
+        }
+      })
+    );
+
+    expect(state.items.map((item) => item.id)).toEqual(['agent:agent', 'plan:p1']);
   });
 
   test('materializes universal_projection terminal items without tool projection as command rows', () => {
