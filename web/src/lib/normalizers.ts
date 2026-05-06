@@ -14,6 +14,7 @@ import type {
   AgentQuestionAnswer,
   AgentQuestionField,
   AgentTurnSettings,
+  ApprovalMode,
   BrowserSessionSnapshot,
   CapabilitySet,
   ContentBlock,
@@ -67,6 +68,14 @@ const reasoningEfforts = new Set<AgentReasoningEffort>([
   'xhigh'
 ]);
 
+const approvalModes = new Set<ApprovalMode>([
+  'ask',
+  'read_only_ask',
+  'trusted_workspace',
+  'allow_all_session',
+  'allow_all_workspace'
+]);
+
 const sessionStatuses = new Set<SessionStatus>([
   'starting',
   'running',
@@ -102,6 +111,9 @@ export function normalizeTurnSettings(value: unknown): AgentTurnSettings {
   }
   if (typeof record.collaboration_mode === 'string') {
     settings.collaboration_mode = record.collaboration_mode;
+  }
+  if (isApprovalMode(record.approval_mode)) {
+    settings.approval_mode = record.approval_mode;
   }
   return settings;
 }
@@ -702,7 +714,8 @@ function normalizeSession(value: unknown): SessionInfo | undefined {
     title: typeof record.title === 'string' ? record.title : null,
     created_at: typeof record.created_at === 'string' ? record.created_at : null,
     updated_at: typeof record.updated_at === 'string' ? record.updated_at : null,
-    usage: normalizeSessionUsage(record.usage)
+    usage: normalizeSessionUsage(record.usage),
+    approval_mode: isApprovalMode(record.approval_mode) ? record.approval_mode : null
   };
 }
 
@@ -810,7 +823,8 @@ function minimalSessionInfo(): SessionInfo {
     title: null,
     created_at: null,
     updated_at: null,
-    usage: null
+    usage: null,
+    approval_mode: null
   };
 }
 
@@ -820,6 +834,10 @@ function numberOrNull(value: unknown): number | null {
 
 function isReasoningEffort(value: unknown): value is AgentReasoningEffort {
   return typeof value === 'string' && reasoningEfforts.has(value as AgentReasoningEffort);
+}
+
+function isApprovalMode(value: unknown): value is ApprovalMode {
+  return typeof value === 'string' && approvalModes.has(value as ApprovalMode);
 }
 
 function isSessionStatus(value: unknown): value is SessionStatus {

@@ -667,6 +667,8 @@ pub struct PlanState {
     pub partial: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<PlanHandoffState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -682,6 +684,34 @@ pub enum PlanStatus {
     Completed,
     Cancelled,
     Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanHandoffState {
+    pub state: PlanHandoffStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<PlanHandoffAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_session_id: Option<SessionId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanHandoffStatus {
+    Available,
+    Dismissed,
+    Implementing,
+    Implemented,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanHandoffAction {
+    SameThread,
+    FreshThread,
+    StayInPlan,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -755,7 +785,7 @@ pub enum ArtifactKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ApprovalKind, ApprovalStatus, RunnerId, WorkspaceId};
+    use crate::{ApprovalKind, ApprovalMode, ApprovalStatus, RunnerId, WorkspaceId};
 
     #[test]
     fn universal_event_serializes_with_uap2_version() {
@@ -829,6 +859,7 @@ mod tests {
                 created_at: None,
                 updated_at: None,
                 usage: None,
+                approval_mode: ApprovalMode::default(),
             }),
         };
         let json = serde_json::to_value(&event).expect("json");

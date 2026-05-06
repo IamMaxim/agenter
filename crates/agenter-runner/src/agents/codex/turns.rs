@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 
-use agenter_core::{AgentReasoningEffort, AgentTurnSettings, NativeRef, TurnId, UserInput};
+use agenter_core::{
+    AgentReasoningEffort, AgentTurnSettings, ApprovalMode, NativeRef, TurnId, UserInput,
+};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -186,9 +188,60 @@ pub fn start_request_from_universal(
                 .map(codex_reasoning_effort)
         }),
         collaboration_mode: settings.and_then(codex_collaboration_mode),
+        approval_policy: settings.and_then(|settings| {
+            settings
+                .approval_mode
+                .and_then(|mode| codex_approval_policy_for_mode(mode, &extra))
+        }),
+        sandbox_policy: settings.and_then(|settings| {
+            settings
+                .approval_mode
+                .and_then(|mode| codex_sandbox_policy_for_mode(mode, &extra))
+        }),
+        permissions: settings.and_then(|settings| {
+            settings
+                .approval_mode
+                .and_then(|mode| codex_permissions_for_mode(mode, &extra))
+        }),
         extra,
         ..Default::default()
     }
+}
+
+fn codex_approval_policy_for_mode(mode: ApprovalMode, extra: &Map<String, Value>) -> Option<Value> {
+    if extra.contains_key("approvalPolicy") {
+        return None;
+    }
+    Some(match mode {
+        ApprovalMode::Ask | ApprovalMode::ReadOnlyAsk | ApprovalMode::TrustedWorkspace => {
+            json!("on-request")
+        }
+        ApprovalMode::AllowAllSession | ApprovalMode::AllowAllWorkspace => json!("never"),
+    })
+}
+
+fn codex_sandbox_policy_for_mode(mode: ApprovalMode, extra: &Map<String, Value>) -> Option<Value> {
+    if extra.contains_key("sandboxPolicy") || extra.contains_key("permissions") {
+        return None;
+    }
+    mode.is_dangerous_allow_all()
+        .then(|| json!({ "type": "dangerFullAccess" }))
+}
+
+fn codex_permissions_for_mode(mode: ApprovalMode, extra: &Map<String, Value>) -> Option<Value> {
+    if extra.contains_key("permissions") || extra.contains_key("sandboxPolicy") {
+        return None;
+    }
+    let id = match mode {
+        ApprovalMode::ReadOnlyAsk => ":read-only",
+        ApprovalMode::Ask | ApprovalMode::TrustedWorkspace => ":workspace",
+        ApprovalMode::AllowAllSession | ApprovalMode::AllowAllWorkspace => return None,
+    };
+    Some(json!({
+        "type": "profile",
+        "id": id,
+        "modifications": null,
+    }))
 }
 
 pub fn steer_request_from_universal(
@@ -425,6 +478,7 @@ assert params["dynamicTools"] == [{"name": "native-only"}], params
                 model: Some("gpt-5".to_owned()),
                 reasoning_effort: Some(AgentReasoningEffort::High),
                 collaboration_mode: Some("plan".to_owned()),
+                approval_mode: None,
             }),
             extra,
         );
@@ -556,6 +610,46 @@ assert params["turnId"] == "turn-1", params
         ))
         .unwrap();
         assert_eq!(preserved["dynamicTools"][0]["name"], "preserved");
+    }
+
+    #[test]
+    fn codex_turn_commands_map_approval_mode_to_native_start_options() {
+        let read_only = serde_json::to_value(start_request_from_universal(
+            "thread-1",
+            &UserInput::Text {
+                text: "hello".to_owned(),
+            },
+            Some(&AgentTurnSettings {
+                model: None,
+                reasoning_effort: None,
+                collaboration_mode: None,
+                approval_mode: Some(ApprovalMode::ReadOnlyAsk),
+            }),
+            Map::new(),
+        ))
+        .unwrap();
+        assert_eq!(read_only["approvalPolicy"], "on-request");
+        assert_eq!(read_only["permissions"]["type"], "profile");
+        assert_eq!(read_only["permissions"]["id"], ":read-only");
+        assert!(read_only.get("sandboxPolicy").is_none());
+
+        let allow_all = serde_json::to_value(start_request_from_universal(
+            "thread-1",
+            &UserInput::Text {
+                text: "hello".to_owned(),
+            },
+            Some(&AgentTurnSettings {
+                model: None,
+                reasoning_effort: None,
+                collaboration_mode: None,
+                approval_mode: Some(ApprovalMode::AllowAllWorkspace),
+            }),
+            Map::new(),
+        ))
+        .unwrap();
+        assert_eq!(allow_all["approvalPolicy"], "never");
+        assert_eq!(allow_all["sandboxPolicy"]["type"], "dangerFullAccess");
+        assert!(allow_all.get("permissions").is_none());
     }
 
     #[test]

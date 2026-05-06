@@ -909,6 +909,7 @@ mod tests {
                 model: Some("gpt-5.4".to_owned()),
                 reasoning_effort: Some(AgentReasoningEffort::High),
                 collaboration_mode: Some("plan".to_owned()),
+                approval_mode: None,
             }),
             input: AgentInput::Text {
                 text: "Plan this".to_owned(),

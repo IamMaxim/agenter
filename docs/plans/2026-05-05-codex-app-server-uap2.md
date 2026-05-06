@@ -42,6 +42,11 @@ reduction into universal events. The control plane owns Agenter session
 registry, user authorization, event cache, replay, and durable approval/question
 delivery state.
 
+Approval policy, persistent approval rules, browser approval-mode UX, and the
+no-Agenter-sandbox posture are owned by
+`docs/plans/2026-05-06-codex-tui-style-approvals.md` and
+`docs/decisions/2026-05-06-codex-approval-modes-without-agenter-sandbox.md`.
+
 ## Non-Goals
 
 - No compatibility bridge for removed legacy normalized projection code.
@@ -1311,6 +1316,81 @@ Verification notes:
   compiled and was ignored because it requires `DATABASE_URL` for disposable
   Postgres.
 - `cd web && npm run test -- sessionSnapshot` passed.
+
+## Stage 13: Durable Plan Handoff State
+
+Owner: live browser debugging pass.
+
+Status: implemented; live re-smoke pending.
+
+Work completed:
+
+- Plan handoff state is now part of `PlanState` as optional `handoff`
+  metadata. The durable state records whether a plan is still available,
+  dismissed, implementing, or implemented, plus the selected handoff action,
+  target fresh-thread session when applicable, and server update timestamp.
+- The control plane publishes a partial `plan.updated` event to mark handoff
+  state. This keeps the marker in the universal event stream and session
+  snapshot without adding a database migration.
+- Same-thread "Implement plan" marks the plan as `implementing` only after the
+  runner accepts the send command. If dispatch fails before runner acceptance,
+  the source plan remains available.
+- Fresh-thread implementation marks the source session plan as `implementing`
+  with `action=fresh_thread` and the created target session id after the
+  initial message dispatch succeeds.
+- "Stay in Plan mode" uses a small session endpoint to mark the plan as
+  `dismissed` without sending a model message.
+- The browser sends plan handoff payloads for same-thread and fresh-thread
+  actions, and reloads use `PlanState.handoff` instead of reload-local
+  dismissed state to decide whether plan action buttons should appear.
+- Partial plan handoff updates merge into existing browser plan rows without
+  clearing the plan title, content, entries, or artifacts.
+
+Verification notes:
+
+- `cargo test -p agenter-control-plane handoff` passed.
+- `cargo test -p agenter-control-plane` passed; two DB-backed tests remain
+  ignored unless `DATABASE_URL` is provided.
+- `cargo check --workspace` passed.
+- `cargo clippy --workspace -- -D warnings` passed.
+- `cd web && npm run check`, `cd web && npm run lint`, `cd web && npm run
+  test`, and `cd web && npm run build` passed.
+
+## Stage 14: Force Reload Plan History Projection
+
+Owner: live browser debugging pass.
+
+Status: implemented; live re-smoke pending.
+
+Work completed:
+
+- Force reload/session discovery now projects Codex native `plan` history items
+  into visible plan content from the decoded native `text` field instead of
+  serializing the whole raw item as display text.
+- The full native plan object is still preserved in `provider_payload`, keeping
+  the local research/debugging contract that non-redacted raw payloads remain
+  available without leaking JSON into the plan card body.
+- Force reload/session discovery now treats structured Codex plans as
+  canonical. If the same imported history batch contains an `agentMessage`
+  whose normalized text exactly matches a native `plan`, the duplicate
+  assistant echo is dropped before it reaches persisted Agenter state.
+- The control-plane snapshot reducer no longer materializes `plan.updated`
+  events into synthetic assistant `ItemState` rows. `snapshot.plans` is the
+  only durable plan surface, and new plan updates clean up the older synthetic
+  `plan:item:*` row id if present.
+- Existing sessions polluted by earlier force reloads should be repaired by
+  force-reloading them again; no frontend compatibility suppression is planned
+  for this case.
+
+Verification notes:
+
+- `cargo test -p agenter-runner
+  codex_force_reload_projects_plan_history_text_without_json_wrapping` passed.
+- `cargo test -p agenter-runner codex_force_reload` passed.
+- `cargo test -p agenter-control-plane
+  plan_updated_reducer_uses_plan_snapshot_without_plain_item_row` passed.
+- `cargo test -p agenter-runner
+  codex_reducer_history_plan_item_emits_only_plan_update` passed.
 
 ## Subagent Coordination
 

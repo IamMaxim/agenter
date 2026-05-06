@@ -34,6 +34,7 @@
     BrowserServerMessage,
     ApprovalDecisionName,
     ApprovalDecision,
+    ApprovalMode,
     ApprovalPolicyRule,
     SessionInfo,
     SessionUsageWindow,
@@ -116,12 +117,19 @@
   let pendingDangerCommand:
     | { command: SlashCommandDefinition; request: SlashCommandRequest }
     | undefined;
-  let openComposerMenu: 'mode' | 'model' | 'reasoning' | 'verbosity' | null = null;
+  let openComposerMenu: 'mode' | 'model' | 'reasoning' | 'approval' | 'verbosity' | null = null;
   type VerbosityMode = 'compact' | 'normal' | 'detailed' | 'debug';
   const VERBOSITY_OPTIONS: VerbosityMode[] = ['compact', 'normal', 'detailed', 'debug'];
   const DEFAULT_VERBOSITY: VerbosityMode = 'debug';
   const VERBOSITY_STORAGE_KEY = 'agenter.chat.verbosity.v1';
   const CHAT_DEBUG_WS_LIMIT = 500;
+  const APPROVAL_MODE_OPTIONS: { value: ApprovalMode; label: string; detail: string }[] = [
+    { value: 'ask', label: 'Ask', detail: 'Ask for approvals unless a rule matches.' },
+    { value: 'read_only_ask', label: 'Read-only ask', detail: 'Default to read-only and ask before writes.' },
+    { value: 'trusted_workspace', label: 'Trusted workspace', detail: 'Still ask, with workspace remember options.' },
+    { value: 'allow_all_session', label: 'Allow all this session', detail: 'Allow all operations with danger-full-access for this session.' },
+    { value: 'allow_all_workspace', label: 'Allow all for workspace', detail: 'Allow all operations with danger-full-access until revoked.' }
+  ];
   let verbosity: VerbosityMode = DEFAULT_VERBOSITY;
   let dismissedPlanIds: Set<string> = new Set();
   let eventStream: HTMLDivElement | undefined;
@@ -190,6 +198,10 @@
   $: planTurnComplete = chatState.planTurnComplete;
   $: modelValue = turnSettings.model ?? usage?.model ?? '';
   $: reasoningValue = turnSettings.reasoning_effort ?? usage?.reasoning_effort ?? '';
+  $: approvalModeValue = turnSettings.approval_mode ?? session?.approval_mode ?? 'ask';
+  $: dangerousApprovalMode = approvalModeValue === 'allow_all_session' || approvalModeValue === 'allow_all_workspace';
+  $: broadAllowAllRules = approvalRules.filter(isBroadAllowAllRule);
+  $: dangerousApprovalStatus = dangerousApprovalMode || broadAllowAllRules.length > 0;
   $: contextLabel = percentLabel(usage?.context?.used_percent);
   $: contextTitle = tokenUsageTitle(usage?.context?.used_tokens, usage?.context?.total_tokens);
   $: window5hLabel = `5h ${percentLabel(usage?.window_5h?.remaining_percent)}`;
@@ -787,9 +799,11 @@
     settingsError = '';
     try {
       turnSettings = await updateSessionSettings(sessionId, next);
+      return true;
     } catch {
       settingsError = 'Could not save agent settings.';
       pushToast({ severity: 'error', message: settingsError });
+      return false;
     }
   }
 
@@ -803,7 +817,7 @@
     });
   }
 
-  function toggleComposerMenu(menu: 'mode' | 'model' | 'reasoning' | 'verbosity') {
+  function toggleComposerMenu(menu: 'mode' | 'model' | 'reasoning' | 'approval' | 'verbosity') {
     openComposerMenu = openComposerMenu === menu ? null : menu;
   }
 
@@ -817,6 +831,14 @@
 
   function reasoningLabel(reasoning: string) {
     return reasoning || 'thinking';
+  }
+
+  function approvalModeLabel(mode: ApprovalMode | string) {
+    return APPROVAL_MODE_OPTIONS.find((option) => option.value === mode)?.label ?? 'Ask';
+  }
+
+  function approvalModeTitle(mode: ApprovalMode | string) {
+    return APPROVAL_MODE_OPTIONS.find((option) => option.value === mode)?.detail ?? 'Ask for approvals.';
   }
 
   function chooseMode(value: string) {
@@ -837,11 +859,51 @@
     void tick().then(() => messageTextarea?.focus());
   }
 
+  function chooseApprovalMode(value: ApprovalMode) {
+    openComposerMenu = null;
+    void setApprovalMode(value).then(() => tick().then(() => messageTextarea?.focus()));
+  }
+
   function setReasoningEffort(reasoning_effort: string) {
     void saveSettings({
       ...turnSettings,
       reasoning_effort: (reasoning_effort || null) as AgentReasoningEffort | null
     });
+  }
+
+  async function setApprovalMode(approval_mode: ApprovalMode) {
+    if (approval_mode === approvalModeValue) {
+      return;
+    }
+    if (isDangerousApprovalMode(approval_mode) && !confirmDangerousApprovalMode(approval_mode)) {
+      return;
+    }
+    const next = {
+      ...turnSettings,
+      approval_mode
+    };
+    const saved = await saveSettings(next);
+    if (!saved) {
+      return;
+    }
+    session = session ? { ...session, approval_mode } : session;
+    if (approval_mode === 'allow_all_workspace') {
+      void loadApprovalRules();
+    }
+  }
+
+  function isDangerousApprovalMode(mode: ApprovalMode | string) {
+    return mode === 'allow_all_session' || mode === 'allow_all_workspace';
+  }
+
+  function confirmDangerousApprovalMode(mode: ApprovalMode) {
+    const workspaceWarning =
+      mode === 'allow_all_workspace'
+        ? '\n\nAllow all for workspace persists for this workspace/provider until revoked and applies to every approval kind.'
+        : '';
+    return window.confirm(
+      `Enable Allow all operations (${mode})?\n\nThis uses danger-full-access. The runner should be isolated in a VM because Agenter will not sandbox it.${workspaceWarning}`
+    );
   }
 
   function resolveDefaultModeId(
@@ -1094,6 +1156,25 @@
     return (kind ?? 'approval').replaceAll('_', ' ');
   }
 
+  function isBroadAllowAllRule(rule: ApprovalPolicyRule) {
+    const matcherKind = typeof rule.matcher.kind === 'string' ? rule.matcher.kind : '';
+    const matcherType = typeof rule.matcher.type === 'string' ? rule.matcher.type : '';
+    const matcherScope = typeof rule.matcher.scope === 'string' ? rule.matcher.scope : '';
+    return (
+      matcherKind === 'allow_all' ||
+      matcherType === 'allow_all' ||
+      matcherScope === 'allow_all' ||
+      rule.label.toLowerCase().includes('allow all')
+    );
+  }
+
+  function approvalRuleLabel(rule: ApprovalPolicyRule) {
+    if (isBroadAllowAllRule(rule)) {
+      return `Allow all operations / danger-full-access - ${approvalKindLabel(rule.kind)}`;
+    }
+    return rule.label;
+  }
+
   function questionAnswers(item: ChatItem, field: AgentQuestionField): string[] {
     if (item.kind !== 'question') {
       return [];
@@ -1206,6 +1287,10 @@
         <span>{session?.provider_id ?? 'provider'}</span>
         <span>·</span>
         <span>{connectionState}</span>
+        {#if dangerousApprovalStatus}
+          <span>·</span>
+          <span class="approval-danger-inline">Allow all operations / danger-full-access</span>
+        {/if}
       </div>
       {#if session}
         <details class="approval-rules-panel">
@@ -1224,8 +1309,8 @@
           {:else}
             <div class="approval-rule-list">
               {#each approvalRules as rule}
-                <div class="approval-rule-row">
-                  <span>{rule.label}</span>
+                <div class:dangerous={isBroadAllowAllRule(rule)} class="approval-rule-row">
+                  <span title={approvalRuleLabel(rule)}>{approvalRuleLabel(rule)}</span>
                   <button class="secondary compact" type="button" on:click={() => revokeApprovalRule(rule.rule_id)}>
                     Revoke
                   </button>
@@ -1241,6 +1326,12 @@
         <button class="secondary compact chat-debug-export" type="button" on:click={handleExportChatDebug}>
           Export debug
         </button>
+      {/if}
+      {#if dangerousApprovalStatus}
+        <span class="status-pill danger approval-mode-danger-pill" title="Allow all operations with danger-full-access is active.">
+          <span class="status-dot" aria-hidden="true"></span>
+          danger-full-access
+        </span>
       {/if}
       <span class:done={sessionStatusTone === 'done'} class:error={sessionStatusTone === 'error'} class:idle={sessionStatusTone === 'idle'} class:running={sessionStatusTone === 'running'} class:waiting={sessionStatusTone === 'waiting'} class="status-pill">
         <span class="status-dot" aria-hidden="true"></span>
@@ -1657,6 +1748,36 @@
                 on:click={() => chooseReasoning(effort)}
               >
                 {effort}
+              </button>
+            {/each}
+          </span>
+        {/if}
+      </span>
+      <span class="composer-dot" aria-hidden="true">·</span>
+      <span class="composer-chip-wrap approval-mode-chip-wrap">
+        <button
+          aria-expanded={openComposerMenu === 'approval'}
+          aria-label="Approval mode"
+          class:danger={dangerousApprovalMode}
+          class="composer-chip"
+          title={approvalModeTitle(approvalModeValue)}
+          type="button"
+          on:click={() => toggleComposerMenu('approval')}
+        >
+          {approvalModeLabel(approvalModeValue)}
+          <AgenterIcon name="chevron" size={14} />
+        </button>
+        {#if openComposerMenu === 'approval'}
+          <span class="composer-chip-menu approval-mode-menu">
+            {#each APPROVAL_MODE_OPTIONS as option}
+              <button
+                class:active={option.value === approvalModeValue}
+                class:danger={isDangerousApprovalMode(option.value)}
+                title={option.detail}
+                type="button"
+                on:click={() => chooseApprovalMode(option.value)}
+              >
+                {option.label}
               </button>
             {/each}
           </span>

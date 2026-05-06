@@ -250,13 +250,10 @@ async fn execute_local_slash_command(
             .await
         }
         "local.model" | "local.mode" | "local.reasoning" => {
-            let mut settings = state
-                .session_turn_settings(user_id, session.session_id)
-                .await
-                .unwrap_or_default();
+            let mut settings_patch = agenter_core::AgentTurnSettings::default();
             match request.command_id.as_str() {
                 "local.model" => {
-                    settings.model = request
+                    settings_patch.model = request
                         .arguments
                         .get("model")
                         .and_then(Value::as_str)
@@ -264,7 +261,7 @@ async fn execute_local_slash_command(
                         .map(str::to_owned);
                 }
                 "local.mode" => {
-                    settings.collaboration_mode = request
+                    settings_patch.collaboration_mode = request
                         .arguments
                         .get("mode")
                         .and_then(Value::as_str)
@@ -272,7 +269,7 @@ async fn execute_local_slash_command(
                         .map(str::to_owned);
                 }
                 "local.reasoning" => {
-                    settings.reasoning_effort = request
+                    settings_patch.reasoning_effort = request
                         .arguments
                         .get("effort")
                         .and_then(Value::as_str)
@@ -280,6 +277,12 @@ async fn execute_local_slash_command(
                 }
                 _ => {}
             }
+            let settings_command_payload = set_turn_settings_command_payload(
+                state
+                    .session_turn_settings(user_id, session.session_id)
+                    .await,
+                settings_patch.clone(),
+            );
             let universal_command_kind = match request.command_id.as_str() {
                 "local.model" => request
                     .arguments
@@ -299,8 +302,8 @@ async fn execute_local_slash_command(
                     }),
                 _ => None,
             }
-            .unwrap_or_else(|| agenter_core::UniversalCommand::SetTurnSettings {
-                settings: settings.clone(),
+            .unwrap_or(agenter_core::UniversalCommand::SetTurnSettings {
+                settings: settings_command_payload,
             });
             let universal_command = slash_command_envelope(
                 user_id,
@@ -314,21 +317,38 @@ async fn execute_local_slash_command(
                 return response;
             }
             publish_slash_user_echo(&state, user_id, session.session_id, &request).await;
-            let Some(settings) = state
-                .update_session_turn_settings(user_id, session.session_id, settings)
+            let settings = match state
+                .update_session_turn_settings(user_id, session.session_id, settings_patch)
                 .await
-            else {
-                if let Some(response) = super::finish_command_or_error_response(
-                    &state,
-                    &universal_command,
-                    crate::state::UniversalCommandIdempotencyStatus::Failed,
-                    super::command_response(StatusCode::NOT_FOUND, None),
-                )
-                .await
-                {
-                    return response;
+            {
+                Ok(Some(settings)) => settings,
+                Ok(None) => {
+                    if let Some(response) = super::finish_command_or_error_response(
+                        &state,
+                        &universal_command,
+                        crate::state::UniversalCommandIdempotencyStatus::Failed,
+                        super::command_response(StatusCode::NOT_FOUND, None),
+                    )
+                    .await
+                    {
+                        return response;
+                    }
+                    return StatusCode::NOT_FOUND.into_response();
                 }
-                return StatusCode::NOT_FOUND.into_response();
+                Err(error) => {
+                    tracing::warn!(%user_id, session_id = %session.session_id, ?error, "slash settings update failed");
+                    if let Some(response) = super::finish_command_or_error_response(
+                        &state,
+                        &universal_command,
+                        crate::state::UniversalCommandIdempotencyStatus::Failed,
+                        super::command_response(StatusCode::INTERNAL_SERVER_ERROR, None),
+                    )
+                    .await
+                    {
+                        return response;
+                    }
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
             };
             let result = agenter_core::SlashCommandResult {
                 accepted: true,
@@ -582,6 +602,46 @@ async fn create_session_from_slash(
             }
         }
     };
+
+    if let Err(error) = state
+        .ensure_approval_mode_rules_for_new_session(
+            user_id,
+            source.workspace.workspace_id,
+            &source.provider_id,
+            source.turn_settings.as_ref(),
+        )
+        .await
+    {
+        tracing::warn!(%user_id, workspace_id = %source.workspace.workspace_id, provider_id = %source.provider_id, %error, "slash session creation rejected because approval-mode rule setup failed");
+        let result = agenter_core::SlashCommandResult {
+            accepted: false,
+            message: "Could not prepare approval policy for the new session.".to_owned(),
+            session: None,
+            provider_payload: None,
+        };
+        if let Some(response) = super::finish_command_or_error_response(
+            &state,
+            &universal_command,
+            crate::state::UniversalCommandIdempotencyStatus::Failed,
+            super::command_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::to_value(&result).ok(),
+            ),
+        )
+        .await
+        {
+            return response;
+        }
+        return slash_result_response(
+            &state,
+            source_session_id,
+            &request,
+            &definition,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            result,
+        )
+        .await;
+    }
 
     let session = state
         .register_session(SessionRegistration {
@@ -1303,6 +1363,26 @@ pub(super) fn local_slash_commands(
     commands
 }
 
+fn set_turn_settings_command_payload(
+    current: Option<agenter_core::AgentTurnSettings>,
+    patch: agenter_core::AgentTurnSettings,
+) -> agenter_core::AgentTurnSettings {
+    let mut merged = current.unwrap_or_default();
+    if patch.model.is_some() {
+        merged.model = patch.model;
+    }
+    if patch.reasoning_effort.is_some() {
+        merged.reasoning_effort = patch.reasoning_effort;
+    }
+    if patch.collaboration_mode.is_some() {
+        merged.collaboration_mode = patch.collaboration_mode;
+    }
+    if patch.approval_mode.is_some() {
+        merged.approval_mode = patch.approval_mode;
+    }
+    merged
+}
+
 struct SlashCommandBuilder(agenter_core::SlashCommandDefinition);
 
 impl SlashCommandBuilder {
@@ -1370,5 +1450,39 @@ fn agent_reasoning_effort_from_str(value: &str) -> Option<agenter_core::AgentRea
         "high" => Some(agenter_core::AgentReasoningEffort::High),
         "xhigh" => Some(agenter_core::AgentReasoningEffort::Xhigh),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_turn_settings_command_payload_keeps_existing_sparse_fields() {
+        let current = agenter_core::AgentTurnSettings {
+            model: Some("gpt-5.2".to_owned()),
+            reasoning_effort: Some(agenter_core::AgentReasoningEffort::Medium),
+            collaboration_mode: Some("plan".to_owned()),
+            approval_mode: Some(agenter_core::ApprovalMode::AllowAllWorkspace),
+        };
+        let patch = agenter_core::AgentTurnSettings {
+            model: None,
+            reasoning_effort: Some(agenter_core::AgentReasoningEffort::High),
+            collaboration_mode: None,
+            approval_mode: None,
+        };
+
+        let merged = set_turn_settings_command_payload(Some(current), patch);
+
+        assert_eq!(merged.model.as_deref(), Some("gpt-5.2"));
+        assert_eq!(
+            merged.reasoning_effort,
+            Some(agenter_core::AgentReasoningEffort::High)
+        );
+        assert_eq!(merged.collaboration_mode.as_deref(), Some("plan"));
+        assert_eq!(
+            merged.approval_mode,
+            Some(agenter_core::ApprovalMode::AllowAllWorkspace)
+        );
     }
 }

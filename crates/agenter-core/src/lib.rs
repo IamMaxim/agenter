@@ -10,18 +10,19 @@ pub mod workspace;
 
 pub use approval::{
     AgentObligation, AgentObligationKind, AgentObligationStatus, ApprovalDecision, ApprovalKind,
-    ApprovalOption, ApprovalOptionKind, ApprovalPolicyMetadata, ApprovalPolicyRulePreview,
-    ApprovalRequest, ApprovalResolutionState, ApprovalRisk, ApprovalStatus, PolicyAction,
+    ApprovalMode, ApprovalOption, ApprovalOptionKind, ApprovalPolicyMetadata,
+    ApprovalPolicyRulePreview, ApprovalRequest, ApprovalResolutionState, ApprovalRisk,
+    ApprovalStatus, PolicyAction,
 };
 pub use events::{
     ArtifactKind, ArtifactState, ContentBlock, ContentBlockKind, DiffFile, DiffState,
     FileChangeKind, ItemRole, ItemState, ItemStatus, NativeRef, PlanEntry, PlanEntryStatus,
-    PlanSource, PlanState, PlanStatus, ProviderNotification, ProviderNotificationSeverity,
-    ToolActionProjection, ToolCommandProjection, ToolEvent, ToolMcpProjection, ToolProjection,
-    ToolProjectionKind, ToolSubagentOperation, ToolSubagentProjection, ToolSubagentStateProjection,
-    UniversalCommand, UniversalCommandEnvelope, UniversalEventEnvelope, UniversalEventKind,
-    UniversalEventSource, UniversalPlanEntry, UniversalSeq, UserInput, UserMessageEvent,
-    UNIVERSAL_PROTOCOL_VERSION,
+    PlanHandoffAction, PlanHandoffState, PlanHandoffStatus, PlanSource, PlanState, PlanStatus,
+    ProviderNotification, ProviderNotificationSeverity, ToolActionProjection,
+    ToolCommandProjection, ToolEvent, ToolMcpProjection, ToolProjection, ToolProjectionKind,
+    ToolSubagentOperation, ToolSubagentProjection, ToolSubagentStateProjection, UniversalCommand,
+    UniversalCommandEnvelope, UniversalEventEnvelope, UniversalEventKind, UniversalEventSource,
+    UniversalPlanEntry, UniversalSeq, UserInput, UserMessageEvent, UNIVERSAL_PROTOCOL_VERSION,
 };
 pub use ids::{
     ApprovalId, ArtifactId, CommandId, ConnectorBindingId, DiffId, ItemId, PlanId, QuestionId,

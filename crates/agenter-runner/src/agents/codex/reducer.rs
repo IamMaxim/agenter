@@ -680,6 +680,7 @@ impl CodexReducer {
                         source: PlanSource::NativeStructured,
                         partial: !matches!(status, ItemStatus::Completed),
                         updated_at: Some(Utc::now()),
+                        handoff: None,
                     },
                 },
             )];
@@ -882,6 +883,7 @@ impl CodexReducer {
                     source: PlanSource::NativeStructured,
                     partial: true,
                     updated_at: Some(Utc::now()),
+                    handoff: None,
                 },
             },
         )]
@@ -943,6 +945,7 @@ impl CodexReducer {
                     source: PlanSource::NativeStructured,
                     partial: false,
                     updated_at: Some(Utc::now()),
+                    handoff: None,
                 },
             },
         )]

@@ -1,24 +1,18 @@
-#![allow(dead_code)]
-
-use std::{collections::HashMap, future::Future, pin::Pin};
+use std::collections::HashMap;
 
 use agenter_core::{
-    AgentCapabilities, AgentOptions, AgentProviderId, ApprovalDecision, ApprovalId, CapabilitySet,
-    ItemId, NativeRef, SessionId, SlashCommandDefinition, SlashCommandRequest, SlashCommandResult,
-    TurnId, UniversalCommandEnvelope, UniversalEventKind, UniversalEventSource, UserInput,
-    WorkspaceRef, UNIVERSAL_PROTOCOL_VERSION,
+    AgentProviderId, ItemId, NativeRef, SessionId, TurnId, UniversalEventKind,
+    UniversalEventSource, UNIVERSAL_PROTOCOL_VERSION,
 };
-use agenter_protocol::runner::{AgentInput, AgentUniversalEvent, RunnerCommandResult, RunnerError};
+use agenter_protocol::runner::AgentUniversalEvent;
 use tokio::sync::mpsc;
 
-pub type AdapterBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type AdapterEventSender = mpsc::UnboundedSender<AdapterEvent>;
 pub type AdapterEventReceiver = mpsc::UnboundedReceiver<AdapterEvent>;
 
 #[derive(Clone, Debug)]
 pub struct AdapterProviderRegistration {
     pub provider_id: AgentProviderId,
-    pub capabilities: CapabilitySet,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -28,11 +22,6 @@ pub struct AdapterRegistry {
 }
 
 impl AdapterRegistry {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn register_provider(&mut self, registration: AdapterProviderRegistration) {
         self.providers
             .insert(registration.provider_id.clone(), registration);
@@ -275,187 +264,11 @@ pub struct AdapterUniversalEvent {
     pub event: UniversalEventKind,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct AdapterStartSessionRequest {
-    pub session_id: SessionId,
-    pub workspace: WorkspaceRef,
-    pub provider_id: AgentProviderId,
-    pub initial_input: Option<AgentInput>,
-    pub universal_command: Option<UniversalCommandEnvelope>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct AdapterLoadSessionRequest {
-    pub session_id: SessionId,
-    pub workspace: WorkspaceRef,
-    pub provider_id: AgentProviderId,
-    pub external_session_id: String,
-    pub universal_command: Option<UniversalCommandEnvelope>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct AdapterStartTurnRequest {
-    pub session_id: SessionId,
-    pub provider_id: AgentProviderId,
-    pub external_session_id: Option<String>,
-    pub input: UserInput,
-    pub universal_command: Option<UniversalCommandEnvelope>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct AdapterUserInputRequest {
-    pub session_id: SessionId,
-    pub input: UserInput,
-    pub universal_command: Option<UniversalCommandEnvelope>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct AdapterApprovalResolutionRequest {
-    pub session_id: SessionId,
-    pub approval_id: ApprovalId,
-    pub decision: ApprovalDecision,
-    pub universal_command: Option<UniversalCommandEnvelope>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdapterCancelTurnRequest {
-    pub session_id: SessionId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdapterSetModeRequest {
-    pub session_id: SessionId,
-    pub mode: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct AdapterProviderCommandRequest {
-    pub session_id: SessionId,
-    pub external_session_id: Option<String>,
-    pub command: SlashCommandRequest,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdapterCloseSessionRequest {
-    pub session_id: SessionId,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum AdapterCommandOutcome {
-    Accepted,
-    AgentOptions(AgentOptions),
-    ProviderCommands(Vec<SlashCommandDefinition>),
-    ProviderCommandExecuted(SlashCommandResult),
-    SessionCreated {
-        session_id: SessionId,
-        external_session_id: String,
-    },
-    SessionLoaded {
-        session_id: SessionId,
-        external_session_id: String,
-    },
-}
-
-impl From<AdapterCommandOutcome> for RunnerCommandResult {
-    fn from(value: AdapterCommandOutcome) -> Self {
-        match value {
-            AdapterCommandOutcome::Accepted => Self::Accepted,
-            AdapterCommandOutcome::AgentOptions(options) => Self::AgentOptions { options },
-            AdapterCommandOutcome::ProviderCommands(commands) => {
-                Self::ProviderCommands { commands }
-            }
-            AdapterCommandOutcome::ProviderCommandExecuted(result) => {
-                Self::ProviderCommandExecuted { result }
-            }
-            AdapterCommandOutcome::SessionCreated {
-                session_id,
-                external_session_id,
-            } => Self::SessionCreated {
-                session_id,
-                external_session_id,
-            },
-            AdapterCommandOutcome::SessionLoaded {
-                session_id,
-                external_session_id,
-            } => Self::SessionResumed {
-                session_id,
-                external_session_id,
-            },
-        }
-    }
-}
-
-pub trait HarnessAdapter: Send + Sync {
-    fn provider_id(&self) -> AgentProviderId;
-
-    fn capabilities(&self) -> CapabilitySet {
-        CapabilitySet::from(AgentCapabilities::default())
-    }
-
-    fn start(
-        &self,
-        request: AdapterStartSessionRequest,
-    ) -> AdapterBoxFuture<'_, anyhow::Result<AdapterCommandOutcome>>;
-
-    fn load(
-        &self,
-        request: AdapterLoadSessionRequest,
-    ) -> AdapterBoxFuture<'_, anyhow::Result<AdapterCommandOutcome>>;
-
-    fn start_turn(
-        &self,
-        request: AdapterStartTurnRequest,
-    ) -> AdapterBoxFuture<'_, anyhow::Result<AdapterCommandOutcome>>;
-
-    fn send_user_input(
-        &self,
-        request: AdapterUserInputRequest,
-    ) -> AdapterBoxFuture<'_, anyhow::Result<AdapterCommandOutcome>>;
-
-    fn resolve_approval(
-        &self,
-        request: AdapterApprovalResolutionRequest,
-    ) -> AdapterBoxFuture<'_, anyhow::Result<AdapterCommandOutcome>>;
-
-    fn cancel_turn(
-        &self,
-        request: AdapterCancelTurnRequest,
-    ) -> AdapterBoxFuture<'_, anyhow::Result<AdapterCommandOutcome>>;
-
-    fn set_mode(
-        &self,
-        request: AdapterSetModeRequest,
-    ) -> AdapterBoxFuture<'_, anyhow::Result<AdapterCommandOutcome>>;
-
-    fn execute_provider_command(
-        &self,
-        request: AdapterProviderCommandRequest,
-    ) -> AdapterBoxFuture<'_, anyhow::Result<AdapterCommandOutcome>>;
-
-    fn close(
-        &self,
-        request: AdapterCloseSessionRequest,
-    ) -> AdapterBoxFuture<'_, anyhow::Result<AdapterCommandOutcome>>;
-
-    fn take_event_stream(
-        &self,
-        session_id: SessionId,
-    ) -> AdapterBoxFuture<'_, anyhow::Result<AdapterEventReceiver>>;
-}
-
-#[must_use]
-pub fn runner_error(code: impl Into<String>, error: anyhow::Error) -> RunnerError {
-    RunnerError {
-        code: code.into(),
-        message: error.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use agenter_core::{
-        AgentCapabilities, AgentProviderId, CapabilitySet, ContentBlock, ContentBlockKind, ItemId,
-        ItemRole, ItemState, ItemStatus, NativeRef, SessionId, TurnId, UniversalEventKind,
+        AgentProviderId, ContentBlock, ContentBlockKind, ItemId, ItemRole, ItemState, ItemStatus,
+        NativeRef, SessionId, TurnId, UniversalEventKind,
     };
 
     #[test]
@@ -463,21 +276,13 @@ mod tests {
         let gemini = AgentProviderId::from(AgentProviderId::GEMINI);
         let qwen = AgentProviderId::from(AgentProviderId::QWEN);
         let session_id = SessionId::nil();
-        let mut registry = super::AdapterRegistry::new();
+        let mut registry = super::AdapterRegistry::default();
 
         registry.register_provider(super::AdapterProviderRegistration {
             provider_id: gemini.clone(),
-            capabilities: CapabilitySet::from(AgentCapabilities {
-                streaming: true,
-                ..AgentCapabilities::default()
-            }),
         });
         registry.register_provider(super::AdapterProviderRegistration {
             provider_id: qwen.clone(),
-            capabilities: CapabilitySet::from(AgentCapabilities {
-                approvals: true,
-                ..AgentCapabilities::default()
-            }),
         });
         registry.bind_session(session_id, qwen.clone());
 

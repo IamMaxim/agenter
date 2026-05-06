@@ -1,6 +1,6 @@
 use agenter_core::{
     AgentObligationKind, AgentObligationStatus, AgentProviderId, AgentTurnSettings,
-    ApprovalDecision, ApprovalId, ApprovalKind, ApprovalRequest,
+    ApprovalDecision, ApprovalId, ApprovalKind, ApprovalMode, ApprovalRequest,
     ApprovalStatus as UniversalApprovalStatus, CommandId, ItemId, QuestionId, QuestionState,
     QuestionStatus, RunnerId, SessionId, SessionSnapshot, SessionStatus, SessionUsageSnapshot,
     TurnId, UniversalEventEnvelope, UniversalEventKind, UniversalEventSource, UniversalSeq, UserId,
@@ -872,6 +872,101 @@ pub async fn update_session_turn_settings(
     row.as_ref().map(session_from_row).transpose()
 }
 
+fn merge_turn_settings(
+    current: Option<AgentTurnSettings>,
+    patch: AgentTurnSettings,
+) -> AgentTurnSettings {
+    let mut merged = current.unwrap_or_default();
+    if patch.model.is_some() {
+        merged.model = patch.model;
+    }
+    if patch.reasoning_effort.is_some() {
+        merged.reasoning_effort = patch.reasoning_effort;
+    }
+    if patch.collaboration_mode.is_some() {
+        merged.collaboration_mode = patch.collaboration_mode;
+    }
+    if patch.approval_mode.is_some() {
+        merged.approval_mode = patch.approval_mode;
+    }
+    merged
+}
+
+pub async fn update_session_turn_settings_with_approval_mode_transition(
+    pool: &PgPool,
+    owner_user_id: UserId,
+    session_id: SessionId,
+    patch: AgentTurnSettings,
+    changed_by_user_id: Option<UserId>,
+) -> Result<Option<AgentTurnSettings>> {
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query(
+        "select session_id, workspace_id, provider_id, turn_settings
+         from agent_sessions
+         where owner_user_id = $1 and session_id = $2
+         for update",
+    )
+    .bind(owner_user_id.as_uuid())
+    .bind(session_id.as_uuid())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+
+    let workspace_id = WorkspaceId::from_uuid(row.try_get("workspace_id")?);
+    let provider_id = AgentProviderId::from(row.try_get::<String, _>("provider_id")?);
+    let current_settings = row
+        .try_get::<Option<serde_json::Value>, _>("turn_settings")?
+        .and_then(|settings| serde_json::from_value(settings).ok());
+    let approval_mode_patch = patch.approval_mode;
+    let merged_settings = merge_turn_settings(current_settings, patch);
+
+    if let Some(approval_mode) = approval_mode_patch {
+        if approval_mode == ApprovalMode::AllowAllWorkspace {
+            create_or_reuse_workspace_allow_all_approval_policy_rule_tx(
+                &mut tx,
+                owner_user_id,
+                workspace_id,
+                &provider_id,
+                None,
+                changed_by_user_id,
+            )
+            .await?;
+        } else {
+            disable_workspace_allow_all_approval_policy_rules_tx(
+                &mut tx,
+                owner_user_id,
+                workspace_id,
+                &provider_id,
+                changed_by_user_id.unwrap_or(owner_user_id),
+            )
+            .await?;
+        }
+    }
+
+    let settings_json =
+        serde_json::to_value(&merged_settings).expect("turn settings must serialize to JSON");
+    let updated = sqlx::query(
+        "update agent_sessions
+         set turn_settings = $3,
+             updated_at = now()
+         where owner_user_id = $1 and session_id = $2
+         returning turn_settings",
+    )
+    .bind(owner_user_id.as_uuid())
+    .bind(session_id.as_uuid())
+    .bind(settings_json)
+    .fetch_one(&mut *tx)
+    .await?;
+    let updated_settings = updated
+        .try_get::<Option<serde_json::Value>, _>("turn_settings")?
+        .and_then(|settings| serde_json::from_value(settings).ok());
+    tx.commit().await?;
+    Ok(updated_settings)
+}
+
 pub async fn update_session_title(
     pool: &PgPool,
     owner_user_id: UserId,
@@ -1510,6 +1605,146 @@ pub async fn create_approval_policy_rule(
     .await?;
 
     approval_policy_rule_from_row(&row)
+}
+
+pub async fn create_or_reuse_workspace_allow_all_approval_policy_rule(
+    pool: &PgPool,
+    owner_user_id: UserId,
+    workspace_id: WorkspaceId,
+    provider_id: &AgentProviderId,
+    source_approval_id: Option<ApprovalId>,
+    created_by_user_id: Option<UserId>,
+) -> Result<ApprovalPolicyRule> {
+    let matcher = serde_json::json!({
+        "type": "allow_all",
+        "applies_to": "all_approval_kinds"
+    });
+    let decision = ApprovalDecision::AcceptForSession;
+    create_approval_policy_rule(
+        pool,
+        NewApprovalPolicyRule {
+            owner_user_id,
+            workspace_id,
+            provider_id,
+            kind: ApprovalKind::ProviderSpecific,
+            label: "Danger: allow all operations for this workspace/provider",
+            matcher: &matcher,
+            decision: &decision,
+            source_approval_id,
+            created_by_user_id,
+        },
+    )
+    .await
+}
+
+async fn create_or_reuse_workspace_allow_all_approval_policy_rule_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    owner_user_id: UserId,
+    workspace_id: WorkspaceId,
+    provider_id: &AgentProviderId,
+    source_approval_id: Option<ApprovalId>,
+    created_by_user_id: Option<UserId>,
+) -> Result<()> {
+    let matcher = serde_json::json!({
+        "type": "allow_all",
+        "applies_to": "all_approval_kinds"
+    });
+    let decision_json =
+        serde_json::to_value(ApprovalDecision::AcceptForSession).map_err(sqlx::Error::decode)?;
+    sqlx::query(
+        "insert into approval_policy_rules (
+            owner_user_id, workspace_id, provider_id, kind, label, matcher, decision,
+            source_approval_id, created_by_user_id
+         )
+         values ($1, $2, $3, 'provider_specific', $4, $5, $6, $7, $8)
+         on conflict (owner_user_id, workspace_id, provider_id, kind, matcher)
+             where disabled_at is null
+         do update set
+            label = excluded.label,
+            decision = excluded.decision,
+            source_approval_id = coalesce(excluded.source_approval_id, approval_policy_rules.source_approval_id),
+            created_by_user_id = coalesce(excluded.created_by_user_id, approval_policy_rules.created_by_user_id),
+            updated_at = now()",
+    )
+    .bind(owner_user_id.as_uuid())
+    .bind(workspace_id.as_uuid())
+    .bind(provider_id.as_str())
+    .bind("Danger: allow all operations for this workspace/provider")
+    .bind(matcher)
+    .bind(decision_json)
+    .bind(source_approval_id.map(ApprovalId::as_uuid))
+    .bind(created_by_user_id.map(UserId::as_uuid))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub async fn disable_workspace_allow_all_approval_policy_rules(
+    pool: &PgPool,
+    owner_user_id: UserId,
+    workspace_id: WorkspaceId,
+    provider_id: &AgentProviderId,
+    disabled_by_user_id: UserId,
+) -> Result<u64> {
+    let matcher = serde_json::json!({
+        "type": "allow_all",
+        "applies_to": "all_approval_kinds"
+    });
+    let result = sqlx::query(
+        "update approval_policy_rules
+         set disabled_at = coalesce(disabled_at, now()),
+             disabled_by_user_id = coalesce(disabled_by_user_id, $5),
+             updated_at = now()
+         where owner_user_id = $1
+            and workspace_id = $2
+            and provider_id = $3
+            and kind = 'provider_specific'
+            and matcher = $4
+            and disabled_at is null",
+    )
+    .bind(owner_user_id.as_uuid())
+    .bind(workspace_id.as_uuid())
+    .bind(provider_id.as_str())
+    .bind(matcher)
+    .bind(disabled_by_user_id.as_uuid())
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+async fn disable_workspace_allow_all_approval_policy_rules_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    owner_user_id: UserId,
+    workspace_id: WorkspaceId,
+    provider_id: &AgentProviderId,
+    disabled_by_user_id: UserId,
+) -> Result<u64> {
+    let matcher = serde_json::json!({
+        "type": "allow_all",
+        "applies_to": "all_approval_kinds"
+    });
+    let result = sqlx::query(
+        "update approval_policy_rules
+         set disabled_at = coalesce(disabled_at, now()),
+             disabled_by_user_id = coalesce(disabled_by_user_id, $5),
+             updated_at = now()
+         where owner_user_id = $1
+            and workspace_id = $2
+            and provider_id = $3
+            and kind = 'provider_specific'
+            and matcher = $4
+            and disabled_at is null",
+    )
+    .bind(owner_user_id.as_uuid())
+    .bind(workspace_id.as_uuid())
+    .bind(provider_id.as_str())
+    .bind(matcher)
+    .bind(disabled_by_user_id.as_uuid())
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(result.rows_affected())
 }
 
 pub async fn list_active_approval_policy_rules(
@@ -2984,6 +3219,7 @@ mod tests {
                     created_at: None,
                     updated_at: None,
                     usage: None,
+                    approval_mode: agenter_core::ApprovalMode::default(),
                 }),
             },
         };
@@ -3501,6 +3737,126 @@ mod tests {
         .expect("second resolution should not fail");
 
         assert!(second_resolution.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
+    async fn approval_policy_rule_allow_all_persists_reuses_and_scopes() {
+        let pool = test_pool().await;
+
+        let suffix = uuid::Uuid::new_v4();
+        let user = create_user(
+            &pool,
+            &format!("approval-rule-user-{suffix}@example.test"),
+            Some("Approval Rule User"),
+        )
+        .await
+        .expect("create user");
+        let runner = register_runner(&pool, &format!("approval-rule-runner-{suffix}"), None)
+            .await
+            .expect("register runner");
+        let workspace_a = upsert_workspace(
+            &pool,
+            runner.runner_id,
+            &format!("/tmp/agenter-approval-rule-a-{suffix}"),
+            None,
+        )
+        .await
+        .expect("upsert workspace a");
+        let workspace_b = upsert_workspace(
+            &pool,
+            runner.runner_id,
+            &format!("/tmp/agenter-approval-rule-b-{suffix}"),
+            None,
+        )
+        .await
+        .expect("upsert workspace b");
+        let provider_a = AgentProviderId::from("codex");
+        let provider_b = AgentProviderId::from("qwen");
+
+        let first = create_or_reuse_workspace_allow_all_approval_policy_rule(
+            &pool,
+            user.user_id,
+            workspace_a.workspace_id,
+            &provider_a,
+            None,
+            Some(user.user_id),
+        )
+        .await
+        .expect("create allow-all rule");
+        assert_eq!(first.kind, ApprovalKind::ProviderSpecific);
+        assert_eq!(
+            first.matcher,
+            serde_json::json!({ "type": "allow_all", "applies_to": "all_approval_kinds" })
+        );
+
+        let reused = create_or_reuse_workspace_allow_all_approval_policy_rule(
+            &pool,
+            user.user_id,
+            workspace_a.workspace_id,
+            &provider_a,
+            None,
+            Some(user.user_id),
+        )
+        .await
+        .expect("reuse active allow-all rule");
+        assert_eq!(reused.rule_id, first.rule_id);
+
+        let different_workspace = create_or_reuse_workspace_allow_all_approval_policy_rule(
+            &pool,
+            user.user_id,
+            workspace_b.workspace_id,
+            &provider_a,
+            None,
+            Some(user.user_id),
+        )
+        .await
+        .expect("create workspace-scoped allow-all rule");
+        assert_ne!(different_workspace.rule_id, first.rule_id);
+
+        let different_provider = create_or_reuse_workspace_allow_all_approval_policy_rule(
+            &pool,
+            user.user_id,
+            workspace_a.workspace_id,
+            &provider_b,
+            None,
+            Some(user.user_id),
+        )
+        .await
+        .expect("create provider-scoped allow-all rule");
+        assert_ne!(different_provider.rule_id, first.rule_id);
+
+        let active = list_active_approval_policy_rules(
+            &pool,
+            user.user_id,
+            workspace_a.workspace_id,
+            &provider_a,
+        )
+        .await
+        .expect("list active rules");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].rule_id, first.rule_id);
+
+        let disabled = disable_workspace_allow_all_approval_policy_rules(
+            &pool,
+            user.user_id,
+            workspace_a.workspace_id,
+            &provider_a,
+            user.user_id,
+        )
+        .await
+        .expect("disable allow-all rule");
+        assert_eq!(disabled, 1);
+
+        let active_after_disable = list_active_approval_policy_rules(
+            &pool,
+            user.user_id,
+            workspace_a.workspace_id,
+            &provider_a,
+        )
+        .await
+        .expect("list active rules after disable");
+        assert!(active_after_disable.is_empty());
     }
 
     #[tokio::test]

@@ -1,12 +1,15 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use agenter_core::{
     AgentCapabilities, AgentCollaborationMode, AgentModelOption, AgentOptions, AgentProviderId,
     AgentQuestionAnswer, AgentReasoningEffort, AgentTurnSettings, ApprovalDecision, ApprovalId,
-    CapabilitySet, ItemId, NativeRef, ProviderCapabilityDetail, ProviderCapabilityStatus,
-    QuestionId, SessionId, SessionStatus, SlashCommandArgument, SlashCommandArgumentKind,
-    SlashCommandDangerLevel, SlashCommandDefinition, SlashCommandRequest, SlashCommandResult,
-    SlashCommandTarget, TurnId, UniversalEventKind, UniversalEventSource, UserInput, WorkspaceRef,
+    ItemId, NativeRef, ProviderCapabilityDetail, ProviderCapabilityStatus, QuestionId, SessionId,
+    SessionStatus, SlashCommandArgument, SlashCommandArgumentKind, SlashCommandDangerLevel,
+    SlashCommandDefinition, SlashCommandRequest, SlashCommandResult, SlashCommandTarget, TurnId,
+    UniversalEventKind, UniversalEventSource, UserInput, WorkspaceRef,
 };
 use agenter_protocol::runner::{
     AgentInput, DiscoveredFileChangeStatus, DiscoveredSession, DiscoveredSessionHistoryItem,
@@ -56,7 +59,6 @@ pub struct CodexRunnerRuntime {
 pub struct CodexRunnerRegistration {
     pub provider_id: AgentProviderId,
     pub capabilities: AgentCapabilities,
-    pub capability_set: CapabilitySet,
 }
 
 #[derive(Clone, Debug)]
@@ -229,7 +231,6 @@ impl CodexRunnerRuntime {
         let capabilities = codex_capabilities();
         CodexRunnerRegistration {
             provider_id: AgentProviderId::from(AgentProviderId::CODEX),
-            capability_set: CapabilitySet::from(capabilities.clone()),
             capabilities,
         }
     }
@@ -889,6 +890,7 @@ impl CodexRuntimeActor {
                             ));
                         }
                     }
+                    history = canonicalize_plan_history_items(history);
                 }
             }
             sessions.push(DiscoveredSession {
@@ -1489,7 +1491,7 @@ fn user_input_from_agent_input(input: AgentInput) -> UserInput {
 }
 
 fn history_items_for_thread(thread: &CodexThread) -> Vec<DiscoveredSessionHistoryItem> {
-    thread
+    let items = thread
         .turns
         .iter()
         .flat_map(|turn| {
@@ -1501,7 +1503,8 @@ fn history_items_for_thread(thread: &CodexThread) -> Vec<DiscoveredSessionHistor
                 )
             })
         })
-        .collect()
+        .collect();
+    canonicalize_plan_history_items(items)
 }
 
 fn history_item_from_raw(
@@ -1528,7 +1531,7 @@ fn history_item_from_raw(
         "plan" => DiscoveredSessionHistoryItem::Plan {
             plan_id: native_item_id,
             title: Some("Codex plan".to_owned()),
-            content: raw_payload.to_string(),
+            content: plan_text_from_raw_payload(&raw_payload),
             provider_payload: Some(raw_payload),
         },
         "commandExecution" => DiscoveredSessionHistoryItem::Command {
@@ -1591,6 +1594,51 @@ fn history_item_from_raw(
             provider_payload: Some(raw_payload),
         },
     }
+}
+
+fn plan_text_from_raw_payload(raw_payload: &Value) -> String {
+    raw_payload
+        .get("text")
+        .and_then(Value::as_str)
+        .or_else(|| raw_payload.get("content").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn canonicalize_plan_history_items(
+    items: Vec<DiscoveredSessionHistoryItem>,
+) -> Vec<DiscoveredSessionHistoryItem> {
+    let plan_fingerprints = items
+        .iter()
+        .filter_map(|item| match item {
+            DiscoveredSessionHistoryItem::Plan { content, .. } => {
+                normalized_history_text(content).filter(|fingerprint| !fingerprint.is_empty())
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+
+    if plan_fingerprints.is_empty() {
+        return items;
+    }
+
+    items
+        .into_iter()
+        .filter(|item| match item {
+            DiscoveredSessionHistoryItem::AgentMessage { content, .. } => {
+                match normalized_history_text(content) {
+                    Some(fingerprint) => !plan_fingerprints.contains(&fingerprint),
+                    None => true,
+                }
+            }
+            _ => true,
+        })
+        .collect()
+}
+
+fn normalized_history_text(text: &str) -> Option<String> {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn native_ref_for_runtime(method: &str, raw_payload: Option<Value>) -> NativeRef {
@@ -1670,6 +1718,135 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn codex_force_reload_projects_plan_history_text_without_json_wrapping() {
+        let raw_payload = json!({
+            "type": "plan",
+            "id": "plan-1",
+            "text": "# Scratch-Direction Exercise\n\n## Summary\nUse the current scratch workspace.",
+        });
+
+        let item = history_item_from_raw(
+            "plan-1".to_owned(),
+            Some("plan".to_owned()),
+            raw_payload.clone(),
+        );
+
+        let DiscoveredSessionHistoryItem::Plan {
+            content,
+            provider_payload,
+            ..
+        } = item
+        else {
+            panic!("expected plan history item");
+        };
+        assert_eq!(
+            content,
+            "# Scratch-Direction Exercise\n\n## Summary\nUse the current scratch workspace."
+        );
+        assert_eq!(provider_payload, Some(raw_payload));
+    }
+
+    #[test]
+    fn codex_force_reload_drops_agent_message_that_duplicates_plan_text() {
+        let plan_payload = json!({
+            "type": "plan",
+            "id": "plan-1",
+            "text": "# Plan\n\nImplement it.",
+        });
+        let items = canonicalize_plan_history_items(vec![
+            history_item_from_raw(
+                "agent-1".to_owned(),
+                Some("agentMessage".to_owned()),
+                json!({ "type": "agentMessage", "id": "agent-1", "text": "# Plan\r\n\r\nImplement it." }),
+            ),
+            history_item_from_raw("plan-1".to_owned(), Some("plan".to_owned()), plan_payload),
+            history_item_from_raw(
+                "agent-2".to_owned(),
+                Some("agentMessage".to_owned()),
+                json!({ "type": "agentMessage", "id": "agent-2", "text": "A separate assistant note." }),
+            ),
+        ]);
+
+        assert_eq!(items.len(), 2);
+        assert!(matches!(
+            items[0],
+            DiscoveredSessionHistoryItem::Plan { .. }
+        ));
+        assert!(matches!(
+            &items[1],
+            DiscoveredSessionHistoryItem::AgentMessage { content, .. } if content == "A separate assistant note."
+        ));
+    }
+
+    #[tokio::test]
+    async fn codex_force_reload_fallback_turns_list_drops_duplicate_agent_plan_echo() {
+        let thread = json!({
+            "id": "thread-1",
+            "preview": "Codex test",
+            "status": { "type": "idle" },
+            "turns": []
+        });
+        let turn = json!({
+            "id": "turn-1",
+            "items": [
+                { "type": "agentMessage", "id": "agent-plan", "text": "# Plan\n\nImplement it." },
+                { "type": "plan", "id": "plan-1", "text": "# Plan\n\nImplement it." }
+            ],
+            "status": { "type": "completed" }
+        });
+        let list_response = serde_json::to_string(&json!({
+            "id": 2,
+            "result": {
+                "data": [thread],
+                "nextCursor": null,
+                "backwardsCursor": null
+            }
+        }))
+        .unwrap();
+        let turns_response = serde_json::to_string(&json!({
+            "id": 3,
+            "result": {
+                "data": [turn],
+                "nextCursor": null,
+                "backwardsCursor": null
+            }
+        }))
+        .unwrap();
+        let script = format!(
+            concat!(
+                "read line\nprintf '%s\\n' '{{\"id\":1,\"result\":{{\"ok\":true}}}}'\n",
+                "python3 -c 'import json,sys; req=json.loads(sys.stdin.readline()); ",
+                "assert req[\"method\"]==\"thread/list\", req; ",
+                "print({list_response:?}, flush=True)'\n",
+                "python3 -c 'import json,sys; req=json.loads(sys.stdin.readline()); ",
+                "assert req[\"method\"]==\"thread/turns/list\", req; ",
+                "print({turns_response:?}, flush=True)'\n"
+            ),
+            list_response = list_response,
+            turns_response = turns_response,
+        );
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let runtime = fake_runtime(&script, sender);
+
+        let sessions = runtime
+            .refresh_sessions(WorkspaceRef {
+                workspace_id: agenter_core::WorkspaceId::new(),
+                runner_id: agenter_core::RunnerId::new(),
+                path: "/workspace".to_owned(),
+                display_name: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].history.len(), 1);
+        assert!(matches!(
+            sessions[0].history[0],
+            DiscoveredSessionHistoryItem::Plan { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1836,6 +2013,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_runtime_approval_answer_writes_exactly_one_native_response() {
+        let script = concat!(
+            "read line\nprintf '%s\n' '{\"id\":1,\"result\":{\"ok\":true}}'\n",
+            "read line\nprintf '%s\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-1\",\"preview\":\"Codex\",\"status\":{\"type\":\"active\",\"activeFlags\":[\"waitingOnApproval\"]},\"turns\":[]}}}'\n",
+            "printf '%s\n' '{\"id\":\"approval-1\",\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"threadId\":\"thread-1\",\"turnId\":\"turn-1\",\"itemId\":\"item-1\",\"approvalId\":\"native-approval\",\"command\":\"printf test\"}}'\n",
+            "python3 -c 'import json,sys; resp=json.loads(sys.stdin.readline()); ",
+            "assert resp[\"id\"]==\"approval-1\", resp; ",
+            "assert resp[\"result\"][\"decision\"]==\"accept\", resp; ",
+            "print(\"{\\\"id\\\":3,\\\"method\\\":\\\"thread/updated\\\",\\\"params\\\":{\\\"threadId\\\":\\\"thread-1\\\"}}\", flush=True)'\n",
+        );
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let runtime = fake_runtime(script, sender);
+        let session_id = SessionId::new();
+        runtime.create_session(session_id, None).await.unwrap();
+
+        let approval = loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let UniversalEventKind::ApprovalRequested { approval } = event.universal.event {
+                break approval;
+            }
+        };
+
+        runtime
+            .answer_approval(approval.approval_id, ApprovalDecision::Accept)
+            .await
+            .unwrap();
+        let error = runtime
+            .answer_approval(approval.approval_id, ApprovalDecision::Accept)
+            .await
+            .expect_err("completed Codex approval is removed from the runtime pending map");
+        assert!(error.to_string().contains("no longer pending"));
+    }
+
+    #[tokio::test]
     async fn codex_runtime_provider_command_guarding_is_explicit() {
         let (sender, _receiver) = mpsc::unbounded_channel();
         let runtime = fake_runtime(
@@ -1926,6 +2140,7 @@ mod tests {
                     model: None,
                     reasoning_effort: None,
                     collaboration_mode: Some("plan".to_owned()),
+                    approval_mode: None,
                 }),
             )
             .await

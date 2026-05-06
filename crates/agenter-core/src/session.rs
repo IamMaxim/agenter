@@ -5,9 +5,9 @@ use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 
 use crate::{
-    ApprovalId, ApprovalRequest, ArtifactId, ArtifactState, DiffId, DiffState, ItemId, ItemState,
-    NativeRef, PlanId, PlanState, QuestionId, RunnerId, SessionId, TurnId, UniversalSeq, UserId,
-    WorkspaceId,
+    ApprovalId, ApprovalMode, ApprovalRequest, ArtifactId, ArtifactState, DiffId, DiffState,
+    ItemId, ItemState, NativeRef, PlanId, PlanState, QuestionId, RunnerId, SessionId, TurnId,
+    UniversalSeq, UserId, WorkspaceId,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -262,6 +262,8 @@ pub struct SessionInfo {
     pub updated_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Box<SessionUsageSnapshot>>,
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -326,6 +328,8 @@ pub struct AgentTurnSettings {
     pub reasoning_effort: Option<AgentReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<ApprovalMode>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

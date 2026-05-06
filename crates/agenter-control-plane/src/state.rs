@@ -6,13 +6,14 @@ use std::{
 
 use agenter_core::{
     AgentProviderId, AgentQuestionAnswer, AgentTurnSettings, ApprovalDecision, ApprovalId,
-    ApprovalOption, ApprovalRequest, ApprovalStatus as UniversalApprovalStatus, CapabilitySet,
-    ContentBlock, ContentBlockKind, DiffFile, ItemRole, ItemState, ItemStatus, NativeRef,
-    ProviderNotification, ProviderNotificationSeverity, QuestionId, QuestionState, QuestionStatus,
-    RunnerId, SessionId, SessionInfo, SessionSnapshot, SessionStatus, SessionUsageSnapshot,
-    ToolActionProjection, ToolCommandProjection, ToolProjection, ToolProjectionKind, TurnStatus,
-    UniversalCommandEnvelope, UniversalEventEnvelope, UniversalEventKind, UniversalEventSource,
-    UniversalSeq, UserId, WorkspaceId, WorkspaceRef, UNIVERSAL_PROTOCOL_VERSION,
+    ApprovalMode, ApprovalOption, ApprovalRequest, ApprovalStatus as UniversalApprovalStatus,
+    CapabilitySet, ContentBlock, ContentBlockKind, DiffFile, ItemRole, ItemState, ItemStatus,
+    NativeRef, ProviderNotification, ProviderNotificationSeverity, QuestionId, QuestionState,
+    QuestionStatus, RunnerId, SessionId, SessionInfo, SessionSnapshot, SessionStatus,
+    SessionUsageSnapshot, ToolActionProjection, ToolCommandProjection, ToolProjection,
+    ToolProjectionKind, TurnStatus, UniversalCommandEnvelope, UniversalEventEnvelope,
+    UniversalEventKind, UniversalEventSource, UniversalSeq, UserId, WorkspaceId, WorkspaceRef,
+    UNIVERSAL_PROTOCOL_VERSION,
 };
 use agenter_protocol::{
     browser::BrowserSessionSnapshot,
@@ -42,6 +43,31 @@ const SESSION_EVENT_BROADCAST_LIMIT: usize = 128;
 const UNIVERSAL_EVENT_REPLAY_LIMIT: usize = 1024;
 const REFRESH_JOB_LOG_LIMIT: usize = 200;
 pub const BROWSER_AUTH_SESSION_TTL: ChronoDuration = ChronoDuration::days(30);
+
+fn merge_turn_settings(
+    current: Option<AgentTurnSettings>,
+    patch: AgentTurnSettings,
+) -> AgentTurnSettings {
+    let mut merged = current.unwrap_or_default();
+    if patch.model.is_some() {
+        merged.model = patch.model;
+    }
+    if patch.reasoning_effort.is_some() {
+        merged.reasoning_effort = patch.reasoning_effort;
+    }
+    if patch.collaboration_mode.is_some() {
+        merged.collaboration_mode = patch.collaboration_mode;
+    }
+    if patch.approval_mode.is_some() {
+        merged.approval_mode = patch.approval_mode;
+    }
+    merged
+}
+
+#[cfg(test)]
+fn approval_mode_transition_from_patch(patch: &AgentTurnSettings) -> Option<ApprovalMode> {
+    patch.approval_mode
+}
 
 #[derive(Clone, Debug)]
 pub struct AppState {
@@ -199,6 +225,19 @@ pub enum ApprovalResolutionLookup {
         session_id: SessionId,
         request: Box<ApprovalRequest>,
     },
+}
+
+#[derive(Clone, Debug)]
+pub enum SessionSettingsUpdateError {
+    ApprovalPolicyRule(String),
+}
+
+impl std::fmt::Display for SessionSettingsUpdateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApprovalPolicyRule(message) => formatter.write_str(message),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1608,6 +1647,52 @@ impl AppState {
         })
     }
 
+    pub async fn mark_plan_handoff(
+        &self,
+        session_id: SessionId,
+        plan_id: agenter_core::PlanId,
+        action: agenter_core::PlanHandoffAction,
+        state: agenter_core::PlanHandoffStatus,
+        target_session_id: Option<SessionId>,
+    ) -> anyhow::Result<Option<UniversalEventEnvelope>> {
+        let Some(snapshot) = self.session_snapshot_replay(session_id, None, true).await else {
+            return Ok(None);
+        };
+        let Some(existing) = snapshot.snapshot.plans.get(&plan_id) else {
+            return Ok(None);
+        };
+        let handoff = agenter_core::PlanHandoffState {
+            state,
+            action: Some(action),
+            target_session_id,
+            updated_at: Some(Utc::now()),
+        };
+        let event = self
+            .publish_universal_event(
+                session_id,
+                existing.turn_id,
+                None,
+                UniversalEventKind::PlanUpdated {
+                    plan: agenter_core::PlanState {
+                        plan_id,
+                        session_id,
+                        turn_id: existing.turn_id,
+                        status: existing.status.clone(),
+                        title: None,
+                        content: None,
+                        entries: Vec::new(),
+                        artifact_refs: Vec::new(),
+                        source: existing.source.clone(),
+                        partial: true,
+                        updated_at: existing.updated_at,
+                        handoff: Some(handoff),
+                    },
+                },
+            )
+            .await?;
+        Ok(Some(event))
+    }
+
     async fn hydrate_snapshot_capabilities(&self, snapshot: &mut SessionSnapshot) {
         if let Some(provider_capabilities) = self
             .provider_capabilities_for_session(snapshot.session_id, snapshot.info.as_ref())
@@ -1827,7 +1912,9 @@ impl AppState {
                     resolving.resolving_decision = Some(decision.clone());
                     out.push(resolving);
                 }
-                ApprovalStatus::Resolved { .. } | ApprovalStatus::Orphaned { .. } => {}
+                ApprovalStatus::Resolved { request } | ApprovalStatus::Orphaned { request } => {
+                    out.push(*request.clone());
+                }
             }
         }
         drop(registry);
@@ -1865,26 +1952,83 @@ impl AppState {
         user_id: UserId,
         session_id: SessionId,
         settings: AgentTurnSettings,
-    ) -> Option<AgentTurnSettings> {
+    ) -> Result<Option<AgentTurnSettings>, SessionSettingsUpdateError> {
         if let Some(pool) = &self.inner.db_pool {
-            let updated = agenter_db::update_session_turn_settings(
+            return agenter_db::update_session_turn_settings_with_approval_mode_transition(
                 pool,
                 user_id,
                 session_id,
-                Some(&settings),
+                settings,
+                Some(user_id),
             )
             .await
-            .ok()
-            .flatten()?;
-            return updated.turn_settings;
+            .map_err(|error| SessionSettingsUpdateError::ApprovalPolicyRule(error.to_string()));
         }
         let mut registry = self.inner.registry.lock().await;
         let session = registry
             .sessions
             .get_mut(&session_id)
-            .filter(|session| session.owner_user_id == user_id)?;
-        session.turn_settings = Some(settings.clone());
-        Some(settings)
+            .filter(|session| session.owner_user_id == user_id);
+        let Some(session) = session else {
+            return Ok(None);
+        };
+        let merged_settings = merge_turn_settings(session.turn_settings.clone(), settings);
+        session.turn_settings = Some(merged_settings.clone());
+        Ok(Some(merged_settings))
+    }
+
+    pub async fn ensure_approval_mode_rules_for_new_session(
+        &self,
+        user_id: UserId,
+        workspace_id: WorkspaceId,
+        provider_id: &AgentProviderId,
+        settings: Option<&AgentTurnSettings>,
+    ) -> Result<(), String> {
+        if let Some(approval_mode) = settings.and_then(|settings| settings.approval_mode) {
+            self.apply_approval_mode_rule_transition(
+                user_id,
+                workspace_id,
+                provider_id,
+                Some(approval_mode),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_approval_mode_rule_transition(
+        &self,
+        user_id: UserId,
+        workspace_id: WorkspaceId,
+        provider_id: &AgentProviderId,
+        approval_mode: Option<ApprovalMode>,
+    ) -> Result<(), String> {
+        let Some(pool) = &self.inner.db_pool else {
+            return Ok(());
+        };
+        if approval_mode == Some(ApprovalMode::AllowAllWorkspace) {
+            agenter_db::create_or_reuse_workspace_allow_all_approval_policy_rule(
+                pool,
+                user_id,
+                workspace_id,
+                provider_id,
+                None,
+                Some(user_id),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        } else {
+            agenter_db::disable_workspace_allow_all_approval_policy_rules(
+                pool,
+                user_id,
+                workspace_id,
+                provider_id,
+                user_id,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     pub async fn accept_runner_agent_event(
@@ -2276,10 +2420,40 @@ impl AppState {
     }
 
     async fn maybe_auto_resolve_approval(&self, session_id: SessionId, request: ApprovalRequest) {
-        let Some(pool) = &self.inner.db_pool else {
+        let Some(session) = self.session_by_id(session_id).await else {
             return;
         };
-        let Some(session) = self.session_by_id(session_id).await else {
+        let approval_mode = session
+            .turn_settings
+            .as_ref()
+            .and_then(|settings| settings.approval_mode)
+            .unwrap_or_else(|| ApprovalMode::default_for_provider(&session.provider_id));
+        match approval_mode {
+            ApprovalMode::AllowAllSession => {
+                self.enqueue_auto_approval_notification(
+                    session_id,
+                    request.approval_id,
+                    "allow_all_session",
+                    "Auto-approved by allow-all session mode.",
+                );
+                let state = self.clone();
+                tokio::spawn(async move {
+                    state
+                        .resolve_approval_from_policy(
+                            session,
+                            request.approval_id,
+                            ApprovalDecision::Accept,
+                        )
+                        .await;
+                });
+                return;
+            }
+            ApprovalMode::Ask
+            | ApprovalMode::ReadOnlyAsk
+            | ApprovalMode::TrustedWorkspace
+            | ApprovalMode::AllowAllWorkspace => {}
+        }
+        let Some(pool) = &self.inner.db_pool else {
             return;
         };
         let Ok(rules) = agenter_db::list_active_approval_policy_rules(
@@ -2302,11 +2476,51 @@ impl AppState {
             rule_id = %rule.rule_id,
             "auto-resolving approval from policy rule"
         );
+        if rule.matcher.get("type").and_then(serde_json::Value::as_str) == Some("allow_all") {
+            self.enqueue_auto_approval_notification(
+                session_id,
+                request.approval_id,
+                "allow_all_workspace",
+                "Auto-approved by active dangerous workspace/provider allow-all rule.",
+            );
+        }
         let state = self.clone();
         tokio::spawn(async move {
             state
                 .resolve_approval_from_policy(session, request.approval_id, rule.decision)
                 .await;
+        });
+    }
+
+    fn enqueue_auto_approval_notification(
+        &self,
+        session_id: SessionId,
+        approval_id: ApprovalId,
+        category: &str,
+        detail: &str,
+    ) {
+        let state = self.clone();
+        let category = category.to_owned();
+        let detail = detail.to_owned();
+        tokio::spawn(async move {
+            state
+                .publish_universal_event(
+                    session_id,
+                    None,
+                    None,
+                    UniversalEventKind::ProviderNotification {
+                        notification: ProviderNotification {
+                            category: "approval_policy".to_owned(),
+                            title: "Approval auto-allowed".to_owned(),
+                            detail: Some(detail),
+                            status: Some(category),
+                            severity: Some(ProviderNotificationSeverity::Warning),
+                            subject: Some(approval_id.to_string()),
+                        },
+                    },
+                )
+                .await
+                .ok();
         });
     }
 
@@ -3515,6 +3729,9 @@ fn merge_plan_into_snapshot(
             next.artifact_refs.sort();
             next.artifact_refs.dedup();
         }
+        if plan.handoff.is_some() {
+            next.handoff = plan.handoff.clone();
+        }
         if changed || next.updated_at.is_none() {
             next.updated_at = incoming_updated_at;
         }
@@ -3528,7 +3745,7 @@ fn merge_plan_into_snapshot(
         next.updated_at = incoming_updated_at;
     }
 
-    materialize_plan_item(snapshot, envelope, &next);
+    remove_materialized_plan_item(snapshot, envelope, &next);
     snapshot.plans.insert(next.plan_id, next);
 }
 
@@ -3551,63 +3768,20 @@ fn plan_changes_existing_plan(
         || !incoming.artifact_refs.is_empty()
 }
 
-fn materialize_plan_item(
+fn remove_materialized_plan_item(
     snapshot: &mut SessionSnapshot,
     envelope: &UniversalEventEnvelope,
     plan: &agenter_core::PlanState,
 ) {
-    if plan.content.is_none() && plan.entries.is_empty() {
-        if let Some(item_id) = envelope.item_id {
-            snapshot.items.remove(&item_id);
-        }
-        snapshot
-            .items
-            .remove(&universal_projection_item_id(&format!(
-                "plan:item:{}",
-                plan.plan_id
-            )));
-        return;
+    if let Some(item_id) = envelope.item_id {
+        snapshot.items.remove(&item_id);
     }
-    let item_id = envelope
-        .item_id
-        .unwrap_or_else(|| universal_projection_item_id(&format!("plan:item:{}", plan.plan_id)));
-    let mut text = plan.content.clone().unwrap_or_default();
-    if !plan.entries.is_empty() {
-        if !text.is_empty() {
-            text.push_str("\n\n");
-        }
-        for entry in &plan.entries {
-            text.push_str("- ");
-            text.push_str(&entry.label);
-            text.push('\n');
-        }
-    }
-    snapshot.items.insert(
-        item_id,
-        ItemState {
-            item_id,
-            session_id: envelope.session_id,
-            turn_id: plan.turn_id.or(envelope.turn_id),
-            role: ItemRole::Assistant,
-            status: match &plan.status {
-                agenter_core::PlanStatus::Completed | agenter_core::PlanStatus::Approved => {
-                    ItemStatus::Completed
-                }
-                agenter_core::PlanStatus::Failed => ItemStatus::Failed,
-                agenter_core::PlanStatus::Cancelled => ItemStatus::Cancelled,
-                _ => ItemStatus::Streaming,
-            },
-            content: vec![ContentBlock {
-                block_id: format!("plan-{}", plan.plan_id),
-                kind: ContentBlockKind::Text,
-                text: Some(text),
-                mime_type: Some("text/markdown".to_owned()),
-                artifact_id: None,
-            }],
-            tool: None,
-            native: envelope.native.clone(),
-        },
-    );
+    snapshot
+        .items
+        .remove(&universal_projection_item_id(&format!(
+            "plan:item:{}",
+            plan.plan_id
+        )));
 }
 
 fn runner_universal_event_envelope(
@@ -3837,6 +4011,7 @@ fn discovered_history_universal_event(
                     source: agenter_core::PlanSource::NativeStructured,
                     partial: false,
                     updated_at: Some(ts),
+                    handoff: None,
                 },
             },
         ),
@@ -4186,6 +4361,11 @@ fn session_info(session: &RegisteredSession) -> SessionInfo {
         created_at: Some(session.created_at),
         updated_at: Some(session.updated_at),
         usage: usage.map(Box::new),
+        approval_mode: session
+            .turn_settings
+            .as_ref()
+            .and_then(|settings| settings.approval_mode)
+            .unwrap_or_else(|| ApprovalMode::default_for_provider(&session.provider_id)),
     }
 }
 
@@ -4207,6 +4387,11 @@ fn db_session_info(session: &agenter_db::models::AgentSession) -> SessionInfo {
         created_at: Some(session.created_at),
         updated_at: Some(session.updated_at),
         usage: usage.map(Box::new),
+        approval_mode: session
+            .turn_settings
+            .as_ref()
+            .and_then(|settings| settings.approval_mode)
+            .unwrap_or_else(|| ApprovalMode::default_for_provider(&session.provider_id)),
     }
 }
 
@@ -4533,6 +4718,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mark_plan_handoff_publishes_durable_plan_update() {
+        let state = AppState::new(
+            "runner-token".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        );
+        let session_id = SessionId::new();
+        let plan_id = agenter_core::PlanId::new();
+
+        state
+            .accept_runner_agent_event(AgentUniversalEvent {
+                protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
+                session_id,
+                event_id: None,
+                turn_id: None,
+                item_id: None,
+                ts: None,
+                source: UniversalEventSource::Runner,
+                native: None,
+                event: UniversalEventKind::PlanUpdated {
+                    plan: agenter_core::PlanState {
+                        plan_id,
+                        session_id,
+                        turn_id: None,
+                        status: agenter_core::PlanStatus::Draft,
+                        title: Some("Plan".to_owned()),
+                        content: Some("Do it".to_owned()),
+                        entries: Vec::new(),
+                        artifact_refs: Vec::new(),
+                        source: agenter_core::PlanSource::NativeStructured,
+                        partial: false,
+                        updated_at: None,
+                        handoff: None,
+                    },
+                },
+            })
+            .await
+            .expect("store source plan");
+
+        let marker = state
+            .mark_plan_handoff(
+                session_id,
+                plan_id,
+                agenter_core::PlanHandoffAction::SameThread,
+                agenter_core::PlanHandoffStatus::Implementing,
+                None,
+            )
+            .await
+            .expect("mark plan handoff")
+            .expect("plan exists");
+
+        assert!(matches!(
+            marker.event,
+            UniversalEventKind::PlanUpdated { .. }
+        ));
+        let snapshot = state
+            .session_snapshot_replay(session_id, None, true)
+            .await
+            .expect("snapshot");
+        let handoff = snapshot.snapshot.plans[&plan_id]
+            .handoff
+            .as_ref()
+            .expect("handoff state");
+        assert_eq!(handoff.state, agenter_core::PlanHandoffStatus::Implementing);
+        assert_eq!(
+            handoff.action,
+            Some(agenter_core::PlanHandoffAction::SameThread)
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_updated_reducer_uses_plan_snapshot_without_plain_item_row() {
+        let state = AppState::new(
+            "runner-token".to_owned(),
+            CookieSecurity::DevelopmentInsecure,
+        );
+        let session_id = SessionId::new();
+        let plan_id = agenter_core::PlanId::new();
+        let old_item_id = universal_projection_item_id(&format!("plan:item:{plan_id}"));
+
+        state
+            .accept_runner_agent_event(AgentUniversalEvent {
+                protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
+                session_id,
+                event_id: None,
+                turn_id: None,
+                item_id: Some(old_item_id),
+                ts: None,
+                source: UniversalEventSource::Native,
+                native: discovery_native_ref("plan", Some("native-plan"), None, None),
+                event: UniversalEventKind::ItemCreated {
+                    item: Box::new(ItemState {
+                        item_id: old_item_id,
+                        session_id,
+                        turn_id: None,
+                        role: ItemRole::Assistant,
+                        status: ItemStatus::Completed,
+                        content: vec![ContentBlock {
+                            block_id: "old-plan".to_owned(),
+                            kind: ContentBlockKind::Text,
+                            text: Some("Plan body".to_owned()),
+                            mime_type: None,
+                            artifact_id: None,
+                        }],
+                        tool: None,
+                        native: discovery_native_ref("plan", Some("native-plan"), None, None),
+                    }),
+                },
+            })
+            .await
+            .expect("store old synthetic item");
+
+        state
+            .accept_runner_agent_event(AgentUniversalEvent {
+                protocol_version: UNIVERSAL_PROTOCOL_VERSION.to_owned(),
+                session_id,
+                event_id: None,
+                turn_id: None,
+                item_id: None,
+                ts: None,
+                source: UniversalEventSource::Native,
+                native: discovery_native_ref("plan", Some("native-plan"), None, None),
+                event: UniversalEventKind::PlanUpdated {
+                    plan: agenter_core::PlanState {
+                        plan_id,
+                        session_id,
+                        turn_id: None,
+                        status: agenter_core::PlanStatus::Draft,
+                        title: Some("Codex plan".to_owned()),
+                        content: Some("Plan body".to_owned()),
+                        entries: Vec::new(),
+                        artifact_refs: Vec::new(),
+                        source: agenter_core::PlanSource::NativeStructured,
+                        partial: false,
+                        updated_at: None,
+                        handoff: None,
+                    },
+                },
+            })
+            .await
+            .expect("store plan");
+
+        let snapshot = state
+            .session_snapshot_replay(session_id, None, true)
+            .await
+            .expect("snapshot");
+        assert!(snapshot.snapshot.plans.contains_key(&plan_id));
+        assert!(
+            !snapshot.snapshot.items.contains_key(&old_item_id),
+            "plan.updated should not leave a plain assistant item row"
+        );
+    }
+
+    #[tokio::test]
     async fn approval_lifecycle_lists_resolving_universal_request() {
         let state = AppState::new(
             "runner-token".to_owned(),
@@ -4594,6 +4932,65 @@ mod tests {
         assert_eq!(
             requests[0].resolving_decision,
             Some(ApprovalDecision::Accept)
+        );
+        let resolved = state
+            .finish_approval_resolution(approval_id, session_id, ApprovalDecision::Accept, None)
+            .await
+            .expect("finish approval");
+        assert_eq!(resolved.status, UniversalApprovalStatus::Approved);
+        let requests = state.pending_approval_requests(session_id).await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].status, UniversalApprovalStatus::Approved);
+        assert!(requests[0].resolved_at.is_some());
+    }
+
+    #[test]
+    fn merge_turn_settings_preserves_approval_mode_for_sparse_patch() {
+        let merged = merge_turn_settings(
+            Some(AgentTurnSettings {
+                model: Some("old-model".to_owned()),
+                reasoning_effort: Some(agenter_core::AgentReasoningEffort::Medium),
+                collaboration_mode: Some("plan".to_owned()),
+                approval_mode: Some(ApprovalMode::AllowAllWorkspace),
+            }),
+            AgentTurnSettings {
+                model: Some("new-model".to_owned()),
+                reasoning_effort: None,
+                collaboration_mode: None,
+                approval_mode: None,
+            },
+        );
+
+        assert_eq!(merged.model.as_deref(), Some("new-model"));
+        assert_eq!(
+            merged.reasoning_effort,
+            Some(agenter_core::AgentReasoningEffort::Medium)
+        );
+        assert_eq!(merged.collaboration_mode.as_deref(), Some("plan"));
+        assert_eq!(merged.approval_mode, Some(ApprovalMode::AllowAllWorkspace));
+    }
+
+    #[test]
+    fn sparse_settings_patch_does_not_request_approval_mode_transition() {
+        let patch = AgentTurnSettings {
+            model: Some("new-model".to_owned()),
+            reasoning_effort: None,
+            collaboration_mode: None,
+            approval_mode: None,
+        };
+
+        assert_eq!(approval_mode_transition_from_patch(&patch), None);
+
+        let patch = AgentTurnSettings {
+            model: None,
+            reasoning_effort: None,
+            collaboration_mode: None,
+            approval_mode: Some(ApprovalMode::Ask),
+        };
+
+        assert_eq!(
+            approval_mode_transition_from_patch(&patch),
+            Some(ApprovalMode::Ask)
         );
     }
 
@@ -4760,6 +5157,126 @@ mod tests {
         assert_eq!(
             replay.replay_through_seq, replay.snapshot_seq,
             "full snapshot reload should replay through the durable snapshot cursor"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing at a disposable Postgres database"]
+    async fn db_approval_mode_transition_updates_settings_and_allow_all_rules_together() {
+        let pool = test_pool().await;
+        let suffix = Uuid::new_v4();
+        let user = agenter_db::create_user(
+            &pool,
+            &format!("approval-mode-transition-{suffix}@example.test"),
+            Some("Approval Mode Transition Test"),
+        )
+        .await
+        .expect("create user");
+        let runner_id = RunnerId::new();
+        agenter_db::upsert_runner_with_id(
+            &pool,
+            runner_id,
+            "approval-mode-transition-runner",
+            Some("test"),
+        )
+        .await
+        .expect("upsert runner");
+        let workspace_id = WorkspaceId::from_uuid(Uuid::new_v4());
+        agenter_db::upsert_workspace_with_id(
+            &pool,
+            workspace_id,
+            runner_id,
+            &format!("/tmp/agenter-approval-mode-transition-{suffix}"),
+            Some("Approval Mode Transition Workspace"),
+        )
+        .await
+        .expect("upsert workspace");
+        let session_id = SessionId::new();
+        let provider_id = AgentProviderId::from(AgentProviderId::CODEX);
+        let starting_settings = AgentTurnSettings {
+            model: Some("gpt-5.2".to_owned()),
+            reasoning_effort: None,
+            collaboration_mode: Some("plan".to_owned()),
+            approval_mode: Some(ApprovalMode::AllowAllWorkspace),
+        };
+        agenter_db::create_session_with_id(
+            &pool,
+            agenter_db::CreateSessionRecord {
+                session_id,
+                owner_user_id: user.user_id,
+                runner_id,
+                workspace_id,
+                provider_id: provider_id.clone(),
+                external_session_id: None,
+                title: Some("Approval Mode Transition".to_owned()),
+                status: SessionStatus::Idle,
+                usage_snapshot: None,
+                turn_settings: Some(starting_settings),
+            },
+        )
+        .await
+        .expect("create session");
+
+        let safer = agenter_db::update_session_turn_settings_with_approval_mode_transition(
+            &pool,
+            user.user_id,
+            session_id,
+            AgentTurnSettings {
+                model: None,
+                reasoning_effort: Some(agenter_core::AgentReasoningEffort::High),
+                collaboration_mode: None,
+                approval_mode: Some(ApprovalMode::Ask),
+            },
+            Some(user.user_id),
+        )
+        .await
+        .expect("transition to ask")
+        .expect("session exists");
+        assert_eq!(safer.approval_mode, Some(ApprovalMode::Ask));
+        assert_eq!(safer.model.as_deref(), Some("gpt-5.2"));
+        assert_eq!(
+            agenter_db::list_active_approval_policy_rules(
+                &pool,
+                user.user_id,
+                workspace_id,
+                &provider_id,
+            )
+            .await
+            .expect("list rules")
+            .len(),
+            0
+        );
+
+        let allow_all = agenter_db::update_session_turn_settings_with_approval_mode_transition(
+            &pool,
+            user.user_id,
+            session_id,
+            AgentTurnSettings {
+                model: None,
+                reasoning_effort: None,
+                collaboration_mode: None,
+                approval_mode: Some(ApprovalMode::AllowAllWorkspace),
+            },
+            Some(user.user_id),
+        )
+        .await
+        .expect("transition to allow all")
+        .expect("session exists");
+        assert_eq!(
+            allow_all.approval_mode,
+            Some(ApprovalMode::AllowAllWorkspace)
+        );
+        assert_eq!(
+            agenter_db::list_active_approval_policy_rules(
+                &pool,
+                user.user_id,
+                workspace_id,
+                &provider_id,
+            )
+            .await
+            .expect("list rules")
+            .len(),
+            1
         );
     }
 

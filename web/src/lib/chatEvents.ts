@@ -178,13 +178,6 @@ export function createChatState(): ChatState {
   };
 }
 
-const DEFAULT_APPROVAL_ACTIONS: ApprovalDecisionName[] = [
-  'accept',
-  'accept_for_session',
-  'decline',
-  'cancel'
-];
-
 function mapNativeDecisionLabel(raw: string): ApprovalDecisionName | undefined {
   const norm = raw.replace(/_/g, '').toLowerCase();
   switch (norm) {
@@ -201,35 +194,8 @@ function mapNativeDecisionLabel(raw: string): ApprovalDecisionName | undefined {
   }
 }
 
-function dedupeStable<T extends string>(items: T[]): T[] {
-  const seen = new Set<T>();
-  const out: T[] = [];
-  for (const x of items) {
-    if (seen.has(x)) {
-      continue;
-    }
-    seen.add(x);
-    out.push(x);
-  }
-  return out;
-}
-
 export function approvalUiChoices(item: Extract<ChatItem, { kind: 'approval' }>): ApprovalUiChoice[] {
-  if (item.options && item.options.length > 0) {
-    return item.options;
-  }
-  const p = item.presentation;
-  const variant = p && typeof p.variant === 'string' ? p.variant : '';
-  if (commandPresentationVariant(variant) && p && Array.isArray(p.available_decisions)) {
-    const mapped = p.available_decisions
-      .filter((entry): entry is string => typeof entry === 'string')
-      .map(mapNativeDecisionLabel)
-      .filter((x): x is ApprovalDecisionName => Boolean(x));
-    if (mapped.length > 0) {
-      return dedupeStable(mapped).map(choiceFromDefaultDecision);
-    }
-  }
-  return DEFAULT_APPROVAL_ACTIONS.map(choiceFromDefaultDecision);
+  return item.options ?? [];
 }
 
 export function approvalUiButtonLabel(decision: ApprovalDecisionName): string {
@@ -255,33 +221,18 @@ export function approvalChoiceFromOption(option: ApprovalOption): ApprovalUiChoi
   return {
     optionId: option.option_id,
     decision,
-    label: option.label || approvalUiButtonLabel(decision),
+    label: approvalOptionLabel(option, decision),
     description: option.description ?? undefined,
     scope: option.scope ?? undefined
   };
 }
 
-function choiceFromDefaultDecision(decision: ApprovalDecisionName): ApprovalUiChoice {
-  return {
-    optionId: defaultOptionId(decision),
-    decision,
-    label: approvalUiButtonLabel(decision)
-  };
-}
-
-function defaultOptionId(decision: ApprovalDecisionName): string {
-  switch (decision) {
-    case 'accept':
-      return 'approve_once';
-    case 'accept_for_session':
-      return 'approve_always';
-    case 'decline':
-      return 'deny';
-    case 'cancel':
-      return 'cancel_turn';
-    default:
-      return decision;
+function approvalOptionLabel(option: ApprovalOption, decision: ApprovalDecisionName): string {
+  const native = option.native_option_id?.replaceAll('_', ' ');
+  if (native && native.toLowerCase() !== decision.replaceAll('_', ' ')) {
+    return native;
   }
+  return option.label || approvalUiButtonLabel(decision);
 }
 
 function approvalDecisionFromOption(option: ApprovalOption): ApprovalDecisionName | undefined {

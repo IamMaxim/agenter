@@ -83,7 +83,8 @@ describe('frontend API normalizers', () => {
         title: null,
         created_at: null,
         updated_at: null,
-        usage: null
+        usage: null,
+        approval_mode: null
       }
     ]);
   });
@@ -149,9 +150,21 @@ describe('frontend API normalizers', () => {
   });
 
   test('normalizes turn settings defensively', () => {
-    expect(normalizeTurnSettings({ model: 123, reasoning_effort: 'mega', collaboration_mode: 'plan' })).toEqual({
+    expect(normalizeTurnSettings({ model: 123, reasoning_effort: 'mega', collaboration_mode: 'plan', approval_mode: 'root' })).toEqual({
       collaboration_mode: 'plan'
     });
+    expect(normalizeTurnSettings({ approval_mode: 'allow_all_workspace' })).toEqual({
+      approval_mode: 'allow_all_workspace'
+    });
+  });
+
+  test('normalizes approval mode on sessions', () => {
+    expect(
+      normalizeSessions([
+        { session_id: 'session-1', workspace_id: 'workspace-1', approval_mode: 'trusted_workspace' },
+        { session_id: 'session-2', workspace_id: 'workspace-1', approval_mode: 'full_send' }
+      ]).map((session) => session.approval_mode)
+    ).toEqual(['trusted_workspace', null]);
   });
 
   test('preserves provider capability details in session snapshots', () => {

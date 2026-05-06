@@ -1142,6 +1142,12 @@ button.busy:disabled .button-spinner {
   white-space: nowrap;
 }
 
+.approval-rule-row.dangerous span,
+.approval-danger-inline {
+  color: var(--danger);
+  font-weight: 700;
+}
+
 .error-text {
   color: var(--danger);
 }
@@ -1197,6 +1203,11 @@ button.busy:disabled .button-spinner {
 .status-pill.error {
   color: var(--danger);
   background: rgb(239 111 97 / 0.08);
+}
+
+.status-pill.danger {
+  color: var(--danger);
+  background: rgb(239 111 97 / 0.11);
 }
 
 .status-pill.done {
@@ -1876,7 +1887,7 @@ button.busy:disabled .button-spinner {
   background-size: 300% 100%;
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
-  animation: textslide 1.8s ease-in-out infinite;
+  animation: textslide 1.8s linear infinite;
 }
 @keyframes textslide {
   from { background-position: 100%; }
@@ -2114,6 +2125,12 @@ button.busy:disabled .button-spinner {
   background: var(--surface-3);
 }
 
+.composer-chip.danger {
+  border-color: color-mix(in srgb, var(--danger) 62%, var(--line));
+  color: var(--danger);
+  background: rgb(239 111 97 / 0.08);
+}
+
 .composer-chip svg {
   color: var(--faint);
   transform: rotate(90deg);
@@ -2156,6 +2173,16 @@ button.busy:disabled .button-spinner {
 .composer-chip-menu button.active {
   color: var(--text);
   background: var(--surface-3);
+}
+
+.composer-chip-menu button.danger {
+  color: var(--danger);
+}
+
+.composer-chip-menu button.danger:hover:not(:disabled),
+.composer-chip-menu button.danger.active {
+  color: var(--danger);
+  background: rgb(239 111 97 / 0.1);
 }
 
 .composer-chip-menu button:disabled {

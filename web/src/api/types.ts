@@ -23,6 +23,13 @@ export interface RunnerInfo {
 
 export type AgentProviderId = string;
 
+export type ApprovalMode =
+  | 'ask'
+  | 'read_only_ask'
+  | 'trusted_workspace'
+  | 'allow_all_session'
+  | 'allow_all_workspace';
+
 export type SessionStatus =
   | 'starting'
   | 'running'
@@ -48,6 +55,7 @@ export interface SessionInfo {
   created_at?: string | null;
   updated_at?: string | null;
   usage?: SessionUsageSnapshot | null;
+  approval_mode?: ApprovalMode | null;
 }
 
 export type AgentReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
@@ -101,6 +109,7 @@ export interface AgentTurnSettings {
   model?: string | null;
   reasoning_effort?: AgentReasoningEffort | null;
   collaboration_mode?: string | null;
+  approval_mode?: ApprovalMode | null;
 }
 
 export type SlashCommandTarget = 'local' | 'runner' | 'provider';

@@ -36,6 +36,29 @@ pub enum ApprovalKind {
     ProviderSpecific,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    #[default]
+    Ask,
+    ReadOnlyAsk,
+    TrustedWorkspace,
+    AllowAllSession,
+    AllowAllWorkspace,
+}
+
+impl ApprovalMode {
+    #[must_use]
+    pub fn is_dangerous_allow_all(&self) -> bool {
+        matches!(self, Self::AllowAllSession | Self::AllowAllWorkspace)
+    }
+
+    #[must_use]
+    pub fn default_for_provider(_provider_id: &crate::AgentProviderId) -> Self {
+        Self::Ask
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalResolutionState {
@@ -317,5 +340,39 @@ impl ApprovalOption {
             Self::deny_with_feedback(),
             Self::cancel_turn(),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ApprovalMode;
+
+    #[test]
+    fn approval_mode_json_names_are_stable() {
+        let cases = [
+            (ApprovalMode::Ask, "ask"),
+            (ApprovalMode::ReadOnlyAsk, "read_only_ask"),
+            (ApprovalMode::TrustedWorkspace, "trusted_workspace"),
+            (ApprovalMode::AllowAllSession, "allow_all_session"),
+            (ApprovalMode::AllowAllWorkspace, "allow_all_workspace"),
+        ];
+
+        for (mode, name) in cases {
+            let json = serde_json::to_value(&mode).expect("serialize approval mode");
+            assert_eq!(json, serde_json::json!(name));
+
+            let decoded: ApprovalMode =
+                serde_json::from_value(json).expect("deserialize approval mode");
+            assert_eq!(decoded, mode);
+        }
+    }
+
+    #[test]
+    fn approval_mode_flags_allow_all_modes_as_dangerous() {
+        assert!(!ApprovalMode::Ask.is_dangerous_allow_all());
+        assert!(!ApprovalMode::ReadOnlyAsk.is_dangerous_allow_all());
+        assert!(!ApprovalMode::TrustedWorkspace.is_dangerous_allow_all());
+        assert!(ApprovalMode::AllowAllSession.is_dangerous_allow_all());
+        assert!(ApprovalMode::AllowAllWorkspace.is_dangerous_allow_all());
     }
 }

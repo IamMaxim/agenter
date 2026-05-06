@@ -234,9 +234,11 @@ observed event order. Do not mark question handling live-smoked from that turn.
 
 ## Approval Checks
 
-Set the session or turn to a policy that asks before command/file changes. The
-exact UI may change, so record the active mode, approval policy, sandbox policy,
-and model before sending the prompt.
+Set the session approval mode to `ask` or `read_only_ask` before the first
+approval prompt. Record the active approval mode, native Codex approval policy,
+native Codex sandbox/permission payload, and model before sending the prompt.
+Agenter approval modes are not Agenter sandbox modes; native Codex
+`sandboxPolicy` and `permissions` are provider pass-through details.
 
 Use this prompt if the minimal smoke did not trigger an approval:
 
@@ -257,6 +259,20 @@ Expected browser evidence:
   typed visible error;
 - duplicate answer with the same idempotency key does not produce a second
   native answer.
+
+Approval-mode evidence:
+
+- switching to `allow_all_session` requires a browser confirmation that says
+  "Allow all operations" and "danger-full-access";
+- after `allow_all_session`, the next approval auto-resolves with an
+  approval-policy warning row and a visible danger status;
+- switching to `allow_all_workspace` requires the same danger confirmation and
+  says the rule persists for the workspace/provider until revoked;
+- after reload, the workspace/provider allow-all rule remains visible in the
+  flat approval rules list and can be revoked;
+- after revocation, the next matching approval asks again;
+- changing model/mode/reasoning without changing approval mode does not create
+  or disable workspace allow-all rules.
 
 ## Raw Payload Checks
 

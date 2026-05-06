@@ -828,6 +828,7 @@ pub fn reduce_acp_message(
                         )
                         .unwrap_or(false),
                         updated_at: None,
+                        handoff: None,
                     },
                 },
             )]

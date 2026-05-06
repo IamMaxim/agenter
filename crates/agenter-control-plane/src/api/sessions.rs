@@ -23,6 +23,8 @@ pub(super) struct CreateSessionRequest {
     /// persisted as the new session's sticky settings.
     #[serde(default)]
     pub(super) settings_override: Option<agenter_core::AgentTurnSettings>,
+    #[serde(default)]
+    pub(super) source_plan_handoff: Option<PlanHandoffRequest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +40,21 @@ pub(super) struct SendMessageRequest {
     /// turn and every subsequent turn until the user changes it again.
     #[serde(default)]
     pub(super) settings_override: Option<agenter_core::AgentTurnSettings>,
+    #[serde(default)]
+    pub(super) plan_handoff: Option<PlanHandoffRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct PlanHandoffRequest {
+    pub(super) session_id: Option<agenter_core::SessionId>,
+    pub(super) plan_id: agenter_core::PlanId,
+    pub(super) action: agenter_core::PlanHandoffAction,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct MarkPlanHandoffRequest {
+    pub(super) plan_id: agenter_core::PlanId,
+    pub(super) action: agenter_core::PlanHandoffAction,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +89,7 @@ pub(super) fn router() -> Router<crate::state::AppState> {
         .route("/", get(list_sessions).post(create_session))
         .route("/{session_id}", get(get_session).patch(update_session))
         .route("/{session_id}/messages", post(send_session_message))
+        .route("/{session_id}/plan-handoff", post(mark_plan_handoff))
         .route("/{session_id}/agent-options", get(session_agent_options))
         .route(
             "/{session_id}/settings",
@@ -168,6 +186,22 @@ pub(super) async fn create_session(
         (!trimmed.is_empty()).then(|| trimmed.to_owned())
     });
     let settings_override = request.settings_override;
+    let source_plan_handoff = request.source_plan_handoff;
+    if let Some(handoff) = &source_plan_handoff {
+        let source_session_id = handoff.session_id.unwrap_or(session_id);
+        if state
+            .session(user.user_id, source_session_id)
+            .await
+            .is_none()
+        {
+            tracing::warn!(
+                user_id = %user.user_id,
+                session_id = %source_session_id,
+                "session creation rejected source plan handoff for missing source session"
+            );
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    }
     let request_id = agenter_protocol::RequestId::from(uuid::Uuid::new_v4().to_string());
     let title = request.title;
     let command = agenter_protocol::runner::RunnerServerMessage::Command(Box::new(
@@ -235,6 +269,25 @@ pub(super) async fn create_session(
         }
     };
 
+    if let Err(error) = state
+        .ensure_approval_mode_rules_for_new_session(
+            user.user_id,
+            workspace.workspace_id,
+            &provider_id,
+            settings_override.as_ref(),
+        )
+        .await
+    {
+        tracing::warn!(
+            user_id = %user.user_id,
+            %workspace_id,
+            provider_id = %provider_id,
+            %error,
+            "session creation rejected because approval-mode rule setup failed"
+        );
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
     let session = state
         .register_session(SessionRegistration {
             session_id,
@@ -260,8 +313,9 @@ pub(super) async fn create_session(
     let info = session.info();
     publish_session_created(&state, info.clone()).await;
 
+    let mut initial_message_sent = false;
     if let Some(content) = initial_message {
-        if let Err(error) = dispatch_user_message(
+        match dispatch_user_message(
             &state,
             DispatchUserMessage {
                 user_id: user.user_id,
@@ -275,12 +329,32 @@ pub(super) async fn create_session(
         )
         .await
         {
-            tracing::warn!(
-                user_id = %user.user_id,
-                session_id = %session.session_id,
-                ?error,
-                "initial session message dispatch failed"
-            );
+            Ok(()) => {
+                initial_message_sent = true;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    user_id = %user.user_id,
+                    session_id = %session.session_id,
+                    ?error,
+                    "initial session message dispatch failed"
+                );
+            }
+        }
+    }
+
+    if initial_message_sent {
+        if let Some(handoff) = source_plan_handoff {
+            let source_session_id = handoff.session_id.unwrap_or(session.session_id);
+            publish_plan_handoff_marker(
+                &state,
+                source_session_id,
+                handoff.plan_id,
+                agenter_core::PlanHandoffAction::FreshThread,
+                agenter_core::PlanHandoffStatus::Implementing,
+                Some(session.session_id),
+            )
+            .await;
         }
     }
 
@@ -364,6 +438,43 @@ async fn publish_user_message(
             %error,
             "failed to publish universal user message event"
         );
+    }
+}
+
+async fn publish_plan_handoff_marker(
+    state: &crate::state::AppState,
+    session_id: agenter_core::SessionId,
+    plan_id: agenter_core::PlanId,
+    action: agenter_core::PlanHandoffAction,
+    handoff_state: agenter_core::PlanHandoffStatus,
+    target_session_id: Option<agenter_core::SessionId>,
+) {
+    match state
+        .mark_plan_handoff(
+            session_id,
+            plan_id,
+            action,
+            handoff_state,
+            target_session_id,
+        )
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::warn!(
+                %session_id,
+                %plan_id,
+                "plan handoff marker skipped because source plan was not found"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                %session_id,
+                %plan_id,
+                %error,
+                "failed to publish plan handoff marker"
+            );
+        }
     }
 }
 
@@ -596,6 +707,13 @@ pub(super) async fn send_session_message(
         tracing::debug!(user_id = %user.user_id, %session_id, "send session message rejected empty content");
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let plan_handoff = request.plan_handoff;
+    if let Some(handoff) = &plan_handoff {
+        if handoff.action != agenter_core::PlanHandoffAction::SameThread {
+            tracing::debug!(user_id = %user.user_id, %session_id, "send session message rejected unsupported plan handoff action");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    }
     let settings_override = request.settings_override.clone();
     let command = agenter_core::UniversalCommandEnvelope {
         command_id: request
@@ -619,9 +737,26 @@ pub(super) async fn send_session_message(
         return response;
     }
     let settings = if let Some(override_settings) = settings_override {
-        state
+        match state
             .update_session_turn_settings(user.user_id, session_id, override_settings)
             .await
+        {
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::warn!(user_id = %user.user_id, %session_id, ?error, "send message settings update failed");
+                if let Some(response) = super::finish_command_or_error_response(
+                    &state,
+                    &command,
+                    crate::state::UniversalCommandIdempotencyStatus::Failed,
+                    super::command_response(StatusCode::INTERNAL_SERVER_ERROR, None),
+                )
+                .await
+                {
+                    return response;
+                }
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
     } else {
         state.session_turn_settings(user.user_id, session_id).await
     };
@@ -684,6 +819,17 @@ pub(super) async fn send_session_message(
                 content_len = content.len(),
                 "session message accepted by runner channel"
             );
+            if let Some(handoff) = plan_handoff {
+                publish_plan_handoff_marker(
+                    &state,
+                    session_id,
+                    handoff.plan_id,
+                    agenter_core::PlanHandoffAction::SameThread,
+                    agenter_core::PlanHandoffStatus::Implementing,
+                    None,
+                )
+                .await;
+            }
             let response = super::command_response(StatusCode::ACCEPTED, None);
             if let Some(response) = super::finish_command_or_error_response(
                 &state,
@@ -824,6 +970,43 @@ pub(super) async fn send_session_message(
     }
 }
 
+pub(super) async fn mark_plan_handoff(
+    State(state): State<crate::state::AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<agenter_core::SessionId>,
+    Json(request): Json<MarkPlanHandoffRequest>,
+) -> Response {
+    let Some(user) = super::authenticated_user_from_headers(&state, &headers).await else {
+        tracing::debug!(%session_id, "mark plan handoff rejected missing or invalid session");
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if state.session(user.user_id, session_id).await.is_none() {
+        tracing::warn!(user_id = %user.user_id, %session_id, "mark plan handoff rejected session not found");
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if request.action != agenter_core::PlanHandoffAction::StayInPlan {
+        tracing::debug!(user_id = %user.user_id, %session_id, "mark plan handoff rejected unsupported action");
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match state
+        .mark_plan_handoff(
+            session_id,
+            request.plan_id,
+            agenter_core::PlanHandoffAction::StayInPlan,
+            agenter_core::PlanHandoffStatus::Dismissed,
+            None,
+        )
+        .await
+    {
+        Ok(Some(_)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::warn!(%session_id, plan_id = %request.plan_id, %error, "failed to mark plan handoff");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 pub(super) async fn session_agent_options(
     State(state): State<crate::state::AppState>,
     headers: HeaderMap,
@@ -928,21 +1111,38 @@ pub(super) async fn update_session_settings(
     {
         return response;
     }
-    let Some(settings) = state
+    let settings = match state
         .update_session_turn_settings(user.user_id, session_id, request.settings)
         .await
-    else {
-        if let Some(response) = super::finish_command_or_error_response(
-            &state,
-            &command,
-            crate::state::UniversalCommandIdempotencyStatus::Failed,
-            super::command_response(StatusCode::NOT_FOUND, None),
-        )
-        .await
-        {
-            return response;
+    {
+        Ok(Some(settings)) => settings,
+        Ok(None) => {
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &command,
+                crate::state::UniversalCommandIdempotencyStatus::Failed,
+                super::command_response(StatusCode::NOT_FOUND, None),
+            )
+            .await
+            {
+                return response;
+            }
+            return StatusCode::NOT_FOUND.into_response();
         }
-        return StatusCode::NOT_FOUND.into_response();
+        Err(error) => {
+            tracing::warn!(user_id = %user.user_id, %session_id, ?error, "session settings update failed");
+            if let Some(response) = super::finish_command_or_error_response(
+                &state,
+                &command,
+                crate::state::UniversalCommandIdempotencyStatus::Failed,
+                super::command_response(StatusCode::INTERNAL_SERVER_ERROR, None),
+            )
+            .await
+            {
+                return response;
+            }
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
     let body = serde_json::to_value(&settings).ok();
     if let Some(response) = super::finish_command_or_error_response(

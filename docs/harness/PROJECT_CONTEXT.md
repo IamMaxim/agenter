@@ -1,6 +1,6 @@
 # Project Context
 
-Last updated: 2026-05-05
+Last updated: 2026-05-06
 
 ## Product Goal
 
@@ -25,6 +25,7 @@ The control plane owns:
 - public REST and realtime APIs;
 - universal event fan-out;
 - pending approval state;
+- explicit approval modes and durable approval policy rules;
 - `uap/2` session snapshots and lightweight event cache.
 
 The runner owns:
@@ -142,3 +143,16 @@ These need protocol spikes or explicit decisions before implementation hardens:
 - frontend app shape: SvelteKit versus Svelte SPA;
 - connector retry and idempotency model;
 - local embedded runner mode versus always separate process.
+
+## Approval Posture
+
+Agenter approval modes are product policy, not sandbox modes. The supported
+session modes are `ask`, `read_only_ask`, `trusted_workspace`,
+`allow_all_session`, and `allow_all_workspace`.
+
+Dangerous allow-all modes are intentionally supported for VM-isolated runners.
+The browser must label them as "Allow all operations" and
+"danger-full-access", and `allow_all_workspace` persists a revocable
+workspace/provider rule that applies to every approval kind. Agenter does not
+provide an agent sandbox; provider-native sandbox or permission fields are
+pass-through details only.

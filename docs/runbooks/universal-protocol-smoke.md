@@ -215,6 +215,8 @@ Manual checks:
 
 - Shell/file approval: answer once, then retry the same browser request with the same idempotency key. Expected state: no second native answer; duplicate returns the stored result or in-flight resolving state.
 - Conflicting duplicate approval: retry with the same key but a different semantic decision. Expected state: `idempotency_conflict` or `approval_conflicting_decision`.
+- Approval mode: enable `allow_all_session` and confirm the next approval auto-resolves with an approval-policy warning row; enable `allow_all_workspace`, reload, and confirm the active workspace/provider allow-all rule is visible and revocable.
+- Sparse settings: change model/mode/reasoning without changing approval mode; confirm no workspace allow-all rule is created, disabled, or hidden as a side effect.
 - Question/user input: answer a question and retry with the same key. Expected state: stored response replay, not a second native response.
 - Cancel while approval is pending: expected state is `cancelled` when a blocked native request is answered with cancel; otherwise a typed `provider_cancel_not_supported` error and no false `turn.cancelled`.
 - Cancel while a provider turn is running without a blocked native approval: ACP providers should return a typed `provider_cancel_not_supported` error unless they explicitly advertise and implement a live interrupt hook.

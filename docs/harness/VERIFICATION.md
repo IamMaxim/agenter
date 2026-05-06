@@ -53,6 +53,21 @@ Composer usage bar manual checklist:
 - Simulate missing or partial usage and confirm unknown metrics render as `--` without implying `0%`.
 - Change mode, model, and reasoning from the composer bar and confirm the saved values remain reflected after reload.
 
+Approval-mode manual checklist:
+
+- Change approval mode to `ask`, `read_only_ask`, and `trusted_workspace`;
+  confirm the selected mode remains reflected after reload.
+- Enable `allow_all_session`; confirm the browser requires a deliberate
+  "Allow all operations" / "danger-full-access" confirmation and shows a danger
+  status while active.
+- Enable `allow_all_workspace`; confirm the same danger confirmation says the
+  rule persists for the workspace/provider until revoked.
+- Revoke the workspace allow-all rule from the flat approval rules list; confirm
+  the danger status clears after reload and the next matching operation asks
+  again.
+- Change model/mode/reasoning without sending `approval_mode`; confirm the
+  approval mode and workspace allow-all rule are not silently changed.
+
 ## Integration Phase
 
 Protocol and connector work should include focused integration checks:
