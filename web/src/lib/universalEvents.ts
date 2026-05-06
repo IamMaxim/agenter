@@ -31,7 +31,8 @@ export function cloneSnapshot(snapshot: SessionSnapshot): SessionSnapshot {
           fields: question.fields.map((field) => ({
             ...field,
             choices: [...field.choices],
-            default_answers: [...field.default_answers]
+            default_answers: [...field.default_answers],
+            schema: cloneJson(field.schema)
           })),
           answer: question.answer
             ? {
@@ -172,6 +173,7 @@ export function applyUniversalEvent(snapshot: SessionSnapshot, envelope: Univers
         title: errorEventTitle(envelope.event.data.code, envelope.native?.method),
         uri: envelope.event.data.message,
         mime_type: null,
+        native: envelope.native ?? null,
         created_at: envelope.ts
       };
       break;
@@ -184,6 +186,7 @@ export function applyUniversalEvent(snapshot: SessionSnapshot, envelope: Univers
         title: envelope.event.data.notification.title,
         uri: providerNotificationDetail(envelope.event.data.notification),
         mime_type: null,
+        native: envelope.native ?? null,
         created_at: envelope.ts
       };
       break;
@@ -196,6 +199,7 @@ export function applyUniversalEvent(snapshot: SessionSnapshot, envelope: Univers
         title: nativeEventTitle(envelope.native?.method, envelope.event.data.summary),
         uri: nativeEventDetail(envelope.native?.method, envelope.event.data.summary),
         mime_type: null,
+        native: envelope.native ?? null,
         created_at: envelope.ts
       };
       break;
@@ -363,6 +367,8 @@ function mergeQuestion(existing: QuestionState | undefined, incoming: QuestionSt
     fields: incoming.fields.length > 0 ? cloneQuestionFields(incoming) : cloneQuestionFields(existing),
     status: incoming.status,
     answer: incoming.answer ?? existing.answer,
+    native_request_id: incoming.native_request_id ?? existing.native_request_id,
+    native_blocking: incoming.native_blocking ?? existing.native_blocking,
     native: incoming.native ?? existing.native,
     requested_at: incoming.requested_at ?? existing.requested_at,
     answered_at: incoming.answered_at ?? existing.answered_at
@@ -388,8 +394,16 @@ function cloneQuestionFields(question: QuestionState): QuestionState['fields'] {
   return question.fields.map((field) => ({
     ...field,
     choices: [...field.choices],
-    default_answers: [...field.default_answers]
+    default_answers: [...field.default_answers],
+    schema: cloneJson(field.schema)
   }));
+}
+
+function cloneJson<T>(value: T): T {
+  if (value === undefined || value === null) {
+    return value;
+  }
+  return structuredClone(value);
 }
 
 function mergeContentDelta(
@@ -521,7 +535,14 @@ function cloneDiff(diff: DiffState): DiffState {
 }
 
 function cloneArtifact(artifact: ArtifactState): ArtifactState {
-  return { ...artifact };
+  return { ...artifact, native: artifact.native ? cloneNativeRef(artifact.native) : artifact.native };
+}
+
+function cloneNativeRef<T extends { raw_payload?: unknown }>(native: T): T {
+  return {
+    ...native,
+    raw_payload: cloneJson(native.raw_payload)
+  };
 }
 
 function minimalSessionInfo(sessionId: string): SessionInfo {

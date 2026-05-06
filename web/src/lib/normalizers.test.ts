@@ -43,7 +43,24 @@ describe('frontend API normalizers', () => {
         runner_id: 'runner-1',
         name: 'runner-1',
         status: 'offline',
-        last_seen_at: null
+        last_seen_at: null,
+        provider_ids: []
+      }
+    ]);
+    expect(
+      normalizeRunners([
+        {
+          runner_id: 'runner-codex',
+          provider_ids: ['codex', 42, '', 'qwen']
+        }
+      ])
+    ).toEqual([
+      {
+        runner_id: 'runner-codex',
+        name: 'runner-codex',
+        status: 'offline',
+        last_seen_at: null,
+        provider_ids: ['codex', 'qwen']
       }
     ]);
     expect(normalizeWorkspaces([{ workspace_id: 'workspace-1', runner_id: 'runner-1' }])).toEqual([
@@ -160,6 +177,65 @@ describe('frontend API normalizers', () => {
         reason: 'Visible but not executed remotely.'
       }
     ]);
+  });
+
+  test('preserves raw native payloads and schema gap fields', () => {
+    const snapshot = normalizeSessionSnapshot({
+      session_id: 'session-1',
+      items: {
+        item1: {
+          item_id: 'item1',
+          session_id: 'session-1',
+          role: 'tool',
+          status: 'completed',
+          tool: {
+            kind: 'tool',
+            subkind: 'web_search',
+            name: 'web_search',
+            title: 'Web search',
+            status: 'completed'
+          },
+          native: {
+            protocol: 'codex/app-server/v2',
+            method: 'rawResponseItem/completed',
+            raw_payload: { params: { item: { id: 'item1' } } }
+          }
+        }
+      },
+      questions: {
+        question1: {
+          question_id: 'question1',
+          session_id: 'session-1',
+          title: 'Input',
+          status: 'pending',
+          native_request_id: 'request-1',
+          native_blocking: true,
+          fields: [
+            {
+              id: 'choice',
+              label: 'Choice',
+              kind: 'select',
+              required: true,
+              secret: false,
+              schema: { type: 'string', enum: ['a', 'b'] }
+            }
+          ]
+        }
+      }
+    });
+
+    expect(snapshot.items.item1.tool?.subkind).toBe('web_search');
+    expect(snapshot.items.item1.native?.raw_payload).toEqual({
+      params: { item: { id: 'item1' } }
+    });
+    expect(snapshot.questions.question1).toMatchObject({
+      native_request_id: 'request-1',
+      native_blocking: true
+    });
+    expect(snapshot.questions.question1.fields[0].schema).toEqual({
+      type: 'string',
+      enum: ['a', 'b']
+    });
   });
 
   test('normalizes versioned universal snapshot frames and defaults legacy missing versions', () => {

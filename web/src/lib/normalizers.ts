@@ -396,6 +396,7 @@ function normalizeToolProjection(value: unknown): ItemState['tool'] {
   }
   return {
     kind: stringOr(record.kind, 'tool'),
+    subkind: typeof record.subkind === 'string' ? record.subkind : null,
     name: stringOr(record.name, ''),
     title: stringOr(record.title, stringOr(record.name, 'Tool')),
     status: stringOr(record.status, 'created') as ItemState['status'],
@@ -488,6 +489,8 @@ function normalizeQuestionState(value: unknown): QuestionState {
     fields: arrayValue(record.fields).map(normalizeQuestionField),
     status: stringOr(record.status, 'pending') as QuestionStatus,
     answer: normalizeQuestionAnswer(record.answer),
+    native_request_id: typeof record.native_request_id === 'string' ? record.native_request_id : null,
+    native_blocking: record.native_blocking === true,
     native: normalizeNativeRef(record.native),
     requested_at: typeof record.requested_at === 'string' ? record.requested_at : null,
     answered_at: typeof record.answered_at === 'string' ? record.answered_at : null
@@ -511,7 +514,8 @@ function normalizeQuestionField(value: unknown): AgentQuestionField {
         description: typeof choiceRecord.description === 'string' ? choiceRecord.description : null
       };
     }),
-    default_answers: arrayValue(record.default_answers).filter(isString)
+    default_answers: arrayValue(record.default_answers).filter(isString),
+    schema: record.schema
   };
 }
 
@@ -583,6 +587,7 @@ function normalizeArtifactState(value: unknown): ArtifactState {
     title: stringOr(record.title, 'Artifact'),
     uri: typeof record.uri === 'string' ? record.uri : null,
     mime_type: typeof record.mime_type === 'string' ? record.mime_type : null,
+    native: normalizeNativeRef(record.native),
     created_at: typeof record.created_at === 'string' ? record.created_at : null
   };
 }
@@ -599,7 +604,8 @@ function normalizeNativeRef(value: unknown): NativeRef | null {
     native_id: typeof record.native_id === 'string' ? record.native_id : null,
     summary: typeof record.summary === 'string' ? record.summary : null,
     hash: typeof record.hash === 'string' ? record.hash : null,
-    pointer: typeof record.pointer === 'string' ? record.pointer : null
+    pointer: typeof record.pointer === 'string' ? record.pointer : null,
+    raw_payload: record.raw_payload
   };
 }
 
@@ -645,7 +651,10 @@ function normalizeRunner(value: unknown): RunnerInfo | undefined {
     runner_id: record.runner_id,
     name: typeof record.name === 'string' ? record.name : record.runner_id,
     status: normalizeRunnerStatus(record.status),
-    last_seen_at: typeof record.last_seen_at === 'string' ? record.last_seen_at : null
+    last_seen_at: typeof record.last_seen_at === 'string' ? record.last_seen_at : null,
+    provider_ids: arrayValue(record.provider_ids).filter(
+      (providerId): providerId is string => typeof providerId === 'string' && providerId.length > 0
+    )
   };
 }
 

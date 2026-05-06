@@ -702,6 +702,11 @@ mod tests {
                     summary: Some("native message".to_owned()),
                     hash: None,
                     pointer: None,
+                    raw_payload: Some(serde_json::json!({
+                        "type": "thread/item",
+                        "id": "native-msg-1",
+                        "text": "hello"
+                    })),
                 }),
                 event: UniversalEventKind::NativeUnknown {
                     summary: Some("native message".to_owned()),
@@ -720,6 +725,7 @@ mod tests {
         assert_eq!(json["event"]["type"], "agent_event");
         assert_eq!(json["event"]["protocol_version"], "uap/2");
         assert_eq!(json["event"]["native"]["protocol"], "qwen-app-server");
+        assert_eq!(json["event"]["native"]["raw_payload"]["id"], "native-msg-1");
         assert_eq!(json["event"]["event"]["type"], "native.unknown");
         assert_eq!(decoded, message);
     }

@@ -18,6 +18,7 @@ impl AgentProviderId {
     pub const QWEN: &'static str = "qwen";
     pub const GEMINI: &'static str = "gemini";
     pub const OPENCODE: &'static str = "opencode";
+    pub const CODEX: &'static str = "codex";
 
     #[must_use]
     pub fn new(value: impl Into<String>) -> Self {
@@ -360,7 +361,7 @@ pub struct AgentCollaborationMode {
     pub reasoning_effort: Option<AgentReasoningEffort>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AgentQuestionField {
     pub id: String,
     pub label: String,
@@ -373,6 +374,8 @@ pub struct AgentQuestionField {
     pub choices: Vec<AgentQuestionChoice>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub default_answers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -425,6 +428,10 @@ pub struct QuestionState {
     pub status: QuestionStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub answer: Option<AgentQuestionAnswer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native_blocking: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native: Option<NativeRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -595,5 +602,46 @@ mod tests {
         let decoded: AgentCapabilities =
             serde_json::from_value(json).expect("deserialize capabilities");
         assert_eq!(decoded, capabilities);
+    }
+
+    #[test]
+    fn question_state_carries_native_request_and_field_schema() {
+        let question = crate::QuestionState {
+            question_id: crate::QuestionId::new(),
+            session_id: crate::SessionId::new(),
+            turn_id: None,
+            title: "Deploy?".to_owned(),
+            description: None,
+            fields: vec![crate::AgentQuestionField {
+                id: "environment".to_owned(),
+                label: "Environment".to_owned(),
+                prompt: Some("Choose where to deploy".to_owned()),
+                kind: "select".to_owned(),
+                required: true,
+                secret: false,
+                choices: Vec::new(),
+                default_answers: Vec::new(),
+                schema: Some(serde_json::json!({
+                    "type": "string",
+                    "enum": ["staging", "production"]
+                })),
+            }],
+            status: crate::QuestionStatus::Pending,
+            answer: None,
+            native_request_id: Some("req-42".to_owned()),
+            native_blocking: true,
+            native: None,
+            requested_at: None,
+            answered_at: None,
+        };
+
+        let json = serde_json::to_value(&question).expect("serialize question");
+        assert_eq!(json["native_request_id"], "req-42");
+        assert_eq!(json["native_blocking"], true);
+        assert_eq!(json["fields"][0]["schema"]["enum"][1], "production");
+
+        let decoded: crate::QuestionState =
+            serde_json::from_value(json).expect("deserialize question");
+        assert_eq!(decoded, question);
     }
 }

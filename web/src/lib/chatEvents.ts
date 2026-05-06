@@ -28,6 +28,8 @@ export type ChatItem =
       processId?: string;
       source?: string;
       actions?: CommandActionView[];
+      subkind?: string;
+      rawPayload?: unknown;
     }
   | {
       id: string;
@@ -44,6 +46,8 @@ export type ChatItem =
       processId?: string;
       source?: string;
       actions?: CommandActionView[];
+      subkind?: string;
+      rawPayload?: unknown;
     }
   | {
       id: string;
@@ -65,7 +69,7 @@ export type ChatItem =
       reasoningEffort?: string;
       prompt?: string;
       states: SubagentStateView[];
-      providerPayload?: Record<string, unknown>;
+      providerPayload?: unknown;
     }
   | {
       id: string;
@@ -73,14 +77,18 @@ export type ChatItem =
       approvalId: string;
       title: string;
       detail?: string;
+      approvalKind?: string;
       presentation?: Record<string, unknown>;
       options?: ApprovalUiChoice[];
       status?: string;
       risk?: string;
       subject?: string;
+      nativeRequestId?: string;
+      nativeBlocking?: boolean;
       resolutionState?: 'pending' | 'resolving';
       resolvingDecision?: string;
       resolvedDecision?: string;
+      rawPayload?: unknown;
     }
   | {
       id: string;
@@ -92,12 +100,16 @@ export type ChatItem =
       answered: boolean;
       status?: string;
       resolvedState?: string;
+      nativeRequestId?: string;
+      nativeBlocking?: boolean;
+      rawPayload?: unknown;
     }
   | {
       id: string;
       kind: 'error';
       title: string;
       detail?: string;
+      rawPayload?: unknown;
     };
 
 export interface CommandActionView {

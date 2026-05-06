@@ -2593,6 +2593,7 @@ fn approval_kind_to_db(kind: &ApprovalKind) -> &'static str {
     match kind {
         ApprovalKind::Command => "command",
         ApprovalKind::FileChange => "file_change",
+        ApprovalKind::Permission => "permission",
         ApprovalKind::Tool => "tool",
         ApprovalKind::ProviderSpecific => "provider_specific",
     }
@@ -2602,6 +2603,7 @@ fn approval_kind_from_db(value: &str) -> Result<ApprovalKind> {
     match value {
         "command" => Ok(ApprovalKind::Command),
         "file_change" => Ok(ApprovalKind::FileChange),
+        "permission" => Ok(ApprovalKind::Permission),
         "tool" => Ok(ApprovalKind::Tool),
         "provider_specific" => Ok(ApprovalKind::ProviderSpecific),
         _ => Err(sqlx::Error::ColumnDecode {
@@ -3035,6 +3037,7 @@ mod tests {
                         summary: Some("Run command".to_owned()),
                         hash: None,
                         pointer: None,
+                        raw_payload: None,
                     }),
                     requested_at: Some(Utc::now()),
                     resolved_at: None,

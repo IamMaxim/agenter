@@ -41,7 +41,6 @@
   let contextMenuVisible = false;
   let refreshJobsByGroup: Record<string, WorkspaceSessionRefreshJob[]> = {};
   let refreshExpandedGroups: Record<string, boolean> = {};
-  const FALLBACK_REFRESH_PROVIDER = 'qwen';
   const TERMINAL_REFRESH_STATUSES: WorkspaceSessionRefreshStatus[] = ['succeeded', 'failed', 'cancelled'];
 
   $: groups = buildSessionTree({ runners, workspacesByRunner, sessions });
@@ -211,6 +210,11 @@
   }
 
   async function newSession(group: SessionTreeGroup) {
+    const providerId = primaryProviderId(group);
+    if (!providerId) {
+      pushToast({ severity: 'warning', message: 'No provider is advertised for this workspace.' });
+      return;
+    }
     if (creatingGroupId) {
       return;
     }
@@ -218,7 +222,7 @@
     try {
       const session = await createSession({
         workspace_id: group.workspace.workspace_id,
-        provider_id: group.sessions[0]?.provider_id ?? FALLBACK_REFRESH_PROVIDER,
+        provider_id: providerId,
         title: `Chat in ${group.workspace.display_name ?? group.workspace.path}`
       });
       window.location.hash = routeHref({ name: 'chat', sessionId: session.session_id }).slice(1);
@@ -232,7 +236,12 @@
   }
 
   function getGroupProviderIds(group: SessionTreeGroup): string[] {
-    return [...new Set(group.sessions.map((session) => session.provider_id))];
+    const sessionProviderIds = group.sessions.map((session) => session.provider_id);
+    return [...new Set([...sessionProviderIds, ...(group.runner.provider_ids ?? [])])];
+  }
+
+  function primaryProviderId(group: SessionTreeGroup): string | undefined {
+    return group.sessions[0]?.provider_id ?? group.runner.provider_ids?.[0];
   }
 
   function openContextMenu(event: MouseEvent, groupId: string) {
@@ -267,7 +276,11 @@
 
   async function reloadRunnerWorkspaceSessions(group: SessionTreeGroup, force = false) {
     const providers = getGroupProviderIds(group);
-    const providerIds = providers.length > 0 ? providers : [FALLBACK_REFRESH_PROVIDER];
+    const providerIds = providers;
+    if (providerIds.length === 0) {
+      pushToast({ severity: 'warning', message: 'No provider is advertised for this workspace.' });
+      return;
+    }
     const startedProviderCount = providerIds.length;
     closeContextMenu();
     refreshJobsByGroup = {

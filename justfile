@@ -63,6 +63,12 @@ gemini-runner workspace=workspace:
 opencode-runner workspace=workspace:
     just runner opencode '{{workspace}}'
 
+codex-runner workspace=workspace:
+    just runner codex '{{workspace}}'
+
+codex-runner-json workspace=workspace:
+    just runner-json codex '{{workspace}}'
+
 web:
     cd web && npm run dev -- --host 0.0.0.0
 

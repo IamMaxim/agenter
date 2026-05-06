@@ -283,6 +283,7 @@ mod tests {
                 summary: Some("hello".to_owned()),
                 hash: None,
                 pointer: None,
+                raw_payload: None,
             }),
             event: UniversalEventKind::NativeUnknown {
                 summary: Some("hello".to_owned()),

@@ -1,26 +1,27 @@
 <script lang="ts">
   import AgenterIcon from './AgenterIcon.svelte';
-  import AnsiBlock from './AnsiBlock.svelte';
   import MarkdownBlock from './MarkdownBlock.svelte';
+  import RawPayloadDetails from './RawPayloadDetails.svelte';
   import type { ChatItem } from '../lib/chatEvents';
 
   export let item: Extract<ChatItem, { kind: 'subagent' }>;
 
   let expanded = false;
-  let providerExpanded = false;
-
   $: agentLabel =
     item.agentIds.length === 0
       ? 'No agent result'
       : item.agentIds.length === 1
         ? item.agentIds[0]
         : `${item.agentIds.length} subagents`;
+  $: hasProviderPayload = item.providerPayload !== undefined;
   $: hasDetail = Boolean(
-    item.prompt || item.model || item.reasoningEffort || item.states.length > 0 || item.agentIds.length > 0
+    item.prompt ||
+      item.model ||
+      item.reasoningEffort ||
+      item.states.length > 0 ||
+      item.agentIds.length > 0 ||
+      hasProviderPayload
   );
-  $: providerPayload = item.providerPayload
-    ? JSON.stringify(item.providerPayload, null, 2)
-    : undefined;
 
   function toggle() {
     if (hasDetail) {
@@ -87,18 +88,7 @@
         <p class="subagent-empty">No completed subagent result yet.</p>
       {/if}
 
-      {#if providerPayload}
-        <button
-          class="subagent-provider-toggle"
-          type="button"
-          on:click={() => (providerExpanded = !providerExpanded)}
-        >
-          Provider payload
-        </button>
-        {#if providerExpanded}
-          <AnsiBlock content={providerPayload} />
-        {/if}
-      {/if}
+      <RawPayloadDetails payload={item.providerPayload} summary="Provider payload" />
     </div>
   {/if}
 </article>

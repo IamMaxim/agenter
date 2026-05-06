@@ -2395,6 +2395,8 @@ impl AppState {
                     fields: Vec::new(),
                     status: QuestionStatus::Pending,
                     answer: None,
+                    native_request_id: None,
+                    native_blocking: false,
                     native: None,
                     requested_at: None,
                     answered_at: None,
@@ -2482,6 +2484,8 @@ impl AppState {
                             fields: Vec::new(),
                             status: QuestionStatus::Pending,
                             answer: None,
+                            native_request_id: None,
+                            native_blocking: false,
                             native: None,
                             requested_at: None,
                             answered_at: None,
@@ -3705,7 +3709,7 @@ fn discovered_history_universal_event(
             (
                 None,
                 Some(item_id),
-                discovery_native_ref("user_message", message_id.as_deref(), Some(content)),
+                discovery_native_ref("user_message", message_id.as_deref(), Some(content), None),
                 UniversalEventKind::ItemCreated {
                     item: Box::new(text_item(
                         session_id,
@@ -3724,7 +3728,7 @@ fn discovered_history_universal_event(
             (
                 None,
                 Some(item_id),
-                discovery_native_ref("assistant_message", Some(message_id), Some(content)),
+                discovery_native_ref("assistant_message", Some(message_id), Some(content), None),
                 UniversalEventKind::ItemCreated {
                     item: Box::new(text_item(
                         session_id,
@@ -3739,11 +3743,16 @@ fn discovered_history_universal_event(
             plan_id,
             title,
             content,
-            ..
+            provider_payload,
         } => (
             None,
             None,
-            discovery_native_ref("plan", Some(plan_id), title.as_deref()),
+            discovery_native_ref(
+                "plan",
+                Some(plan_id),
+                title.as_deref(),
+                provider_payload.as_ref(),
+            ),
             UniversalEventKind::PlanUpdated {
                 plan: agenter_core::PlanState {
                     plan_id: agenter_core::PlanId::from_uuid(universal_projection_uuid(plan_id)),
@@ -3767,7 +3776,7 @@ fn discovered_history_universal_event(
             status,
             input,
             output,
-            ..
+            provider_payload,
         } => {
             let item_id = universal_projection_item_id(tool_call_id);
             let status = match status {
@@ -3778,7 +3787,12 @@ fn discovered_history_universal_event(
             (
                 None,
                 Some(item_id),
-                discovery_native_ref("tool", Some(tool_call_id), title.as_deref()),
+                discovery_native_ref(
+                    "tool",
+                    Some(tool_call_id),
+                    title.as_deref(),
+                    provider_payload.as_ref(),
+                ),
                 UniversalEventKind::ItemCreated {
                     item: Box::new(ItemState {
                         item_id,
@@ -3795,6 +3809,7 @@ fn discovered_history_universal_event(
                         }],
                         tool: Some(ToolProjection {
                             kind: ToolProjectionKind::Tool,
+                            subkind: None,
                             name: name.clone(),
                             title: title.clone().unwrap_or_else(|| name.replace('_', " ")),
                             status,
@@ -3805,7 +3820,12 @@ fn discovered_history_universal_event(
                             subagent: None,
                             mcp: None,
                         }),
-                        native: discovery_native_ref("tool", Some(tool_call_id), title.as_deref()),
+                        native: discovery_native_ref(
+                            "tool",
+                            Some(tool_call_id),
+                            title.as_deref(),
+                            provider_payload.as_ref(),
+                        ),
                     }),
                 },
             )
@@ -3821,7 +3841,7 @@ fn discovered_history_universal_event(
             output,
             exit_code,
             success,
-            ..
+            provider_payload,
         } => {
             let item_id = universal_projection_item_id(command_id);
             let status = if !*success {
@@ -3832,7 +3852,12 @@ fn discovered_history_universal_event(
             (
                 None,
                 Some(item_id),
-                discovery_native_ref("command", Some(command_id), Some(command)),
+                discovery_native_ref(
+                    "command",
+                    Some(command_id),
+                    Some(command),
+                    provider_payload.as_ref(),
+                ),
                 UniversalEventKind::ItemCreated {
                     item: Box::new(ItemState {
                         item_id,
@@ -3849,6 +3874,7 @@ fn discovered_history_universal_event(
                         }],
                         tool: Some(ToolProjection {
                             kind: ToolProjectionKind::Command,
+                            subkind: Some("command".to_owned()),
                             name: "command".to_owned(),
                             title: command.clone(),
                             status,
@@ -3886,17 +3912,23 @@ fn discovered_history_universal_event(
                             subagent: None,
                             mcp: None,
                         }),
-                        native: discovery_native_ref("command", Some(command_id), Some(command)),
+                        native: discovery_native_ref(
+                            "command",
+                            Some(command_id),
+                            Some(command),
+                            provider_payload.as_ref(),
+                        ),
                     }),
                 },
             )
         }
         DiscoveredSessionHistoryItem::FileChange {
+            change_id,
             path,
             change_kind,
             status,
             diff,
-            ..
+            provider_payload,
         } => {
             let diff_status = match status {
                 DiscoveredFileChangeStatus::Applied
@@ -3906,10 +3938,17 @@ fn discovered_history_universal_event(
             (
                 None,
                 None,
-                discovery_native_ref("file_change", Some(path), Some(path)),
+                discovery_native_ref(
+                    "file_change",
+                    Some(change_id),
+                    Some(path),
+                    provider_payload.as_ref(),
+                ),
                 UniversalEventKind::DiffUpdated {
                     diff: agenter_core::DiffState {
-                        diff_id: agenter_core::DiffId::from_uuid(universal_projection_uuid(path)),
+                        diff_id: agenter_core::DiffId::from_uuid(universal_projection_uuid(
+                            change_id,
+                        )),
                         session_id,
                         turn_id: None,
                         title: Some(path.clone()),
@@ -3929,7 +3968,7 @@ fn discovered_history_universal_event(
             title,
             detail,
             status,
-            provider_payload: _,
+            provider_payload,
         } => (
             None,
             None,
@@ -3937,6 +3976,7 @@ fn discovered_history_universal_event(
                 category,
                 native_event_id.as_deref().or(Some(event_id)),
                 Some(title),
+                provider_payload.as_ref(),
             ),
             UniversalEventKind::ProviderNotification {
                 notification: ProviderNotification {
@@ -3980,6 +4020,7 @@ fn discovery_native_ref(
     method: &str,
     native_id: Option<&str>,
     summary: Option<&str>,
+    raw_payload: Option<&serde_json::Value>,
 ) -> Option<NativeRef> {
     Some(NativeRef {
         protocol: "provider.discovery".to_owned(),
@@ -3989,6 +4030,7 @@ fn discovery_native_ref(
         summary: summary.map(str::to_owned),
         hash: None,
         pointer: None,
+        raw_payload: raw_payload.cloned(),
     })
 }
 
@@ -4270,6 +4312,36 @@ mod tests {
         ));
         assert_eq!(events[0].session_id, session_id);
         assert_eq!(events[0].source, UniversalEventSource::Native);
+    }
+
+    #[test]
+    fn discovered_history_preserves_provider_payload_in_native_refs() {
+        let session_id = SessionId::new();
+        let payload = serde_json::json!({
+            "method": "rawResponseItem/completed",
+            "params": { "item": { "id": "native-1" } }
+        });
+        let events = discovered_history_events(
+            session_id,
+            UserId::new(),
+            &[DiscoveredSessionHistoryItem::NativeNotification {
+                event_id: Some("native-1".to_owned()),
+                category: "raw".to_owned(),
+                title: "Raw provider event".to_owned(),
+                detail: None,
+                status: None,
+                provider_payload: Some(payload.clone()),
+            }],
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .native
+                .as_ref()
+                .and_then(|native| native.raw_payload.as_ref()),
+            Some(&payload)
+        );
     }
 
     #[tokio::test]

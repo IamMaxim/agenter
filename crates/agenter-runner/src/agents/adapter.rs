@@ -168,6 +168,7 @@ impl AdapterEvent {
                 summary: Some("session status changed".to_owned()),
                 hash: None,
                 pointer: None,
+                raw_payload: None,
             }),
             UniversalEventKind::SessionStatusChanged { status, reason },
         )
@@ -195,6 +196,7 @@ impl AdapterEvent {
                 summary: Some("error reported".to_owned()),
                 hash: None,
                 pointer: None,
+                raw_payload: None,
             }),
             UniversalEventKind::ErrorReported { code, message },
         )
@@ -592,6 +594,7 @@ mod tests {
             summary: None,
             hash: None,
             pointer: None,
+            raw_payload: None,
         }
     }
 }

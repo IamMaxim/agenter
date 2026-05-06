@@ -1,6 +1,7 @@
 <script lang="ts">
   import AgenterIcon from './AgenterIcon.svelte';
   import AnsiBlock from './AnsiBlock.svelte';
+  import RawPayloadDetails from './RawPayloadDetails.svelte';
   import type { ChatItem } from '../lib/chatEvents';
 
   type IconName =
@@ -28,13 +29,15 @@
   }
 
   $: commandActions = item.eventKind === 'command' ? (item.actions ?? []) : [];
+  $: rawPayload = item.rawPayload;
+  $: hasRawPayload = rawPayload !== undefined;
   $: hasCommandMeta =
     item.eventKind === 'command' &&
     (item.exitCode !== undefined || item.durationMs !== undefined || item.processId || item.source);
   $: hasDetail = Boolean(
-    item.detail || ('output' in item && item.output) || commandActions.length > 0 || hasCommandMeta
+    item.detail || ('output' in item && item.output) || commandActions.length > 0 || hasCommandMeta || hasRawPayload
   );
-  $: rowKind = toolKind(item.eventKind, item.title);
+  $: rowKind = toolKind(item.eventKind, item.title, item.subkind);
   $: iconName = toolIconName(rowKind, item.title);
   $: statusTone = item.success === false ? 'error' : rowStatusTone(item.status);
   $: showStatusGlyph = statusTone === 'error' || statusTone === 'waiting' || isActiveToolRow(item.eventKind, item.status);
@@ -53,7 +56,10 @@
     }
   }
 
-  function toolKind(eventKind: string, title: string) {
+  function toolKind(eventKind: string, title: string, subkind?: string) {
+    if (subkind) {
+      return subkind.replace(/_/g, ' ');
+    }
     const value = `${eventKind} ${title}`.toLowerCase();
     if (value.includes('read')) return 'read';
     if (value.includes('write')) return 'write';
@@ -159,6 +165,7 @@
       {#if 'output' in item && item.output}
         <div class="tool-detail-code"><AnsiBlock content={item.output} /></div>
       {/if}
+      <RawPayloadDetails payload={rawPayload} />
     </div>
   {/if}
 </article>

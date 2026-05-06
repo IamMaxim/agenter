@@ -85,6 +85,37 @@ describe('session APIs', () => {
     );
   });
 
+  test('executeSlashCommand preserves non-object provider payloads', async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: () =>
+        Promise.resolve(
+          JSON.stringify({
+            accepted: true,
+            message: 'Provider returned raw payload.',
+            session: null,
+            provider_payload: ['raw', 1, true]
+          })
+        )
+    });
+    vi.stubGlobal('fetch', fetch);
+
+    await expect(
+      executeSlashCommand('session 1', {
+        command_id: 'codex.raw',
+        arguments: {},
+        raw_input: '/raw',
+        confirmed: true
+      })
+    ).resolves.toEqual({
+      accepted: true,
+      message: 'Provider returned raw payload.',
+      session: undefined,
+      provider_payload: ['raw', 1, true]
+    });
+  });
+
   test('refreshes provider sessions for a workspace', async () => {
     const fetch = vi.fn().mockResolvedValue({
       ok: true,

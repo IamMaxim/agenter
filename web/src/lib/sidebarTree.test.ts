@@ -6,7 +6,8 @@ import type { RunnerInfo, SessionInfo, WorkspaceRef } from '../api/types';
 const runnerOnline: RunnerInfo = {
   runner_id: 'runner-a',
   name: 'mac-mini',
-  status: 'online'
+  status: 'online',
+  provider_ids: ['codex']
 };
 
 const runnerOffline: RunnerInfo = {
@@ -70,6 +71,7 @@ describe('sidebar session tree', () => {
       'mbp:Psychoville'
     ]);
     expect(tree[0].status).toBe('online');
+    expect(tree[0].runner.provider_ids).toEqual(['codex']);
     expect(tree[0].sessions.map((session) => session.session_id)).toEqual([
       'session-a',
       'session-b'

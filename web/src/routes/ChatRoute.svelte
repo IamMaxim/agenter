@@ -4,6 +4,7 @@
   import InlineEventRow from '../components/InlineEventRow.svelte';
   import MarkdownBlock from '../components/MarkdownBlock.svelte';
   import PlanCard from '../components/PlanCard.svelte';
+  import RawPayloadDetails from '../components/RawPayloadDetails.svelte';
   import SubagentEventRow from '../components/SubagentEventRow.svelte';
   import { ApiError } from '../api/http';
   import { disableApprovalRule, listApprovalRules } from '../api/approvalRules';
@@ -108,6 +109,7 @@
   let agentOptions: AgentOptions = { models: [], collaboration_modes: [] };
   let turnSettings: AgentTurnSettings = {};
   let questionDrafts: Record<string, Record<string, string[]>> = {};
+  let customQuestionSelections: Record<string, boolean> = {};
   let slashCommands: SlashCommandDefinition[] = [];
   let slashSelectionIndex = 0;
   let pendingDangerCommand:
@@ -1063,6 +1065,10 @@
     return decision.replaceAll('_', ' ');
   }
 
+  function approvalKindLabel(kind: string | undefined) {
+    return (kind ?? 'approval').replaceAll('_', ' ');
+  }
+
   function questionAnswers(item: ChatItem, field: AgentQuestionField): string[] {
     if (item.kind !== 'question') {
       return [];
@@ -1080,6 +1086,17 @@
     };
   }
 
+  function questionFieldKey(questionId: string, fieldId: string) {
+    return `${questionId}:${fieldId}`;
+  }
+
+  function setCustomQuestionSelected(questionId: string, fieldId: string, selected: boolean) {
+    customQuestionSelections = {
+      ...customQuestionSelections,
+      [questionFieldKey(questionId, fieldId)]: selected
+    };
+  }
+
   function toggleQuestionChoice(item: ChatItem, field: AgentQuestionField, value: string, checked: boolean) {
     if (item.kind !== 'question') {
       return;
@@ -1087,6 +1104,28 @@
     const current = questionAnswers(item, field);
     const answers = checked ? [...new Set([...current, value])] : current.filter((answer) => answer !== value);
     setQuestionAnswers(item.questionId, field.id, answers);
+  }
+
+  function isSingleChoiceField(field: AgentQuestionField) {
+    return (field.kind === 'single_select' || field.kind === 'choice') && field.choices.length > 0;
+  }
+
+  function isCustomQuestionAnswer(item: ChatItem, field: AgentQuestionField) {
+    if (item.kind !== 'question') {
+      return false;
+    }
+    const answer = questionAnswers(item, field)[0];
+    return (
+      customQuestionSelections[questionFieldKey(item.questionId, field.id)] === true ||
+      (typeof answer === 'string' && answer.length > 0 && !field.choices.some((choice) => choice.value === answer))
+    );
+  }
+
+  function customQuestionAnswer(item: ChatItem, field: AgentQuestionField) {
+    if (item.kind !== 'question') {
+      return '';
+    }
+    return isCustomQuestionAnswer(item, field) ? questionAnswers(item, field)[0] : '';
   }
 
   async function submitQuestion(item: ChatItem) {
@@ -1225,13 +1264,30 @@
               <span class="approval-resolved-icon" aria-hidden="true"><AgenterIcon name="checklist" size={12} /></span>
               <span>Approval answered</span>
               <code>{resolvedApprovalLabel(item.resolvedDecision)}</code>
+              <RawPayloadDetails payload={item.rawPayload} />
             </article>
           {:else}
             <article class="event-card approval-card log-card">
               <div class="card-heading log-card-heading">
-                <span class="log-eyebrow">! approval requested</span>
+                <span class="log-eyebrow">! {approvalKindLabel(item.approvalKind)} approval</span>
               </div>
               <strong>{item.title}</strong>
+              {#if item.approvalKind || item.nativeRequestId || item.nativeBlocking}
+                <div class="approval-meta-grid">
+                  {#if item.approvalKind}
+                    <span>kind</span>
+                    <strong>{approvalKindLabel(item.approvalKind)}</strong>
+                  {/if}
+                  {#if item.nativeRequestId}
+                    <span>request</span>
+                    <strong>{item.nativeRequestId}</strong>
+                  {/if}
+                  {#if item.nativeBlocking}
+                    <span>blocking</span>
+                    <strong>yes</strong>
+                  {/if}
+                </div>
+              {/if}
               {#if commandApprovalPresentation(item.presentation)}
                 <div class="approval-meta-grid">
                   <span>command</span>
@@ -1282,6 +1338,7 @@
                   </button>
                 {/each}
               </div>
+              <RawPayloadDetails payload={item.rawPayload} />
             </article>
           {/if}
         {:else if item.kind === 'question'}
@@ -1296,8 +1353,20 @@
             {#if item.description}
               <p>{item.description}</p>
             {/if}
+            {#if item.nativeRequestId || item.nativeBlocking}
+              <div class="approval-meta-grid">
+                {#if item.nativeRequestId}
+                  <span>request</span>
+                  <strong>{item.nativeRequestId}</strong>
+                {/if}
+                {#if item.nativeBlocking}
+                  <span>blocking</span>
+                  <strong>yes</strong>
+                {/if}
+              </div>
+            {/if}
             {#each item.fields as field}
-              <label class="question-field">
+              <div class="question-field">
                 <span>{field.label}</span>
                 {#if field.prompt}
                   <small>{field.prompt}</small>
@@ -1313,21 +1382,68 @@
                           on:change={(event) =>
                             toggleQuestionChoice(item, field, choice.value, event.currentTarget.checked)}
                         />
-                        <span>{choice.label}</span>
+                        <span class="choice-text">
+                          <strong>{choice.label}</strong>
+                          {#if choice.description}
+                            <small>{choice.description}</small>
+                          {/if}
+                        </span>
                       </label>
                     {/each}
                   </div>
-                {:else if field.kind === 'single_select' && field.choices.length > 0}
-                  <select
-                    disabled={item.answered}
-                    value={questionAnswers(item, field)[0] ?? ''}
-                    on:change={(event) => setQuestionAnswers(item.questionId, field.id, [event.currentTarget.value])}
-                  >
-                    <option value="">Choose...</option>
+                {:else if isSingleChoiceField(field)}
+                  <div class="choice-list single-choice-list">
                     {#each field.choices as choice}
-                      <option value={choice.value}>{choice.label}</option>
+                      <label class:active={questionAnswers(item, field)[0] === choice.value}>
+                        <input
+                          type="radio"
+                          name={`${item.questionId}-${field.id}`}
+                          disabled={item.answered}
+                          checked={questionAnswers(item, field)[0] === choice.value}
+                          on:change={() => {
+                            setCustomQuestionSelected(item.questionId, field.id, false);
+                            setQuestionAnswers(item.questionId, field.id, [choice.value]);
+                          }}
+                        />
+                        <span class="choice-text">
+                          <strong>{choice.label}</strong>
+                          {#if choice.description}
+                            <small>{choice.description}</small>
+                          {/if}
+                        </span>
+                      </label>
                     {/each}
-                  </select>
+                    <label class:active={isCustomQuestionAnswer(item, field)}>
+                      <input
+                        type="radio"
+                        name={`${item.questionId}-${field.id}`}
+                        disabled={item.answered}
+                        checked={isCustomQuestionAnswer(item, field)}
+                        on:change={() => {
+                          setCustomQuestionSelected(item.questionId, field.id, true);
+                          setQuestionAnswers(item.questionId, field.id, [customQuestionAnswer(item, field)]);
+                        }}
+                      />
+                      <span class="choice-text">
+                        <strong>Custom response</strong>
+                        <small>Send plain text instead of one of these options.</small>
+                      </span>
+                    </label>
+                    <input
+                      class="question-custom-input"
+                      type={field.secret ? 'password' : 'text'}
+                      disabled={item.answered}
+                      placeholder="Type custom response..."
+                      value={customQuestionAnswer(item, field)}
+                      on:focus={() => {
+                        if (!isCustomQuestionAnswer(item, field)) {
+                          setCustomQuestionSelected(item.questionId, field.id, true);
+                          setQuestionAnswers(item.questionId, field.id, ['']);
+                        }
+                      }}
+                      on:input={(event) => setQuestionAnswers(item.questionId, field.id, [event.currentTarget.value])}
+                    />
+                  </div>
                 {:else}
                   <input
                     type={field.secret ? 'password' : field.kind === 'number' ? 'number' : 'text'}
@@ -1336,13 +1452,15 @@
                     on:input={(event) => setQuestionAnswers(item.questionId, field.id, [event.currentTarget.value])}
                   />
                 {/if}
-              </label>
+                <RawPayloadDetails payload={field.schema} summary="Field schema" />
+              </div>
             {/each}
             {#if !item.answered}
               <div class="inline-actions">
                 <button type="button" on:click={() => submitQuestion(item)}>Answer</button>
               </div>
             {/if}
+            <RawPayloadDetails payload={item.rawPayload} />
           </article>
         {:else if item.kind === 'error'}
           <article class="event-card error-card">
@@ -1354,6 +1472,7 @@
                 <pre>{item.detail}</pre>
               </details>
             {/if}
+            <RawPayloadDetails payload={item.rawPayload} />
           </article>
         {/if}
       {/each}

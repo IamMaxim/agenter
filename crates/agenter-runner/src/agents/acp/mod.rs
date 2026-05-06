@@ -946,6 +946,7 @@ fn acp_native_ref(
         summary: Some(summary.to_owned()),
         hash: None,
         pointer: None,
+        raw_payload: None,
     }
 }
 
@@ -974,6 +975,7 @@ fn acp_tool_item(
         }],
         tool: Some(ToolProjection {
             kind: ToolProjectionKind::Tool,
+            subkind: None,
             name: event.name.clone(),
             title: event.title.clone().unwrap_or_else(|| event.name.clone()),
             status,
@@ -1054,6 +1056,7 @@ pub mod acp_reducer {
                         summary: Some("ACP prompt started".to_owned()),
                         hash: None,
                         pointer: None,
+                        raw_payload: None,
                     }),
                     event: UniversalEventKind::TurnStarted {
                         turn: TurnState {
@@ -1087,6 +1090,7 @@ pub mod acp_reducer {
                         summary: Some("ACP prompt completed".to_owned()),
                         hash: None,
                         pointer: None,
+                        raw_payload: None,
                     }),
                     event: UniversalEventKind::TurnCompleted {
                         turn: TurnState {
@@ -1301,6 +1305,7 @@ fn acp_command_event(input: AcpCommandEventInput<'_>) -> crate::agents::adapter:
                 content,
                 tool: Some(ToolProjection {
                     kind: ToolProjectionKind::Command,
+                    subkind: Some("command".to_owned()),
                     name: "terminal".to_owned(),
                     title: command.to_owned(),
                     status,

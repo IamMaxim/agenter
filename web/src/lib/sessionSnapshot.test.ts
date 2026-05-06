@@ -672,6 +672,248 @@ describe('universal session snapshot client reducer', () => {
     ]);
   });
 
+  test('keeps raw native payloads in materialized snapshot state', () => {
+    const state = applyUniversalClientMessage(createUniversalClientState(), {
+      type: 'session_snapshot',
+      protocol_version: 'uap/2',
+      snapshot: snapshot({
+        latest_seq: '7',
+        items: {
+          item1: {
+            item_id: 'item1',
+            session_id: 's1',
+            role: 'tool',
+            status: 'completed',
+            content: [],
+            tool: {
+              kind: 'tool',
+              subkind: 'context_compaction',
+              name: 'context_compaction',
+              title: 'Context compaction',
+              status: 'completed'
+            },
+            native: {
+              protocol: 'codex/app-server/v2',
+              method: 'rawResponseItem/completed',
+              raw_payload: { item: { id: 'item1', type: 'context_compaction' } }
+            }
+          }
+        }
+      }),
+      events: [],
+      replay_complete: true
+    });
+
+    expect(state.snapshot!.items.item1.tool?.subkind).toBe('context_compaction');
+    expect(state.snapshot!.items.item1.native?.raw_payload).toEqual({
+      item: { id: 'item1', type: 'context_compaction' }
+    });
+  });
+
+  test('keeps raw native payloads on provider rows after snapshot materialization', () => {
+    const state = applyUniversalClientMessage(createUniversalClientState(), {
+      type: 'session_snapshot',
+      protocol_version: 'uap/2',
+      snapshot: snapshot({ latest_seq: '1' }),
+      events: [
+        {
+          ...universalEvent('2', 'provider-raw'),
+          event_id: 'provider-raw',
+          native: {
+            protocol: 'codex/app-server/v2',
+            method: 'rawResponseItem/completed',
+            raw_payload: { params: { item: { id: 'native-1' } } }
+          },
+          event: {
+            type: 'native.unknown',
+            data: { summary: 'rawResponseItem/completed' }
+          }
+        }
+      ],
+      replay_complete: true
+    });
+
+    expect(state.snapshot!.artifacts['native:provider-raw'].native?.raw_payload).toEqual({
+      params: { item: { id: 'native-1' } }
+    });
+    expect(state.chat.items).toEqual([
+      expect.objectContaining({
+        id: 'event:artifact:native:provider-raw',
+        kind: 'inlineEvent',
+        rawPayload: { params: { item: { id: 'native-1' } } }
+      })
+    ]);
+  });
+
+  test('materializes raw native payloads and schema metadata on approval and question rows', () => {
+    const state = materializeSnapshotChatState(
+      snapshot({
+        approvals: {
+          permission1: {
+            approval_id: 'permission1',
+            session_id: 's1',
+            kind: 'permission',
+            title: 'Allow network access',
+            details: 'Grant network access for strict auto review.',
+            options: [{ option_id: 'accept', kind: 'approve_once', label: 'Allow once' }],
+            status: 'pending',
+            subject: 'network',
+            native_request_id: 'req-permission',
+            native_blocking: true,
+            native: {
+              protocol: 'codex/app-server/v2',
+              method: 'item/permissions/requestApproval',
+              raw_payload: { method: 'item/permissions/requestApproval', params: { scope: 'network' } }
+            }
+          }
+        },
+        questions: {
+          q_schema: {
+            question_id: 'q_schema',
+            session_id: 's1',
+            title: 'Pick deployment target',
+            description: 'MCP elicitation',
+            fields: [
+              {
+                id: 'target',
+                label: 'Target',
+                prompt: 'Choose one',
+                kind: 'single_select',
+                required: true,
+                secret: false,
+                choices: [{ value: 'prod', label: 'Production' }],
+                default_answers: ['prod'],
+                schema: { type: 'string', enum: ['prod', 'staging'] }
+              }
+            ],
+            status: 'pending',
+            native_request_id: 'req-question',
+            native_blocking: true,
+            native: {
+              protocol: 'codex/app-server/v2',
+              method: 'mcpServer/elicitation/request',
+              raw_payload: { method: 'mcpServer/elicitation/request', params: { schema: true } }
+            }
+          }
+        }
+      })
+    );
+
+    expect(state.items).toEqual([
+      expect.objectContaining({
+        id: 'approval:permission1',
+        kind: 'approval',
+        approvalKind: 'permission',
+        rawPayload: { method: 'item/permissions/requestApproval', params: { scope: 'network' } }
+      }),
+      expect.objectContaining({
+        id: 'question:q_schema',
+        kind: 'question',
+        nativeRequestId: 'req-question',
+        nativeBlocking: true,
+        rawPayload: { method: 'mcpServer/elicitation/request', params: { schema: true } },
+        fields: [
+          expect.objectContaining({
+            id: 'target',
+            schema: { type: 'string', enum: ['prod', 'staging'] },
+            default_answers: ['prod']
+          })
+        ]
+      })
+    ]);
+  });
+
+  test('materializes tool subkinds and item raw payloads from universal rows', () => {
+    const state = materializeSnapshotChatState(
+      snapshot({
+        items: {
+          search: {
+            item_id: 'search',
+            session_id: 's1',
+            role: 'tool',
+            status: 'completed',
+            content: [{ block_id: 'search-result', kind: 'tool_result', text: 'Found docs' }],
+            tool: {
+              kind: 'tool',
+              subkind: 'web_search',
+              name: 'web_search',
+              title: 'Search web',
+              status: 'completed',
+              output_summary: 'Found docs'
+            },
+            native: {
+              protocol: 'codex/app-server/v2',
+              method: 'item/completed',
+              raw_payload: { item: { type: 'web_search', query: 'uap2' } }
+            }
+          },
+          compaction: {
+            item_id: 'compaction',
+            session_id: 's1',
+            role: 'system',
+            status: 'completed',
+            content: [{ block_id: 'compact', kind: 'provider_status', text: 'Context compacted' }],
+            tool: {
+              kind: 'tool',
+              subkind: 'context_compaction',
+              name: 'context_compaction',
+              title: 'Context compaction',
+              status: 'completed'
+            },
+            native: {
+              protocol: 'codex/app-server/v2',
+              method: 'thread/compact/start',
+              raw_payload: { method: 'thread/compact/start' }
+            }
+          },
+          review: {
+            item_id: 'review',
+            session_id: 's1',
+            role: 'system',
+            status: 'completed',
+            content: [{ block_id: 'review-mode', kind: 'provider_status', text: 'Entered review mode' }],
+            tool: {
+              kind: 'tool',
+              subkind: 'review_mode',
+              name: 'review_mode',
+              title: 'Review mode',
+              status: 'completed'
+            },
+            native: {
+              protocol: 'codex/app-server/v2',
+              method: 'review/start',
+              raw_payload: { method: 'review/start' }
+            }
+          }
+        }
+      })
+    );
+
+    expect(state.items).toEqual([
+      expect.objectContaining({
+        id: 'event:item:search',
+        kind: 'inlineEvent',
+        eventKind: 'tool',
+        subkind: 'web_search',
+        rawPayload: { item: { type: 'web_search', query: 'uap2' } }
+      }),
+      expect.objectContaining({
+        id: 'event:item:compaction',
+        kind: 'inlineEvent',
+        eventKind: 'tool',
+        subkind: 'context_compaction',
+        rawPayload: { method: 'thread/compact/start' }
+      }),
+      expect.objectContaining({
+        id: 'event:item:review',
+        kind: 'inlineEvent',
+        eventKind: 'tool',
+        subkind: 'review_mode',
+        rawPayload: { method: 'review/start' }
+      })
+    ]);
+  });
+
   test('detects real capability data before feature gating existing controls', () => {
     expect(hasCapabilitySignal(undefined)).toBe(false);
     expect(hasCapabilitySignal(snapshot({ capabilities: undefined }).capabilities)).toBe(false);

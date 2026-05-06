@@ -14,6 +14,7 @@ pub(super) struct RunnerInfoResponse {
     pub(super) name: String,
     pub(super) status: &'static str,
     pub(super) last_seen_at: Option<String>,
+    pub(super) provider_ids: Vec<agenter_core::AgentProviderId>,
 }
 
 pub(super) fn router() -> Router<crate::state::AppState> {
@@ -39,24 +40,34 @@ pub(super) async fn list_runners(
         .list_runners_with_connection_status()
         .await
         .into_iter()
-        .map(|entry| RunnerInfoResponse {
-            runner_id: entry.runner.runner_id,
-            name: entry
+        .map(|entry| {
+            let provider_ids = entry
                 .runner
-                .workspaces
-                .first()
-                .and_then(|workspace| workspace.display_name.clone())
-                .or_else(|| {
-                    entry
-                        .runner
-                        .capabilities
-                        .agent_providers
-                        .first()
-                        .map(|provider| provider.provider_id.to_string())
-                })
-                .unwrap_or_else(|| entry.runner.runner_id.to_string()),
-            status: if entry.connected { "online" } else { "offline" },
-            last_seen_at: None,
+                .capabilities
+                .agent_providers
+                .iter()
+                .map(|provider| provider.provider_id.clone())
+                .collect::<Vec<_>>();
+            RunnerInfoResponse {
+                runner_id: entry.runner.runner_id,
+                name: entry
+                    .runner
+                    .workspaces
+                    .first()
+                    .and_then(|workspace| workspace.display_name.clone())
+                    .or_else(|| {
+                        entry
+                            .runner
+                            .capabilities
+                            .agent_providers
+                            .first()
+                            .map(|provider| provider.provider_id.to_string())
+                    })
+                    .unwrap_or_else(|| entry.runner.runner_id.to_string()),
+                status: if entry.connected { "online" } else { "offline" },
+                last_seen_at: None,
+                provider_ids,
+            }
         })
         .collect();
     tracing::debug!(runner_count = runners.len(), "listed runners");

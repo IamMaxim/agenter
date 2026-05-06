@@ -245,11 +245,15 @@ function materializeQuestion(question: QuestionState): Extract<ChatItem, { kind:
       required: field.required,
       secret: field.secret,
       choices: field.choices ?? [],
-      default_answers: field.default_answers ?? []
+      default_answers: field.default_answers ?? [],
+      schema: field.schema
     })),
     answered: question.status === 'answered',
     status: question.status,
-    resolvedState: terminal ? question.status : undefined
+    resolvedState: terminal ? question.status : undefined,
+    nativeRequestId: question.native_request_id ?? undefined,
+    nativeBlocking: question.native_blocking ?? undefined,
+    rawPayload: question.native?.raw_payload
   };
 }
 
@@ -294,7 +298,7 @@ function materializeItem(item: ItemState): ChatItem | undefined {
       title: item.native?.summary ?? 'Warning',
       detail: content || undefined,
       status: item.status,
-      source: item.native?.protocol ?? undefined
+      ...nativeRowFields(item)
     };
   }
   if (item.content.some((block) => block.kind === 'provider_status')) {
@@ -305,7 +309,7 @@ function materializeItem(item: ItemState): ChatItem | undefined {
       title: item.native?.summary ?? 'Provider status',
       detail: content || undefined,
       status: item.status,
-      source: item.native?.protocol ?? undefined
+      ...nativeRowFields(item)
     };
   }
   if (item.content.some((block) => block.kind === 'reasoning')) {
@@ -317,7 +321,7 @@ function materializeItem(item: ItemState): ChatItem | undefined {
       title: item.native?.summary ?? 'Reasoning',
       detail: content || undefined,
       status: item.status,
-      source: item.native?.protocol ?? undefined
+      ...nativeRowFields(item)
     };
   }
   if (item.content.some((block) => block.kind === 'image')) {
@@ -328,7 +332,7 @@ function materializeItem(item: ItemState): ChatItem | undefined {
       title: item.native?.summary ?? 'Image',
       detail: imageDetail(item.content) || content || undefined,
       status: item.status,
-      source: item.native?.protocol ?? undefined
+      ...nativeRowFields(item)
     };
   }
   if (item.content.some((block) => block.kind === 'native')) {
@@ -340,7 +344,7 @@ function materializeItem(item: ItemState): ChatItem | undefined {
       title: item.native?.summary ?? item.native?.method ?? 'Native event',
       detail: content || undefined,
       status: item.status,
-      source: item.native?.protocol ?? undefined
+      ...nativeRowFields(item)
     };
   }
   if (first?.kind === 'command_output' || first?.kind === 'terminal_input') {
@@ -352,7 +356,7 @@ function materializeItem(item: ItemState): ChatItem | undefined {
       detail: undefined,
       output: commandOutputText(item.content),
       status: item.status,
-      source: item.native?.protocol ?? undefined
+      ...nativeRowFields(item)
     };
   }
   if (isNativeCommand) {
@@ -364,7 +368,7 @@ function materializeItem(item: ItemState): ChatItem | undefined {
       detail: undefined,
       output: commandOutputText(item.content),
       status: item.status,
-      source: item.native?.protocol ?? undefined
+      ...nativeRowFields(item)
     };
   }
   if (isNativeFileChange) {
@@ -378,7 +382,7 @@ function materializeItem(item: ItemState): ChatItem | undefined {
         (first?.text?.trim() || 'File change'),
       detail: fileChangeDetail(item.content) || content || undefined,
       status: item.status,
-      source: item.native?.protocol ?? undefined
+      ...nativeRowFields(item)
     };
   }
   return {
@@ -388,7 +392,7 @@ function materializeItem(item: ItemState): ChatItem | undefined {
     title: item.native?.summary ?? item.native?.method ?? first?.kind ?? 'Tool activity',
     detail: content || undefined,
     status: item.status,
-    source: item.native?.protocol ?? undefined
+    ...nativeRowFields(item)
   };
 }
 
@@ -410,7 +414,8 @@ function materializeToolItem(item: ItemState, content: string): ChatItem {
         'File change',
       detail: fileChangeDetail(item.content) || content || undefined,
       status: tool.status ?? item.status,
-      source: item.native?.protocol ?? undefined
+      subkind: tool.subkind ?? undefined,
+      ...nativeRowFields(item)
     };
   }
   if (tool.kind === 'subagent' && tool.subagent) {
@@ -433,7 +438,8 @@ function materializeToolItem(item: ItemState, content: string): ChatItem {
         agentId: state.agent_id,
         status: state.status,
         message: state.message ?? undefined
-      }))
+      })),
+      providerPayload: item.native?.raw_payload
     };
   }
 
@@ -451,6 +457,8 @@ function materializeToolItem(item: ItemState, content: string): ChatItem {
       durationMs: tool.command.duration_ms ?? undefined,
       processId: tool.command.process_id ?? undefined,
       source: tool.command.source ?? undefined,
+      subkind: tool.subkind ?? undefined,
+      rawPayload: item.native?.raw_payload,
       actions: (tool.command.actions ?? []).map((action) => ({
         kind: action.kind,
         label: action.label,
@@ -474,7 +482,15 @@ function materializeToolItem(item: ItemState, content: string): ChatItem {
     title: tool.title || tool.name || 'Tool',
     detail: detail ?? undefined,
     status: tool.status ?? item.status,
-    source: item.native?.protocol ?? undefined
+    subkind: tool.subkind ?? undefined,
+    ...nativeRowFields(item)
+  };
+}
+
+function nativeRowFields(item: ItemState): { source?: string; rawPayload?: unknown } {
+  return {
+    source: item.native?.protocol ?? undefined,
+    rawPayload: item.native?.raw_payload
   };
 }
 
@@ -553,14 +569,18 @@ function materializeApproval(approval: ApprovalRequest): Extract<ChatItem, { kin
     approvalId: approval.approval_id,
     title: approval.title,
     detail: approval.details ?? undefined,
+    approvalKind: approval.kind,
     options: terminal
       ? []
       : approval.options.map(approvalChoiceFromOption).filter((x): x is NonNullable<typeof x> => Boolean(x)),
     status: approval.status,
     risk: approval.risk ?? undefined,
     subject: approval.subject ?? undefined,
+    nativeRequestId: approval.native_request_id ?? undefined,
+    nativeBlocking: approval.native_blocking ?? undefined,
     resolutionState: approval.status === 'resolving' ? 'resolving' : approval.status === 'pending' ? 'pending' : undefined,
-    resolvedDecision
+    resolvedDecision,
+    rawPayload: approval.native?.raw_payload
   };
 }
 
@@ -587,14 +607,15 @@ function materializeDiff(diff: DiffState): Extract<ChatItem, { kind: 'inlineEven
 }
 
 function materializeArtifact(
-  artifact: { artifact_id: string; kind: string; title: string; uri?: string | null }
+  artifact: { artifact_id: string; kind: string; title: string; uri?: string | null; native?: { raw_payload?: unknown } | null }
 ): ChatItem {
   if (artifact.kind === 'error') {
     return {
       id: `event:artifact:${artifact.artifact_id}`,
       kind: 'error',
       title: artifact.title,
-      detail: artifact.uri ?? undefined
+      detail: artifact.uri ?? undefined,
+      rawPayload: artifact.native?.raw_payload
     };
   }
   return {
@@ -604,7 +625,8 @@ function materializeArtifact(
     displayLevel: artifact.kind === 'native_raw' ? 'raw' : 'normal',
     title: artifact.title,
     detail: artifact.uri ?? undefined,
-    status: artifact.kind === 'native_raw' ? 'native' : artifact.kind
+    status: artifact.kind === 'native_raw' ? 'native' : artifact.kind,
+    rawPayload: artifact.native?.raw_payload
   };
 }
 

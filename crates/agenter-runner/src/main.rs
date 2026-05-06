@@ -29,6 +29,7 @@ use agenter_protocol::{
 use agents::acp::{AcpProviderProfile, AcpRunnerRuntime, AcpTurnRequest, PendingAcpApproval};
 use agents::adapter::{AdapterEvent, AdapterProviderRegistration, AdapterRuntime};
 use agents::approval_state::{PendingApprovalSubmitError, PendingProviderApproval};
+use agents::codex::runtime::{codex_provider_commands, CodexRunnerRuntime};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
@@ -211,6 +212,9 @@ async fn main() -> anyhow::Result<()> {
     if fake_mode_requested() {
         tracing::info!("starting fake runner mode");
         run_fake_runner().await?;
+    } else if codex_mode_requested() {
+        tracing::info!("starting codex app-server runner mode");
+        run_codex_runner().await?;
     } else if acp_mode_requested() {
         tracing::info!("starting multi-provider ACP runner mode");
         run_acp_runner(AcpProviderProfile::available_all()).await?;
@@ -244,6 +248,11 @@ fn qwen_mode_requested() -> bool {
 fn acp_mode_requested() -> bool {
     env::args().any(|arg| arg == "acp" || arg == "--acp")
         || env::var("AGENTER_RUNNER_MODE").is_ok_and(|mode| mode == "acp")
+}
+
+fn codex_mode_requested() -> bool {
+    env::args().any(|arg| arg == "codex" || arg == "--codex")
+        || env::var("AGENTER_RUNNER_MODE").is_ok_and(|mode| mode == "codex")
 }
 
 fn gemini_mode_requested() -> bool {
@@ -799,6 +808,411 @@ async fn run_acp_runner(profiles: Vec<AcpProviderProfile>) -> anyhow::Result<()>
     Ok(())
 }
 
+async fn run_codex_runner() -> anyhow::Result<()> {
+    let url = env::var("AGENTER_CONTROL_PLANE_WS")
+        .unwrap_or_else(|_| DEFAULT_CONTROL_PLANE_WS.to_owned());
+    let token = env::var("AGENTER_DEV_RUNNER_TOKEN")
+        .unwrap_or_else(|_| DEFAULT_DEV_RUNNER_TOKEN.to_owned());
+    let workspace_path = env::var("AGENTER_WORKSPACE")
+        .map(PathBuf::from)
+        .unwrap_or(env::current_dir()?);
+    let workspace_path = workspace_path.canonicalize().unwrap_or(workspace_path);
+    let hello_template = codex_hello(token, workspace_path.clone());
+    let wal = RunnerWal::open(runner_wal_path(hello_template.runner_id, &workspace_path)).await?;
+    let advertised_workspace = hello_template.workspaces.first().cloned();
+    let provider_id = AgentProviderId::from(AgentProviderId::CODEX);
+    let mut adapter_runtime = AdapterRuntime::new();
+    adapter_runtime.register_provider(AdapterProviderRegistration {
+        provider_id: provider_id.clone(),
+        capabilities: CodexRunnerRuntime::registration().capability_set,
+    });
+    let (codex_event_sender, mut codex_event_receiver) = mpsc::unbounded_channel::<AdapterEvent>();
+    let (background_event_sender, mut background_event_receiver) =
+        mpsc::unbounded_channel::<(Option<RequestId>, RunnerEvent)>();
+    let runtime = CodexRunnerRuntime::spawn(workspace_path.clone(), codex_event_sender.clone())?;
+
+    loop {
+        tracing::info!(url = %url, runner_id = %hello_template.runner_id, "connecting Codex runner to control plane");
+        let (socket, _) = match connect_async(&url).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                tracing::warn!(%error, "Codex runner websocket connect failed; retrying");
+                sleep(runner_reconnect_delay()).await;
+                continue;
+            }
+        };
+        let (mut sender, mut receiver) = socket.split();
+        let mut server_message_reassembler =
+            RunnerTransportChunkReassembler::new(runner_ws_max_message_bytes());
+        let mut hello = hello_template.clone();
+        let acked = wal.acked_seq().await;
+        hello.acked_runner_event_seq = (acked > 0).then_some(acked);
+        hello.replay_from_runner_event_seq = wal
+            .unacked()
+            .await
+            .first()
+            .map(|record| record.runner_event_seq);
+        send_runner_message(&mut sender, RunnerClientMessage::Hello(hello)).await?;
+        replay_unacked_wal(&mut sender, &wal).await?;
+
+        let transport_result: anyhow::Result<()> = async {
+            loop {
+                tokio::select! {
+                    background = background_event_receiver.recv() => {
+                        let Some((request_id, event)) = background else {
+                            continue;
+                        };
+                        if let Err(error) = send_wal_event(&mut sender, &wal, request_id, None, event).await {
+                            tracing::warn!(%error, "failed to send Codex background event; reconnecting");
+                            break;
+                        }
+                    }
+                    event = codex_event_receiver.recv() => {
+                        let Some(adapter_event) = event else {
+                            continue;
+                        };
+                        let Some(agent_event) = adapter_event.universal_projection_for_wal() else {
+                            continue;
+                        };
+                        let session_id = agent_event.session_id;
+                        if let Err(error) = send_wal_event(
+                            &mut sender,
+                            &wal,
+                            None,
+                            Some(session_id),
+                            RunnerEvent::AgentEvent(Box::new(agent_event)),
+                        )
+                        .await {
+                            tracing::warn!(%error, "failed to send Codex agent event; reconnecting");
+                            break;
+                        }
+                    }
+                    message = receiver.next() => {
+                        let Some(message) = message else {
+                            tracing::info!("control plane websocket closed for Codex runner");
+                            break;
+                        };
+                        let Message::Text(text) = message? else {
+                            continue;
+                        };
+                        let Some(message) = next_runner_server_message(&mut server_message_reassembler, &text)? else {
+                            continue;
+                        };
+                        let Some(envelope) = handle_runner_server_message(&wal, message).await else {
+                            continue;
+                        };
+
+                        match envelope.command {
+                            RunnerCommand::CreateSession(command) => {
+                                if command.provider_id != provider_id {
+                                    send_runner_message(
+                                        &mut sender,
+                                        RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                            request_id: envelope.request_id,
+                                            outcome: RunnerResponseOutcome::Error {
+                                                error: RunnerError {
+                                                    code: "codex_provider_not_available".to_owned(),
+                                                    message: format!("Codex runner cannot create provider `{}`", command.provider_id),
+                                                },
+                                            },
+                                        }),
+                                    ).await?;
+                                    continue;
+                                }
+                                let outcome = match runtime.create_session(command.session_id, command.initial_input).await {
+                                    Ok(handle) => {
+                                        adapter_runtime.bind_session(handle.session_id, provider_id.clone());
+                                        RunnerResponseOutcome::Ok {
+                                            result: RunnerCommandResult::SessionCreated {
+                                                session_id: handle.session_id,
+                                                external_session_id: handle.external_session_id,
+                                            },
+                                        }
+                                    }
+                                    Err(error) => RunnerResponseOutcome::Error {
+                                        error: runner_error("codex_create_session_failed", error),
+                                    },
+                                };
+                                send_runner_message(
+                                    &mut sender,
+                                    RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                        request_id: envelope.request_id,
+                                        outcome,
+                                    }),
+                                ).await?;
+                            }
+                            RunnerCommand::ResumeSession(command) => {
+                                let outcome = match runtime
+                                    .resume_session(command.session_id, command.external_session_id)
+                                    .await
+                                {
+                                    Ok(handle) => {
+                                        adapter_runtime.bind_session(handle.session_id, provider_id.clone());
+                                        RunnerResponseOutcome::Ok {
+                                            result: RunnerCommandResult::SessionResumed {
+                                                session_id: handle.session_id,
+                                                external_session_id: handle.external_session_id,
+                                            },
+                                        }
+                                    }
+                                    Err(error) => RunnerResponseOutcome::Error {
+                                        error: runner_error("codex_resume_session_failed", error),
+                                    },
+                                };
+                                send_runner_message(
+                                    &mut sender,
+                                    RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                        request_id: envelope.request_id,
+                                        outcome,
+                                    }),
+                                ).await?;
+                            }
+                            RunnerCommand::RefreshSessions(command) => {
+                                let request_id = envelope.request_id.clone();
+                                let background_sender = background_event_sender.clone();
+                                let runtime = runtime.clone();
+                                tokio::spawn(async move {
+                                    let reporter = RunnerOperationReporter {
+                                        request_id: request_id.clone(),
+                                        sender: background_sender.clone(),
+                                    };
+                                    reporter.info(
+                                        RunnerOperationStatus::Accepted,
+                                        "Refresh accepted",
+                                        None,
+                                        Some("Codex refresh task started".to_owned()),
+                                    );
+                                    reporter.info(
+                                        RunnerOperationStatus::Discovering,
+                                        "Discovering Codex threads",
+                                        None,
+                                        Some("Listing Codex app-server threads".to_owned()),
+                                    );
+                                    let event = match runtime.refresh_sessions(command.workspace.clone()).await {
+                                        Ok(sessions) => {
+                                            reporter.info(
+                                                RunnerOperationStatus::SendingResults,
+                                                "Sending refresh results",
+                                                None,
+                                                Some(format!("Sending {} discovered Codex sessions", sessions.len())),
+                                            );
+                                            RunnerEvent::SessionsDiscovered(DiscoveredSessions {
+                                                workspace: command.workspace,
+                                                provider_id: command.provider_id,
+                                                sessions,
+                                            })
+                                        }
+                                        Err(error) => {
+                                            reporter.error(
+                                                RunnerOperationStatus::Failed,
+                                                "Refresh failed",
+                                                Some(error.to_string()),
+                                            );
+                                            RunnerEvent::Error(runner_error("codex_refresh_sessions_failed", error))
+                                        }
+                                    };
+                                    background_sender.send((Some(request_id), event)).ok();
+                                });
+                                send_runner_message(
+                                    &mut sender,
+                                    RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                        request_id: envelope.request_id,
+                                        outcome: RunnerResponseOutcome::Ok {
+                                            result: RunnerCommandResult::Accepted,
+                                        },
+                                    }),
+                                ).await?;
+                            }
+                            RunnerCommand::GetAgentOptions(_command) => {
+                                let runtime = runtime.clone();
+                                let outcome = match runtime.agent_options().await {
+                                    Ok(options) => RunnerResponseOutcome::Ok {
+                                        result: RunnerCommandResult::AgentOptions { options },
+                                    },
+                                    Err(error) => RunnerResponseOutcome::Error {
+                                        error: runner_error("codex_agent_options_failed", error),
+                                    },
+                                };
+                                send_runner_message(
+                                    &mut sender,
+                                    RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                        request_id: envelope.request_id,
+                                        outcome,
+                                    }),
+                                ).await?;
+                            }
+                            RunnerCommand::AgentSendInput(command) => {
+                                adapter_runtime.bind_session(command.session_id, provider_id.clone());
+                                send_runner_message(
+                                    &mut sender,
+                                    RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                        request_id: envelope.request_id.clone(),
+                                        outcome: RunnerResponseOutcome::Ok {
+                                            result: RunnerCommandResult::Accepted,
+                                        },
+                                    }),
+                                ).await?;
+                                let runtime = runtime.clone();
+                                let event_sender = codex_event_sender.clone();
+                                tokio::spawn(async move {
+                                    let session_id = command.session_id;
+                                    if let Err(error) = runtime
+                                        .send_input(session_id, command.external_session_id, command.input, command.settings)
+                                        .await
+                                    {
+                                        tracing::error!(%session_id, %error, "Codex turn failed");
+                                        event_sender
+                                            .send(AdapterEvent::session_status(
+                                                AgentProviderId::from(AgentProviderId::CODEX),
+                                                "codex/app-server",
+                                                None,
+                                                session_id,
+                                                SessionStatus::Failed,
+                                                Some(error.to_string()),
+                                            ))
+                                            .ok();
+                                        event_sender
+                                            .send(AdapterEvent::error(
+                                                AgentProviderId::from(AgentProviderId::CODEX),
+                                                "codex/app-server",
+                                                None,
+                                                session_id,
+                                                Some("codex_adapter_error".to_owned()),
+                                                error.to_string(),
+                                            ))
+                                            .ok();
+                                    }
+                                });
+                            }
+                            RunnerCommand::AnswerApproval(command) => {
+                                let outcome = match runtime
+                                    .answer_approval(command.approval_id, command.decision)
+                                    .await
+                                {
+                                    Ok(()) => RunnerResponseOutcome::Ok {
+                                        result: RunnerCommandResult::Accepted,
+                                    },
+                                    Err(error) => RunnerResponseOutcome::Error {
+                                        error: runner_error("codex_approval_response_failed", error),
+                                    },
+                                };
+                                send_runner_message(
+                                    &mut sender,
+                                    RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                        request_id: envelope.request_id,
+                                        outcome,
+                                    }),
+                                ).await?;
+                            }
+                            RunnerCommand::ListProviderCommands(_command) => {
+                                send_runner_message(
+                                    &mut sender,
+                                    RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                        request_id: envelope.request_id,
+                                        outcome: RunnerResponseOutcome::Ok {
+                                            result: RunnerCommandResult::ProviderCommands {
+                                                commands: codex_provider_commands(),
+                                            },
+                                        },
+                                    }),
+                                ).await?;
+                            }
+                            RunnerCommand::ExecuteProviderCommand(command) => {
+                                let outcome = match runtime
+                                    .execute_provider_command(command.session_id, command.external_session_id, command.command)
+                                    .await
+                                {
+                                    Ok(result) => RunnerResponseOutcome::Ok {
+                                        result: RunnerCommandResult::ProviderCommandExecuted { result },
+                                    },
+                                    Err(error) => RunnerResponseOutcome::Error {
+                                        error: runner_error("codex_provider_command_failed", error),
+                                    },
+                                };
+                                send_runner_message(
+                                    &mut sender,
+                                    RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                        request_id: envelope.request_id,
+                                        outcome,
+                                    }),
+                                ).await?;
+                            }
+                            RunnerCommand::AnswerQuestion(command) => {
+                                let outcome = match runtime.answer_question(command.answer).await {
+                                    Ok(()) => RunnerResponseOutcome::Ok {
+                                        result: RunnerCommandResult::Accepted,
+                                    },
+                                    Err(error) => RunnerResponseOutcome::Error {
+                                        error: runner_error("codex_question_response_failed", error),
+                                    },
+                                };
+                                send_runner_message(
+                                    &mut sender,
+                                    RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                        request_id: envelope.request_id,
+                                        outcome,
+                                    }),
+                                ).await?;
+                            }
+                            RunnerCommand::InterruptSession { session_id } => {
+                                let outcome = match runtime.interrupt_session(session_id).await {
+                                    Ok(()) => RunnerResponseOutcome::Ok {
+                                        result: RunnerCommandResult::Accepted,
+                                    },
+                                    Err(error) => RunnerResponseOutcome::Error {
+                                        error: runner_error("codex_interrupt_failed", error),
+                                    },
+                                };
+                                send_runner_message(
+                                    &mut sender,
+                                    RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                        request_id: envelope.request_id,
+                                        outcome,
+                                    }),
+                                ).await?;
+                            }
+                            RunnerCommand::ShutdownSession(command) => {
+                                let outcome = match runtime.shutdown_session(command.session_id).await {
+                                    Ok(()) => {
+                                        adapter_runtime.unbind_session(command.session_id);
+                                        RunnerResponseOutcome::Ok {
+                                            result: RunnerCommandResult::Accepted,
+                                        }
+                                    }
+                                    Err(error) => RunnerResponseOutcome::Error {
+                                        error: runner_error("codex_shutdown_failed", error),
+                                    },
+                                };
+                                send_runner_message(
+                                    &mut sender,
+                                    RunnerClientMessage::Response(RunnerResponseEnvelope {
+                                        request_id: envelope.request_id,
+                                        outcome,
+                                    }),
+                                ).await?;
+                            }
+                        }
+                    }
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok(())
+        }
+        .await;
+
+        if let Some(ref workspace) = advertised_workspace {
+            tracing::debug!(workspace = %workspace.path, "Codex runner closed");
+        }
+        if let Err(error) = transport_result {
+            tracing::warn!(%error, "Codex runner transport session failed; reconnecting");
+        }
+        sleep(runner_reconnect_delay()).await;
+    }
+
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
 async fn run_fake_runner() -> anyhow::Result<()> {
     let url = env::var("AGENTER_CONTROL_PLANE_WS")
         .unwrap_or_else(|_| DEFAULT_CONTROL_PLANE_WS.to_owned());
@@ -1212,6 +1626,37 @@ fn acp_hello(
     }
 }
 
+fn codex_hello(token: String, workspace_path: PathBuf) -> RunnerHello {
+    let registration = CodexRunnerRuntime::registration();
+    let runner_id = configured_runner_id(&registration.provider_id, &workspace_path);
+    let workspace_id = configured_workspace_id(&registration.provider_id, &workspace_path);
+    RunnerHello {
+        runner_id,
+        protocol_version: PROTOCOL_VERSION.to_owned(),
+        token,
+        capabilities: RunnerCapabilities {
+            agent_providers: vec![AgentProviderAdvertisement {
+                provider_id: registration.provider_id,
+                capabilities: registration.capabilities,
+            }],
+            transports: vec!["codex-app-server".to_owned()],
+            workspace_discovery: false,
+        },
+        acked_runner_event_seq: None,
+        replay_from_runner_event_seq: None,
+        workspaces: vec![WorkspaceRef {
+            workspace_id,
+            runner_id,
+            path: workspace_path.display().to_string(),
+            display_name: workspace_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .or_else(|| Some("codex workspace".to_owned())),
+        }],
+    }
+}
+
 fn configured_runner_id(provider_id: &AgentProviderId, workspace_path: &Path) -> RunnerId {
     env::var("AGENTER_RUNNER_ID")
         .ok()
@@ -1569,6 +2014,7 @@ fn fake_native(method: &str, native_id: &str, summary: &str) -> NativeRef {
         summary: Some(summary.to_owned()),
         hash: None,
         pointer: None,
+        raw_payload: None,
     }
 }
 
@@ -1606,6 +2052,7 @@ fn fake_command_item(
         }],
         tool: Some(ToolProjection {
             kind: ToolProjectionKind::Command,
+            subkind: Some("command".to_owned()),
             name: "command".to_owned(),
             title: "printf fake-runner".to_owned(),
             status,
@@ -1660,6 +2107,7 @@ fn fake_tool_item(
         }],
         tool: Some(ToolProjection {
             kind: ToolProjectionKind::Tool,
+            subkind: None,
             name: "fake_lookup".to_owned(),
             title: "Fake lookup".to_owned(),
             status,

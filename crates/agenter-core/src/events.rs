@@ -61,6 +61,8 @@ pub struct ToolEvent {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolProjection {
     pub kind: ToolProjectionKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subkind: Option<String>,
     pub name: String,
     pub title: String,
     pub status: ItemStatus,
@@ -299,7 +301,7 @@ pub enum UniversalEventSource {
     Native,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct NativeRef {
     pub protocol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -314,6 +316,8 @@ pub struct NativeRef {
     pub hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pointer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_payload: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -504,6 +508,16 @@ pub enum UniversalCommand {
         provider_id: AgentProviderId,
         external_session_id: String,
     },
+    ForkSession {
+        session_id: SessionId,
+        workspace: WorkspaceRef,
+        provider_id: AgentProviderId,
+        external_session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_session_id: Option<SessionId>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_turn_id: Option<TurnId>,
+    },
     CloseSession,
     StartTurn {
         input: UserInput,
@@ -569,7 +583,7 @@ pub enum UserInput {
     Blocks { blocks: Vec<ContentBlock> },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ItemState {
     pub item_id: ItemId,
     pub session_id: SessionId,
@@ -709,7 +723,7 @@ pub struct DiffFile {
     pub diff: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ArtifactState {
     pub artifact_id: ArtifactId,
     pub session_id: SessionId,
@@ -721,6 +735,8 @@ pub struct ArtifactState {
     pub uri: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<DateTime<Utc>>,
 }
@@ -817,5 +833,111 @@ mod tests {
         };
         let json = serde_json::to_value(&event).expect("json");
         assert_eq!(json["data"]["session"]["provider_id"], "qwen");
+    }
+
+    #[test]
+    fn agent_provider_id_has_codex_constant() {
+        assert_eq!(AgentProviderId::CODEX, "codex");
+        assert_eq!(
+            AgentProviderId::from(AgentProviderId::CODEX).as_str(),
+            "codex"
+        );
+    }
+
+    #[test]
+    fn universal_command_serializes_fork_session() {
+        let session_id = SessionId::new();
+        let source_session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let command = UniversalCommand::ForkSession {
+            session_id,
+            workspace: WorkspaceRef {
+                workspace_id: WorkspaceId::new(),
+                runner_id: RunnerId::new(),
+                path: "/work".to_owned(),
+                display_name: Some("Work".to_owned()),
+            },
+            provider_id: AgentProviderId::from(AgentProviderId::CODEX),
+            external_session_id: "thread-1".to_owned(),
+            source_session_id: Some(source_session_id),
+            source_turn_id: Some(turn_id),
+        };
+
+        let json = serde_json::to_value(&command).expect("serialize command");
+        assert_eq!(json["type"], "fork_session");
+        assert_eq!(json["provider_id"], "codex");
+        assert_eq!(json["external_session_id"], "thread-1");
+
+        let decoded: UniversalCommand = serde_json::from_value(json).expect("deserialize command");
+        assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn native_ref_raw_payload_survives_event_serialization() {
+        let session_id = SessionId::new();
+        let event = UniversalEventEnvelope {
+            event_id: "event-raw".to_owned(),
+            seq: UniversalSeq::new(9),
+            session_id,
+            turn_id: None,
+            item_id: None,
+            ts: Utc::now(),
+            source: UniversalEventSource::Native,
+            native: Some(NativeRef {
+                protocol: "codex/app-server/v2".to_owned(),
+                method: Some("rawResponseItem/completed".to_owned()),
+                kind: Some("notification".to_owned()),
+                native_id: Some("frame-1".to_owned()),
+                summary: Some("raw item".to_owned()),
+                hash: None,
+                pointer: None,
+                raw_payload: Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "rawResponseItem/completed",
+                    "params": {
+                        "item": {
+                            "id": "item-1",
+                            "type": "reasoning"
+                        }
+                    }
+                })),
+            }),
+            event: UniversalEventKind::NativeUnknown {
+                summary: Some("raw item".to_owned()),
+            },
+        };
+
+        let json = serde_json::to_value(&event).expect("serialize event");
+        assert_eq!(
+            json["native"]["raw_payload"]["params"]["item"]["type"],
+            "reasoning"
+        );
+
+        let decoded: UniversalEventEnvelope =
+            serde_json::from_value(json).expect("deserialize event");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn tool_projection_carries_codex_rich_subkind() {
+        let tool = ToolProjection {
+            kind: ToolProjectionKind::Tool,
+            subkind: Some("web_search".to_owned()),
+            name: "web_search".to_owned(),
+            title: "Web search".to_owned(),
+            status: ItemStatus::Completed,
+            detail: None,
+            input_summary: Some("query".to_owned()),
+            output_summary: Some("3 results".to_owned()),
+            command: None,
+            subagent: None,
+            mcp: None,
+        };
+
+        let json = serde_json::to_value(&tool).expect("serialize tool");
+        assert_eq!(json["subkind"], "web_search");
+
+        let decoded: ToolProjection = serde_json::from_value(json).expect("deserialize tool");
+        assert_eq!(decoded, tool);
     }
 }

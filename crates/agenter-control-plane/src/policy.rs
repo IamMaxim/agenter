@@ -57,6 +57,12 @@ impl PolicyEngine {
                 reason: "file change requires user approval".to_owned(),
                 rewritten_request: None,
             },
+            ApprovalKind::Permission => PolicyDecision {
+                action: PolicyAction::Ask,
+                risk: ApprovalRisk::Unknown,
+                reason: "provider permission request requires user approval".to_owned(),
+                rewritten_request: None,
+            },
             ApprovalKind::Tool | ApprovalKind::ProviderSpecific => PolicyDecision {
                 action: PolicyAction::Ask,
                 risk: ApprovalRisk::Unknown,
@@ -139,7 +145,7 @@ fn rule_previews_for_request(request: &ApprovalRequest) -> Vec<ApprovalPolicyRul
                 label: "Approve file changes in this workspace".to_owned(),
             });
         }
-        ApprovalKind::Tool | ApprovalKind::ProviderSpecific => {
+        ApprovalKind::Permission | ApprovalKind::Tool | ApprovalKind::ProviderSpecific => {
             if let Some(method) = native_method(request) {
                 previews.push(ApprovalPolicyRulePreview {
                     kind: request.kind.clone(),

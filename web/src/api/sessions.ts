@@ -280,10 +280,7 @@ export async function executeSlashCommand(
     accepted: record.accepted === true,
     message: typeof record.message === 'string' ? record.message : '',
     session: normalizeSessionInfo(record.session),
-    provider_payload:
-      typeof record.provider_payload === 'object' && record.provider_payload !== null
-        ? (record.provider_payload as Record<string, unknown>)
-        : null
+    provider_payload: record.provider_payload
   };
 }
 

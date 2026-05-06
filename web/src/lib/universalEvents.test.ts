@@ -138,6 +138,16 @@ describe('universal event reducer', () => {
               }
             ],
             status: 'pending',
+            native_request_id: 'request-1',
+            native_blocking: true,
+            native: {
+              protocol: 'codex/app-server/v2',
+              method: 'mcpServer/elicitation/request',
+              raw_payload: {
+                id: 'request-1',
+                method: 'mcpServer/elicitation/request'
+              }
+            },
             requested_at: '2026-05-04T11:58:00Z'
           }
         }
@@ -168,11 +178,60 @@ describe('universal event reducer', () => {
       title: 'Pick target',
       description: 'Choose a deployment target',
       status: 'answered',
+      native_request_id: 'request-1',
+      native_blocking: true,
       requested_at: '2026-05-04T11:58:00Z',
       answered_at: '2026-05-04T12:00:00Z',
       answer: { question_id: 'q1', answers: { target: ['prod'] } }
     });
+    expect(state.questions.q1.native?.raw_payload).toEqual({
+      id: 'request-1',
+      method: 'mcpServer/elicitation/request'
+    });
     expect(state.questions.q1.fields).toHaveLength(1);
     expect(state.questions.q1.fields[0].label).toBe('Target');
+  });
+
+  test('applies item events without losing native raw payload or tool subkind', () => {
+    const state = applyUniversalEvent(
+      snapshot(),
+      event({
+        event_id: 'evt-item',
+        native: {
+          protocol: 'codex/app-server/v2',
+          method: 'rawResponseItem/completed',
+          raw_payload: { params: { item: { id: 'item1', type: 'web_search' } } }
+        },
+        event: {
+          type: 'item.created',
+          data: {
+            item: {
+              item_id: 'item1',
+              session_id: 's1',
+              role: 'tool',
+              status: 'completed',
+              content: [],
+              tool: {
+                kind: 'tool',
+                subkind: 'web_search',
+                name: 'web_search',
+                title: 'Web search',
+                status: 'completed'
+              },
+              native: {
+                protocol: 'codex/app-server/v2',
+                method: 'rawResponseItem/completed',
+                raw_payload: { params: { item: { id: 'item1', type: 'web_search' } } }
+              }
+            }
+          }
+        }
+      })
+    );
+
+    expect(state.items.item1.tool?.subkind).toBe('web_search');
+    expect(state.items.item1.native?.raw_payload).toEqual({
+      params: { item: { id: 'item1', type: 'web_search' } }
+    });
   });
 });

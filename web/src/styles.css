@@ -1779,6 +1779,11 @@ button.busy:disabled .button-spinner {
   gap: 0.5rem;
 }
 
+.single-choice-list {
+  display: grid;
+  gap: 0.5rem;
+}
+
 .choice-list label {
   display: inline-flex;
   align-items: center;
@@ -1790,8 +1795,38 @@ button.busy:disabled .button-spinner {
   background: var(--bg);
 }
 
+.single-choice-list label {
+  align-items: flex-start;
+  width: min(100%, 46rem);
+  padding: 0.45rem 0.6rem;
+}
+
+.choice-list label.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg));
+}
+
+.choice-text {
+  display: grid;
+  gap: 0.12rem;
+}
+
+.choice-text strong {
+  font-size: 0.88rem;
+  font-weight: 650;
+}
+
+.choice-text small {
+  color: var(--dim);
+  line-height: 1.35;
+}
+
 .choice-list input {
   width: auto;
+}
+
+.question-custom-input {
+  width: min(100%, 46rem);
 }
 
 .back-link {

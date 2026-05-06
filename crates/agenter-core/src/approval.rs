@@ -31,6 +31,7 @@ impl ApprovalDecision {
 pub enum ApprovalKind {
     Command,
     FileChange,
+    Permission,
     Tool,
     ProviderSpecific,
 }

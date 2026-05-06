@@ -18,6 +18,7 @@ export interface RunnerInfo {
   name: string;
   status?: RunnerStatus;
   last_seen_at?: string | null;
+  provider_ids?: AgentProviderId[];
 }
 
 export type AgentProviderId = string;
@@ -138,7 +139,7 @@ export interface SlashCommandResult {
   accepted: boolean;
   message: string;
   session?: SessionInfo | null;
-  provider_payload?: Record<string, unknown> | null;
+  provider_payload?: unknown;
 }
 
 export interface AgentQuestionChoice {
@@ -156,6 +157,7 @@ export interface AgentQuestionField {
   secret: boolean;
   choices: AgentQuestionChoice[];
   default_answers: string[];
+  schema?: unknown;
 }
 
 export interface AgentQuestionAnswer {
@@ -181,6 +183,8 @@ export interface QuestionState {
   fields: AgentQuestionField[];
   status: QuestionStatus;
   answer?: AgentQuestionAnswer | null;
+  native_request_id?: string | null;
+  native_blocking?: boolean;
   native?: NativeRef | null;
   requested_at?: string | null;
   answered_at?: string | null;
@@ -199,6 +203,7 @@ export interface NativeRef {
   summary?: string | null;
   hash?: string | null;
   pointer?: string | null;
+  raw_payload?: unknown;
 }
 
 export interface CapabilitySet {
@@ -306,6 +311,7 @@ export type ToolProjectionKind = 'command' | 'subagent' | 'mcp' | 'tool' | strin
 
 export interface ToolProjection {
   kind: ToolProjectionKind;
+  subkind?: string | null;
   name: string;
   title: string;
   status: ItemStatus;
@@ -509,6 +515,7 @@ export interface ArtifactState {
   title: string;
   uri?: string | null;
   mime_type?: string | null;
+  native?: NativeRef | null;
   created_at?: string | null;
 }
 
